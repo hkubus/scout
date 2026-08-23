@@ -23,6 +23,16 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
     last_used_at TEXT,
     last_error TEXT
   )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS notification_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    listing_key TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    status TEXT NOT NULL,
+    message TEXT,
+    sent_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (listing_key, channel)
+  )`);
   const watchColumns = new Set((db.prepare('PRAGMA table_info(watches)').all() as Array<{ name: string }>).map((column) => column.name));
   if (!watchColumns.has('shipping_only')) db.exec('ALTER TABLE watches ADD COLUMN shipping_only INTEGER NOT NULL DEFAULT 0');
   if (!watchColumns.has('min_price_pln')) db.exec('ALTER TABLE watches ADD COLUMN min_price_pln REAL');

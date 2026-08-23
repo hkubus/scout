@@ -4,7 +4,7 @@ import { dedupeKey, normalizeListing, parseOlxCards, parsePolishPrice, parseStru
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { median, pruneBefore, scoreDeal } from '../server/scoring';
-import { buildDiscordEmbed, notificationKey } from '../server/notifications';
+import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, priorityFromDiscount, publishNtfy, validateNtfyConfig } from '../server/notifications';
 import { filterListings } from '../server/service';
 
 test('validates approved HTTPS search URLs and blocks off-domain redirects', () => {
@@ -79,6 +79,34 @@ test('builds one stable Discord embed key per listing', () => {
   assert.equal(notificationKey(listing), 'olx:abc-1');
   assert.equal(embed.embeds[0].fields.find((field) => field.name === 'Confidence')?.value, '94%');
   assert.equal(embed.embeds[0].url, listing.url);
+});
+
+test('maps deal tiers to independent notification thresholds and ntfy payloads', async () => {
+  const listing = { marketplace: 'OLX' as const, listingId: 'ntfy-1', title: 'Deck', price: 900, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/deck-ntfy-1', observedAt: '2026-08-22T00:00:00.000Z' };
+  assert.equal(priorityFromDiscount(18), 'strong');
+  assert.equal(priorityFromDiscount(20), 'very-strong');
+  assert.equal(priorityFromDiscount(30), 'exceptional');
+  assert.equal(meetsMinimumPriority('very-strong', 'strong'), true);
+  assert.equal(meetsMinimumPriority('strong', 'exceptional'), false);
+  const config = validateNtfyConfig({ serverUrl: 'https://ntfy.sh/', topic: 'scout-deals', token: 'tk_test', minimumPriority: 'exceptional' });
+  const payload = buildNtfyPayload({ listing, typical: 1400, discountPercent: 35.7, confidence: 94 }, config.topic);
+  let requestedUrl = '';
+  let requestedInit: RequestInit | undefined;
+  await publishNtfy(config, payload, async (input, init) => {
+    requestedUrl = String(input);
+    requestedInit = init;
+    return new Response(null, { status: 200 });
+  });
+  assert.equal(requestedUrl, 'https://ntfy.sh/');
+  assert.equal(requestedInit?.headers && new Headers(requestedInit.headers).get('authorization'), 'Bearer tk_test');
+  assert.equal(JSON.parse(String(requestedInit?.body)).priority, 5);
+  assert.equal(JSON.parse(String(requestedInit?.body)).click, listing.url);
+});
+
+test('rejects unsafe ntfy endpoints and invalid topics', () => {
+  assert.throws(() => validateNtfyConfig({ serverUrl: 'https://example.com?token=secret', topic: 'scout-deals' }), /credentials or query/);
+  assert.throws(() => validateNtfyConfig({ serverUrl: 'http://example.com', topic: 'scout-deals' }), /HTTPS/);
+  assert.throws(() => validateNtfyConfig({ serverUrl: 'https://ntfy.sh', topic: 'not a topic' }), /topic must be/);
 });
 
 test('uses query tokens as the default comparability filter', () => {

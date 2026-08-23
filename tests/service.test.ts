@@ -36,6 +36,41 @@ test('encrypts Discord secrets and validates settings bounds', () => {
   } finally { context.close(); }
 });
 
+test('stores ntfy credentials encrypted and routes channel priorities independently', async () => {
+  const context = fixture();
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  globalThis.fetch = (async (input, init) => {
+    requests.push({ url: String(input), init });
+    return new Response(null, { status: 204 });
+  }) as typeof fetch;
+  const notifyDeal = (context.service as any).notifyDeal.bind(context.service) as (listing: any, typical: number, discountPercent: number, confidence: number) => Promise<void>;
+  try {
+    const settings = context.service.saveSettings({
+      webhook: 'https://discord.com/api/webhooks/123/token',
+      discordMinimumPriority: 'very-strong',
+      ntfy: { serverUrl: 'https://ntfy.sh', topic: 'scout-deals', token: 'tk_secret', minimumPriority: 'exceptional' },
+    });
+    assert.equal(settings.discordMinimumPriority, 'very-strong');
+    assert.equal(settings.ntfy.configured, true);
+    assert.equal(settings.ntfy.minimumPriority, 'exceptional');
+    const stored = context.db.prepare("SELECT value FROM settings WHERE key = 'ntfy_config'").get() as { value: string };
+    assert.equal(stored.value.includes('scout-deals'), false);
+    assert.equal(stored.value.includes('tk_secret'), false);
+
+    const base = { marketplace: 'OLX' as const, price: 900, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/priority', observedAt: new Date().toISOString() };
+    await notifyDeal({ ...base, listingId: 'very-strong', title: 'Very strong deal' }, 1200, 25, 92);
+    assert.deepEqual((context.db.prepare('SELECT channel, status FROM notification_deliveries WHERE listing_key = ? ORDER BY channel').all('olx:very-strong') as Array<{ channel: string; status: string }>).map((row) => ({ channel: row.channel, status: row.status })), [{ channel: 'Discord', status: 'delivered' }]);
+    await notifyDeal({ ...base, listingId: 'exceptional', title: 'Exceptional deal' }, 1400, 35, 96);
+    assert.deepEqual((context.db.prepare('SELECT channel, status FROM notification_deliveries WHERE listing_key = ? ORDER BY channel').all('olx:exceptional') as Array<{ channel: string; status: string }>).map((row) => ({ channel: row.channel, status: row.status })), [{ channel: 'Discord', status: 'delivered' }, { channel: 'ntfy', status: 'delivered' }]);
+    assert.equal(requests.filter((request) => request.url === 'https://ntfy.sh/').length, 1);
+    assert.equal(new Headers(requests.find((request) => request.url === 'https://ntfy.sh/')?.init?.headers).get('authorization'), 'Bearer tk_secret');
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.close();
+  }
+});
+
 test('stores marketplace sessions encrypted and rejects cross-marketplace state', () => {
   const context = fixture();
   const state = {

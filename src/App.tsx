@@ -49,6 +49,7 @@ import type {
   MarketTrackedListing,
   MarketWatch,
   MarketWatchInput,
+  NotificationPriority,
   NotificationRecord,
   SearchSourceStatus,
   SettingsData,
@@ -1749,6 +1750,18 @@ function ConnectorsPage({
       setTesting(false);
     }
   };
+  const testNtfy = async () => {
+    setTesting(true);
+    try {
+      await api.testNtfy();
+      onToast("ntfy test delivered.");
+      await loadRuns();
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+    } finally {
+      setTesting(false);
+    }
+  };
   const connectorColor = (source: string) =>
     connectors.find((connector) => connector.name === source)?.color ??
     "#8a94a6";
@@ -1789,7 +1802,7 @@ function ConnectorsPage({
             connector={connector}
             key={connector.name}
             testing={testing}
-            onTest={connector.name === "Discord" ? testWebhook : undefined}
+            onTest={connector.name === "Discord" ? testWebhook : connector.name === "ntfy" ? testNtfy : undefined}
           />
         ))}
       </div>
@@ -1865,7 +1878,7 @@ function ConnectorCard({
   onTest?: () => void;
 }) {
   const configured =
-    connector.name !== "Discord" ||
+    (connector.name !== "Discord" && connector.name !== "ntfy") ||
     !connector.detail.toLowerCase().includes("not configured");
   return (
     <article className="connector-card">
@@ -1873,9 +1886,11 @@ function ConnectorCard({
         <span className="connector-logo" style={{ color: connector.color }}>
           {connector.kind === "discord"
             ? "D"
-            : connector.name === "Allegro Lokalnie"
-              ? "A"
-              : connector.name[0]}
+            : connector.kind === "ntfy"
+              ? "N"
+              : connector.name === "Allegro Lokalnie"
+                ? "A"
+                : connector.name[0]}
         </span>
         <span
           className={`status-pill status-pill--${connector.status.toLowerCase()}`}
@@ -1914,7 +1929,7 @@ function ConnectorCard({
           {configured
             ? testing
               ? "Sending…"
-              : "Test webhook"
+              : connector.kind === "ntfy" ? "Test ntfy notification" : "Test webhook"
             : "Configure in Settings"}
         </button>
       ) : null}
@@ -1938,6 +1953,12 @@ function SettingsPage({
   const [interval, setIntervalValue] = useState("5");
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [testingNtfy, setTestingNtfy] = useState(false);
+  const [discordMinimumPriority, setDiscordMinimumPriority] = useState<NotificationPriority>("strong");
+  const [ntfyServerUrl, setNtfyServerUrl] = useState("https://ntfy.sh");
+  const [ntfyTopic, setNtfyTopic] = useState("");
+  const [ntfyToken, setNtfyToken] = useState("");
+  const [ntfyMinimumPriority, setNtfyMinimumPriority] = useState<NotificationPriority>("exceptional");
   const [sessionMarketplace, setSessionMarketplace] = useState<Marketplace>("OLX");
   const [sessionLabel, setSessionLabel] = useState("");
   const [storageStateInput, setStorageStateInput] = useState("");
@@ -1948,6 +1969,9 @@ function SettingsPage({
       const result = await api.settings();
       setSettings(result);
       setIntervalValue(String(result.defaultInterval));
+      setDiscordMinimumPriority(result.discordMinimumPriority);
+      setNtfyServerUrl(result.ntfy?.serverUrl ?? "https://ntfy.sh");
+      setNtfyMinimumPriority(result.ntfy?.minimumPriority ?? "exceptional");
     } catch (error) {
       onToast(errorMessage(error), "error");
     }
@@ -1967,12 +1991,30 @@ function SettingsPage({
     }
     setSaving(true);
     try {
+      const ntfyTouched = Boolean(
+        settings?.ntfy?.configured ||
+        ntfyTopic.trim() ||
+        ntfyToken.trim() ||
+        ntfyServerUrl.trim() !== "https://ntfy.sh",
+      );
       const result = await api.saveSettings({
         interval: numericInterval,
         webhook: webhook.trim() || undefined,
+        discordMinimumPriority,
+        ntfy: ntfyTouched
+          ? {
+              serverUrl: ntfyServerUrl.trim() || undefined,
+              topic: ntfyTopic.trim() || undefined,
+              token: ntfyToken.trim() || undefined,
+              minimumPriority: ntfyMinimumPriority,
+            }
+          : undefined,
       });
       setSettings(result);
       setWebhook("");
+      setNtfyTopic("");
+      setNtfyToken("");
+      setNtfyServerUrl(result.ntfy?.serverUrl ?? "https://ntfy.sh");
       onToast("Settings saved securely.");
     } catch (error) {
       onToast(errorMessage(error), "error");
@@ -2006,6 +2048,37 @@ function SettingsPage({
       onToast(errorMessage(error), "error");
     } finally {
       setTesting(false);
+    }
+  };
+  const clearNtfy = async () => {
+    if (!window.confirm("Remove the saved ntfy configuration?")) return;
+    setSaving(true);
+    try {
+      const result = await api.saveSettings({
+        interval: Number(interval),
+        clearNtfy: true,
+      });
+      setSettings(result);
+      setNtfyServerUrl("https://ntfy.sh");
+      setNtfyTopic("");
+      setNtfyToken("");
+      setNtfyMinimumPriority(result.ntfy?.minimumPriority ?? "exceptional");
+      onToast("ntfy configuration removed.");
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+    } finally {
+      setSaving(false);
+    }
+  };
+  const testNtfy = async () => {
+    setTestingNtfy(true);
+    try {
+      await api.testNtfy();
+      onToast("ntfy test delivered.");
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+    } finally {
+      setTestingNtfy(false);
     }
   };
   const saveMarketplaceSession = async () => {
@@ -2049,6 +2122,7 @@ function SettingsPage({
     }
   };
   const configured = settings?.webhookConfigured ?? false;
+  const ntfyConfigured = settings?.ntfy?.configured ?? false;
   const settingsLoaded = settings !== null;
   return (
     <>
@@ -2238,6 +2312,14 @@ function SettingsPage({
               onChange={(event) => setWebhook(event.target.value)}
             />
           </label>
+          <label className="field-label">
+            Minimum deal priority <span>Discord channel filter</span>
+            <select value={discordMinimumPriority} onChange={(event) => setDiscordMinimumPriority(event.target.value as NotificationPriority)}>
+              <option value="strong">Strong and above</option>
+              <option value="very-strong">Very strong and above</option>
+              <option value="exceptional">Exceptional only</option>
+            </select>
+          </label>
           <div className="settings-actions">
             <button
               className="outline-button"
@@ -2270,6 +2352,87 @@ function SettingsPage({
             <span>
               Secret encryption uses the deployment secret. The stored webhook
               is never returned to the browser.
+            </span>
+          </div>
+        </section>
+        <section className="settings-section settings-section--wide">
+          <div className="settings-section-heading">
+            <div className="settings-symbol settings-symbol--blue">
+              <Send size={18} />
+            </div>
+            <div>
+              <h2>ntfy notifications</h2>
+              <p>
+                Send only the priority tier you choose to an ntfy topic. The
+                default is Exceptional only, keeping this channel quiet.
+              </p>
+            </div>
+            <span className={`settings-status ${ntfyConfigured ? "" : "settings-status--idle"}`}>
+              <i />
+              {settingsLoaded ? ntfyConfigured ? "Configured" : "Not configured" : "Loading…"}
+            </span>
+          </div>
+          <div className="field-row">
+            <label className="field-label">
+              Server URL
+              <input
+                type="url"
+                autoComplete="off"
+                disabled={!settingsLoaded}
+                value={ntfyServerUrl}
+                onChange={(event) => setNtfyServerUrl(event.target.value)}
+                placeholder="https://ntfy.sh"
+              />
+            </label>
+            <label className="field-label">
+              Topic
+              <input
+                autoComplete="off"
+                disabled={!settingsLoaded}
+                value={ntfyTopic}
+                onChange={(event) => setNtfyTopic(event.target.value)}
+                placeholder={ntfyConfigured ? (settings?.ntfy?.topicMasked ?? "Saved topic") : "e.g. scout-deals"}
+              />
+            </label>
+          </div>
+          <div className="field-row">
+            <label className="field-label">
+              Access token <span>optional</span>
+              <input
+                type="password"
+                autoComplete="new-password"
+                disabled={!settingsLoaded}
+                value={ntfyToken}
+                onChange={(event) => setNtfyToken(event.target.value)}
+                placeholder={settings?.ntfy?.tokenConfigured ? "Saved token" : "tk_…"}
+              />
+            </label>
+            <label className="field-label">
+              Minimum deal priority <span>ntfy channel filter</span>
+              <select value={ntfyMinimumPriority} onChange={(event) => setNtfyMinimumPriority(event.target.value as NotificationPriority)}>
+                <option value="strong">Strong and above</option>
+                <option value="very-strong">Very strong and above</option>
+                <option value="exceptional">Exceptional only</option>
+              </select>
+            </label>
+          </div>
+          <div className="settings-actions">
+            <button className="outline-button" disabled={testingNtfy || !ntfyConfigured} onClick={testNtfy}>
+              {testingNtfy ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}
+              {testingNtfy ? "Sending…" : "Send test notification"}
+            </button>
+            {ntfyConfigured ? (
+              <button className="outline-button danger-outline" disabled={saving} onClick={clearNtfy}>
+                <Trash2 size={15} />
+                Remove ntfy
+              </button>
+            ) : null}
+          </div>
+          <div className="security-note">
+            <ShieldCheck size={17} />
+            <span>
+              The topic and optional access token are encrypted at rest. Topic
+              names behave like passwords, so avoid sharing them publicly.
             </span>
           </div>
         </section>

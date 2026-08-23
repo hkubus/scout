@@ -1,4 +1,4 @@
-import type { ConnectorRun, DashboardData, ManualSearchResponse, MarketResearchData, MarketWatch, MarketWatchInput, Marketplace, NotificationRecord, SearchFilters, SettingsData, Watch } from './types';
+import type { ConnectorRun, DashboardData, ManualSearchResponse, MarketResearchData, MarketWatch, MarketWatchInput, Marketplace, NotificationPriority, NotificationRecord, SearchFilters, SettingsData, Watch } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -34,10 +34,11 @@ export const api = {
   deleteWatch: (id: string) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('DELETE')),
   scan: (watchId?: string) => request<{ queued: boolean; message: string }>('/api/scans', json('POST', watchId ? { watchId } : {})),
   settings: () => request<SettingsData>('/api/settings'),
-  saveSettings: (settings: { interval: number; webhook?: string; clearWebhook?: boolean }) => request<SettingsData>('/api/settings', json('PATCH', settings)),
+  saveSettings: (settings: { interval: number; webhook?: string; clearWebhook?: boolean; discordMinimumPriority?: NotificationPriority; clearNtfy?: boolean; ntfy?: { serverUrl?: string; topic?: string; token?: string; minimumPriority?: NotificationPriority } }) => request<SettingsData>('/api/settings', json('PATCH', settings)),
   saveMarketplaceSession: (marketplace: Marketplace, label: string, storageState: unknown) => request<SettingsData>(`/api/marketplace-sessions/${encodeURIComponent(marketplace)}`, json('PUT', { label, storageState })),
   deleteMarketplaceSession: (marketplace: Marketplace) => request<SettingsData>(`/api/marketplace-sessions/${encodeURIComponent(marketplace)}`, json('DELETE')),
   testWebhook: () => request<{ delivered: boolean }>('/api/settings/webhook/test', { method: 'POST' }),
+  testNtfy: () => request<{ delivered: boolean }>('/api/settings/ntfy/test', { method: 'POST' }),
   notifications: () => request<{ notifications: NotificationRecord[] }>('/api/notifications'),
   connectorRuns: () => request<{ runs: ConnectorRun[] }>('/api/connector-runs'),
 };

@@ -336,7 +336,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .connector-banner strong { color: var(--text-strong); font-size: 13px; }
 .connector-banner span { color: var(--muted); font-size: 12px; }
 .connector-banner button { margin-left: auto; display: inline-flex; align-items: center; gap: 7px; border: 0; background: transparent; color: var(--blue); font-size: 12px; font-weight: 600; }
-.connector-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 13px; }
+.connector-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 13px; }
 .connector-card { padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow); }
 .connector-card-top { display: flex; justify-content: space-between; align-items: center; }
 .connector-logo { width: 29px; height: 29px; display: grid; place-items: center; border-radius: 8px; background: var(--surface-muted); font-size: 17px; font-weight: 750; }

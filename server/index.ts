@@ -237,9 +237,29 @@ app.post('/api/scans', async (request, reply) => {
   return reply.code(202).send(service.queueScan(body.watchId));
 });
 
-app.patch('/api/settings', async (request) => service.saveSettings(request.body as { interval?: number; webhook?: string; clearWebhook?: boolean }));
+const notificationPriority = z.enum(['strong', 'very-strong', 'exceptional']);
+const settingsInput = z.object({
+  interval: z.number().int().min(5).max(1440).optional(),
+  webhook: z.string().max(512).optional(),
+  clearWebhook: z.boolean().optional(),
+  discordMinimumPriority: notificationPriority.optional(),
+  clearNtfy: z.boolean().optional(),
+  ntfy: z.object({
+    serverUrl: z.string().max(512).optional(),
+    topic: z.string().max(64).optional(),
+    token: z.string().max(512).optional(),
+    minimumPriority: notificationPriority.optional(),
+  }).strict().optional(),
+}).strict();
+
+app.patch('/api/settings', async (request, reply) => {
+  const parsed = settingsInput.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid settings', details: parsed.error.flatten() });
+  return service.saveSettings(parsed.data);
+});
 
 app.post('/api/settings/webhook/test', async () => service.testWebhook());
+app.post('/api/settings/ntfy/test', async () => service.testNtfy());
 
 app.post('/api/notifications/preview', async (request, reply) => {
   const body = request.body as { marketplace?: Marketplace; listingId?: string; title?: string; price?: number; typical?: number; url?: string };

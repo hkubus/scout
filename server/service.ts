@@ -1,11 +1,11 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { chromium, type Browser } from 'playwright-core';
-import { buildDiscordEmbed, notificationKey } from './notifications';
+import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, parseNotificationPriority, priorityFromDiscount, publishNtfy, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { createPublicAdapter, exponentialBackoff, validateSearchUrl, type Marketplace, type NormalizedListing } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
 import { median, scoreDeal } from './scoring';
-import type { Connector, ConnectorRun, DashboardData, DealLabel, Listing, ManualSearchResponse, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationRecord, SearchFilters, SettingsData, Watch } from '../src/types';
+import type { Connector, ConnectorRun, DashboardData, DealLabel, Listing, ManualSearchResponse, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, SearchFilters, SettingsData, Watch } from '../src/types';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -15,6 +15,7 @@ const connectorDefinitions: Array<Pick<Connector, 'name' | 'kind' | 'color'>> = 
   { name: 'Allegro Lokalnie', kind: 'marketplace', color: '#f27526' },
   { name: 'Vinted', kind: 'marketplace', color: '#55a9b0' },
   { name: 'Discord', kind: 'discord', color: '#32a85b' },
+  { name: 'ntfy', kind: 'ntfy', color: '#4f9da6' },
 ];
 const marketplaces: Marketplace[] = ['OLX', 'Allegro Lokalnie', 'Vinted'];
 
@@ -114,6 +115,21 @@ export class ScoutService {
 
   private setSetting(key: string, value: string) {
     this.db.prepare('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run(key, value, nowIso());
+  }
+
+  private discordMinimumPriority(): NotificationPriority {
+    return parseNotificationPriority(this.getSetting('discord_minimum_priority'), 'strong');
+  }
+
+  private ntfyConfig(): NtfyConfig | null {
+    const encrypted = this.getSetting('ntfy_config');
+    if (!encrypted) return null;
+    try {
+      const parsed = JSON.parse(decryptSecret(encrypted)) as { serverUrl?: string; topic?: string; token?: string; minimumPriority?: unknown };
+      return validateNtfyConfig(parsed);
+    } catch {
+      return null;
+    }
   }
 
   private marketplaceSessionRow(marketplace: Marketplace) {
@@ -368,12 +384,14 @@ export class ScoutService {
 
   getConnectors(): Connector[] {
     const webhookConfigured = Boolean(this.getSetting('discord_webhook'));
+    const ntfyConfigured = Boolean(this.ntfyConfig());
     return connectorDefinitions.map((definition) => {
       if (definition.name === 'Discord' && !webhookConfigured) return { ...definition, status: 'Idle', detail: 'Webhook not configured', lastSuccess: 'Never', requests: 0, latency: '—' };
+      if (definition.name === 'ntfy' && !ntfyConfigured) return { ...definition, status: 'Idle', detail: 'ntfy not configured', lastSuccess: 'Never', requests: 0, latency: '—' };
       const last = this.db.prepare('SELECT * FROM connector_runs WHERE source = ? ORDER BY started_at DESC LIMIT 1').get(definition.name) as Record<string, any> | undefined;
       const count = this.db.prepare('SELECT COUNT(*) AS count FROM connector_runs WHERE source = ?').get(definition.name) as { count: number };
       const lastSuccess = this.db.prepare("SELECT finished_at FROM connector_runs WHERE source = ? AND status = 'ok' ORDER BY finished_at DESC LIMIT 1").get(definition.name) as { finished_at?: string } | undefined;
-      if (!last) return { ...definition, status: 'Idle', detail: definition.name === 'Discord' ? 'Webhook configured; no delivery yet' : 'No connector run yet', lastSuccess: 'Never', requests: Number(count?.count ?? 0), latency: '—' };
+      if (!last) return { ...definition, status: 'Idle', detail: definition.name === 'Discord' ? 'Webhook configured; no delivery yet' : definition.name === 'ntfy' ? 'ntfy configured; no delivery yet' : 'No connector run yet', lastSuccess: 'Never', requests: Number(count?.count ?? 0), latency: '—' };
       const status: Connector['status'] = last.status === 'ok' ? 'OK' : last.status === 'error' ? 'Degraded' : last.status === 'running' ? 'Warning' : 'Idle';
       return { ...definition, status, detail: last.message || (status === 'OK' ? 'Last run completed' : 'Waiting for a run'), lastSuccess: relativeTime(lastSuccess?.finished_at), requests: Number(count?.count ?? 0), latency: duration(last.started_at, last.finished_at) };
     });
@@ -401,22 +419,54 @@ export class ScoutService {
 
   settings(): SettingsData {
     const webhookConfigured = Boolean(this.getSetting('discord_webhook'));
+    const ntfy = this.ntfyConfig();
     return {
       defaultInterval: Number(this.getSetting('default_interval') ?? 5),
       webhookConfigured,
       webhookMasked: webhookConfigured ? '••••••••••••••••' : null,
+      discordMinimumPriority: this.discordMinimumPriority(),
+      ntfy: {
+        configured: Boolean(ntfy),
+        serverUrl: ntfy?.serverUrl ?? null,
+        topicMasked: ntfy ? '••••••••••••••••' : null,
+        tokenConfigured: Boolean(ntfy?.token),
+        minimumPriority: ntfy?.minimumPriority ?? 'exceptional',
+      },
       publicExposureWarning: process.env.SCOUT_PUBLIC === 'true',
       marketplaceSessions: this.marketplaceSessions(),
     };
   }
 
-  saveSettings(input: { interval?: number; webhook?: string; clearWebhook?: boolean }) {
+  saveSettings(input: {
+    interval?: number;
+    webhook?: string;
+    clearWebhook?: boolean;
+    discordMinimumPriority?: NotificationPriority;
+    clearNtfy?: boolean;
+    ntfy?: { serverUrl?: string; topic?: string; token?: string; minimumPriority?: NotificationPriority };
+  }) {
     if (input.interval !== undefined) {
       if (!Number.isInteger(input.interval) || input.interval < 5 || input.interval > 1440) throw new ServiceError('Polling interval must be between 5 and 1440 minutes');
       this.setSetting('default_interval', String(input.interval));
     }
     if (input.clearWebhook) this.db.prepare("DELETE FROM settings WHERE key = 'discord_webhook'").run();
     if (input.webhook?.trim()) this.setSetting('discord_webhook', encryptSecret(validateDiscordWebhook(input.webhook.trim())));
+    if (input.discordMinimumPriority !== undefined) this.setSetting('discord_minimum_priority', parseNotificationPriority(input.discordMinimumPriority, 'strong'));
+    if (input.clearNtfy) this.db.prepare("DELETE FROM settings WHERE key = 'ntfy_config'").run();
+    if (input.ntfy !== undefined) {
+      const current = this.ntfyConfig();
+      try {
+        const config = validateNtfyConfig({
+          serverUrl: input.ntfy.serverUrl?.trim() || current?.serverUrl,
+          topic: input.ntfy.topic?.trim() || current?.topic,
+          token: input.ntfy.token?.trim() || current?.token,
+          minimumPriority: input.ntfy.minimumPriority ?? current?.minimumPriority ?? 'exceptional',
+        });
+        this.setSetting('ntfy_config', encryptSecret(JSON.stringify(config)));
+      } catch (error) {
+        throw new ServiceError(error instanceof Error ? error.message : 'Invalid ntfy configuration');
+      }
+    }
     return this.settings();
   }
 
@@ -426,7 +476,7 @@ export class ScoutService {
       const payload = parseJson<Record<string, any>>(row.payload_json, {});
       const embed = payload.embeds?.[0];
       const below = embed?.fields?.find((field: any) => field.name === 'Below typical')?.value;
-      return { id: Number(row.id), title: embed?.title ?? (payload.test ? 'Discord test notification' : row.listing_key), reason: below ? `${below} below typical` : payload.test ? 'Webhook connectivity test' : 'Deal alert', observedAt: row.sent_at ?? row.created_at, status: row.status };
+      return { id: Number(row.id), title: embed?.title ?? payload.title ?? (payload.test ? `${payload.channel === 'ntfy' ? 'ntfy' : 'Discord'} test notification` : row.listing_key), reason: below ? `${below} below typical` : payload.test ? `${payload.channel === 'ntfy' ? 'ntfy' : 'Webhook'} connectivity test` : 'Deal alert', observedAt: row.sent_at ?? row.created_at, status: row.status };
     });
   }
 
@@ -458,6 +508,33 @@ export class ScoutService {
       const message = error instanceof Error ? error.message : 'Discord delivery failed';
       this.db.prepare('INSERT INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(key, JSON.stringify({ ...payload, test: true }), 'failed', sentAt);
       this.recordRun('Discord', 'error', message, sentAt, nowIso());
+      throw new ServiceError(message, 502);
+    }
+  }
+
+  async testNtfy() {
+    const config = this.ntfyConfig();
+    if (!config) throw new ServiceError('Configure ntfy before sending a test', 409);
+    const sentAt = nowIso();
+    const payload = {
+      topic: config.topic,
+      title: 'Scout is connected',
+      message: 'Your important deal alerts will be delivered here.',
+      priority: 3,
+      tags: ['white_check_mark'],
+      click: config.serverUrl,
+    };
+    const key = `test-ntfy-${Date.now()}`;
+    try {
+      await publishNtfy(config, payload);
+      this.db.prepare('INSERT INTO notifications (listing_key, payload_json, status, sent_at, created_at) VALUES (?, ?, ?, ?, ?)').run(key, JSON.stringify({ ...payload, test: true, channel: 'ntfy' }), 'delivered', sentAt, sentAt);
+      this.recordRun('ntfy', 'ok', 'Test ntfy notification delivered', sentAt, nowIso());
+      this.emit('notification', { refresh: true });
+      return { delivered: true };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'ntfy delivery failed';
+      this.db.prepare('INSERT INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(key, JSON.stringify({ ...payload, test: true, channel: 'ntfy' }), 'failed', sentAt);
+      this.recordRun('ntfy', 'error', message, sentAt, nowIso());
       throw new ServiceError(message, 502);
     }
   }
@@ -626,20 +703,55 @@ export class ScoutService {
   }
 
   private async notifyDeal(listing: NormalizedListing, typical: number, discountPercent: number, confidence: number) {
-    const encrypted = this.getSetting('discord_webhook');
-    if (!encrypted) return;
+    const priority = priorityFromDiscount(discountPercent);
+    const encryptedDiscord = this.getSetting('discord_webhook');
+    const ntfy = this.ntfyConfig();
+    const channels: Array<'Discord' | 'ntfy'> = [];
+    if (encryptedDiscord && meetsMinimumPriority(priority, this.discordMinimumPriority())) channels.push('Discord');
+    if (ntfy && meetsMinimumPriority(priority, ntfy.minimumPriority)) channels.push('ntfy');
+    if (!channels.length) return;
     const key = notificationKey(listing);
-    const existing = this.db.prepare('SELECT id FROM notifications WHERE listing_key = ?').get(key);
-    if (existing) return;
     const payload = buildDiscordEmbed({ listing, typical, discountPercent, confidence });
     const created = nowIso();
-    this.db.prepare('INSERT INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(key, JSON.stringify(payload), 'pending', created);
-    try {
-      const response = await fetch(validateDiscordWebhook(decryptSecret(encrypted)), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(12_000) });
-      if (!response.ok) throw new Error(`Discord returned ${response.status}`);
-      this.db.prepare("UPDATE notifications SET status = 'delivered', sent_at = ? WHERE listing_key = ?").run(nowIso(), key);
-    } catch {
-      this.db.prepare("UPDATE notifications SET status = 'failed' WHERE listing_key = ?").run(key);
+    const existing = this.db.prepare('SELECT id, status, payload_json, sent_at, created_at FROM notifications WHERE listing_key = ?').get(key) as { id?: number; status?: string; payload_json?: string; sent_at?: string; created_at?: string } | undefined;
+    if (!existing) {
+      this.db.prepare('INSERT INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(key, JSON.stringify(payload), 'pending', created);
+    } else if (channels.includes('Discord')) {
+      const oldPayload = parseJson<Record<string, any>>(existing.payload_json, {});
+      if (oldPayload.embeds?.length) {
+        this.db.prepare(`INSERT OR IGNORE INTO notification_deliveries (listing_key, channel, status, message, sent_at, created_at) VALUES (?, 'Discord', ?, ?, ?, ?)`).run(key, existing.status === 'failed' ? 'failed' : 'delivered', existing.status === 'failed' ? 'Previous delivery failed' : null, existing.sent_at ?? existing.created_at ?? created, existing.created_at ?? created);
+      }
+    }
+
+    const results = await Promise.all(channels.map(async (channel) => {
+      const claimed = this.db.prepare('INSERT OR IGNORE INTO notification_deliveries (listing_key, channel, status, created_at) VALUES (?, ?, ?, ?)').run(key, channel, 'pending', created);
+      if (!claimed.changes) return null;
+      const started = nowIso();
+      try {
+        if (channel === 'Discord') {
+          if (!encryptedDiscord) throw new Error('Discord webhook is not configured');
+          const response = await fetch(validateDiscordWebhook(decryptSecret(encryptedDiscord)), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(12_000) });
+          if (!response.ok) throw new Error(`Discord returned ${response.status}`);
+        } else {
+          if (!ntfy) throw new Error('ntfy is not configured');
+          await publishNtfy(ntfy, buildNtfyPayload({ listing, typical, discountPercent, confidence }, ntfy.topic, priority));
+        }
+        const finished = nowIso();
+        this.db.prepare("UPDATE notification_deliveries SET status = 'delivered', message = NULL, sent_at = ? WHERE listing_key = ? AND channel = ?").run(finished, key, channel);
+        this.recordRun(channel, 'ok', `${channel} notification delivered`, started, finished);
+        return 'delivered' as const;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : `${channel} delivery failed`;
+        this.db.prepare("UPDATE notification_deliveries SET status = 'failed', message = ? WHERE listing_key = ? AND channel = ?").run(message, key, channel);
+        this.recordRun(channel, 'error', message, started, nowIso());
+        return 'failed' as const;
+      }
+    }));
+    const attempted = results.filter((result): result is 'delivered' | 'failed' => result !== null);
+    if (attempted.length) {
+      const delivered = attempted.includes('delivered');
+      this.db.prepare(`UPDATE notifications SET status = ?, sent_at = ? WHERE listing_key = ?`).run(delivered ? 'delivered' : 'failed', delivered ? nowIso() : null, key);
+      this.emit('notification', { refresh: true });
     }
   }
 

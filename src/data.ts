@@ -34,6 +34,7 @@ export const connectors: Connector[] = [
   { name: 'Allegro Lokalnie', kind: 'marketplace', status: 'OK', detail: 'Public search pages reachable', lastSuccess: '2m ago', color: '#f27526', requests: 366, latency: '1.1 s' },
   { name: 'Vinted', kind: 'marketplace', status: 'Warning', detail: 'Intermittent challenge page · backing off', lastSuccess: '6m ago', color: '#55a9b0', requests: 290, latency: '2.4 s' },
   { name: 'Discord', kind: 'discord', status: 'OK', detail: 'Webhook destination configured', lastSuccess: '1m ago', color: '#32a85b', requests: 18, latency: '410 ms' },
+  { name: 'ntfy', kind: 'ntfy', status: 'Idle', detail: 'Priority-filtered alerts', lastSuccess: 'Never', color: '#4f9da6', requests: 0, latency: '—' },
 ];
 
 export const dashboardSeed: DashboardData = { listings, watches, connectors, stats: { watching: watches.length, newToday: listings.length, strongDeals: listings.filter((listing) => listing.dealStrength >= 4).length }, lastScan: '1m ago', lastScanTime: '10:24:18' };
@@ -46,6 +47,7 @@ export const emptyDashboard: DashboardData = {
     { name: 'Allegro Lokalnie', kind: 'marketplace', status: 'Idle', detail: 'No connector run yet', lastSuccess: 'Never', color: '#f27526', requests: 0, latency: '—' },
     { name: 'Vinted', kind: 'marketplace', status: 'Idle', detail: 'No connector run yet', lastSuccess: 'Never', color: '#55a9b0', requests: 0, latency: '—' },
     { name: 'Discord', kind: 'discord', status: 'Idle', detail: 'Webhook not configured', lastSuccess: 'Never', color: '#32a85b', requests: 0, latency: '—' },
+    { name: 'ntfy', kind: 'ntfy', status: 'Idle', detail: 'ntfy not configured', lastSuccess: 'Never', color: '#4f9da6', requests: 0, latency: '—' },
   ],
   stats: { watching: 0, newToday: 0, strongDeals: 0 },
   lastScan: 'Never',

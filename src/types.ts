@@ -2,6 +2,7 @@ export type Theme = 'light' | 'dark' | 'system';
 export type View = 'overview' | 'search' | 'watches' | 'market-research' | 'listings' | 'connectors' | 'settings';
 export type Marketplace = 'OLX' | 'Allegro Lokalnie' | 'Vinted';
 export type DealLabel = 'Exceptional' | 'Very strong' | 'Strong' | 'Watch';
+export type NotificationPriority = 'strong' | 'very-strong' | 'exceptional';
 
 export interface Listing {
   id: string;
@@ -124,8 +125,8 @@ export interface MarketResearchData {
 }
 
 export interface Connector {
-  name: Marketplace | 'Discord';
-  kind: 'marketplace' | 'discord';
+  name: Marketplace | 'Discord' | 'ntfy';
+  kind: 'marketplace' | 'discord' | 'ntfy';
   status: 'OK' | 'Warning' | 'Degraded' | 'Idle';
   detail: string;
   lastSuccess: string;
@@ -162,8 +163,18 @@ export interface SettingsData {
   defaultInterval: number;
   webhookConfigured: boolean;
   webhookMasked: string | null;
+  discordMinimumPriority: NotificationPriority;
+  ntfy: NtfySettings;
   publicExposureWarning: boolean;
   marketplaceSessions: MarketplaceSession[];
+}
+
+export interface NtfySettings {
+  configured: boolean;
+  serverUrl: string | null;
+  topicMasked: string | null;
+  tokenConfigured: boolean;
+  minimumPriority: NotificationPriority;
 }
 
 export interface MarketplaceSession {

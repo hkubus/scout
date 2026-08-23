@@ -19,7 +19,11 @@ Copy `.env.example` to `.env`, set a long random `SCOUT_SECRET`, then run:
 docker compose up -d --build
 ```
 
-The compiled dashboard and API are served together on port 3001. SQLite, migrations, encrypted Discord webhook settings, and notification history live in the `scout-data` volume.
+The compiled dashboard and API are served together on port 3001. SQLite, migrations, encrypted Discord/ntfy settings, per-channel delivery records, and notification history live in the `scout-data` volume.
+
+## Notifications
+
+Settings supports Discord webhooks and ntfy topics. Each channel has its own minimum deal priority (`Strong`, `Very strong`, or `Exceptional`), so ntfy can be limited to only the most important alerts while Discord receives the broader stream. ntfy uses the standard JSON publish API and can optionally send a bearer access token; credentials are encrypted with `SCOUT_SECRET`.
 
 ## Optional marketplace sessions
 

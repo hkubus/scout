@@ -69,6 +69,17 @@ CREATE TABLE IF NOT EXISTS notifications (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  listing_key TEXT NOT NULL,
+  channel TEXT NOT NULL,
+  status TEXT NOT NULL,
+  message TEXT,
+  sent_at TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE (listing_key, channel)
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,
@@ -133,6 +144,7 @@ CREATE TABLE IF NOT EXISTS market_price_observations (
 
 CREATE INDEX IF NOT EXISTS observations_watch_time ON observations (watch_id, observed_at);
 CREATE INDEX IF NOT EXISTS listings_last_seen ON listings (last_seen_at);
+CREATE INDEX IF NOT EXISTS notification_deliveries_listing ON notification_deliveries (listing_key);
 CREATE INDEX IF NOT EXISTS market_watches_due ON market_watches (enabled, next_scan_at);
 CREATE INDEX IF NOT EXISTS market_listings_watch_status ON market_listings (market_watch_id, status);
 CREATE INDEX IF NOT EXISTS market_price_listing_time ON market_price_observations (market_listing_id, observed_at);
