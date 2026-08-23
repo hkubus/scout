@@ -11,15 +11,39 @@ npm run dev
 
 Open http://localhost:4173. The Vite client uses the Fastify API at port 3001 and shows an offline state when the API is unavailable.
 
-## Production
+## Production (Node)
 
-Copy `.env.example` to `.env`, set a long random `SCOUT_SECRET`, then run:
+Install the locked dependencies, build the dashboard, and start the API/server process:
 
 ```bash
-docker compose up -d --build
+npm ci
+npm run typecheck
+npm test
+npm run build
+
+export NODE_ENV=production
+export SCOUT_SECRET='replace-with-a-random-value-at-least-32-characters-long'
+export SCOUT_HOST=127.0.0.1
+export TZ=Europe/Warsaw
+export SCOUT_DB_PATH=./data/scout.sqlite
+npm start
 ```
 
-The compiled dashboard and API are served together on port 3001. SQLite, migrations, encrypted Discord webhook settings, and notification history live in the `scout-data` volume.
+The compiled dashboard and API are served together on port 3001. Keep `SCOUT_HOST=127.0.0.1` when placing an authenticated reverse proxy in front; set it to `0.0.0.0` only for a trusted LAN/VPN. `TZ` controls the server-local 22:00–08:00 overnight window, so set it explicitly for the deployment timezone. SQLite, migrations, encrypted Discord/ntfy settings, per-channel delivery records, and notification history live under `SCOUT_DB_PATH`.
+
+`SCOUT_PUBLIC=true` enables a visible public-exposure warning in Settings; it does not provide login or access control. Do not expose Scout directly to the public internet. If a separately hosted frontend needs API access, set `SCOUT_CORS_ORIGIN` to an explicit comma-separated allowlist; CORS is disabled by default.
+
+For a source checkout, the deployment checks are:
+
+```bash
+npm run typecheck
+npm test
+npm run build
+```
+
+## Notifications
+
+Settings supports Discord webhooks and ntfy topics. Each channel has its own minimum deal priority (`Strong`, `Very strong`, or `Exceptional`), so ntfy can be limited to only the most important alerts while Discord receives the broader stream. ntfy uses the standard JSON publish API and can optionally send a bearer access token; credentials are encrypted with `SCOUT_SECRET`.
 
 ## Optional marketplace sessions
 

@@ -1,4 +1,79 @@
 import type { NormalizedListing } from './marketplaces';
+import type { NotificationPriority } from '../src/types';
+
+export const notificationPriorityRank: Record<NotificationPriority, number> = {
+  strong: 1,
+  'very-strong': 2,
+  exceptional: 3,
+};
+
+export function isNotificationPriority(value: unknown): value is NotificationPriority {
+  return value === 'strong' || value === 'very-strong' || value === 'exceptional';
+}
+
+export function parseNotificationPriority(value: unknown, fallback: NotificationPriority): NotificationPriority {
+  return isNotificationPriority(value) ? value : fallback;
+}
+
+export function priorityFromDiscount(discountPercent: number): NotificationPriority {
+  if (discountPercent >= 30) return 'exceptional';
+  if (discountPercent >= 20) return 'very-strong';
+  return 'strong';
+}
+
+export function meetsMinimumPriority(actual: NotificationPriority, minimum: NotificationPriority) {
+  return notificationPriorityRank[actual] >= notificationPriorityRank[minimum];
+}
+
+export function notificationPriorityLabel(priority: NotificationPriority) {
+  if (priority === 'exceptional') return 'Exceptional';
+  if (priority === 'very-strong') return 'Very strong';
+  return 'Strong';
+}
+
+export function ntfyPriorityNumber(priority: NotificationPriority) {
+  if (priority === 'exceptional') return 5;
+  if (priority === 'very-strong') return 4;
+  return 3;
+}
+
+export interface NtfyConfig {
+  serverUrl: string;
+  topic: string;
+  token?: string;
+  minimumPriority: NotificationPriority;
+}
+
+export interface NtfyPayload {
+  topic: string;
+  title: string;
+  message: string;
+  priority: number;
+  tags: string[];
+  click: string;
+}
+
+export function validateNtfyConfig(input: {
+  serverUrl?: string | null;
+  topic?: string | null;
+  token?: string | null;
+  minimumPriority?: unknown;
+}): NtfyConfig {
+  const serverValue = (input.serverUrl ?? 'https://ntfy.sh').trim();
+  let server: URL;
+  try { server = new URL(serverValue); } catch { throw new Error('Enter a valid ntfy server URL'); }
+  const localHttpHosts = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
+  if (server.protocol !== 'https:' && !(server.protocol === 'http:' && localHttpHosts.has(server.hostname))) {
+    throw new Error('ntfy server must use HTTPS (HTTP is allowed only for localhost)');
+  }
+  if (server.username || server.password || server.search || server.hash) throw new Error('ntfy server URL cannot include credentials or query parameters');
+  const serverUrl = `${server.origin}${server.pathname.replace(/\/+$/, '')}`;
+  const topic = (input.topic ?? '').trim();
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(topic)) throw new Error('ntfy topic must be 1–64 letters, numbers, hyphens, or underscores');
+  const token = (input.token ?? '').trim() || undefined;
+  if (token && token.length > 512) throw new Error('ntfy access token is too long');
+  return { serverUrl, topic, token, minimumPriority: parseNotificationPriority(input.minimumPriority, 'exceptional') };
+}
 
 export interface DealNotificationInput {
   listing: NormalizedListing;
@@ -6,6 +81,36 @@ export interface DealNotificationInput {
   discountPercent: number;
   confidence: number;
   observedAt?: string;
+}
+
+export function buildNtfyPayload(input: DealNotificationInput, topic: string, priority = priorityFromDiscount(input.discountPercent)): NtfyPayload {
+  const { listing } = input;
+  const tags = priority === 'exceptional' ? ['rotating_light', 'moneybag'] : priority === 'very-strong' ? ['warning', 'moneybag'] : ['moneybag'];
+  return {
+    topic,
+    title: `${notificationPriorityLabel(priority)} deal · ${listing.marketplace}`,
+    message: [
+      listing.title,
+      `${listing.price.toLocaleString('pl-PL')} zł · ${input.discountPercent.toFixed(1)}% below typical · ${input.confidence}% confidence`,
+      listing.url,
+    ].join('\n'),
+    priority: ntfyPriorityNumber(priority),
+    tags,
+    click: listing.url,
+  };
+}
+
+export async function publishNtfy(config: NtfyConfig, payload: NtfyPayload, fetcher: typeof fetch = fetch) {
+  const response = await fetcher(`${config.serverUrl}/`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(config.token ? { authorization: `Bearer ${config.token}` } : {}),
+    },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(12_000),
+  });
+  if (!response.ok) throw new Error(`ntfy returned ${response.status}`);
 }
 
 export function buildDiscordEmbed(input: DealNotificationInput) {
