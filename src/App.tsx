@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   ArrowRight,
   BarChart3,
+  Calculator,
   Bell,
   Check,
   CheckCircle2,
@@ -44,18 +45,22 @@ import type {
   ConnectorRun,
   DashboardData,
   Listing,
+  ListingDetail,
+  ListingDecision,
   Marketplace,
   MarketResearchData,
   MarketTrackedListing,
   MarketWatch,
   MarketWatchInput,
   NotificationPriority,
+  PriceHistoryPoint,
   NotificationRecord,
   SearchSourceStatus,
   SettingsData,
   Theme,
   View,
   Watch,
+  WatchAnalytics,
 } from "./types";
 
 const navItems: Array<{ id: View; label: string; icon: typeof Grid2X2 }> = [
@@ -114,6 +119,8 @@ function App() {
   const [selectedWatchName, setSelectedWatchName] = useState<string | null>(
     null,
   );
+  const [analyticsWatch, setAnalyticsWatch] = useState<Watch | null>(null);
+  const [selectedListing, setSelectedListing] = useState<Listing | null>(null);
   const [busyWatchIds, setBusyWatchIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -151,6 +158,7 @@ function App() {
     source.addEventListener("scan", refresh);
     source.addEventListener("watch", refresh);
     source.addEventListener("notification", refresh);
+    source.addEventListener("listing-action", refresh);
     source.addEventListener("market-watch", () => setMarketRefreshKey((value) => value + 1));
     source.onerror = () => setConnection("offline");
     return () => source.close();
@@ -189,7 +197,7 @@ function App() {
     }));
     setShowWatchDialog(false);
     notify(
-      `${result.watch.name} is learning. Alerts begin after 30 listings and 24 hours.`,
+      `${result.watch.name} is learning. Alerts begin after 30 listings and 6 hours.`,
     );
   };
   const withBusyWatch = async (watch: Watch, action: () => Promise<void>) => {
@@ -264,6 +272,19 @@ function App() {
     setSelectedWatchName(watch.name);
     setView("listings");
   };
+  const updateListingAction = useCallback((listing: Listing) => {
+    setData((previous) => ({
+      ...previous,
+      listings: previous.listings.map((item) =>
+        item.id === listing.id
+          ? { ...item, decision: listing.decision, note: listing.note }
+          : item,
+      ),
+    }));
+    setSelectedListing((current) =>
+      current?.id === listing.id ? { ...current, decision: listing.decision, note: listing.note } : current,
+    );
+  }, []);
 
   return (
     <div className="app-shell">
@@ -303,16 +324,17 @@ function App() {
           </div>
         ) : null}
         {view === "overview" ? (
-          <Overview
-            data={data}
-            isLoading={isLoading}
-            scanning={scanning}
-            onNewWatch={() => setShowWatchDialog(true)}
-            onNavigate={openView}
-            onScan={() => requestScan()}
-          />
+        <Overview
+          data={data}
+          isLoading={isLoading}
+          scanning={scanning}
+          onNewWatch={() => setShowWatchDialog(true)}
+          onNavigate={openView}
+          onScan={() => requestScan()}
+          onSelectListing={setSelectedListing}
+        />
         ) : null}
-        {view === "search" ? <SearchPage /> : null}
+        {view === "search" ? <SearchPage onSelectListing={setSelectedListing} /> : null}
         {view === "watches" ? (
           <WatchesPage
             watches={data.watches}
@@ -324,6 +346,7 @@ function App() {
             onDelete={deleteWatch}
             onScan={scanWatch}
             onViewListings={showWatchListings}
+            onAnalytics={setAnalyticsWatch}
           />
         ) : null}
         {view === "market-research" ? (
@@ -334,6 +357,7 @@ function App() {
             listings={data.listings}
             selectedWatchName={selectedWatchName}
             onClearWatch={() => setSelectedWatchName(null)}
+            onSelectListing={setSelectedListing}
           />
         ) : null}
         {view === "connectors" ? (
@@ -367,8 +391,21 @@ function App() {
           onSubmit={(min, max) => updatePriceRange(editingWatch, min, max)}
         />
       ) : null}
+      {analyticsWatch ? (
+        <WatchAnalyticsDialog
+          watch={analyticsWatch}
+          onClose={() => setAnalyticsWatch(null)}
+        />
+      ) : null}
       {showHistory ? (
         <HistoryDialog onClose={() => setShowHistory(false)} />
+      ) : null}
+      {selectedListing ? (
+        <ListingDetailDrawer
+          listing={selectedListing}
+          onClose={() => setSelectedListing(null)}
+          onUpdated={updateListingAction}
+        />
       ) : null}
       {toast ? (
         <div
@@ -502,6 +539,7 @@ function Overview({
   onNewWatch,
   onNavigate,
   onScan,
+  onSelectListing,
 }: {
   data: DashboardData;
   isLoading: boolean;
@@ -509,6 +547,7 @@ function Overview({
   onNewWatch: () => void;
   onNavigate: (view: View) => void;
   onScan: () => void;
+  onSelectListing: (listing: Listing) => void;
 }) {
   const [marketplace, setMarketplace] = useState<"All" | Marketplace>("All");
   const [strength, setStrength] = useState<"All" | "Strong" | "Exceptional">(
@@ -644,6 +683,7 @@ function Overview({
           listings={visibleListings}
           isLoading={isLoading}
           compact
+          onSelect={onSelectListing}
         />
         <div className="section-footer">
           <button
@@ -726,10 +766,12 @@ function ListingTable({
   listings,
   compact = false,
   isLoading = false,
+  onSelect,
 }: {
   listings: Listing[];
   compact?: boolean;
   isLoading?: boolean;
+  onSelect?: (listing: Listing) => void;
 }) {
   if (isLoading)
     return (
@@ -761,7 +803,7 @@ function ListingTable({
         <span aria-label="Open listing" />
       </div>
       {listings.map((listing) => (
-        <ListingRow key={listing.id} listing={listing} />
+        <ListingRow key={listing.id} listing={listing} onSelect={onSelect} />
       ))}
     </div>
   );
@@ -781,16 +823,31 @@ function ListingThumbnail({ listing }: { listing: Listing }) {
     </div>
   );
 }
-function ListingRow({ listing }: { listing: Listing }) {
+function ListingRow({ listing, onSelect }: { listing: Listing; onSelect?: (listing: Listing) => void }) {
   return (
     <div className="listing-table listing-row">
-      <div className="listing-item">
+      <button
+        type="button"
+        className="listing-item listing-item--button"
+        onClick={() => onSelect?.(listing)}
+        disabled={!onSelect}
+        aria-label={`View details for ${listing.title}`}
+      >
         <ListingThumbnail listing={listing} />
         <div>
           <strong>{listing.title}</strong>
           <span>{listing.subtitle || listing.watch}</span>
+          {listing.decision ? (
+            <em className={`decision-chip decision-chip--${listing.decision}`}>
+              {listing.decision === "buy"
+                ? "Buy"
+                : listing.decision === "watch"
+                  ? "Watch"
+                  : "Pass"}
+            </em>
+          ) : null}
         </div>
-      </div>
+      </button>
       <div className="marketplace-cell">
         <i style={{ background: marketplaceColors[listing.marketplace] }} />
         {listing.marketplace}
@@ -920,7 +977,7 @@ function ConnectorPanel({
   );
 }
 
-function SearchPage() {
+function SearchPage({ onSelectListing }: { onSelectListing: (listing: Listing) => void }) {
   const [query, setQuery] = useState("");
   const [terms, setTerms] = useState("");
   const [excluded, setExcluded] = useState("");
@@ -1159,7 +1216,7 @@ function SearchPage() {
             Searching public marketplace pages…
           </div>
         ) : listings.length ? (
-          <SearchResultsTable listings={listings} />
+          <SearchResultsTable listings={listings} onSelect={onSelectListing} />
         ) : (
           <div className="empty-state">
             <ListFilter size={25} />
@@ -1178,7 +1235,7 @@ function SearchPage() {
   );
 }
 
-function SearchResultsTable({ listings }: { listings: Listing[] }) {
+function SearchResultsTable({ listings, onSelect }: { listings: Listing[]; onSelect: (listing: Listing) => void }) {
   return (
     <div className="search-table-wrap">
       <div className="search-table search-table--head">
@@ -1191,13 +1248,18 @@ function SearchResultsTable({ listings }: { listings: Listing[] }) {
       </div>
       {listings.map((listing) => (
         <div className="search-table search-result-row" key={listing.id}>
-          <div className="listing-item">
+          <button
+            type="button"
+            className="listing-item listing-item--button"
+            onClick={() => onSelect(listing)}
+            aria-label={`View details for ${listing.title}`}
+          >
             <ListingThumbnail listing={listing} />
             <div>
               <strong>{listing.title}</strong>
               <span>{listing.subtitle || "No extra details"}</span>
             </div>
-          </div>
+          </button>
           <div className="marketplace-cell">
             <i style={{ background: marketplaceColors[listing.marketplace] }} />
             {listing.marketplace}
@@ -1242,6 +1304,7 @@ function WatchesPage({
   onDelete,
   onScan,
   onViewListings,
+  onAnalytics,
 }: {
   watches: Watch[];
   busyWatchIds: Set<string>;
@@ -1252,6 +1315,7 @@ function WatchesPage({
   onDelete: (watch: Watch) => void;
   onScan: (watch: Watch) => void;
   onViewListings: (watch: Watch) => void;
+  onAnalytics: (watch: Watch) => void;
 }) {
   const [search, setSearch] = useState("");
   const filtered = watches.filter((watch) =>
@@ -1294,6 +1358,7 @@ function WatchesPage({
               onDelete={() => onDelete(watch)}
               onScan={() => onScan(watch)}
               onListings={() => onViewListings(watch)}
+              onAnalytics={() => onAnalytics(watch)}
             />
           ))}
         </div>
@@ -1336,6 +1401,7 @@ function WatchRow({
   onDelete,
   onScan,
   onListings,
+  onAnalytics,
 }: {
   watch: Watch;
   busy: boolean;
@@ -1345,6 +1411,7 @@ function WatchRow({
   onDelete: () => void;
   onScan: () => void;
   onListings: () => void;
+  onAnalytics: () => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   return (
@@ -1415,6 +1482,14 @@ function WatchRow({
           <Clock3 size={15} />
           {watch.enabled ? `Next ${watch.nextScan}` : "Paused"}
         </span>
+        <button
+          className="icon-button"
+          onClick={onAnalytics}
+          title="View watch analytics"
+          aria-label={`View analytics for ${watch.name}`}
+        >
+          <BarChart3 size={17} />
+        </button>
         <button
           className="icon-button"
           onClick={onListings}
@@ -1500,6 +1575,158 @@ function WatchRow({
         </div>
       </div>
     </article>
+  );
+}
+
+function formatAnalyticsPrice(value: number | null) {
+  return value === null ? "—" : formatPln(value);
+}
+
+function formatAnalyticsDate(value: string | null) {
+  if (!value) return "—";
+  return new Date(value.includes("T") ? value : `${value}T00:00:00Z`).toLocaleDateString("pl-PL", {
+    day: "2-digit",
+    month: "short",
+  });
+}
+
+function AnalyticsTrendChart({ analytics }: { analytics: WatchAnalytics }) {
+  const width = 760;
+  const height = 250;
+  const padding = { top: 18, right: 18, bottom: 28, left: 48 };
+  const plotted = analytics.points
+    .map((point, index) => ({ point, index }))
+    .filter(({ point }) => point.medianPrice !== null);
+  if (!plotted.length) {
+    return <div className="analytics-chart-empty">Not enough observations to draw a trend yet.</div>;
+  }
+  const values = plotted.flatMap(({ point }) => [point.lowerPrice, point.medianPrice, point.upperPrice]).filter((value): value is number => value !== null);
+  const rawMin = Math.min(...values);
+  const rawMax = Math.max(...values);
+  const spread = rawMax - rawMin;
+  const min = spread ? rawMin : Math.max(0, rawMin - Math.max(rawMin * 0.05, 1));
+  const max = spread ? rawMax : rawMax + Math.max(rawMax * 0.05, 1);
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const x = (index: number) => padding.left + (analytics.points.length === 1 ? 0.5 : index / (analytics.points.length - 1)) * plotWidth;
+  const y = (value: number) => padding.top + ((max - value) / (max - min || 1)) * plotHeight;
+  const upperPath = plotted.map(({ point, index }) => `${x(index)},${y(point.upperPrice ?? point.medianPrice!)}`).join(" ");
+  const lowerPath = plotted.slice().reverse().map(({ point, index }) => `${x(index)},${y(point.lowerPrice ?? point.medianPrice!)}`).join(" ");
+  const medianPath = plotted.map(({ point, index }) => `${x(index)},${y(point.medianPrice!)}`).join(" ");
+  const labelPoints = analytics.points.length > 2 ? [analytics.points[0], analytics.points[Math.floor((analytics.points.length - 1) / 2)], analytics.points[analytics.points.length - 1]] : analytics.points;
+  return (
+    <>
+      <svg className="analytics-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${analytics.watchName} median price trend`}>
+        <title>{analytics.watchName} price trend</title>
+        {[0, 0.5, 1].map((ratio) => {
+          const value = max - (max - min) * ratio;
+          return (
+            <g key={ratio}>
+              <line x1={padding.left} x2={width - padding.right} y1={y(value)} y2={y(value)} className="analytics-grid-line" />
+              <text x={padding.left - 9} y={y(value) + 4} textAnchor="end" className="analytics-axis-label">{Math.round(value).toLocaleString("pl-PL")}</text>
+            </g>
+          );
+        })}
+        <path d={`${upperPath} ${lowerPath} Z`} className="analytics-band" />
+        <polyline points={medianPath} className="analytics-line" />
+        {plotted.map(({ point, index }) => (
+          <circle key={`${point.date}-${index}`} cx={x(index)} cy={y(point.medianPrice!)} r="3.5" className="analytics-point">
+            <title>{`${formatAnalyticsDate(point.date)} · ${formatAnalyticsPrice(point.medianPrice)}`}</title>
+          </circle>
+        ))}
+      </svg>
+      <div className="analytics-chart-labels">
+        {labelPoints.map((point) => <span key={point.date}>{formatAnalyticsDate(point.date)}</span>)}
+      </div>
+    </>
+  );
+}
+
+function WatchAnalyticsDialog({ watch, onClose }: { watch: Watch; onClose: () => void }) {
+  const [days, setDays] = useState(30);
+  const [analytics, setAnalytics] = useState<WatchAnalytics | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    void api.watchAnalytics(watch.id, days).then((result) => {
+      if (!cancelled) setAnalytics(result);
+    }).catch((requestError) => {
+      if (!cancelled) setError(errorMessage(requestError));
+    }).finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [watch.id, days]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const current = analytics?.current;
+  const trend = analytics?.medianChangePercent ?? null;
+  const trendClass = trend === null ? "" : trend < 0 ? "analytics-value--positive" : trend > 0 ? "analytics-value--negative" : "";
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <section className="modal modal--analytics" role="dialog" aria-modal="true" aria-labelledby="watch-analytics-title">
+        <div className="modal-header">
+          <div>
+            <span className="modal-kicker">Watch analytics</span>
+            <h2 id="watch-analytics-title">{watch.name}</h2>
+            <p>Daily price movement and current market shape from Scout’s observations.</p>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="Close watch analytics"><X size={20} /></button>
+        </div>
+        <div className="modal-body analytics-body">
+          <div className="analytics-toolbar">
+            <span>{analytics ? `${analytics.totalObservations.toLocaleString("pl-PL")} observations · ${formatAnalyticsDate(analytics.firstObservedAt)}–${formatAnalyticsDate(analytics.lastObservedAt)}` : "Loading observation history…"}</span>
+            <div className="analytics-range-options" role="group" aria-label="Analytics time range">
+              {[30, 90, 180].map((option) => <button key={option} className={days === option ? "analytics-range-option analytics-range-option--active" : "analytics-range-option"} onClick={() => setDays(option)}>{option}d</button>)}
+            </div>
+          </div>
+          {loading && !analytics ? <div className="analytics-loading"><LoaderCircle size={20} className="spin" />Loading analytics…</div> : null}
+          {error ? <div className="analytics-error" role="alert"><AlertTriangle size={16} />{error}</div> : null}
+          {analytics && !error ? (
+            <>
+              <div className="analytics-stat-grid">
+                <div className="analytics-stat"><span>Current median</span><strong>{formatAnalyticsPrice(current?.medianPrice ?? null)}</strong><small>latest daily snapshot</small></div>
+                <div className="analytics-stat"><span>Trend</span><strong className={trendClass}>{trend === null ? "Learning" : `${trend > 0 ? "+" : ""}${trend.toFixed(1)}%`}</strong><small>versus first day in range</small></div>
+                <div className="analytics-stat"><span>Current listings</span><strong>{current?.listingCount ?? 0}</strong><small>latest observed day</small></div>
+                <div className="analytics-stat"><span>Strong+ rate</span><strong>{current?.strongDealRate === null || current?.strongDealRate === undefined ? "Learning" : `${current.strongDealRate.toFixed(0)}%`}</strong><small>{current?.strongDealCount ?? 0} qualifying listings</small></div>
+              </div>
+              <section className="analytics-section">
+                <div className="analytics-section-heading"><div><span className="drawer-section-kicker">Price trend</span><h3>Median asking price</h3></div><span>Middle 50% shaded</span></div>
+                <div className="analytics-chart-card"><AnalyticsTrendChart analytics={analytics} /></div>
+              </section>
+              <div className="analytics-detail-grid">
+                <section className="analytics-section analytics-section--card">
+                  <div className="analytics-section-heading"><div><span className="drawer-section-kicker">Current snapshot</span><h3>Price distribution</h3></div><Database size={16} /></div>
+                  <div className="analytics-distribution-grid">
+                    <div><span>Lowest</span><strong>{formatAnalyticsPrice(current?.minPrice ?? null)}</strong></div>
+                    <div><span>25th percentile</span><strong>{formatAnalyticsPrice(current?.lowerPrice ?? null)}</strong></div>
+                    <div><span>Median</span><strong>{formatAnalyticsPrice(current?.medianPrice ?? null)}</strong></div>
+                    <div><span>75th percentile</span><strong>{formatAnalyticsPrice(current?.upperPrice ?? null)}</strong></div>
+                    <div><span>Highest</span><strong>{formatAnalyticsPrice(current?.maxPrice ?? null)}</strong></div>
+                  </div>
+                </section>
+                <section className="analytics-section analytics-section--card">
+                  <div className="analytics-section-heading"><div><span className="drawer-section-kicker">Current snapshot</span><h3>By marketplace</h3></div><Tag size={16} /></div>
+                  {analytics.sources.length ? <div className="analytics-source-list">{analytics.sources.map((source) => <div className="analytics-source-row" key={source.source}><span><i style={{ background: marketplaceColors[source.source] }} />{source.source}</span><strong>{formatAnalyticsPrice(source.medianPrice)}</strong><small>{source.listingCount} listing{source.listingCount === 1 ? "" : "s"}</small></div>)}</div> : <div className="analytics-inline-empty">No current listings in this range.</div>}
+                </section>
+              </div>
+              <div className="analytics-note"><Info size={16} /><span>Trend points use one latest observation per listing per day, so frequent polling does not distort the median. Strong+ rate appears after Scout has learned a baseline.</span></div>
+            </>
+          ) : null}
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -1608,14 +1835,17 @@ function ListingsPage({
   listings,
   selectedWatchName,
   onClearWatch,
+  onSelectListing,
 }: {
   listings: Listing[];
   selectedWatchName: string | null;
   onClearWatch: () => void;
+  onSelectListing: (listing: Listing) => void;
 }) {
   const [search, setSearch] = useState("");
   const [marketplace, setMarketplace] = useState<"All" | Marketplace>("All");
   const [sort, setSort] = useState<"Newest" | "Strongest" | "Price">("Newest");
+  const [decision, setDecision] = useState<"All" | ListingDecision>("All");
   const filtered = useMemo(
     () =>
       listings
@@ -1632,6 +1862,7 @@ function ListingsPage({
             .toLowerCase()
             .includes(search.toLowerCase()),
         )
+        .filter((listing) => decision === "All" || listing.decision === decision)
         .slice()
         .sort((a, b) =>
           sort === "Strongest"
@@ -1640,7 +1871,7 @@ function ListingsPage({
               ? a.price - b.price
               : Date.parse(b.observedAt) - Date.parse(a.observedAt),
         ),
-    [listings, marketplace, search, selectedWatchName, sort],
+    [listings, marketplace, search, selectedWatchName, sort, decision],
   );
   return (
     <>
@@ -1686,6 +1917,11 @@ function ListingsPage({
             )
           }
         />
+        <SelectControl
+          value={decision === "All" ? "All decisions" : decision === "buy" ? "Buy" : decision === "watch" ? "Watch" : "Pass"}
+          options={["All decisions", "Buy", "Watch", "Pass"]}
+          onChange={(value) => setDecision(value === "Buy" ? "buy" : value === "Watch" ? "watch" : value === "Pass" ? "pass" : "All")}
+        />
       </div>
       {selectedWatchName ? (
         <div className="active-filter">
@@ -1698,7 +1934,7 @@ function ListingsPage({
           </button>
         </div>
       ) : null}
-      <ListingTable listings={filtered} />
+      <ListingTable listings={filtered} onSelect={onSelectListing} />
       <div className="retention-note">
         <Database size={17} />
         <span>
@@ -1707,6 +1943,244 @@ function ListingsPage({
         </span>
       </div>
     </>
+  );
+}
+
+function PriceSparkline({ points }: { points: PriceHistoryPoint[] }) {
+  if (!points.length) return <div className="price-chart-empty">No saved price observations yet.</div>;
+  const values = points.map((point) => point.price);
+  const minimum = Math.min(...values);
+  const maximum = Math.max(...values);
+  const padding = Math.max((maximum - minimum) * 0.14, Math.max(maximum, 1) * 0.025, 1);
+  const chartMinimum = Math.max(0, minimum - padding);
+  const chartMaximum = maximum + padding;
+  const coordinates = points.map((point, index) => {
+    const x = points.length === 1 ? 50 : (index / (points.length - 1)) * 100;
+    const y = 88 - ((point.price - chartMinimum) / Math.max(chartMaximum - chartMinimum, 1)) * 76;
+    return `${x.toFixed(2)},${y.toFixed(2)}`;
+  });
+  const latest = coordinates[coordinates.length - 1].split(",");
+  return (
+    <svg className="price-chart" viewBox="0 0 100 100" role="img" aria-label="Listing price history">
+      <defs>
+        <linearGradient id="price-chart-fill" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0" stopColor="var(--blue)" stopOpacity=".18" />
+          <stop offset="1" stopColor="var(--blue)" stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <path d={`M ${coordinates.join(" L ")} L 100,100 L 0,100 Z`} fill="url(#price-chart-fill)" />
+      <polyline points={coordinates.join(" ")} fill="none" stroke="var(--blue)" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
+      <circle cx={latest[0]} cy={latest[1]} r="3.2" fill="var(--surface)" stroke="var(--blue)" strokeWidth="2" vectorEffect="non-scaling-stroke" />
+    </svg>
+  );
+}
+
+function ListingDetailDrawer({
+  listing,
+  onClose,
+  onUpdated,
+}: {
+  listing: Listing;
+  onClose: () => void;
+  onUpdated: (listing: Listing) => void;
+}) {
+  const [detail, setDetail] = useState<ListingDetail>({
+    listing,
+    history: [],
+    action: { decision: listing.decision ?? null, note: listing.note ?? '', updatedAt: null },
+    firstSeenAt: listing.observedAt,
+    lastSeenAt: listing.observedAt,
+  });
+  const [decision, setDecision] = useState<ListingDecision | null>(listing.decision ?? null);
+  const [note, setNote] = useState(listing.note ?? "");
+  const [shippingCost, setShippingCost] = useState("");
+  const [extraCost, setExtraCost] = useState("");
+  const [resalePrice, setResalePrice] = useState(listing.typical === null ? "" : String(listing.typical));
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const currentListing = detail.listing;
+  const totalCost = currentListing.price + (Number(shippingCost) || 0) + (Number(extraCost) || 0);
+  const expectedResale = resalePrice === "" ? null : Number(resalePrice);
+  const expectedProfit = expectedResale === null || !Number.isFinite(expectedResale) ? null : expectedResale - totalCost;
+  const expectedMargin = expectedProfit === null || totalCost <= 0 ? null : (expectedProfit / totalCost) * 100;
+  const typicalSavings = currentListing.typical === null ? null : currentListing.typical - totalCost;
+
+  useEffect(() => {
+    let active = true;
+    const fallback: ListingDetail = {
+      listing,
+      history: [],
+      action: { decision: listing.decision ?? null, note: listing.note ?? '', updatedAt: null },
+      firstSeenAt: listing.observedAt,
+      lastSeenAt: listing.observedAt,
+    };
+    setDetail(fallback);
+    setDecision(listing.decision ?? null);
+    setNote(listing.note ?? "");
+    setResalePrice(listing.typical === null ? "" : String(listing.typical));
+    setShippingCost("");
+    setExtraCost("");
+    setError(null);
+    setLoading(true);
+    api
+      .listingDetail(listing.id)
+      .then((result) => {
+        if (!active) return;
+        setDetail(result);
+        setDecision(result.action.decision);
+        setNote(result.action.note);
+        if (result.listing.typical !== null) setResalePrice(String(result.listing.typical));
+      })
+      .catch(async () => {
+        // Manual search results do not have stored observations yet, but their triage action can still persist.
+        try {
+          const action = await api.listingAction(listing.id);
+          if (!active) return;
+          setDetail((current) => ({ ...current, action }));
+          setDecision(action.decision);
+          setNote(action.note);
+        } catch {
+          // The listing itself remains useful when the API is offline or the result is not stored.
+        }
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [listing.id]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !saving) onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, saving]);
+
+  const saveAction = async (nextDecision = decision) => {
+    setSaving(true);
+    setError(null);
+    try {
+      const result = await api.updateListingAction(listing.id, { decision: nextDecision, note });
+      const updatedListing = { ...detail.listing, decision: result.action.decision, note: result.action.note };
+      setDetail((current) => ({ ...current, listing: updatedListing, action: result.action }));
+      setDecision(result.action.decision);
+      setNote(result.action.note);
+      onUpdated(updatedListing);
+    } catch (saveError) {
+      setError(errorMessage(saveError));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const chartPoints = detail.history.length
+    ? detail.history
+    : [{ price: currentListing.price, observedAt: currentListing.observedAt }];
+  const lastPoint = chartPoints[chartPoints.length - 1];
+  return (
+    <div
+      className="listing-drawer-backdrop"
+      role="presentation"
+      onMouseDown={(event) => event.target === event.currentTarget && !saving && onClose()}
+    >
+      <aside className="listing-drawer" role="dialog" aria-modal="true" aria-labelledby="listing-detail-title">
+        <div className="listing-drawer-header">
+          <div>
+            <span className="drawer-kicker">{currentListing.marketplace} · {currentListing.watch}</span>
+            <h2 id="listing-detail-title">{currentListing.title}</h2>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="Close listing details">
+            <X size={20} />
+          </button>
+        </div>
+        <div className="listing-drawer-body">
+          <div className="drawer-hero">
+            <div className="drawer-image-wrap">
+              <ListingThumbnail listing={currentListing} />
+            </div>
+            <div className="drawer-hero-copy">
+              <strong className="drawer-price">{formatPln(currentListing.price)}</strong>
+              <span>{currentListing.typical === null ? "Baseline is still learning" : `${Math.abs(currentListing.belowTypical ?? 0).toFixed(1)}% below typical`}</span>
+              <small>{currentListing.condition || "Condition not specified"}{currentListing.location ? ` · ${currentListing.location}` : ""}</small>
+            </div>
+          </div>
+
+          <section className="drawer-section drawer-section--decision">
+            <div className="drawer-section-heading">
+              <div><span className="drawer-section-kicker">Triage</span><h3>What do you want to do?</h3></div>
+              {decision ? <span className={`decision-chip decision-chip--${decision}`}>{decision === "buy" ? "Buy" : decision === "watch" ? "Watch" : "Pass"}</span> : null}
+            </div>
+            <div className="decision-grid">
+              {(["buy", "watch", "pass"] as ListingDecision[]).map((option) => {
+                const Icon = option === "buy" ? Check : option === "watch" ? Bell : X;
+                const label = option === "buy" ? "Buy" : option === "watch" ? "Watch" : "Pass";
+                return (
+                  <button
+                    type="button"
+                    key={option}
+                    className={`decision-button decision-button--${option} ${decision === option ? "decision-button--active" : ""}`}
+                    disabled={saving}
+                    onClick={() => void saveAction(option)}
+                  >
+                    <Icon size={16} />{label}
+                  </button>
+                );
+              })}
+            </div>
+            {decision ? <button className="clear-decision" type="button" disabled={saving} onClick={() => void saveAction(null)}>Clear decision</button> : null}
+            <label className="drawer-note-label">
+              Note
+              <textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="e.g. Ask for a battery-health screenshot" />
+            </label>
+            <button className="outline-button drawer-save-note" type="button" disabled={saving} onClick={() => void saveAction()}>
+              {saving ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />}
+              {saving ? "Saving…" : "Save note"}
+            </button>
+            {error ? <div className="form-error" role="alert"><AlertTriangle size={15} />{error}</div> : null}
+          </section>
+
+          <section className="drawer-section">
+            <div className="drawer-section-heading">
+              <div><span className="drawer-section-kicker">Evidence</span><h3>Price history</h3></div>
+              {loading ? <LoaderCircle size={16} className="spin" /> : <span className="drawer-muted">{detail.history.length ? `${detail.history.length} observations` : "First look"}</span>}
+            </div>
+            <div className="price-chart-card"><PriceSparkline points={chartPoints} /><div className="price-chart-labels"><span>{formatPln(Math.min(...chartPoints.map((point) => point.price)))}</span><strong>Latest {formatPln(lastPoint.price)}</strong><span>{formatPln(Math.max(...chartPoints.map((point) => point.price)))}</span></div></div>
+            <div className="drawer-meta-grid">
+              <div><span>First seen</span><strong>{new Date(detail.firstSeenAt).toLocaleDateString("pl-PL", { day: "2-digit", month: "short" })}</strong></div>
+              <div><span>Last seen</span><strong>{new Date(detail.lastSeenAt).toLocaleDateString("pl-PL", { day: "2-digit", month: "short" })}</strong></div>
+              <div><span>Shipping</span><strong>{currentListing.shippingAvailable === true ? "Available" : currentListing.shippingAvailable === false ? "Pickup only" : "Unknown"}</strong></div>
+            </div>
+          </section>
+
+          <section className="drawer-section drawer-section--calculator">
+            <div className="drawer-section-heading">
+              <div><span className="drawer-section-kicker">Scenario</span><h3>Total cost & resale</h3></div>
+              <Calculator size={17} />
+            </div>
+            <p className="drawer-section-copy">Estimate what this deal costs after delivery and what is left if you resell it.</p>
+            <div className="calculator-fields">
+              <label className="field-label">Shipping / fees <span>PLN</span><input type="number" min="0" step="1" value={shippingCost} onChange={(event) => setShippingCost(event.target.value)} placeholder="0" /></label>
+              <label className="field-label">Other cost <span>PLN</span><input type="number" min="0" step="1" value={extraCost} onChange={(event) => setExtraCost(event.target.value)} placeholder="0" /></label>
+              <label className="field-label">Expected resale <span>PLN</span><input type="number" min="0" step="1" value={resalePrice} onChange={(event) => setResalePrice(event.target.value)} placeholder="Add estimate" /></label>
+            </div>
+            <div className="calculator-results">
+              <div><span>Total cost</span><strong>{formatPln(totalCost)}</strong></div>
+              <div><span>Expected profit</span><strong className={expectedProfit === null ? "" : expectedProfit >= 0 ? "result-positive" : "result-negative"}>{expectedProfit === null ? "Add resale" : formatPln(expectedProfit)}</strong></div>
+              <div><span>Margin</span><strong className={expectedMargin === null ? "" : expectedMargin >= 0 ? "result-positive" : "result-negative"}>{expectedMargin === null ? "—" : `${expectedMargin.toFixed(1)}%`}</strong></div>
+            </div>
+            {typicalSavings !== null ? <div className={`calculator-callout ${typicalSavings >= 0 ? "calculator-callout--positive" : "calculator-callout--negative"}`}><Info size={15} />{typicalSavings >= 0 ? `${formatPln(typicalSavings)} below the learned typical price after extra costs.` : `${formatPln(Math.abs(typicalSavings))} above the learned typical price after extra costs.`}</div> : null}
+          </section>
+        </div>
+        <div className="listing-drawer-footer">
+          <span>{currentListing.observed}</span>
+          <a className="primary-button" href={currentListing.url} target="_blank" rel="noreferrer"><ExternalLink size={16} />Open listing</a>
+        </div>
+      </aside>
+    </div>
   );
 }
 
@@ -1951,6 +2425,7 @@ function SettingsPage({
   const [settings, setSettings] = useState<SettingsData | null>(null);
   const [webhook, setWebhook] = useState("");
   const [interval, setIntervalValue] = useState("5");
+  const [nightInterval, setNightInterval] = useState("30");
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testingNtfy, setTestingNtfy] = useState(false);
@@ -1969,6 +2444,7 @@ function SettingsPage({
       const result = await api.settings();
       setSettings(result);
       setIntervalValue(String(result.defaultInterval));
+      setNightInterval(String(result.nightInterval));
       setDiscordMinimumPriority(result.discordMinimumPriority);
       setNtfyServerUrl(result.ntfy?.serverUrl ?? "https://ntfy.sh");
       setNtfyMinimumPriority(result.ntfy?.minimumPriority ?? "exceptional");
@@ -1981,12 +2457,21 @@ function SettingsPage({
   }, [loadSettings]);
   const save = async () => {
     const numericInterval = Number(interval);
+    const numericNightInterval = Number(nightInterval);
     if (
       !Number.isInteger(numericInterval) ||
       numericInterval < 5 ||
       numericInterval > 1440
     ) {
       onToast("Polling interval must be between 5 and 1440 minutes.", "error");
+      return;
+    }
+    if (
+      !Number.isInteger(numericNightInterval) ||
+      numericNightInterval < 5 ||
+      numericNightInterval > 1440
+    ) {
+      onToast("Night polling interval must be between 5 and 1440 minutes.", "error");
       return;
     }
     setSaving(true);
@@ -1999,6 +2484,7 @@ function SettingsPage({
       );
       const result = await api.saveSettings({
         interval: numericInterval,
+        nightInterval: numericNightInterval,
         webhook: webhook.trim() || undefined,
         discordMinimumPriority,
         ntfy: ntfyTouched
@@ -2011,6 +2497,8 @@ function SettingsPage({
           : undefined,
       });
       setSettings(result);
+      setIntervalValue(String(result.defaultInterval));
+      setNightInterval(String(result.nightInterval));
       setWebhook("");
       setNtfyTopic("");
       setNtfyToken("");
@@ -2171,20 +2659,32 @@ function SettingsPage({
               <p>New watches use these values unless overridden.</p>
             </div>
           </div>
-          <label className="field-label">
-            Default polling interval <span>minutes</span>
-            <input
-              type="number"
-              min="5"
-              max="1440"
-              value={interval}
-              onChange={(event) => setIntervalValue(event.target.value)}
-            />
-          </label>
+          <div className="field-row">
+            <label className="field-label">
+              Default polling interval <span>minutes</span>
+              <input
+                type="number"
+                min="5"
+                max="1440"
+                value={interval}
+                onChange={(event) => setIntervalValue(event.target.value)}
+              />
+            </label>
+            <label className="field-label">
+              Night polling interval <span>22:00–08:00 · server local time</span>
+              <input
+                type="number"
+                min="5"
+                max="1440"
+                value={nightInterval}
+                onChange={(event) => setNightInterval(event.target.value)}
+              />
+            </label>
+          </div>
           <div className="field-help">
             <Info size={15} />
-            Safe minimum is 5 minutes. Public pages may still ask Scout to slow
-            down.
+            Night polling is a floor: watches that already run slower will not
+            be accelerated. The default is 30 minutes overnight.
           </div>
         </section>
         <section className="settings-section settings-section--wide">
@@ -2737,7 +3237,7 @@ function WatchDialog({
           <div className="modal-note">
             <Zap size={16} />
             <span>
-              Baseline learning needs 30 comparable listings and 24 hours of
+              Baseline learning needs 30 comparable listings and 6 hours of
               observations. No deal alerts fire while learning.
             </span>
           </div>

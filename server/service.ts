@@ -1,11 +1,11 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { chromium, type Browser } from 'playwright-core';
+import { chromium, type Browser, type BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, parseNotificationPriority, priorityFromDiscount, publishNtfy, validateNtfyConfig, type NtfyConfig } from './notifications';
-import { createPublicAdapter, exponentialBackoff, validateSearchUrl, type Marketplace, type NormalizedListing } from './marketplaces';
+import { buildMarketplaceSearchUrl, createPublicAdapter, exponentialBackoff, parseShippingAvailability, validateSearchUrl, type Marketplace, type NormalizedListing } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
-import { median, scoreDeal } from './scoring';
-import type { Connector, ConnectorRun, DashboardData, DealLabel, Listing, ManualSearchResponse, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, SearchFilters, SettingsData, Watch } from '../src/types';
+import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, median, scoreDeal } from './scoring';
+import type { Connector, ConnectorRun, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDetail, ManualSearchResponse, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -18,6 +18,9 @@ const connectorDefinitions: Array<Pick<Connector, 'name' | 'kind' | 'color'>> = 
   { name: 'ntfy', kind: 'ntfy', color: '#4f9da6' },
 ];
 const marketplaces: Marketplace[] = ['OLX', 'Allegro Lokalnie', 'Vinted'];
+export const DEFAULT_NIGHT_INTERVAL_MINUTES = 30;
+const NIGHT_START_HOUR = 22;
+const NIGHT_END_HOUR = 8;
 
 export class ServiceError extends Error {
   status: number;
@@ -31,6 +34,30 @@ export class ServiceError extends Error {
 export function marketStatusAfterMiss(currentMissingScans: number, threshold = 3) {
   const missingScans = Math.max(0, Math.floor(currentMissingScans)) + 1;
   return { missingScans, status: missingScans >= threshold ? 'ended' as const : 'active' as const };
+}
+
+export function isNightPollingWindow(value = new Date()) {
+  const hour = value.getHours();
+  return hour >= NIGHT_START_HOUR || hour < NIGHT_END_HOUR;
+}
+
+function nextPollingBoundary(from: Date, night: boolean) {
+  const boundary = new Date(from);
+  if (night && from.getHours() >= NIGHT_START_HOUR) boundary.setDate(boundary.getDate() + 1);
+  boundary.setHours(night ? NIGHT_END_HOUR : NIGHT_START_HOUR, 0, 0, 0);
+  return boundary;
+}
+
+export function nextWatchScanAt(finishedAt: string, dayIntervalMinutes: number, nightIntervalMinutes = DEFAULT_NIGHT_INTERVAL_MINUTES) {
+  const from = new Date(finishedAt);
+  const dayInterval = Math.max(5, Math.floor(Number(dayIntervalMinutes) || 5));
+  const configuredNightInterval = Number(nightIntervalMinutes);
+  const nightInterval = Math.max(dayInterval, Math.floor(Number.isFinite(configuredNightInterval) ? configuredNightInterval : DEFAULT_NIGHT_INTERVAL_MINUTES));
+  const night = isNightPollingWindow(from);
+  const next = new Date(from.getTime() + (night ? nightInterval : dayInterval) * 60_000);
+  const boundary = nextPollingBoundary(from, night);
+  if (next > boundary) return boundary.toISOString();
+  return next.toISOString();
 }
 
 const nowIso = () => new Date().toISOString();
@@ -52,6 +79,41 @@ function timeOnly(value?: string | null) {
   return new Date(value).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+function percentile(values: number[], fraction: number) {
+  const sorted = values.filter(Number.isFinite).slice().sort((a, b) => a - b);
+  if (!sorted.length) return null;
+  const position = (sorted.length - 1) * fraction;
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) return sorted[lower];
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
+}
+
+type WatchAnalyticsObservation = {
+  listingId: number;
+  marketplace: Marketplace;
+  price: number;
+  typical: number | null;
+  observedAt: string;
+};
+
+function analyticsPriceStats(rows: WatchAnalyticsObservation[]) {
+  const prices = rows.map((row) => row.price).filter(Number.isFinite);
+  const medianPrice = median(prices);
+  const baselinedRows = rows.filter((row) => row.typical !== null && row.typical > 0);
+  const strongDealCount = baselinedRows.filter((row) => ((row.typical! - row.price) / row.typical!) * 100 >= 18).length;
+  return {
+    medianPrice,
+    lowerPrice: percentile(prices, 0.25),
+    upperPrice: percentile(prices, 0.75),
+    minPrice: prices.length ? Math.min(...prices) : null,
+    maxPrice: prices.length ? Math.max(...prices) : null,
+    listingCount: rows.length,
+    strongDealCount,
+    strongDealRate: baselinedRows.length ? (strongDealCount / baselinedRows.length) * 100 : null,
+  };
+}
+
 function duration(started?: string | null, finished?: string | null) {
   if (!started || !finished) return '—';
   const milliseconds = Math.max(0, Date.parse(finished) - Date.parse(started));
@@ -60,6 +122,18 @@ function duration(started?: string | null, finished?: string | null) {
 
 function parseJson<T>(value: string | null | undefined, fallback: T): T {
   try { return value ? JSON.parse(value) as T : fallback; } catch { return fallback; }
+}
+
+function parseListingKey(key: string): { marketplace: Marketplace; listingId: string } {
+  const separator = key.indexOf(':');
+  const marketplace = separator === -1 ? '' : key.slice(0, separator);
+  const listingId = separator === -1 ? '' : key.slice(separator + 1);
+  if (!marketplaces.includes(marketplace as Marketplace) || !listingId) throw new ServiceError('Invalid listing key', 400);
+  return { marketplace: marketplace as Marketplace, listingId };
+}
+
+function parseListingDecision(value: unknown): ListingDecision | null {
+  return value === 'buy' || value === 'watch' || value === 'pass' ? value : null;
 }
 
 function secretKey() {
@@ -89,13 +163,6 @@ export function validateDiscordWebhook(value: string) {
     throw new ServiceError('Webhook must be an HTTPS Discord webhook URL');
   }
   return url.toString();
-}
-
-function searchUrl(marketplace: Marketplace, query: string) {
-  const encoded = encodeURIComponent(query.trim());
-  if (marketplace === 'OLX') return `https://www.olx.pl/d/oferty/q-${query.trim().toLowerCase().replace(/[^a-z0-9ąćęłńóśźż]+/gi, '-')}/`;
-  if (marketplace === 'Allegro Lokalnie') return `https://allegrolokalnie.pl/oferty/q/${encoded}`;
-  return `https://www.vinted.pl/catalog?search_text=${encoded}`;
 }
 
 export class ScoutService {
@@ -199,7 +266,7 @@ export class ScoutService {
     const stats = this.db.prepare('SELECT COUNT(DISTINCT o.listing_id) AS samples, MIN(o.observed_at) AS first_observed FROM observations o JOIN listings l ON l.id = o.listing_id WHERE o.watch_id = ? AND (? = 0 OR l.shipping_available = 1) AND (? IS NULL OR l.price_pln >= ?) AND (? IS NULL OR l.price_pln <= ?)').get(row.id, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln) as { samples: number; first_observed: string | null };
     const samples = Number(stats?.samples ?? 0);
     const observationHours = stats?.first_observed ? Math.max(0, Math.floor((Date.now() - Date.parse(stats.first_observed)) / 3_600_000)) : 0;
-    const readiness = Math.round(Math.min(1, samples / 30, observationHours / 24) * 100);
+    const readiness = Math.round(Math.min(1, samples / BASELINE_MIN_SAMPLES, observationHours / BASELINE_MIN_HOURS) * 100);
     const enabled = Boolean(row.enabled);
     return {
       id: row.id,
@@ -211,7 +278,7 @@ export class ScoutService {
       location: row.location,
       condition: row.condition,
       samples,
-      targetSamples: 30,
+      targetSamples: BASELINE_MIN_SAMPLES,
       observationHours,
       readiness,
       status: enabled ? (readiness >= 100 ? 'Ready' : 'Learning') : 'Paused',
@@ -251,6 +318,9 @@ export class ScoutService {
       condition: row.condition || undefined,
       location: row.location || undefined,
       shippingAvailable: row.shipping_available === null ? null : Boolean(row.shipping_available),
+      listingId: String(row.listing_id),
+      decision: parseListingDecision(row.listing_decision),
+      note: typeof row.listing_note === 'string' ? row.listing_note : '',
     };
   }
 
@@ -258,8 +328,80 @@ export class ScoutService {
     return (this.db.prepare('SELECT * FROM watches ORDER BY created_at DESC').all() as WatchRow[]).map((row) => this.watchFromRow(row));
   }
 
+  watchAnalytics(id: string, rangeDays = 30): WatchAnalytics {
+    const row = this.db.prepare('SELECT id, name, shipping_only, min_price_pln, max_price_pln FROM watches WHERE id = ?').get(id) as WatchRow | undefined;
+    if (!row) throw new ServiceError('Watch not found', 404);
+    const days = Math.max(7, Math.min(180, Math.floor(rangeDays)));
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60_000).toISOString();
+    const rawRows = this.db.prepare(`SELECT o.listing_id, l.marketplace, o.price_pln, l.typical_pln, o.observed_at
+      FROM observations o
+      JOIN listings l ON l.id = o.listing_id
+      WHERE o.watch_id = ?
+        AND o.observed_at >= ?
+        AND (? = 0 OR l.shipping_available = 1)
+        AND (? IS NULL OR o.price_pln >= ?)
+        AND (? IS NULL OR o.price_pln <= ?)
+      ORDER BY o.observed_at ASC`).all(id, cutoff, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln) as Array<Record<string, any>>;
+    const observations = rawRows.map((item): WatchAnalyticsObservation => ({
+      listingId: Number(item.listing_id),
+      marketplace: item.marketplace as Marketplace,
+      price: Number(item.price_pln),
+      typical: item.typical_pln === null || item.typical_pln === undefined ? null : Number(item.typical_pln),
+      observedAt: String(item.observed_at),
+    }));
+    const daily = new Map<string, Map<number, WatchAnalyticsObservation>>();
+    for (const observation of observations) {
+      const date = observation.observedAt.slice(0, 10);
+      const day = daily.get(date) ?? new Map<number, WatchAnalyticsObservation>();
+      const previousForDay = day.get(observation.listingId);
+      if (!previousForDay || observation.observedAt > previousForDay.observedAt) day.set(observation.listingId, observation);
+      daily.set(date, day);
+    }
+    const points: WatchAnalyticsPoint[] = Array.from(daily.entries()).sort(([a], [b]) => a.localeCompare(b)).map(([date, rowsForDay]) => {
+      const stats = analyticsPriceStats(Array.from(rowsForDay.values()));
+      return { date, medianPrice: stats.medianPrice, lowerPrice: stats.lowerPrice, upperPrice: stats.upperPrice, listingCount: stats.listingCount };
+    });
+    const currentRows = points.length ? daily.get(points[points.length - 1].date) : undefined;
+    const current = analyticsPriceStats(currentRows ? Array.from(currentRows.values()) : []);
+    const firstMedian = points.find((point) => point.medianPrice !== null)?.medianPrice ?? null;
+    const medianChangePercent = firstMedian !== null && current.medianPrice !== null && firstMedian > 0
+      ? ((current.medianPrice - firstMedian) / firstMedian) * 100
+      : null;
+    const sourceRows = new Map<Marketplace, WatchAnalyticsObservation[]>();
+    for (const observation of currentRows ? Array.from(currentRows.values()) : []) {
+      const source = sourceRows.get(observation.marketplace) ?? [];
+      source.push(observation);
+      sourceRows.set(observation.marketplace, source);
+    }
+    const sources: WatchAnalyticsSource[] = Array.from(sourceRows.entries()).sort(([a], [b]) => a.localeCompare(b)).map(([source, sourceListings]) => {
+      const stats = analyticsPriceStats(sourceListings);
+      return { source, medianPrice: stats.medianPrice, listingCount: stats.listingCount, strongDealCount: stats.strongDealCount };
+    });
+    return {
+      watchId: id,
+      watchName: String(row.name),
+      rangeDays: days,
+      firstObservedAt: observations[0]?.observedAt ?? null,
+      lastObservedAt: observations[observations.length - 1]?.observedAt ?? null,
+      totalObservations: observations.length,
+      current: {
+        medianPrice: current.medianPrice,
+        lowerPrice: current.lowerPrice,
+        upperPrice: current.upperPrice,
+        minPrice: current.minPrice,
+        maxPrice: current.maxPrice,
+        listingCount: current.listingCount,
+        strongDealCount: current.strongDealCount,
+        strongDealRate: current.strongDealRate,
+      },
+      medianChangePercent,
+      points,
+      sources,
+    };
+  }
+
   getListings() {
-    const rows = this.db.prepare(`SELECT l.*, (SELECT o.watch_id FROM observations o WHERE o.listing_id = l.id ORDER BY o.observed_at DESC LIMIT 1) AS watch_id, (SELECT w.name FROM observations o JOIN watches w ON w.id = o.watch_id WHERE o.listing_id = l.id ORDER BY o.observed_at DESC LIMIT 1) AS watch_name FROM listings l WHERE EXISTS (SELECT 1 FROM observations o WHERE o.listing_id = l.id) ORDER BY l.last_seen_at DESC LIMIT 200`).all() as Array<Record<string, any>>;
+    const rows = this.db.prepare(`SELECT l.*, a.decision AS listing_decision, a.note AS listing_note, (SELECT o.watch_id FROM observations o WHERE o.listing_id = l.id ORDER BY o.observed_at DESC LIMIT 1) AS watch_id, (SELECT w.name FROM observations o JOIN watches w ON w.id = o.watch_id WHERE o.listing_id = l.id ORDER BY o.observed_at DESC LIMIT 1) AS watch_name FROM listings l LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id WHERE EXISTS (SELECT 1 FROM observations o WHERE o.listing_id = l.id) ORDER BY l.last_seen_at DESC LIMIT 200`).all() as Array<Record<string, any>>;
     const watches = new Map(this.getWatches().map((watch) => [watch.id, watch]));
     return rows.filter((row) => {
       const watch = watches.get(row.watch_id);
@@ -269,18 +411,53 @@ export class ScoutService {
     }).map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100));
   }
 
+  listingDetail(key: string): ListingDetail {
+    const { marketplace, listingId } = parseListingKey(key);
+    const row = this.db.prepare(`SELECT l.*, a.decision AS listing_decision, a.note AS listing_note, a.updated_at AS action_updated_at, (SELECT o.watch_id FROM observations o WHERE o.listing_id = l.id ORDER BY o.observed_at DESC LIMIT 1) AS watch_id, (SELECT w.name FROM observations o JOIN watches w ON w.id = o.watch_id WHERE o.listing_id = l.id ORDER BY o.observed_at DESC LIMIT 1) AS watch_name FROM listings l LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id WHERE l.marketplace = ? AND l.listing_id = ?`).get(marketplace, listingId) as Record<string, any> | undefined;
+    if (!row) throw new ServiceError('Listing detail is not available yet', 404);
+    const watches = new Map(this.getWatches().map((watch) => [watch.id, watch]));
+    const listing = this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100);
+    const history = (this.db.prepare('SELECT price_pln, observed_at FROM observations WHERE listing_id = ? ORDER BY observed_at DESC LIMIT 120').all(row.id) as Array<{ price_pln: number; observed_at: string }>).reverse().map((point): PriceHistoryPoint => ({ price: Number(point.price_pln), observedAt: point.observed_at }));
+    return {
+      listing,
+      history,
+      action: { decision: listing.decision ?? null, note: listing.note ?? '', updatedAt: row.action_updated_at ?? null },
+      firstSeenAt: row.first_seen_at,
+      lastSeenAt: row.last_seen_at,
+    };
+  }
+
+  listingAction(key: string): ListingAction {
+    const { marketplace, listingId } = parseListingKey(key);
+    const row = this.db.prepare('SELECT decision, note, updated_at FROM listing_actions WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as { decision?: unknown; note?: string; updated_at?: string } | undefined;
+    return { decision: parseListingDecision(row?.decision), note: row?.note ?? '', updatedAt: row?.updated_at ?? null };
+  }
+
+  updateListingAction(key: string, decision: ListingDecision | null, note: string): ListingAction {
+    const { marketplace, listingId } = parseListingKey(key);
+    const safeNote = note.trim().slice(0, 2000);
+    const timestamp = nowIso();
+    if (decision === null && !safeNote) {
+      this.db.prepare('DELETE FROM listing_actions WHERE marketplace = ? AND listing_id = ?').run(marketplace, listingId);
+    } else {
+      this.db.prepare(`INSERT INTO listing_actions (marketplace, listing_id, decision, note, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(marketplace, listing_id) DO UPDATE SET decision = excluded.decision, note = excluded.note, updated_at = excluded.updated_at`).run(marketplace, listingId, decision, safeNote, timestamp);
+    }
+    this.emit('listing-action', { key, decision });
+    return { decision, note: safeNote, updatedAt: safeNote || decision ? timestamp : null };
+  }
+
   async manualSearch(input: SearchFilters): Promise<ManualSearchResponse> {
     const tasks = input.sources.map(async (source) => {
       const started = Date.now();
       try {
         const adapter = createPublicAdapter(source, (url) => this.fetchPublicPage(url, source));
-        const fetched = await adapter.fetchPublicSearch(searchUrl(source, input.query));
+        const fetched = await adapter.fetchPublicSearch(buildMarketplaceSearchUrl(source, input.query, input));
         const comparable = filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', {
-          minPrice: input.minPrice, maxPrice: input.maxPrice, condition: input.condition, location: input.location,
+          condition: input.condition, location: input.location,
         });
-        if (input.shippingOnly) await this.enrichShipping(comparable, source);
+        await this.enrichShipping(comparable, source, { limit: 24 });
         const filtered = filterListings(comparable, input.query, input.terms ?? '', input.excluded ?? '', { shippingOnly: input.shippingOnly });
-        const pendingShipping = input.shippingOnly ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
+        const pendingShipping = comparable.filter((listing) => listing.shippingAvailable === null).length;
         return {
           listings: filtered.slice(0, 100).map((listing): Listing => ({
             id: `${listing.marketplace}:${listing.listingId}`, title: listing.title,
@@ -346,8 +523,8 @@ export class ScoutService {
         const runId = this.recordRun(source, 'running', `Researching ${row.name}`, started, null);
         try {
           const adapter = createPublicAdapter(source, (url) => this.fetchPublicPage(url, source));
-          const fetched = await adapter.fetchPublicSearch(searchUrl(source, row.query));
-          const filters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, location: row.location };
+          const fetched = await adapter.fetchPublicSearch(buildMarketplaceSearchUrl(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' }));
+          const filters = { condition: row.condition, location: row.location };
           const comparable = filterListings(fetched, row.query, row.included_terms ?? '', row.excluded_terms ?? '', filters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
           const filtered = filterListings(comparable, row.query, row.included_terms ?? '', row.excluded_terms ?? '', { ...filters, shippingOnly: Boolean(row.shipping_only) });
@@ -422,6 +599,7 @@ export class ScoutService {
     const ntfy = this.ntfyConfig();
     return {
       defaultInterval: Number(this.getSetting('default_interval') ?? 5),
+      nightInterval: Number(this.getSetting('night_interval') ?? DEFAULT_NIGHT_INTERVAL_MINUTES),
       webhookConfigured,
       webhookMasked: webhookConfigured ? '••••••••••••••••' : null,
       discordMinimumPriority: this.discordMinimumPriority(),
@@ -439,6 +617,7 @@ export class ScoutService {
 
   saveSettings(input: {
     interval?: number;
+    nightInterval?: number;
     webhook?: string;
     clearWebhook?: boolean;
     discordMinimumPriority?: NotificationPriority;
@@ -448,6 +627,10 @@ export class ScoutService {
     if (input.interval !== undefined) {
       if (!Number.isInteger(input.interval) || input.interval < 5 || input.interval > 1440) throw new ServiceError('Polling interval must be between 5 and 1440 minutes');
       this.setSetting('default_interval', String(input.interval));
+    }
+    if (input.nightInterval !== undefined) {
+      if (!Number.isInteger(input.nightInterval) || input.nightInterval < 5 || input.nightInterval > 1440) throw new ServiceError('Night polling interval must be between 5 and 1440 minutes');
+      this.setSetting('night_interval', String(input.nightInterval));
     }
     if (input.clearWebhook) this.db.prepare("DELETE FROM settings WHERE key = 'discord_webhook'").run();
     if (input.webhook?.trim()) this.setSetting('discord_webhook', encryptSecret(validateDiscordWebhook(input.webhook.trim())));
@@ -569,10 +752,16 @@ export class ScoutService {
         const runId = this.recordRun(source, 'running', `Scanning ${row.name}`, started, null);
         try {
           const matchingExact = exactUrls.filter((url) => validateSearchUrl(url, source).valid);
-          const urls = matchingExact.length ? matchingExact : [searchUrl(source, row.query)];
+          const urls = matchingExact.length
+            ? matchingExact
+            : [buildMarketplaceSearchUrl(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' })];
           const adapter = createPublicAdapter(source, (url) => this.fetchPublicPage(url, source));
           const fetched = (await Promise.all(urls.map((url) => adapter.fetchPublicSearch(url)))).flat();
-          const comparable = filterListings(fetched, row.query, row.included_terms, row.excluded_terms, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, location: row.location });
+          const comparable = filterListings(fetched, row.query, row.included_terms, row.excluded_terms, {
+            ...(matchingExact.length ? { minPrice: row.min_price_pln, maxPrice: row.max_price_pln } : {}),
+            condition: row.condition,
+            location: row.location,
+          });
           if (row.shipping_only) await this.enrichShipping(comparable, source);
           const filtered = filterListings(comparable, row.query, row.included_terms, row.excluded_terms, { shippingOnly: Boolean(row.shipping_only) });
           for (const listing of filtered) await this.storeListing(row, listing);
@@ -587,7 +776,7 @@ export class ScoutService {
         }
       }));
       const finished = nowIso();
-      const next = new Date(Date.now() + Math.max(5, Number(row.interval_minutes)) * 60_000).toISOString();
+      const next = nextWatchScanAt(finished, Number(row.interval_minutes), Number(this.getSetting('night_interval') ?? DEFAULT_NIGHT_INTERVAL_MINUTES));
       this.db.prepare('UPDATE watches SET next_scan_at = ?, updated_at = ? WHERE id = ?').run(next, finished, row.id);
       this.setSetting('last_scan', JSON.stringify({ at: finished }));
       this.emit('scan', { refresh: true, watchId: row.id });
@@ -629,6 +818,8 @@ export class ScoutService {
 
   private async renderPublicPage(url: string, marketplace: Marketplace, storageState?: MarketplaceStorageState) {
     let browser: Browser | undefined;
+    let context: BrowserContext | undefined;
+    let ownsContext = false;
     try {
       if (process.env.SCOUT_BROWSER_WS) {
         browser = await chromium.connectOverCDP(process.env.SCOUT_BROWSER_WS, { timeout: 8_000 });
@@ -637,9 +828,17 @@ export class ScoutService {
         if (!executablePath) throw new Error('Chromium is not available; configure SCOUT_BROWSER_WS');
         browser = await chromium.launch({ executablePath, headless: true, args: ['--no-sandbox', '--disable-gpu'] });
       }
-      const context = storageState
-        ? await browser.newContext({ locale: 'pl-PL', storageState: storageState as any })
-        : browser.contexts()[0] ?? await browser.newContext({ locale: 'pl-PL' });
+      const existingContext = browser.contexts()[0];
+      if (storageState) {
+        context = await browser.newContext({ locale: 'pl-PL', storageState: storageState as any });
+        ownsContext = true;
+      } else if (existingContext) {
+        context = existingContext;
+      } else {
+        context = await browser.newContext({ locale: 'pl-PL' });
+        ownsContext = true;
+      }
+      if (!context) throw new Error('Chromium context could not be created');
       const page = await context.newPage();
       try {
         const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 });
@@ -649,7 +848,13 @@ export class ScoutService {
         if (response && !response.ok()) throw new Error(`Chromium page returned ${response.status()}`);
         return await page.content();
       } finally { await page.close(); }
-    } finally { if (browser) await browser.close(); }
+    } finally {
+      try {
+        if (ownsContext && context) await context.close();
+      } finally {
+        if (browser) await browser.close();
+      }
+    }
   }
 
   private pruneRetention() {
@@ -661,7 +866,7 @@ export class ScoutService {
     this.setSetting('last_prune', nowIso());
   }
 
-  private async enrichShipping(listings: NormalizedListing[], marketplace: Marketplace) {
+  private async enrichShipping(listings: NormalizedListing[], marketplace: Marketplace, options: { limit?: number } = {}) {
     const lookup = this.db.prepare('SELECT shipping_available FROM listings WHERE marketplace = ? AND listing_id = ?');
     for (const listing of listings) {
       if (listing.shippingAvailable !== null) continue;
@@ -669,14 +874,13 @@ export class ScoutService {
       if (cached?.shipping_available !== null && cached?.shipping_available !== undefined) listing.shippingAvailable = Boolean(cached.shipping_available);
     }
     if (marketplace === 'OLX') return;
-    const unknown = listings.filter((listing) => listing.shippingAvailable === null).slice(0, 8);
+    const unknown = listings.filter((listing) => listing.shippingAvailable === null).slice(0, Math.max(0, options.limit ?? 8));
     for (let offset = 0; offset < unknown.length; offset += 2) {
       await Promise.all(unknown.slice(offset, offset + 2).map(async (listing) => {
         try {
           const html = await this.fetchPublicPage(listing.url, marketplace);
-          const available = marketplace === 'Vinted'
-            ? /transaction_permitted\\?["']:\s*true/i.test(html)
-            : [...html.matchAll(/<div[^>]*class=["'][^"']*mlc-delivery-options__name[^"']*["'][^>]*>([\s\S]*?)<\/div>/gi)].some((match) => !/odbi[oó]r osobisty/i.test(match[1].replace(/<[^>]*>/g, ' ')));
+          const available = parseShippingAvailability(html, marketplace);
+          if (available === null) return;
           listing.shippingAvailable = available;
           this.cacheShipping(listing);
         } catch { /* unknown remains excluded and will be retried on a later scan */ }
@@ -685,6 +889,7 @@ export class ScoutService {
   }
 
   private cacheShipping(listing: NormalizedListing) {
+    if (listing.shippingAvailable === null) return;
     const checked = nowIso();
     this.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(marketplace, listing_id) DO UPDATE SET shipping_available = excluded.shipping_available, last_seen_at = excluded.last_seen_at`).run(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable ? 1 : 0, checked, checked);
   }

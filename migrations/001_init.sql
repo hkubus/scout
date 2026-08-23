@@ -42,6 +42,16 @@ CREATE TABLE IF NOT EXISTS listings (
   UNIQUE (marketplace, listing_id)
 );
 
+CREATE TABLE IF NOT EXISTS listing_actions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  marketplace TEXT NOT NULL,
+  listing_id TEXT NOT NULL,
+  decision TEXT CHECK (decision IN ('buy', 'watch', 'pass') OR decision IS NULL),
+  note TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  UNIQUE (marketplace, listing_id)
+);
+
 CREATE TABLE IF NOT EXISTS observations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   listing_id INTEGER NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
@@ -144,6 +154,7 @@ CREATE TABLE IF NOT EXISTS market_price_observations (
 
 CREATE INDEX IF NOT EXISTS observations_watch_time ON observations (watch_id, observed_at);
 CREATE INDEX IF NOT EXISTS listings_last_seen ON listings (last_seen_at);
+CREATE INDEX IF NOT EXISTS listing_actions_key ON listing_actions (marketplace, listing_id);
 CREATE INDEX IF NOT EXISTS notification_deliveries_listing ON notification_deliveries (listing_key);
 CREATE INDEX IF NOT EXISTS market_watches_due ON market_watches (enabled, next_scan_at);
 CREATE INDEX IF NOT EXISTS market_listings_watch_status ON market_listings (market_watch_id, status);

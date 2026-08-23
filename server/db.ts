@@ -48,6 +48,7 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
   if (!marketWatchColumns.has('max_price_pln')) db.exec('ALTER TABLE market_watches ADD COLUMN max_price_pln REAL');
   if (!marketWatchColumns.has('shipping_only')) db.exec('ALTER TABLE market_watches ADD COLUMN shipping_only INTEGER NOT NULL DEFAULT 0');
   db.prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run('default_interval', '5', new Date().toISOString());
+  db.prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run('night_interval', '30', new Date().toISOString());
   return db;
 }
 

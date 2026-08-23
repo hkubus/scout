@@ -8,6 +8,9 @@ export interface ScoreResult {
   qualifies: boolean;
 }
 
+export const BASELINE_MIN_SAMPLES = 30;
+export const BASELINE_MIN_HOURS = 6;
+
 export function median(values: number[]) {
   const sorted = values.filter(Number.isFinite).slice().sort((a, b) => a - b);
   if (!sorted.length) return null;
@@ -16,8 +19,8 @@ export function median(values: number[]) {
 }
 
 export function scoreDeal(prices: number[], price: number, options: { minSamples?: number; minHours?: number; observedHours?: number; sensitivity?: number } = {}): ScoreResult {
-  const minSamples = options.minSamples ?? 30;
-  const minHours = options.minHours ?? 24;
+  const minSamples = options.minSamples ?? BASELINE_MIN_SAMPLES;
+  const minHours = options.minHours ?? BASELINE_MIN_HOURS;
   const typical = median(prices);
   if (typical === null || price <= 0) return { typical, mad: null, deviation: null, discountPercent: null, confidence: 0, isReady: false, qualifies: false };
   const deviations = prices.map((value) => Math.abs(value - typical));

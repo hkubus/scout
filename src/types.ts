@@ -3,6 +3,7 @@ export type View = 'overview' | 'search' | 'watches' | 'market-research' | 'list
 export type Marketplace = 'OLX' | 'Allegro Lokalnie' | 'Vinted';
 export type DealLabel = 'Exceptional' | 'Very strong' | 'Strong' | 'Watch';
 export type NotificationPriority = 'strong' | 'very-strong' | 'exceptional';
+export type ListingDecision = 'buy' | 'watch' | 'pass';
 
 export interface Listing {
   id: string;
@@ -22,6 +23,28 @@ export interface Listing {
   condition?: string;
   location?: string;
   shippingAvailable: boolean | null;
+  listingId?: string;
+  decision?: ListingDecision | null;
+  note?: string;
+}
+
+export interface PriceHistoryPoint {
+  price: number;
+  observedAt: string;
+}
+
+export interface ListingAction {
+  decision: ListingDecision | null;
+  note: string;
+  updatedAt?: string | null;
+}
+
+export interface ListingDetail {
+  listing: Listing;
+  history: PriceHistoryPoint[];
+  action: ListingAction;
+  firstSeenAt: string;
+  lastSeenAt: string;
 }
 
 export interface Watch {
@@ -46,6 +69,43 @@ export interface Watch {
   shippingOnly: boolean;
   minPrice: number | null;
   maxPrice: number | null;
+}
+
+export interface WatchAnalyticsPoint {
+  date: string;
+  medianPrice: number | null;
+  lowerPrice: number | null;
+  upperPrice: number | null;
+  listingCount: number;
+}
+
+export interface WatchAnalyticsSource {
+  source: Marketplace;
+  medianPrice: number | null;
+  listingCount: number;
+  strongDealCount: number;
+}
+
+export interface WatchAnalytics {
+  watchId: string;
+  watchName: string;
+  rangeDays: number;
+  firstObservedAt: string | null;
+  lastObservedAt: string | null;
+  totalObservations: number;
+  current: {
+    medianPrice: number | null;
+    lowerPrice: number | null;
+    upperPrice: number | null;
+    minPrice: number | null;
+    maxPrice: number | null;
+    listingCount: number;
+    strongDealCount: number;
+    strongDealRate: number | null;
+  };
+  medianChangePercent: number | null;
+  points: WatchAnalyticsPoint[];
+  sources: WatchAnalyticsSource[];
 }
 
 export interface SearchFilters {
@@ -161,6 +221,7 @@ export interface NotificationRecord {
 
 export interface SettingsData {
   defaultInterval: number;
+  nightInterval: number;
   webhookConfigured: boolean;
   webhookMasked: string | null;
   discordMinimumPriority: NotificationPriority;

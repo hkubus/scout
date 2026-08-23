@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { dedupeKey, normalizeListing, parseOlxCards, parsePolishPrice, parseStructuredListings, parseVintedCards, validateSearchUrl } from '../server/marketplaces';
+import { buildMarketplaceSearchUrl, dedupeKey, normalizeListing, parseAllegroCards, parseOlxCards, parsePolishPrice, parseShippingAvailability, parseStructuredListings, parseVintedCards, validateSearchUrl } from '../server/marketplaces';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { median, pruneBefore, scoreDeal } from '../server/scoring';
@@ -12,6 +12,40 @@ test('validates approved HTTPS search URLs and blocks off-domain redirects', () 
   assert.equal(validateSearchUrl('http://www.olx.pl/d/q-steam-deck/').valid, false);
   assert.equal(validateSearchUrl('https://olx.pl.evil.example/').valid, false);
   assert.equal(validateSearchUrl('https://allegrolokalnie.pl/oferty/').marketplace, 'Allegro Lokalnie');
+});
+
+test('builds native marketplace filter URLs for price and supported conditions', () => {
+  const olx = new URL(buildMarketplaceSearchUrl('OLX', 'steam deck', { minPrice: 500, maxPrice: 1500, shippingOnly: true }));
+  assert.equal(olx.searchParams.get('search[filter_float_price:from]'), '500');
+  assert.equal(olx.searchParams.get('search[filter_float_price:to]'), '1500');
+  assert.equal(olx.searchParams.get('courier'), 'on');
+
+  const allegro = new URL(buildMarketplaceSearchUrl('Allegro Lokalnie', 'steam deck', { minPrice: 500, maxPrice: 1500, condition: 'New' }));
+  assert.equal(allegro.searchParams.get('price_from'), '500');
+  assert.equal(allegro.searchParams.get('price_to'), '1500');
+  assert.deepEqual(allegro.searchParams.getAll('zrodlo'), ['lokalnie']);
+  assert.equal(allegro.searchParams.get('stan'), 'nowe');
+
+  const vinted = new URL(buildMarketplaceSearchUrl('Vinted', 'steam deck', { minPrice: 500, maxPrice: 1500, condition: 'New' }));
+  assert.equal(vinted.searchParams.get('price_from'), '500');
+  assert.equal(vinted.searchParams.get('price_to'), '1500');
+  assert.deepEqual(vinted.searchParams.getAll('status_ids[]'), ['6', '1']);
+  const usedVinted = new URL(buildMarketplaceSearchUrl('Vinted', 'steam deck', { condition: 'Used' }));
+  assert.deepEqual(usedVinted.searchParams.getAll('status_ids[]'), ['2', '3', '4', '5']);
+});
+
+test('adds marketplace-native newest ordering for generated watch URLs', () => {
+  const olx = new URL(buildMarketplaceSearchUrl('OLX', 'steam deck', { sort: 'newest' }));
+  assert.equal(olx.searchParams.get('search[order]'), 'created_at:desc');
+
+  const allegro = new URL(buildMarketplaceSearchUrl('Allegro Lokalnie', 'steam deck', { sort: 'newest' }));
+  assert.equal(allegro.searchParams.get('sort'), 'startingTime-desc');
+
+  const vinted = new URL(buildMarketplaceSearchUrl('Vinted', 'steam deck', { sort: 'newest' }));
+  assert.equal(vinted.searchParams.get('order'), 'newest_first');
+
+  const manual = new URL(buildMarketplaceSearchUrl('OLX', 'steam deck'));
+  assert.equal(manual.searchParams.has('search[order]'), false);
 });
 
 test('normalizes Polish prices and deduplicates by marketplace/listing id', () => {
@@ -48,6 +82,32 @@ test('parses rendered OLX cards without relying on generated class names', () =>
   assert.equal(listing.shippingAvailable, true);
 });
 
+test('parses Allegro Lokalnie offer type as shipping availability', () => {
+  const html = `
+    <article class="mlc-itembox__container" data-card-analytics-click="buy-1">
+      <a href="/oferta/steam-deck-buy" itemprop="url"><h3 itemprop="itemOffered">Steam Deck with shipping</h3></a>
+      <span class="mlc-itembox__offer-type mlc-itembox__offer-type--buy_now">Kup teraz</span>
+      <span class="ml-offer-price__dollars">1 200</span>
+    </article>
+    <article class="mlc-itembox__container" data-card-analytics-click="classified-1">
+      <a href="/oferta/steam-deck-pickup" itemprop="url"><h3 itemprop="itemOffered">Steam Deck pickup only</h3></a>
+      <span class="mlc-itembox__offer-type mlc-itembox__offer-type--classified">Ogłoszenie</span>
+      <span class="ml-offer-price__dollars">900</span>
+    </article>`;
+  const listings = parseAllegroCards(html);
+  assert.deepEqual(listings.map((listing) => listing.shippingAvailable), [true, false]);
+  assert.deepEqual(listings.map((listing) => listing.listingId), ['buy-1', 'classified-1']);
+});
+
+test('reads shipping state from Vinted and marketplace detail-page signals', () => {
+    assert.equal(parseShippingAvailability('<div data-testid="item-shipping-banner"><h3>Wysyłka</h3></div>', 'Vinted'), true);
+    assert.equal(parseShippingAvailability('<main><p>Tylko odbiór osobisty</p></main>', 'Vinted'), false);
+    assert.equal(parseShippingAvailability('<script>window.item={"transaction_permitted":false}</script>', 'Vinted'), false);
+    assert.equal(parseShippingAvailability('<div class="mlc-delivery-options__name">Allegro Paczkomaty InPost</div>', 'Allegro Lokalnie'), true);
+  assert.equal(parseShippingAvailability('<main><p>Odbiór osobisty</p></main>', 'Allegro Lokalnie'), false);
+  assert.equal(parseShippingAvailability('<html><body>challenge</body></html>', 'Vinted'), null);
+});
+
 test('parses Vinted public card labels and uses item price rather than total price', () => {
   const html = `<div><img src="https://images1.vinted.net/item.webp" alt="Procesor"><a href="/items/9728935135-procesor-i5-8400?referrer=catalog" data-testid="product-item-id-9728935135--overlay-link" title="Procesor i5-8400, Marka: Intel, Stan: Bardzo dobry, 80.00 zł, 86.90 zł"></a></div>`;
   const [listing] = parseVintedCards(html);
@@ -64,6 +124,8 @@ test('keeps cold-start deals silent until samples and hours are ready', () => {
   const ready = scoreDeal(prices, 650, { observedHours: 30 });
   assert.equal(ready.isReady, true);
   assert.equal(ready.qualifies, true);
+  assert.equal(scoreDeal(prices, 650, { observedHours: 6 }).isReady, true);
+  assert.equal(scoreDeal(prices, 650, { observedHours: 5 }).isReady, false);
   assert.equal(median([1, 3, 2]), 2);
 });
 

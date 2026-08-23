@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase } from '../server/db';
 import { parseMarketplaceStorageState } from '../server/marketplace-sessions';
-import { ScoutService, ServiceError, decryptSecret, encryptSecret, filterListings, marketStatusAfterMiss, validateDiscordWebhook } from '../server/service';
+import { ScoutService, ServiceError, decryptSecret, encryptSecret, filterListings, marketStatusAfterMiss, nextWatchScanAt, validateDiscordWebhook } from '../server/service';
 
 function fixture() {
   const directory = mkdtempSync(join(tmpdir(), 'scout-service-'));
@@ -24,6 +24,19 @@ test('starts with truthful empty dashboard data and unconfigured notifications',
   } finally { context.close(); }
 });
 
+test('slows normal watch polling overnight without skipping the morning boundary', () => {
+  const minutesBetween = (from: string, to: string) => (Date.parse(to) - Date.parse(from)) / 60_000;
+  const beforeNight = new Date(2026, 7, 23, 21, 55, 0, 0).toISOString();
+  const overnight = new Date(2026, 7, 23, 22, 0, 0, 0).toISOString();
+  const beforeMorning = new Date(2026, 7, 24, 7, 50, 0, 0).toISOString();
+  const morning = new Date(2026, 7, 24, 8, 0, 0, 0).toISOString();
+  assert.equal(minutesBetween(beforeNight, nextWatchScanAt(beforeNight, 5, 30)), 5);
+  assert.equal(minutesBetween(overnight, nextWatchScanAt(overnight, 5, 30)), 30);
+  assert.equal(nextWatchScanAt(beforeMorning, 5, 30), morning);
+  assert.equal(minutesBetween(morning, nextWatchScanAt(morning, 5, 30)), 5);
+  assert.equal(minutesBetween(overnight, nextWatchScanAt(overnight, 60, 30)), 60);
+});
+
 test('encrypts Discord secrets and validates settings bounds', () => {
   const context = fixture();
   try {
@@ -32,7 +45,9 @@ test('encrypts Discord secrets and validates settings bounds', () => {
     assert.equal(validateDiscordWebhook(webhook), webhook);
     assert.throws(() => validateDiscordWebhook('https://example.com/api/webhooks/123/token'), ServiceError);
     assert.throws(() => context.service.saveSettings({ interval: 3 }), /between 5 and 1440/);
-    assert.equal(context.service.saveSettings({ interval: 15 }).defaultInterval, 15);
+    const settings = context.service.saveSettings({ interval: 15, nightInterval: 45 });
+    assert.equal(settings.defaultInterval, 15);
+    assert.equal(settings.nightInterval, 45);
   } finally { context.close(); }
 });
 
@@ -122,6 +137,93 @@ test('keeps provisional baselines and deal labels hidden during cold start', () 
     assert.equal(dashboard.listings[0].typical, null);
     assert.equal(dashboard.listings[0].dealLabel, 'Watch');
     assert.equal(dashboard.stats.strongDeals, 0);
+  } finally { context.close(); }
+});
+
+test('marks a baseline ready after 30 comparable listings and six hours', () => {
+  const context = fixture();
+  try {
+    const firstObserved = new Date(Date.now() - 8 * 3_600_000).toISOString();
+    const now = new Date().toISOString();
+    context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run('ready-watch', 'Ready watch', 'cpu', '["OLX"]', 1, now, now, now);
+    const insertListing = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+    const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    for (let index = 0; index < 30; index += 1) {
+      insertListing.run('OLX', `ready-listing-${index}`, `CPU ${index}`, 1000 + index, `https://www.olx.pl/d/oferta/ready-listing-${index}`, firstObserved, firstObserved);
+      const listing = context.db.prepare('SELECT id FROM listings WHERE listing_id = ?').get(`ready-listing-${index}`) as { id: number };
+      insertObservation.run(listing.id, 'ready-watch', 1000 + index, firstObserved);
+    }
+    const [watch] = context.service.getWatches();
+    assert.equal(watch.samples, 30);
+    assert.ok(watch.observationHours >= 6);
+    assert.equal(watch.readiness, 100);
+    assert.equal(watch.status, 'Ready');
+  } finally { context.close(); }
+});
+
+test('aggregates watch analytics by daily listing snapshots', () => {
+  const context = fixture();
+  try {
+    const dayOne = new Date(Date.now() - 2 * 24 * 60 * 60_000);
+    dayOne.setUTCHours(12, 0, 0, 0);
+    const dayTwo = new Date(Date.now() - 24 * 60 * 60_000);
+    dayTwo.setUTCHours(12, 0, 0, 0);
+    const first = dayOne.toISOString();
+    const second = dayTwo.toISOString();
+    const now = new Date().toISOString();
+    context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run('analytics-watch', 'Analytics watch', 'deck', '["OLX","Vinted"]', 1, now, now, now);
+    const insertListing = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, typical_pln, shipping_available, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    insertListing.run('OLX', 'analytics-one', 'Deck one', 1200, 1500, 1, 'https://www.olx.pl/d/oferta/analytics-one', first, second);
+    insertListing.run('OLX', 'analytics-two', 'Deck two', 1800, 2000, 1, 'https://www.olx.pl/d/oferta/analytics-two', first, second);
+    insertListing.run('Vinted', 'analytics-three', 'Deck three', 1600, 1800, 1, 'https://www.vinted.pl/items/analytics-three', second, second);
+    const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    const listingOne = context.db.prepare("SELECT id FROM listings WHERE listing_id = 'analytics-one'").get() as { id: number };
+    const listingTwo = context.db.prepare("SELECT id FROM listings WHERE listing_id = 'analytics-two'").get() as { id: number };
+    const listingThree = context.db.prepare("SELECT id FROM listings WHERE listing_id = 'analytics-three'").get() as { id: number };
+    insertObservation.run(listingOne.id, 'analytics-watch', 1000, first);
+    insertObservation.run(listingOne.id, 'analytics-watch', 950, new Date(dayOne.getTime() + 60 * 60_000).toISOString());
+    insertObservation.run(listingTwo.id, 'analytics-watch', 1500, first);
+    insertObservation.run(listingOne.id, 'analytics-watch', 1200, second);
+    insertObservation.run(listingTwo.id, 'analytics-watch', 1800, second);
+    insertObservation.run(listingThree.id, 'analytics-watch', 1600, second);
+
+    const analytics = context.service.watchAnalytics('analytics-watch', 30);
+    assert.equal(analytics.totalObservations, 6);
+    assert.deepEqual(analytics.points.map((point) => point.listingCount), [2, 3]);
+    assert.deepEqual(analytics.points.map((point) => point.medianPrice), [1225, 1600]);
+    assert.equal(analytics.current.lowerPrice, 1400);
+    assert.equal(analytics.current.upperPrice, 1700);
+    assert.equal(analytics.current.strongDealCount, 1);
+    assert.equal(analytics.current.strongDealRate, 1 / 3 * 100);
+    assert.equal(analytics.sources.find((source) => source.source === 'OLX')?.listingCount, 2);
+    assert.equal(analytics.sources.find((source) => source.source === 'Vinted')?.medianPrice, 1600);
+    assert.ok((analytics.medianChangePercent ?? 0) > 30);
+  } finally { context.close(); }
+});
+
+test('returns listing price history and persists Buy/Watch/Pass triage actions', () => {
+  const context = fixture();
+  try {
+    const firstSeen = '2026-08-21T10:00:00.000Z';
+    const lastSeen = '2026-08-22T10:00:00.000Z';
+    context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run('triage-watch', 'Triage watch', 'headphones', '["OLX"]', 1, lastSeen, firstSeen, lastSeen);
+    context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run('OLX', 'triage-listing', 'Headphones', 400, 'https://www.olx.pl/d/oferta/triage-listing', firstSeen, lastSeen);
+    const listing = context.db.prepare('SELECT id FROM listings WHERE listing_id = ?').get('triage-listing') as { id: number };
+    context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)').run(listing.id, 'triage-watch', 450, firstSeen);
+    context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)').run(listing.id, 'triage-watch', 400, lastSeen);
+
+    const saved = context.service.updateListingAction('OLX:triage-listing', 'buy', 'Ask for a battery screenshot');
+    assert.deepEqual(saved.decision, 'buy');
+    assert.equal(saved.note, 'Ask for a battery screenshot');
+    assert.equal(context.service.getListings()[0].decision, 'buy');
+    const detail = context.service.listingDetail('OLX:triage-listing');
+    assert.deepEqual(detail.history.map((point) => point.price), [450, 400]);
+    assert.equal(detail.action.decision, 'buy');
+    assert.equal(detail.action.note, 'Ask for a battery screenshot');
+
+    context.service.updateListingAction('OLX:triage-listing', null, '');
+    assert.equal(context.service.listingDetail('OLX:triage-listing').action.decision, null);
+    assert.equal(context.service.listingDetail('OLX:triage-listing').action.note, '');
   } finally { context.close(); }
 });
 
