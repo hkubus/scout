@@ -1021,7 +1021,6 @@ function SearchPage({ onSelectListing }: { onSelectListing: (listing: Listing) =
   const [condition, setCondition] = useState("Any");
   const [location, setLocation] = useState("");
   const [shippingOnly, setShippingOnly] = useState(false);
-  const [aiRelevance, setAiRelevance] = useState(true);
   const [sources, setSources] = useState<Marketplace[]>([
     "OLX",
     "Allegro Lokalnie",
@@ -1063,7 +1062,6 @@ function SearchPage({ onSelectListing }: { onSelectListing: (listing: Listing) =
         minPrice: numericMin,
         maxPrice: numericMax,
         shippingOnly,
-        aiRelevance,
         condition,
         location: location.trim(),
       });
@@ -1195,17 +1193,6 @@ function SearchPage({ onSelectListing }: { onSelectListing: (listing: Listing) =
             <span>
               <strong>Shipping only</strong>
               <small>Hide pickup-only and unknown delivery results</small>
-            </span>
-          </label>
-          <label className="check-option">
-            <input
-              type="checkbox"
-              checked={aiRelevance}
-              onChange={(event) => setAiRelevance(event.target.checked)}
-            />
-            <span>
-              <strong>AI relevance filter</strong>
-              <small>Exclude accessories, parts, and unrelated listings</small>
             </span>
           </label>
         </div>

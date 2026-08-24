@@ -239,7 +239,6 @@ const searchInput = z.object({
   minPrice: z.number().nonnegative().nullable().optional().default(null),
   maxPrice: z.number().positive().nullable().optional().default(null),
   shippingOnly: z.boolean().optional().default(false),
-  aiRelevance: z.boolean().optional().default(true),
   condition: z.string().max(80).optional().default('Any'),
   location: z.string().max(120).optional().default(''),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });

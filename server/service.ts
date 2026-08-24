@@ -4,7 +4,7 @@ import { chromium, type Browser, type BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { buildMarketplaceSearchUrl, createPublicAdapter, exponentialBackoff, parseShippingAvailability, validateSearchUrl, type ListingAvailability, type Marketplace, type NormalizedListing } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
-import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, draftNegotiationMessageWithDeepSeek, listingNormalizationInputHash, listingRelevanceInputHash, normalizeListingWithDeepSeek, normalizeOpenRouterModel, DeepSeekError, parseStoredListingNormalization, type ListingRelevanceContext, type NegotiationListingContext } from './ai';
+import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, draftNegotiationMessageWithDeepSeek, legacyListingNormalizationInputHash, legacyListingRelevanceInputHash, listingNormalizationInputHash, listingRelevanceInputHash, normalizeListingWithDeepSeek, normalizeOpenRouterModel, DeepSeekError, parseStoredListingNormalization, type ListingRelevanceContext, type NegotiationListingContext } from './ai';
 import { OlxMessagingError, sendOlxMessageOnPage } from './olx-messaging';
 import { AllegroMessagingError, sendAllegroMessageOnPage } from './allegro-messaging';
 import { offerCeiling, recommendNegotiationPrice, type NegotiationRecommendation } from './negotiation';
@@ -467,6 +467,7 @@ export class ScoutService {
     const config = this.deepSeekConfig();
     if (!config.apiKey) return { listings, excluded: 0, failed: 0, unknown: 0, notConfigured: true };
     const apiKey = config.apiKey;
+    const pendingClassifications = new Map<string, Promise<{ relevant: boolean; reason: string }>>();
 
     const classified: Array<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> = [];
     for (let offset = 0; offset < listings.length; offset += 4) {
@@ -481,19 +482,21 @@ export class ScoutService {
           excludedTerms: search.excludedTerms,
         };
         const inputHash = listingRelevanceInputHash(context);
+        const legacyInputHash = legacyListingRelevanceInputHash(context);
         if (watchId) {
           const cached = this.db.prepare('SELECT input_hash, model, relevant, reason, error, relevance_status FROM listing_relevance WHERE watch_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, listing.marketplace, listing.listingId) as { input_hash?: string; model?: string; relevant?: number; reason?: string; error?: string | null; relevance_status?: string } | undefined;
           const cachedStatus: 'relevant' | 'irrelevant' | 'unknown' = cached?.relevance_status === 'irrelevant' || cached?.relevance_status === 'unknown' || cached?.relevance_status === 'relevant'
             ? cached.relevance_status
             : cached?.error ? 'unknown' : cached?.relevant === 0 ? 'irrelevant' : 'relevant';
-          if (cached?.input_hash === inputHash && cached.model === config.model && cachedStatus !== 'unknown' && !cached.error) {
+          if ((cached?.input_hash === inputHash || cached?.input_hash === legacyInputHash) && cached.model === config.model && cachedStatus !== 'unknown' && !cached.error) {
+            if (cached.input_hash === legacyInputHash) this.saveListingRelevance({ watchId, listing, inputHash, model: config.model, relevant: cachedStatus === 'relevant', status: cachedStatus, reason: cached.reason ?? 'Reused cached relevance decision' });
             return { listing, status: cachedStatus };
           }
         }
 
         const reusable = this.db.prepare(`SELECT relevant, reason, relevance_status FROM listing_relevance
-          WHERE marketplace = ? AND listing_id = ? AND input_hash = ? AND model = ? AND relevance_status IN ('relevant', 'irrelevant') AND error IS NULL
-          ORDER BY checked_at DESC LIMIT 1`).get(listing.marketplace, listing.listingId, inputHash, config.model) as { relevant?: number; reason?: string; relevance_status?: string } | undefined;
+          WHERE input_hash = ? AND model = ? AND relevance_status IN ('relevant', 'irrelevant') AND error IS NULL
+          ORDER BY checked_at DESC LIMIT 1`).get(inputHash, config.model) as { relevant?: number; reason?: string; relevance_status?: string } | undefined;
         if (reusable) {
           const status: 'relevant' | 'irrelevant' = reusable.relevance_status === 'irrelevant' || reusable.relevant === 0 ? 'irrelevant' : 'relevant';
           if (watchId) this.saveListingRelevance({ watchId, listing, inputHash, model: config.model, relevant: status === 'relevant', status, reason: reusable.reason ?? 'Reused cached relevance decision' });
@@ -501,7 +504,12 @@ export class ScoutService {
         }
 
         try {
-          const result = await this.classifyListingRelevance(context, { apiKey, model: config.model });
+          let classification = pendingClassifications.get(inputHash);
+          if (!classification) {
+            classification = this.classifyListingRelevance(context, { apiKey, model: config.model });
+            pendingClassifications.set(inputHash, classification);
+          }
+          const result = await classification;
           const status: 'relevant' | 'irrelevant' = result.relevant ? 'relevant' : 'irrelevant';
           if (watchId) this.saveListingRelevance({ watchId, listing, inputHash, model: config.model, relevant: result.relevant, status, reason: result.reason });
           return { listing, status };
@@ -829,11 +837,28 @@ export class ScoutService {
       location: row.location ? String(row.location) : undefined,
     };
     const inputHash = listingNormalizationInputHash(source);
+    const legacyInputHash = legacyListingNormalizationInputHash(source);
     const cached = parseStoredListingNormalization(row.ai_normalization_json);
     const sameInput = row.ai_normalization_input_hash === inputHash && row.ai_normalization_model === config.model;
     if (!force && sameInput && cached) return cached;
+    if (!force && row.ai_normalization_input_hash === legacyInputHash && row.ai_normalization_model === config.model && cached) {
+      this.db.prepare('UPDATE listings SET ai_normalization_input_hash = ? WHERE marketplace = ? AND listing_id = ?').run(inputHash, marketplace, listingId);
+      return cached;
+    }
     if (!force && sameInput && row.ai_normalization_error && row.ai_normalization_at && Date.now() - Date.parse(row.ai_normalization_at) < 6 * 60 * 60_000) {
       throw new ServiceError(String(row.ai_normalization_error), 502);
+    }
+    if (!force) {
+      const reusable = this.db.prepare(`SELECT ai_normalization_json FROM listings
+        WHERE ai_normalization_input_hash = ? AND ai_normalization_model = ? AND ai_normalization_json IS NOT NULL
+        ORDER BY ai_normalization_at DESC LIMIT 1`).get(inputHash, config.model) as { ai_normalization_json?: string } | undefined;
+      const shared = parseStoredListingNormalization(reusable?.ai_normalization_json);
+      if (shared) {
+        const normalizedAt = nowIso();
+        this.db.prepare('UPDATE listings SET ai_normalization_json = ?, ai_normalization_input_hash = ?, ai_normalization_model = ?, ai_normalization_at = ?, ai_normalization_error = NULL WHERE marketplace = ? AND listing_id = ?').run(JSON.stringify(shared), inputHash, config.model, normalizedAt, marketplace, listingId);
+        this.emit('ai-normalization', { key: `${marketplace}:${listingId}`, status: 'ready' });
+        return shared;
+      }
     }
 
     try {
@@ -874,8 +899,13 @@ export class ScoutService {
     const row = this.db.prepare('SELECT title, condition, location, ai_normalization_json, ai_normalization_input_hash, ai_normalization_model, ai_normalization_at, ai_normalization_error FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as Record<string, any> | undefined;
     if (row) {
       const inputHash = listingNormalizationInputHash({ marketplace, title: String(row.title ?? ''), condition: row.condition ? String(row.condition) : undefined, location: row.location ? String(row.location) : undefined });
+      const legacyInputHash = legacyListingNormalizationInputHash({ marketplace, title: String(row.title ?? ''), condition: row.condition ? String(row.condition) : undefined, location: row.location ? String(row.location) : undefined });
       const sameInput = row.ai_normalization_input_hash === inputHash && row.ai_normalization_model === config.model;
       if (sameInput && parseStoredListingNormalization(row.ai_normalization_json)) return;
+      if (row.ai_normalization_input_hash === legacyInputHash && row.ai_normalization_model === config.model && parseStoredListingNormalization(row.ai_normalization_json)) {
+        this.db.prepare('UPDATE listings SET ai_normalization_input_hash = ? WHERE marketplace = ? AND listing_id = ?').run(inputHash, marketplace, listingId);
+        return;
+      }
       if (sameInput && row.ai_normalization_error && row.ai_normalization_at && Date.now() - Date.parse(row.ai_normalization_at) < 6 * 60 * 60_000) return;
     }
     this.aiNormalizationKeys.add(key);
@@ -1124,26 +1154,16 @@ export class ScoutService {
         const comparable = filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters);
         await this.enrichShipping(comparable, source, { limit: 24 });
         const filtered = filterListings(comparable, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, shippingOnly: input.shippingOnly });
-        const relevance = await this.filterListingsByAiRelevance(filtered, {
-          query: input.query,
-          includedTerms: input.terms ?? '',
-          excludedTerms: input.excluded ?? '',
-        }, undefined, input.aiRelevance !== false);
-        const relevanceNote = [
-          relevance.excluded ? `${relevance.excluded} excluded by AI` : '',
-          relevance.unknown ? `${relevance.unknown} AI checks unknown` : '',
-          relevance.notConfigured ? 'AI relevance inactive' : '',
-        ].filter(Boolean).join(' · ');
         const pendingShipping = comparable.filter((listing) => listing.shippingAvailable === null).length;
         return {
-          listings: relevance.listings.slice(0, 100).map((listing): Listing => ({
+          listings: filtered.slice(0, 100).map((listing): Listing => ({
             id: `${listing.marketplace}:${listing.listingId}`, title: listing.title,
             subtitle: [listing.condition, listing.location].filter(Boolean).join(' · '), marketplace: listing.marketplace,
             price: listing.price, typical: null, belowTypical: null, observed: 'just now', observedAt: listing.observedAt,
             dealStrength: 1, dealLabel: 'Watch', image: listing.imageUrl ?? '', url: listing.url, watch: 'Manual search',
             condition: listing.condition, location: listing.location, shippingAvailable: listing.shippingAvailable ?? null, priceNegotiable: listing.priceNegotiable ?? null,
           })),
-          status: { source, status: 'ok' as const, count: relevance.listings.length, pendingShipping, durationMs: Date.now() - started, message: relevance.listings.length ? `${relevance.listings.length} matches${relevanceNote ? ` · ${relevanceNote}` : ''}` : relevance.notConfigured ? `No matches${relevanceNote ? ` · ${relevanceNote}` : ''}` : relevanceNote || 'No matching listings' },
+          status: { source, status: 'ok' as const, count: filtered.length, pendingShipping, durationMs: Date.now() - started, message: filtered.length ? `${filtered.length} matches` : 'No matching listings' },
         };
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Search failed';

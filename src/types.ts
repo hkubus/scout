@@ -186,7 +186,6 @@ export interface SearchFilters {
   minPrice?: number | null;
   maxPrice?: number | null;
   shippingOnly?: boolean;
-  aiRelevance?: boolean;
   condition?: string;
   location?: string;
 }

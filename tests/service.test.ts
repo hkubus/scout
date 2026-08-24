@@ -426,7 +426,7 @@ test('filters and caches irrelevant listings per watch', async () => {
   } finally { context.close(); }
 });
 
-test('applies the AI relevance gate to one-off marketplace search results', async () => {
+test('does not apply the AI relevance gate to one-off marketplace search results', async () => {
   let requests = 0;
   const context = fixture({
     classifyListingRelevance: async (listing) => {
@@ -445,10 +445,10 @@ test('applies the AI relevance gate to one-off marketplace search results', asyn
         { '@type': 'Product', name: 'GPU fan replacement', sku: 'GPU-2', url: 'https://www.olx.pl/d/oferta/gpu-2', offers: { '@type': 'Offer', price: '80' } },
       ],
     })}</script>`;
-    const result = await context.service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '', aiRelevance: true });
-    assert.deepEqual(result.listings.map((listing) => listing.title), ['GPU graphics card RTX 4070']);
-    assert.equal(result.sources[0].message, '1 matches · 1 excluded by AI');
-    assert.equal(requests, 2);
+    const result = await context.service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
+    assert.deepEqual(result.listings.map((listing) => listing.title), ['GPU fan replacement', 'GPU graphics card RTX 4070']);
+    assert.equal(result.sources[0].message, '2 matches');
+    assert.equal(requests, 0);
   } finally { context.close(); }
 });
 
@@ -685,7 +685,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -767,7 +767,7 @@ test('applies manual price filters after marketplace parsing rather than trustin
         { '@type': 'Product', name: 'CPU 250', sku: 'cpu-250', url: 'https://www.olx.pl/d/oferta/cpu-250', offers: { price: '250' } },
       ],
     })}</script>`;
-    const result = await context.service.manualSearch({ query: 'cpu', sources: ['OLX'], minPrice: 100, maxPrice: 200, terms: '', excluded: '', shippingOnly: false, condition: 'Any', location: '', aiRelevance: false });
+    const result = await context.service.manualSearch({ query: 'cpu', sources: ['OLX'], minPrice: 100, maxPrice: 200, terms: '', excluded: '', shippingOnly: false, condition: 'Any', location: '' });
     assert.deepEqual(result.listings.map((listing) => listing.price), [150]);
   } finally { context.close(); }
 });
@@ -904,6 +904,6 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 5);
+    assert.equal(after.migrations.count, 6);
   } finally { context.close(); }
 });
