@@ -1,3 +1,6 @@
+> [!WARNING]
+> This entire project is vibecoded and probably should not be used by anyone other than its original author. It may contain serious bugs, unsafe assumptions, and incomplete behavior. Use it at your own risk.
+
 # Scout
 
 Scout is a single-user, LAN/VPN-friendly marketplace deal monitor for public OLX, Allegro Lokalnie, and Vinted searches.
