@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildMarketplaceSearchUrl, dedupeKey, normalizeListing, parseAllegroCards, parseOlxCards, parsePolishPrice, parseShippingAvailability, parseStructuredListings, parseVintedCards, validateSearchUrl } from '../server/marketplaces';
+import { buildMarketplaceSearchUrl, dedupeKey, normalizeListing, parseAllegroCards, parseListingAvailability, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, validateSearchUrl } from '../server/marketplaces';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { median, pruneBefore, scoreDeal } from '../server/scoring';
@@ -12,6 +12,7 @@ test('validates approved HTTPS search URLs and blocks off-domain redirects', () 
   assert.equal(validateSearchUrl('http://www.olx.pl/d/q-steam-deck/').valid, false);
   assert.equal(validateSearchUrl('https://olx.pl.evil.example/').valid, false);
   assert.equal(validateSearchUrl('https://allegrolokalnie.pl/oferty/').marketplace, 'Allegro Lokalnie');
+  assert.equal(validateSearchUrl('https://allegro.pl/oferty/').valid, false);
 });
 
 test('builds native marketplace filter URLs for price and supported conditions', () => {
@@ -52,7 +53,16 @@ test('normalizes Polish prices and deduplicates by marketplace/listing id', () =
   assert.equal(parsePolishPrice('1 899,00 zł'), 1899);
   const listing = normalizeListing({ marketplace: 'OLX', listingId: 'abc', title: '  Deck  512GB ', price: '1 899 zł', url: 'https://www.olx.pl/d/oferta/deck-abc' });
   assert.equal(listing.title, 'Deck 512GB');
+  assert.equal(listing.priceNegotiable, null);
   assert.equal(dedupeKey(listing), 'olx:abc');
+});
+
+test('detects explicit Polish negotiation signals without guessing from silence', () => {
+  assert.equal(parsePriceNegotiability('Cena do negocjacji'), true);
+  assert.equal(parsePriceNegotiability('Możliwość negocjacji'), true);
+  assert.equal(parsePriceNegotiability('Cena nie do negocjacji'), false);
+  assert.equal(parsePriceNegotiability('Cena sztywna'), false);
+  assert.equal(parsePriceNegotiability('Używany, stan bardzo dobry'), null);
 });
 
 test('parses public JSON-LD listing fixtures and fails closed on unsupported markup', () => {
@@ -61,6 +71,24 @@ test('parses public JSON-LD listing fixtures and fails closed on unsupported mar
   assert.equal(listings.length, 1);
   assert.equal(listings[0].price, 1899);
   assert.equal(parseStructuredListings('<html><body>challenge</body></html>', 'OLX').length, 0);
+});
+
+test('accepts explicit empty search pages but rejects arbitrary zero-card markup', () => {
+  const empty = parseSearchPage('<html><body><div data-testid="no-results">No results</div></body></html>', 'OLX');
+  assert.equal(empty.empty, true);
+  assert.equal(empty.pageStatus, 'empty');
+  assert.equal(empty.length, 0);
+  assert.throws(() => parseSearchPage('<html><body><p>Welcome to the marketplace</p></body></html>', 'OLX'), /no supported listing or empty-state/);
+});
+
+test('classifies listing details as live, terminal, or unknown without inferring a sale', () => {
+  const live = parseListingAvailability('<html><body><h1>Steam Deck OLED</h1><div data-testid="ad-card-title">Steam Deck OLED 512GB</div><button>Wyślij wiadomość</button></body></html>', 'OLX');
+  assert.deepEqual(live, { status: 'live' });
+  const terminal = parseListingAvailability('<html><body><h1>Ogłoszenie jest niedostępne</h1><p>Ta oferta nie jest już dostępna.</p></body></html>', 'OLX');
+  assert.equal(terminal.status, 'terminal');
+  assert.equal(parseListingAvailability('<html><body><h1>Checking your browser</h1><p>Cloudflare challenge</p></body></html>', 'OLX').status, 'unknown');
+  assert.equal(parseListingAvailability('', 'OLX', 404).status, 'terminal');
+  assert.equal(parseListingAvailability('', 'OLX', 503).status, 'unknown');
 });
 
 test('normalizes object-shaped JSON-LD images before storage', () => {
@@ -73,13 +101,14 @@ test('normalizes object-shaped JSON-LD images before storage', () => {
 });
 
 test('parses rendered OLX cards without relying on generated class names', () => {
-  const html = `<div data-cy="l-card" data-testid="l-card" id="1089143315"><img src="https://ireland.apollo.olxcdn.com/image.jpg" alt="Intel i5"><div data-testid="card-delivery-badge">Dostawa</div><div data-testid="ad-card-title"><a data-testid="card-title-link" href="/d/oferta/intel-i5-8400-CID99-IDabc123.html"><h4>Intel Core i5 8400</h4></a><p data-testid="ad-price">180 zł</p></div><div data-nx-name="NexusBadge">Używane</div><p data-testid="location-date">Warszawa - Dzisiaj</p></div>`;
+  const html = `<div data-cy="l-card" data-testid="l-card" id="1089143315"><img src="https://ireland.apollo.olxcdn.com/image.jpg" alt="Intel i5"><div data-testid="card-delivery-badge">Dostawa</div><div data-testid="ad-card-title"><a data-testid="card-title-link" href="/d/oferta/intel-i5-8400-CID99-IDabc123.html"><h4>Intel Core i5 8400</h4></a><p data-testid="ad-price">180 zł</p><span>Do negocjacji</span></div><div data-nx-name="NexusBadge">Używane</div><p data-testid="location-date">Warszawa - Dzisiaj</p></div>`;
   const [listing] = parseOlxCards(html);
   assert.equal(listing.listingId, '1089143315');
   assert.equal(listing.price, 180);
   assert.equal(listing.location, 'Warszawa');
   assert.equal(listing.condition, 'Używane');
   assert.equal(listing.shippingAvailable, true);
+  assert.equal(listing.priceNegotiable, true);
 });
 
 test('parses Allegro Lokalnie offer type as shipping availability', () => {
@@ -87,15 +116,18 @@ test('parses Allegro Lokalnie offer type as shipping availability', () => {
     <article class="mlc-itembox__container" data-card-analytics-click="buy-1">
       <a href="/oferta/steam-deck-buy" itemprop="url"><h3 itemprop="itemOffered">Steam Deck with shipping</h3></a>
       <span class="mlc-itembox__offer-type mlc-itembox__offer-type--buy_now">Kup teraz</span>
+      <span class="price-negotiability">Cena do negocjacji</span>
       <span class="ml-offer-price__dollars">1 200</span>
     </article>
     <article class="mlc-itembox__container" data-card-analytics-click="classified-1">
       <a href="/oferta/steam-deck-pickup" itemprop="url"><h3 itemprop="itemOffered">Steam Deck pickup only</h3></a>
       <span class="mlc-itembox__offer-type mlc-itembox__offer-type--classified">Ogłoszenie</span>
+      <span class="price-negotiability">Cena sztywna</span>
       <span class="ml-offer-price__dollars">900</span>
     </article>`;
   const listings = parseAllegroCards(html);
   assert.deepEqual(listings.map((listing) => listing.shippingAvailable), [true, false]);
+  assert.deepEqual(listings.map((listing) => listing.priceNegotiable), [true, false]);
   assert.deepEqual(listings.map((listing) => listing.listingId), ['buy-1', 'classified-1']);
 });
 
@@ -127,6 +159,7 @@ test('keeps cold-start deals silent until samples and hours are ready', () => {
   assert.equal(scoreDeal(prices, 650, { observedHours: 6 }).isReady, true);
   assert.equal(scoreDeal(prices, 650, { observedHours: 5 }).isReady, false);
   assert.equal(median([1, 3, 2]), 2);
+  assert.equal(median([1, 3]), 2);
 });
 
 test('prunes observations older than the retention window', () => {

@@ -1,4 +1,4 @@
-import type { ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, ManualSearchResponse, MarketResearchData, MarketWatch, MarketWatchInput, Marketplace, NotificationPriority, NotificationRecord, SearchFilters, SettingsData, Watch, WatchAnalytics } from './types';
+import type { ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, ManualSearchResponse, MarketResearchData, MarketWatch, MarketWatchInput, Marketplace, NegotiationRecommendation, NegotiationResult, NotificationPriority, NotificationRecord, SearchFilters, SellerMessage, SettingsData, Watch, WatchAnalytics } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -25,20 +25,32 @@ export const api = {
   dashboard: () => request<DashboardData>('/api/dashboard'),
   watchAnalytics: (id: string, days = 30) => request<WatchAnalytics>(`/api/watches/${encodeURIComponent(id)}/analytics?days=${days}`),
   createWatch: (watch: Watch) => request<{ watch: Watch }>('/api/watches', json('POST', watch)),
-  updateWatch: (id: string, patch: Partial<Pick<Watch, 'enabled' | 'interval' | 'shippingOnly' | 'minPrice' | 'maxPrice'>>) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
+  updateWatch: (id: string, patch: Partial<Pick<Watch, 'enabled' | 'interval' | 'shippingOnly' | 'aiRelevance' | 'minPrice' | 'maxPrice'>> & { archived?: boolean }) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
   search: (filters: SearchFilters) => request<ManualSearchResponse>('/api/search', json('POST', filters)),
-  marketResearch: () => request<MarketResearchData>('/api/market-watches'),
+  marketResearch: (options: { page?: number; pageSize?: number; watchId?: string; status?: 'active' | 'ended' | 'superseded' } = {}) => {
+    const params = new URLSearchParams();
+    if (options.page !== undefined) params.set('page', String(options.page));
+    if (options.pageSize !== undefined) params.set('pageSize', String(options.pageSize));
+    if (options.watchId) params.set('watchId', options.watchId);
+    if (options.status) params.set('status', options.status);
+    const suffix = params.toString() ? `?${params.toString()}` : '';
+    return request<MarketResearchData>(`/api/market-watches${suffix}`);
+  },
   createMarketWatch: (watch: MarketWatchInput) => request<{ watch: MarketWatch }>('/api/market-watches', json('POST', watch)),
   updateMarketWatch: (id: string, patch: Partial<Pick<MarketWatch, 'name' | 'query' | 'enabled' | 'intervalHours' | 'terms' | 'excluded' | 'location' | 'condition' | 'sources' | 'minPrice' | 'maxPrice' | 'shippingOnly'>>) => request<{ ok: true }>(`/api/market-watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
   deleteMarketWatch: (id: string) => request<{ ok: true }>(`/api/market-watches/${encodeURIComponent(id)}`, json('DELETE')),
   scanMarketWatch: (id: string) => request<{ queued: boolean; message: string }>(`/api/market-watches/${encodeURIComponent(id)}/scan`, { method: 'POST' }),
   deleteWatch: (id: string) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('DELETE')),
-  listingDetail: (key: string) => request<ListingDetail>(`/api/listing-detail?key=${encodeURIComponent(key)}`),
+  listingDetail: (key: string, watchId?: string | null) => request<ListingDetail>(`/api/listing-detail?key=${encodeURIComponent(key)}${watchId ? `&watchId=${encodeURIComponent(watchId)}` : ''}`),
+  normalizeListing: (key: string, force = false) => request<ListingDetail>('/api/ai/normalize-listing', json('POST', { key, force })),
+  recommendNegotiation: (key: string, input: { maxTotalCost: number | null; shippingCost?: number; otherCosts?: number }) => request<NegotiationRecommendation>('/api/negotiation/recommendation', json('POST', { key, ...input })),
+  negotiateAndSend: (key: string, offerPrice: number | null = null, budget?: { maxTotalCost: number; shippingCost?: number; otherCosts?: number }) => request<NegotiationResult>('/api/ai/negotiate', json('POST', { key, offerPrice, ...budget })),
+  messages: () => request<{ messages: SellerMessage[] }>('/api/messages'),
   listingAction: (key: string) => request<ListingAction>(`/api/listing-actions?key=${encodeURIComponent(key)}`),
   updateListingAction: (key: string, action: { decision: ListingDecision | null; note: string }) => request<{ action: ListingAction }>('/api/listing-actions', json('PATCH', { key, ...action })),
   scan: (watchId?: string) => request<{ queued: boolean; message: string }>('/api/scans', json('POST', watchId ? { watchId } : {})),
   settings: () => request<SettingsData>('/api/settings'),
-  saveSettings: (settings: { interval: number; nightInterval?: number; webhook?: string; clearWebhook?: boolean; discordMinimumPriority?: NotificationPriority; clearNtfy?: boolean; ntfy?: { serverUrl?: string; topic?: string; token?: string; minimumPriority?: NotificationPriority } }) => request<SettingsData>('/api/settings', json('PATCH', settings)),
+  saveSettings: (settings: { interval: number; nightInterval?: number; webhook?: string; clearWebhook?: boolean; discordMinimumPriority?: NotificationPriority; dailyDigest?: { enabled?: boolean; time?: string; discord?: boolean; ntfy?: boolean }; clearNtfy?: boolean; ntfy?: { serverUrl?: string; topic?: string; token?: string; minimumPriority?: NotificationPriority }; ai?: { apiKey?: string; clearApiKey?: boolean; model?: string }; autoNegotiation?: { enabled?: boolean; maxTotalCost?: number | null; shippingCost?: number; otherCosts?: number; minimumDiscountPercent?: number; openingDiscountPercent?: number; dailyLimit?: number } }) => request<SettingsData>('/api/settings', json('PATCH', settings)),
   saveMarketplaceSession: (marketplace: Marketplace, label: string, storageState: unknown) => request<SettingsData>(`/api/marketplace-sessions/${encodeURIComponent(marketplace)}`, json('PUT', { label, storageState })),
   deleteMarketplaceSession: (marketplace: Marketplace) => request<SettingsData>(`/api/marketplace-sessions/${encodeURIComponent(marketplace)}`, json('DELETE')),
   testWebhook: () => request<{ delivered: boolean }>('/api/settings/webhook/test', { method: 'POST' }),

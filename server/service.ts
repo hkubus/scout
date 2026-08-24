@@ -1,14 +1,73 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { chromium, type Browser, type BrowserContext } from 'playwright-core';
-import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, parseNotificationPriority, priorityFromDiscount, publishNtfy, validateNtfyConfig, type NtfyConfig } from './notifications';
-import { buildMarketplaceSearchUrl, createPublicAdapter, exponentialBackoff, parseShippingAvailability, validateSearchUrl, type Marketplace, type NormalizedListing } from './marketplaces';
+import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, validateNtfyConfig, type NtfyConfig } from './notifications';
+import { buildMarketplaceSearchUrl, createPublicAdapter, exponentialBackoff, parseShippingAvailability, validateSearchUrl, type ListingAvailability, type Marketplace, type NormalizedListing } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
+import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, draftNegotiationMessageWithDeepSeek, listingNormalizationInputHash, listingRelevanceInputHash, normalizeListingWithDeepSeek, normalizeOpenRouterModel, DeepSeekError, parseStoredListingNormalization, type ListingRelevanceContext, type NegotiationListingContext } from './ai';
+import { OlxMessagingError, sendOlxMessageOnPage } from './olx-messaging';
+import { AllegroMessagingError, sendAllegroMessageOnPage } from './allegro-messaging';
+import { offerCeiling, recommendNegotiationPrice, type NegotiationRecommendation } from './negotiation';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, median, scoreDeal } from './scoring';
-import type { Connector, ConnectorRun, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDetail, ManualSearchResponse, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
+import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDetail, ManualSearchResponse, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
 
 type Database = any;
 type WatchRow = Record<string, any>;
+type ListingRelevanceSearch = Pick<ListingRelevanceContext, 'query' | 'includedTerms' | 'excludedTerms'>;
+type RelevanceFilterResult = {
+  listings: NormalizedListing[];
+  excluded: number;
+  failed: number;
+  unknown: number;
+  notConfigured: boolean;
+};
+
+type DealNotificationCandidate = {
+  watchId: string;
+  listing: NormalizedListing;
+  typical: number;
+  discountPercent: number;
+  confidence: number;
+};
+
+type AutoNegotiationConfig = Omit<AutoNegotiationSettings, 'sentToday' | 'attemptedToday'>;
+type DigestChannel = 'Discord' | 'ntfy';
+type DailyDigestConfig = Omit<DailyDigestSettings, 'lastSentAt'>;
+
+type DigestCandidateRow = {
+  id: number;
+  watch_id: string;
+  watch_name: string;
+  marketplace: Marketplace;
+  listing_id: string;
+  sequence: number;
+  title: string;
+  url: string;
+  image_url: string | null;
+  price_pln: number;
+  typical_pln: number;
+  discount_percent: number;
+  confidence: number;
+  priority: NotificationPriority;
+  observed_at: string;
+};
+
+const DEFAULT_AUTO_NEGOTIATION_CONFIG: AutoNegotiationConfig = {
+  enabled: false,
+  maxTotalCost: null,
+  shippingCost: 0,
+  otherCosts: 0,
+  minimumDiscountPercent: 18,
+  openingDiscountPercent: 12,
+  dailyLimit: 3,
+};
+
+const DEFAULT_DAILY_DIGEST_CONFIG: DailyDigestConfig = {
+  enabled: false,
+  time: '08:00',
+  discord: true,
+  ntfy: false,
+};
 
 const connectorDefinitions: Array<Pick<Connector, 'name' | 'kind' | 'color'>> = [
   { name: 'OLX', kind: 'marketplace', color: '#159b96' },
@@ -29,6 +88,13 @@ export class ServiceError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+export interface ScoutServiceDependencies {
+  classifyListingRelevance?: typeof classifyListingRelevanceWithDeepSeek;
+  draftNegotiation?: typeof draftNegotiationMessageWithDeepSeek;
+  sendOlxMessage?: (listingUrl: string, message: string) => Promise<void>;
+  sendAllegroMessage?: (listingUrl: string, message: string) => Promise<void>;
 }
 
 export function marketStatusAfterMiss(currentMissingScans: number, threshold = 3) {
@@ -169,10 +235,94 @@ export class ScoutService {
   private db: Database;
   private emit: (event: string, payload: unknown) => void;
   private running = new Set<string>();
+  private lastSchedulerTickAt: string | null = null;
+  private aiNormalizationQueue: Array<{ marketplace: Marketplace; listingId: string }> = [];
+  private aiNormalizationKeys = new Set<string>();
+  private activeAiNormalizations = 0;
+  private digestRunning = false;
+  private readonly maxConcurrentAiNormalizations = 2;
+  private readonly classifyListingRelevance: typeof classifyListingRelevanceWithDeepSeek;
+  private readonly draftNegotiation: typeof draftNegotiationMessageWithDeepSeek;
+  private readonly sendOlxMessageOverride?: (listingUrl: string, message: string) => Promise<void>;
+  private readonly sendAllegroMessageOverride?: (listingUrl: string, message: string) => Promise<void>;
 
-  constructor(db: Database, emit: (event: string, payload: unknown) => void) {
+  constructor(db: Database, emit: (event: string, payload: unknown) => void, dependencies: ScoutServiceDependencies = {}) {
     this.db = db;
     this.emit = emit;
+    this.classifyListingRelevance = dependencies.classifyListingRelevance ?? classifyListingRelevanceWithDeepSeek;
+    this.draftNegotiation = dependencies.draftNegotiation ?? draftNegotiationMessageWithDeepSeek;
+    this.sendOlxMessageOverride = dependencies.sendOlxMessage;
+    this.sendAllegroMessageOverride = dependencies.sendAllegroMessage;
+  }
+
+  private transaction<T>(callback: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = callback();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch { /* preserve the original database error */ }
+      throw error;
+    }
+  }
+
+  private createScan(watchId: string, watchKind: 'watch' | 'research', marketplace: Marketplace, startedAt = nowIso()) {
+    const result = this.db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run(watchId, watchKind, marketplace, 'running', startedAt);
+    return Number(result.lastInsertRowid);
+  }
+
+  private completeScan(scanId: number, message?: string) {
+    this.db.prepare("UPDATE scans SET status = 'completed', completed_at = ?, error = ? WHERE id = ?").run(nowIso(), message ?? null, scanId);
+  }
+
+  private failScan(scanId: number, error: unknown) {
+    const message = (error instanceof Error ? error.message : String(error || 'Scan failed')).slice(0, 500);
+    this.db.prepare("UPDATE scans SET status = 'failed', completed_at = ?, error = ? WHERE id = ?").run(nowIso(), message, scanId);
+  }
+
+  schedulerTick() {
+    this.lastSchedulerTickAt = nowIso();
+    this.queueDue();
+  }
+
+  readiness() {
+    let database = false;
+    let databaseError: string | null = null;
+    try {
+      const result = this.db.prepare('SELECT 1 AS ok').get() as { ok?: number } | undefined;
+      database = result?.ok === 1;
+    } catch (error) {
+      databaseError = error instanceof Error ? error.message : 'Database probe failed';
+    }
+    const lastTickAgeMs = this.lastSchedulerTickAt ? Math.max(0, Date.now() - Date.parse(this.lastSchedulerTickAt)) : null;
+    let staleScans = 0;
+    let migration: { count?: number; latest?: string | null } = { count: 0, latest: null };
+    let degradedConnectors: Array<Connector['name']> = [];
+    try {
+      if (database) {
+        staleScans = Number((this.db.prepare("SELECT COUNT(*) AS count FROM scans WHERE status = 'running' OR status = 'interrupted'").get() as { count?: number } | undefined)?.count ?? 0);
+        migration = this.db.prepare('SELECT COUNT(*) AS count, MAX(id) AS latest FROM migrations').get() as { count?: number; latest?: string | null };
+        degradedConnectors = this.getConnectors().filter((connector) => connector.status === 'Degraded').map((connector) => connector.name);
+      }
+    } catch (error) {
+      database = false;
+      databaseError = error instanceof Error ? error.message : 'Database readiness probe failed';
+    }
+    const scheduler = {
+      lastTickAt: this.lastSchedulerTickAt,
+      ageMs: lastTickAgeMs,
+      healthy: lastTickAgeMs !== null && lastTickAgeMs < 90_000,
+    };
+    const ready = database && scheduler.healthy;
+    return {
+      status: ready ? 'ready' as const : 'not-ready' as const,
+      database: { ok: database, error: databaseError },
+      scheduler,
+      scans: { staleOrInterrupted: staleScans },
+      migrations: { count: Number(migration?.count ?? 0), latest: migration?.latest ?? null },
+      connectors: { degraded: degradedConnectors, degradedCount: degradedConnectors.length },
+    };
   }
 
   private getSetting(key: string) {
@@ -182,6 +332,195 @@ export class ScoutService {
 
   private setSetting(key: string, value: string) {
     this.db.prepare('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run(key, value, nowIso());
+  }
+
+  private autoNegotiationConfig(): AutoNegotiationConfig {
+    const stored = parseJson<Partial<AutoNegotiationConfig>>(this.getSetting('auto_negotiation_config'), {});
+    const finite = (value: unknown, fallback: number, minimum: number, maximum?: number) => {
+      const parsed = typeof value === 'number' ? value : Number(value);
+      return Number.isFinite(parsed) && parsed >= minimum && (maximum === undefined || parsed <= maximum) ? parsed : fallback;
+    };
+    const maxTotalCost = stored.maxTotalCost === null ? null : finite(stored.maxTotalCost, 0, 0.01);
+    return {
+      enabled: stored.enabled === true,
+      maxTotalCost: maxTotalCost === 0 ? null : maxTotalCost,
+      shippingCost: finite(stored.shippingCost, DEFAULT_AUTO_NEGOTIATION_CONFIG.shippingCost, 0),
+      otherCosts: finite(stored.otherCosts, DEFAULT_AUTO_NEGOTIATION_CONFIG.otherCosts, 0),
+      minimumDiscountPercent: finite(stored.minimumDiscountPercent, DEFAULT_AUTO_NEGOTIATION_CONFIG.minimumDiscountPercent, 18, 80),
+      openingDiscountPercent: finite(stored.openingDiscountPercent, DEFAULT_AUTO_NEGOTIATION_CONFIG.openingDiscountPercent, 1, 50),
+      dailyLimit: Math.floor(finite(stored.dailyLimit, DEFAULT_AUTO_NEGOTIATION_CONFIG.dailyLimit, 1, 50)),
+    };
+  }
+
+  private dailyDigestConfig(): DailyDigestConfig {
+    const stored = parseJson<Partial<DailyDigestConfig>>(this.getSetting('daily_digest_config'), {});
+    const time = typeof stored.time === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(stored.time)
+      ? stored.time
+      : DEFAULT_DAILY_DIGEST_CONFIG.time;
+    return {
+      enabled: stored.enabled === true,
+      time,
+      discord: stored.discord === undefined ? DEFAULT_DAILY_DIGEST_CONFIG.discord : stored.discord === true,
+      ntfy: stored.ntfy === true,
+    };
+  }
+
+  private dailyDigestSettings(): DailyDigestSettings {
+    return { ...this.dailyDigestConfig(), lastSentAt: this.getSetting('daily_digest_last_sent_at') };
+  }
+
+  private localDateAndTime(value = new Date()) {
+    const pad = (part: number) => String(part).padStart(2, '0');
+    return {
+      date: `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`,
+      time: `${pad(value.getHours())}:${pad(value.getMinutes())}`,
+    };
+  }
+
+  private currentDayStart() {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    return start.toISOString();
+  }
+
+  private autoNegotiationSettings(): AutoNegotiationSettings {
+    const config = this.autoNegotiationConfig();
+    const counts = this.db.prepare(`SELECT COUNT(*) AS attempted, SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent
+      FROM automatic_negotiations WHERE created_at >= ?`).get(this.currentDayStart()) as { attempted?: number; sent?: number } | undefined;
+    return {
+      ...config,
+      sentToday: Number(counts?.sent ?? 0),
+      attemptedToday: Number(counts?.attempted ?? 0),
+    };
+  }
+
+  private deepSeekApiKey() {
+    // Keep reading the old key name so switching providers does not invalidate
+    // an already saved token; newly saved credentials use the OpenRouter name.
+    for (const key of ['openrouter_api_key', 'deepseek_api_key']) {
+      const stored = this.getSetting(key);
+      if (stored) {
+        try {
+          const decrypted = decryptSecret(stored).trim();
+          if (decrypted) return { apiKey: decrypted, source: 'settings' as const };
+        } catch {
+          // Fall through to the next stored key or environment variable so a
+          // damaged optional setting cannot prevent the rest of Scout from starting.
+        }
+      }
+    }
+    const environment = process.env.SCOUT_OPENROUTER_API_KEY?.trim()
+      || process.env.OPENROUTER_API_KEY?.trim()
+      || process.env.SCOUT_DEEPSEEK_API_KEY?.trim();
+    return environment ? { apiKey: environment, source: 'environment' as const } : { apiKey: null, source: 'none' as const };
+  }
+
+  private deepSeekModel() {
+    return normalizeOpenRouterModel(this.getSetting('deepseek_model')?.trim()
+      || process.env.SCOUT_OPENROUTER_MODEL?.trim()
+      || process.env.SCOUT_DEEPSEEK_MODEL?.trim()
+      || DEFAULT_DEEPSEEK_MODEL);
+  }
+
+  private deepSeekConfig() {
+    const credential = this.deepSeekApiKey();
+    return {
+      apiKey: credential.apiKey,
+      model: this.deepSeekModel(),
+      source: credential.source,
+    };
+  }
+
+  private saveListingRelevance(input: {
+    watchId: string;
+    listing: NormalizedListing;
+    inputHash: string;
+    model: string;
+    relevant: boolean;
+    status: 'relevant' | 'irrelevant' | 'unknown';
+    reason: string;
+    error?: string | null;
+  }) {
+    this.db.prepare(`INSERT INTO listing_relevance (watch_id, marketplace, listing_id, input_hash, model, relevant, reason, error, checked_at, relevance_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(watch_id, marketplace, listing_id) DO UPDATE SET input_hash = excluded.input_hash, model = excluded.model, relevant = excluded.relevant, reason = excluded.reason, error = excluded.error, checked_at = excluded.checked_at, relevance_status = excluded.relevance_status`).run(
+      input.watchId,
+      input.listing.marketplace,
+      input.listing.listingId,
+      input.inputHash,
+      input.model,
+      input.relevant ? 1 : 0,
+      input.reason.slice(0, 240),
+      input.error?.slice(0, 500) ?? null,
+      nowIso(),
+      input.status,
+    );
+  }
+
+  private async filterListingsByAiRelevance(
+    listings: NormalizedListing[],
+    search: ListingRelevanceSearch,
+    watchId: string | undefined,
+    enabled: boolean,
+  ): Promise<RelevanceFilterResult> {
+    if (!enabled || !listings.length) return { listings, excluded: 0, failed: 0, unknown: 0, notConfigured: false };
+    const config = this.deepSeekConfig();
+    if (!config.apiKey) return { listings, excluded: 0, failed: 0, unknown: 0, notConfigured: true };
+    const apiKey = config.apiKey;
+
+    const classified: Array<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> = [];
+    for (let offset = 0; offset < listings.length; offset += 4) {
+      const batch = await Promise.all(listings.slice(offset, offset + 4).map(async (listing): Promise<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> => {
+        const context: ListingRelevanceContext = {
+          marketplace: listing.marketplace,
+          title: listing.title,
+          condition: listing.condition,
+          location: listing.location,
+          query: search.query,
+          includedTerms: search.includedTerms,
+          excludedTerms: search.excludedTerms,
+        };
+        const inputHash = listingRelevanceInputHash(context);
+        if (watchId) {
+          const cached = this.db.prepare('SELECT input_hash, model, relevant, reason, error, relevance_status FROM listing_relevance WHERE watch_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, listing.marketplace, listing.listingId) as { input_hash?: string; model?: string; relevant?: number; reason?: string; error?: string | null; relevance_status?: string } | undefined;
+          const cachedStatus: 'relevant' | 'irrelevant' | 'unknown' = cached?.relevance_status === 'irrelevant' || cached?.relevance_status === 'unknown' || cached?.relevance_status === 'relevant'
+            ? cached.relevance_status
+            : cached?.error ? 'unknown' : cached?.relevant === 0 ? 'irrelevant' : 'relevant';
+          if (cached?.input_hash === inputHash && cached.model === config.model && cachedStatus !== 'unknown' && !cached.error) {
+            return { listing, status: cachedStatus };
+          }
+        }
+
+        const reusable = this.db.prepare(`SELECT relevant, reason, relevance_status FROM listing_relevance
+          WHERE marketplace = ? AND listing_id = ? AND input_hash = ? AND model = ? AND relevance_status IN ('relevant', 'irrelevant') AND error IS NULL
+          ORDER BY checked_at DESC LIMIT 1`).get(listing.marketplace, listing.listingId, inputHash, config.model) as { relevant?: number; reason?: string; relevance_status?: string } | undefined;
+        if (reusable) {
+          const status: 'relevant' | 'irrelevant' = reusable.relevance_status === 'irrelevant' || reusable.relevant === 0 ? 'irrelevant' : 'relevant';
+          if (watchId) this.saveListingRelevance({ watchId, listing, inputHash, model: config.model, relevant: status === 'relevant', status, reason: reusable.reason ?? 'Reused cached relevance decision' });
+          return { listing, status };
+        }
+
+        try {
+          const result = await this.classifyListingRelevance(context, { apiKey, model: config.model });
+          const status: 'relevant' | 'irrelevant' = result.relevant ? 'relevant' : 'irrelevant';
+          if (watchId) this.saveListingRelevance({ watchId, listing, inputHash, model: config.model, relevant: result.relevant, status, reason: result.reason });
+          return { listing, status };
+        } catch (error) {
+          const message = (error instanceof Error ? error.message : 'OpenRouter could not classify listing relevance').slice(0, 500);
+          if (watchId) this.saveListingRelevance({ watchId, listing, inputHash, model: config.model, relevant: true, status: 'unknown', reason: 'AI relevance check failed', error: message });
+          return { listing, status: 'unknown' };
+        }
+      }));
+      classified.push(...batch);
+    }
+
+    return {
+      listings: classified.filter((item) => item.status !== 'irrelevant').map((item) => item.listing),
+      excluded: classified.filter((item) => item.status === 'irrelevant').length,
+      failed: classified.filter((item) => item.status === 'unknown').length,
+      unknown: classified.filter((item) => item.status === 'unknown').length,
+      notConfigured: false,
+    };
   }
 
   private discordMinimumPriority(): NotificationPriority {
@@ -263,11 +602,19 @@ export class ScoutService {
   }
 
   private watchFromRow(row: WatchRow): Watch {
-    const stats = this.db.prepare('SELECT COUNT(DISTINCT o.listing_id) AS samples, MIN(o.observed_at) AS first_observed FROM observations o JOIN listings l ON l.id = o.listing_id WHERE o.watch_id = ? AND (? = 0 OR l.shipping_available = 1) AND (? IS NULL OR l.price_pln >= ?) AND (? IS NULL OR l.price_pln <= ?)').get(row.id, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln) as { samples: number; first_observed: string | null };
+    const stats = this.db.prepare(`SELECT COUNT(DISTINCT o.listing_id) AS samples, MIN(o.observed_at) AS first_observed
+      FROM observations o
+      JOIN listings l ON l.id = o.listing_id
+      WHERE o.watch_id = ?
+        AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND EXISTS (SELECT 1 FROM watches rw WHERE rw.id = r.watch_id AND rw.ai_relevance = 1))
+        AND (? = 0 OR l.shipping_available = 1)
+        AND (? IS NULL OR o.price_pln >= ?)
+        AND (? IS NULL OR o.price_pln <= ?)`).get(row.id, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln) as { samples: number; first_observed: string | null };
     const samples = Number(stats?.samples ?? 0);
     const observationHours = stats?.first_observed ? Math.max(0, Math.floor((Date.now() - Date.parse(stats.first_observed)) / 3_600_000)) : 0;
     const readiness = Math.round(Math.min(1, samples / BASELINE_MIN_SAMPLES, observationHours / BASELINE_MIN_HOURS) * 100);
-    const enabled = Boolean(row.enabled);
+    const archived = Boolean(row.archived_at);
+    const enabled = Boolean(row.enabled) && !archived;
     return {
       id: row.id,
       name: row.name,
@@ -281,35 +628,50 @@ export class ScoutService {
       targetSamples: BASELINE_MIN_SAMPLES,
       observationHours,
       readiness,
-      status: enabled ? (readiness >= 100 ? 'Ready' : 'Learning') : 'Paused',
+      status: archived ? 'Archived' : enabled ? (readiness >= 100 ? 'Ready' : 'Learning') : 'Paused',
       interval: Number(row.interval_minutes),
       nextScan: enabled ? relativeTimeFuture(row.next_scan_at) : 'Paused',
       enabled,
       exactUrls: parseJson<string[]>(row.exact_urls_json, []),
       sensitivity: Number(row.sensitivity ?? 1),
       shippingOnly: Boolean(row.shipping_only),
+      aiRelevance: row.ai_relevance === undefined ? true : Boolean(row.ai_relevance),
       minPrice: row.min_price_pln === null ? null : Number(row.min_price_pln),
       maxPrice: row.max_price_pln === null ? null : Number(row.max_price_pln),
+      archivedAt: row.archived_at ?? null,
     };
   }
 
   private listingFromRow(row: Record<string, any>, baselineReady: boolean): Listing {
-    const typical = baselineReady && row.typical_pln !== null ? Number(row.typical_pln) : null;
+    const associationTypical = row.watch_typical_pln ?? row.typical_pln;
+    const typical = baselineReady && associationTypical !== null && associationTypical !== undefined ? Number(associationTypical) : null;
     const price = Number(row.price_pln);
     const belowTypical = typical && typical > 0 ? -Math.max(0, ((typical - price) / typical) * 100) : null;
     const discount = belowTypical === null ? 0 : Math.abs(belowTypical);
-    const dealStrength = discount >= 30 ? 5 : discount >= 20 ? 4 : discount >= 12 ? 3 : discount > 0 ? 2 : 1;
-    const dealLabel: DealLabel = dealStrength >= 5 ? 'Exceptional' : dealStrength === 4 ? 'Very strong' : dealStrength === 3 ? 'Strong' : 'Watch';
+    const dealStrength = row.watch_deal_strength === null || row.watch_deal_strength === undefined
+      ? discount >= 30 ? 5 : discount >= 20 ? 4 : discount >= 12 ? 3 : discount > 0 ? 2 : 1
+      : Number(row.watch_deal_strength);
+    const dealLabel: DealLabel = row.watch_deal_label === 'Exceptional' || row.watch_deal_label === 'Very strong' || row.watch_deal_label === 'Strong' || row.watch_deal_label === 'Watch'
+      ? row.watch_deal_label
+      : dealStrength >= 5 ? 'Exceptional' : dealStrength === 4 ? 'Very strong' : dealStrength === 3 ? 'Strong' : 'Watch';
+    const marketplaceListingKey = `${row.marketplace}:${row.listing_id}`;
+    const associationId = row.watch_listing_id === null || row.watch_listing_id === undefined
+      ? row.watch_id ? `${row.watch_id}:${marketplaceListingKey}` : undefined
+      : `${row.watch_id}:${row.watch_listing_id}`;
     return {
-      id: `${row.marketplace}:${row.listing_id}`,
+      id: marketplaceListingKey,
+      marketplaceListingKey,
+      associationId,
+      watchId: row.watch_id ?? null,
+      watchListingId: row.watch_listing_id === null || row.watch_listing_id === undefined ? null : Number(row.watch_listing_id),
       title: row.title,
       subtitle: row.subtitle || row.condition || row.location || '',
       marketplace: row.marketplace,
       price,
       typical,
       belowTypical,
-      observed: relativeTime(row.last_seen_at),
-      observedAt: row.last_seen_at,
+      observed: relativeTime(row.watch_last_seen_at ?? row.last_seen_at),
+      observedAt: row.watch_last_seen_at ?? row.last_seen_at,
       dealStrength,
       dealLabel,
       image: row.image_url || '',
@@ -318,13 +680,21 @@ export class ScoutService {
       condition: row.condition || undefined,
       location: row.location || undefined,
       shippingAvailable: row.shipping_available === null ? null : Boolean(row.shipping_available),
+      priceNegotiable: row.price_negotiable === null || row.price_negotiable === undefined ? null : Boolean(row.price_negotiable),
       listingId: String(row.listing_id),
       decision: parseListingDecision(row.listing_decision),
       note: typeof row.listing_note === 'string' ? row.listing_note : '',
+      aiNormalization: parseStoredListingNormalization(row.ai_normalization_json),
+      aiNormalizationAt: row.ai_normalization_at ?? null,
+      aiNormalizationError: row.ai_normalization_error ?? null,
     };
   }
 
   getWatches() {
+    return (this.db.prepare("SELECT * FROM watches WHERE archived_at IS NULL ORDER BY created_at DESC").all() as WatchRow[]).map((row) => this.watchFromRow(row));
+  }
+
+  allWatches() {
     return (this.db.prepare('SELECT * FROM watches ORDER BY created_at DESC').all() as WatchRow[]).map((row) => this.watchFromRow(row));
   }
 
@@ -333,11 +703,12 @@ export class ScoutService {
     if (!row) throw new ServiceError('Watch not found', 404);
     const days = Math.max(7, Math.min(180, Math.floor(rangeDays)));
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60_000).toISOString();
-    const rawRows = this.db.prepare(`SELECT o.listing_id, l.marketplace, o.price_pln, l.typical_pln, o.observed_at
+    const rawRows = this.db.prepare(`SELECT o.listing_id, l.marketplace, o.price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, o.observed_at
       FROM observations o
       JOIN listings l ON l.id = o.listing_id
       WHERE o.watch_id = ?
         AND o.observed_at >= ?
+        AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND EXISTS (SELECT 1 FROM watches rw WHERE rw.id = r.watch_id AND rw.ai_relevance = 1))
         AND (? = 0 OR l.shipping_available = 1)
         AND (? IS NULL OR o.price_pln >= ?)
         AND (? IS NULL OR o.price_pln <= ?)
@@ -401,7 +772,19 @@ export class ScoutService {
   }
 
   getListings() {
-    const rows = this.db.prepare(`SELECT l.*, a.decision AS listing_decision, a.note AS listing_note, (SELECT o.watch_id FROM observations o WHERE o.listing_id = l.id ORDER BY o.observed_at DESC LIMIT 1) AS watch_id, (SELECT w.name FROM observations o JOIN watches w ON w.id = o.watch_id WHERE o.listing_id = l.id ORDER BY o.observed_at DESC LIMIT 1) AS watch_name FROM listings l LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id WHERE EXISTS (SELECT 1 FROM observations o WHERE o.listing_id = l.id) ORDER BY l.last_seen_at DESC LIMIT 200`).all() as Array<Record<string, any>>;
+    const rows = this.db.prepare(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note
+      FROM listings l
+      JOIN watch_listings wl ON wl.listing_id = l.id
+      JOIN watches w ON w.id = wl.watch_id
+      LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id
+      WHERE w.archived_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM listing_relevance r
+          WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id
+            AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))
+            AND w.ai_relevance = 1
+        )
+      ORDER BY l.last_seen_at DESC, wl.id DESC LIMIT 200`).all() as Array<Record<string, any>>;
     const watches = new Map(this.getWatches().map((watch) => [watch.id, watch]));
     return rows.filter((row) => {
       const watch = watches.get(row.watch_id);
@@ -411,20 +794,99 @@ export class ScoutService {
     }).map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100));
   }
 
-  listingDetail(key: string): ListingDetail {
+  listingDetail(key: string, watchId?: string | null): ListingDetail {
     const { marketplace, listingId } = parseListingKey(key);
-    const row = this.db.prepare(`SELECT l.*, a.decision AS listing_decision, a.note AS listing_note, a.updated_at AS action_updated_at, (SELECT o.watch_id FROM observations o WHERE o.listing_id = l.id ORDER BY o.observed_at DESC LIMIT 1) AS watch_id, (SELECT w.name FROM observations o JOIN watches w ON w.id = o.watch_id WHERE o.listing_id = l.id ORDER BY o.observed_at DESC LIMIT 1) AS watch_name FROM listings l LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id WHERE l.marketplace = ? AND l.listing_id = ?`).get(marketplace, listingId) as Record<string, any> | undefined;
+    const row = this.db.prepare(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, a.decision AS listing_decision, a.note AS listing_note, a.updated_at AS action_updated_at
+      FROM listings l
+      LEFT JOIN watch_listings wl ON wl.listing_id = l.id AND (? IS NULL OR wl.watch_id = ?)
+      LEFT JOIN watches w ON w.id = wl.watch_id
+      LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id
+      WHERE l.marketplace = ? AND l.listing_id = ? AND (? IS NULL OR wl.watch_id = ?)
+      ORDER BY CASE WHEN wl.id IS NOT NULL THEN 0 ELSE 1 END, wl.last_seen_at DESC LIMIT 1`).get(watchId ?? null, watchId ?? null, marketplace, listingId, watchId ?? null, watchId ?? null) as Record<string, any> | undefined;
     if (!row) throw new ServiceError('Listing detail is not available yet', 404);
-    const watches = new Map(this.getWatches().map((watch) => [watch.id, watch]));
+    const watches = new Map(this.allWatches().map((watch) => [watch.id, watch]));
     const listing = this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100);
-    const history = (this.db.prepare('SELECT price_pln, observed_at FROM observations WHERE listing_id = ? ORDER BY observed_at DESC LIMIT 120').all(row.id) as Array<{ price_pln: number; observed_at: string }>).reverse().map((point): PriceHistoryPoint => ({ price: Number(point.price_pln), observedAt: point.observed_at }));
+    const history = (this.db.prepare('SELECT price_pln, observed_at FROM observations WHERE listing_id = ? AND (? IS NULL OR watch_id = ?) ORDER BY observed_at DESC, id DESC LIMIT 120').all(row.id, row.watch_id ?? watchId ?? null, row.watch_id ?? watchId ?? null) as Array<{ price_pln: number; observed_at: string }>).reverse().map((point): PriceHistoryPoint => ({ price: Number(point.price_pln), observedAt: point.observed_at }));
     return {
       listing,
       history,
       action: { decision: listing.decision ?? null, note: listing.note ?? '', updatedAt: row.action_updated_at ?? null },
-      firstSeenAt: row.first_seen_at,
-      lastSeenAt: row.last_seen_at,
+      firstSeenAt: row.watch_first_seen_at ?? row.first_seen_at,
+      lastSeenAt: row.watch_last_seen_at ?? row.last_seen_at,
     };
+  }
+
+  private async normalizeStoredListing(marketplace: Marketplace, listingId: string, force = false) {
+    const config = this.deepSeekConfig();
+    if (!config.apiKey) throw new ServiceError('OpenRouter is not configured. Add an API key in Settings or set SCOUT_OPENROUTER_API_KEY.', 409);
+    const row = this.db.prepare('SELECT marketplace, listing_id, title, condition, location, ai_normalization_json, ai_normalization_input_hash, ai_normalization_model, ai_normalization_at, ai_normalization_error FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as Record<string, any> | undefined;
+    if (!row) throw new ServiceError('Listing detail is not available yet', 404);
+
+    const source = {
+      marketplace,
+      title: String(row.title ?? ''),
+      condition: row.condition ? String(row.condition) : undefined,
+      location: row.location ? String(row.location) : undefined,
+    };
+    const inputHash = listingNormalizationInputHash(source);
+    const cached = parseStoredListingNormalization(row.ai_normalization_json);
+    const sameInput = row.ai_normalization_input_hash === inputHash && row.ai_normalization_model === config.model;
+    if (!force && sameInput && cached) return cached;
+    if (!force && sameInput && row.ai_normalization_error && row.ai_normalization_at && Date.now() - Date.parse(row.ai_normalization_at) < 6 * 60 * 60_000) {
+      throw new ServiceError(String(row.ai_normalization_error), 502);
+    }
+
+    try {
+      const normalization = await normalizeListingWithDeepSeek(source, { apiKey: config.apiKey, model: config.model });
+      const normalizedAt = nowIso();
+      this.db.prepare('UPDATE listings SET ai_normalization_json = ?, ai_normalization_input_hash = ?, ai_normalization_model = ?, ai_normalization_at = ?, ai_normalization_error = NULL WHERE marketplace = ? AND listing_id = ?').run(JSON.stringify(normalization), inputHash, config.model, normalizedAt, marketplace, listingId);
+      this.emit('ai-normalization', { key: `${marketplace}:${listingId}`, status: 'ready' });
+      return normalization;
+    } catch (error) {
+      const message = (error instanceof ServiceError ? error.message : error instanceof Error ? error.message : 'Listing normalization failed').slice(0, 500);
+      const attemptedAt = nowIso();
+      this.db.prepare('UPDATE listings SET ai_normalization_json = NULL, ai_normalization_input_hash = ?, ai_normalization_model = ?, ai_normalization_at = ?, ai_normalization_error = ? WHERE marketplace = ? AND listing_id = ?').run(inputHash, config.model, attemptedAt, message, marketplace, listingId);
+      this.emit('ai-normalization', { key: `${marketplace}:${listingId}`, status: 'error' });
+      if (error instanceof ServiceError) throw error;
+      throw new ServiceError(message, error instanceof DeepSeekError ? 502 : 500);
+    }
+  }
+
+  private drainAiNormalizationQueue() {
+    while (this.activeAiNormalizations < this.maxConcurrentAiNormalizations && this.aiNormalizationQueue.length) {
+      const job = this.aiNormalizationQueue.shift()!;
+      this.activeAiNormalizations += 1;
+      void this.normalizeStoredListing(job.marketplace, job.listingId)
+        .catch(() => undefined)
+        .finally(() => {
+          this.activeAiNormalizations -= 1;
+          this.aiNormalizationKeys.delete(`${job.marketplace}:${job.listingId}`);
+          this.drainAiNormalizationQueue();
+        });
+    }
+  }
+
+  private queueAiNormalization(marketplace: Marketplace, listingId: string) {
+    const config = this.deepSeekConfig();
+    if (!config.apiKey) return;
+    const key = `${marketplace}:${listingId}`;
+    if (this.aiNormalizationKeys.has(key)) return;
+    const row = this.db.prepare('SELECT title, condition, location, ai_normalization_json, ai_normalization_input_hash, ai_normalization_model, ai_normalization_at, ai_normalization_error FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as Record<string, any> | undefined;
+    if (row) {
+      const inputHash = listingNormalizationInputHash({ marketplace, title: String(row.title ?? ''), condition: row.condition ? String(row.condition) : undefined, location: row.location ? String(row.location) : undefined });
+      const sameInput = row.ai_normalization_input_hash === inputHash && row.ai_normalization_model === config.model;
+      if (sameInput && parseStoredListingNormalization(row.ai_normalization_json)) return;
+      if (sameInput && row.ai_normalization_error && row.ai_normalization_at && Date.now() - Date.parse(row.ai_normalization_at) < 6 * 60 * 60_000) return;
+    }
+    this.aiNormalizationKeys.add(key);
+    this.aiNormalizationQueue.push({ marketplace, listingId });
+    this.drainAiNormalizationQueue();
+  }
+
+  async normalizeListingByKey(key: string, force = false) {
+    const { marketplace, listingId } = parseListingKey(key);
+    await this.normalizeStoredListing(marketplace, listingId, force);
+    return this.listingDetail(key);
   }
 
   listingAction(key: string): ListingAction {
@@ -446,27 +908,242 @@ export class ScoutService {
     return { decision, note: safeNote, updatedAt: safeNote || decision ? timestamp : null };
   }
 
+  private sellerMessageFromRow(row: Record<string, any>): SellerMessage {
+    return {
+      id: Number(row.id),
+      marketplace: row.marketplace as Marketplace,
+      listingId: String(row.listing_id),
+      listingTitle: String(row.listing_title),
+      listingUrl: String(row.listing_url),
+      message: String(row.message),
+      offerPrice: row.offer_price_pln === null || row.offer_price_pln === undefined ? null : Number(row.offer_price_pln),
+      model: String(row.model),
+      source: row.source === 'automatic' ? 'automatic' : 'manual',
+      status: row.status === 'failed' ? 'failed' : 'sent',
+      error: row.error ? String(row.error) : null,
+      createdAt: String(row.created_at),
+      sentAt: row.sent_at ? String(row.sent_at) : null,
+    };
+  }
+
+  messages(): SellerMessage[] {
+    const rows = this.db.prepare('SELECT * FROM seller_messages ORDER BY created_at DESC LIMIT 100').all() as Array<Record<string, any>>;
+    return rows.map((row) => this.sellerMessageFromRow(row));
+  }
+
+  private saveSellerMessage(input: {
+    marketplace: Marketplace;
+    listingId: string;
+    listingTitle: string;
+    listingUrl: string;
+    message: string;
+    offerPrice: number | null;
+    model: string;
+    source?: SellerMessageSource;
+    status: 'sent' | 'failed';
+    error?: string | null;
+    createdAt: string;
+    sentAt?: string | null;
+  }) {
+    const result = this.db.prepare(`INSERT INTO seller_messages (marketplace, listing_id, listing_title, listing_url, message, offer_price_pln, model, source, status, error, created_at, sent_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      input.marketplace,
+      input.listingId,
+      input.listingTitle,
+      input.listingUrl,
+      input.message,
+      input.offerPrice,
+      input.model,
+      input.source ?? 'manual',
+      input.status,
+      input.error ? input.error.slice(0, 500) : null,
+      input.createdAt,
+      input.sentAt ?? null,
+    );
+    return this.sellerMessageFromRow(this.db.prepare('SELECT * FROM seller_messages WHERE id = ?').get(Number(result.lastInsertRowid)) as Record<string, any>);
+  }
+
+  recommendNegotiationPriceByKey(key: string, maxTotalCost: number | null = null, shippingCost = 0, otherCosts = 0, openingDiscountPercent?: number): NegotiationRecommendation {
+    const { marketplace } = parseListingKey(key);
+    if (marketplace !== 'OLX' && marketplace !== 'Allegro Lokalnie') throw new ServiceError('AI seller negotiation is currently available for OLX and Allegro Lokalnie only.', 409);
+    const detail = this.listingDetail(key);
+    try {
+      return recommendNegotiationPrice({
+        askingPrice: detail.listing.price,
+        priceNegotiable: detail.listing.priceNegotiable ?? null,
+        maxTotalCost,
+        shippingCost,
+        otherCosts,
+        openingDiscountPercent,
+      });
+    } catch (error) {
+      throw new ServiceError(error instanceof Error ? error.message : 'Could not calculate a negotiation price.', 400);
+    }
+  }
+
+  async negotiateAndSendByKey(key: string, offerPrice: number | null = null, budget?: { maxTotalCost: number; shippingCost?: number; otherCosts?: number }, source: SellerMessageSource = 'manual') {
+    const { marketplace, listingId } = parseListingKey(key);
+    if (marketplace !== 'OLX' && marketplace !== 'Allegro Lokalnie') throw new ServiceError('AI seller negotiation is currently available for OLX and Allegro Lokalnie only.', 409);
+    const row = this.db.prepare('SELECT marketplace, listing_id, title, price_pln, url, condition, location, price_negotiable FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as Record<string, any> | undefined;
+    if (!row) throw new ServiceError('Listing detail is not available yet', 404);
+
+    const config = this.deepSeekConfig();
+    if (!config.apiKey) throw new ServiceError('OpenRouter is not configured. Add an API key in Settings or set SCOUT_OPENROUTER_API_KEY.', 409);
+    try {
+      if (!this.readMarketplaceSession(marketplace)) throw new ServiceError(`Connect your ${marketplace} account in Settings before sending seller messages.`, 409);
+    } catch (error) {
+      if (error instanceof ServiceError) throw error;
+      throw new ServiceError(error instanceof Error ? error.message : `The ${marketplace} session could not be read. Re-import it in Settings.`, 409);
+    }
+
+    const askingPrice = Number(row.price_pln);
+    if (source === 'automatic' && row.price_negotiable !== 1) {
+      throw new ServiceError('Automatic negotiation requires an explicit negotiable-price signal.', 409);
+    }
+    const normalizedOffer = offerPrice === null || offerPrice === undefined ? null : Math.round(Number(offerPrice) * 100) / 100;
+    if (normalizedOffer !== null && (!Number.isFinite(normalizedOffer) || normalizedOffer <= 0 || normalizedOffer >= askingPrice)) {
+      throw new ServiceError('Opening offer must be positive and lower than the listing price.', 400);
+    }
+    if (normalizedOffer !== null && budget) {
+      let ceiling: number;
+      try {
+        ceiling = offerCeiling(budget.maxTotalCost, askingPrice, budget.shippingCost ?? 0, budget.otherCosts ?? 0);
+      } catch (error) {
+        throw new ServiceError(error instanceof Error ? error.message : 'Invalid negotiation budget.', 400);
+      }
+      if (normalizedOffer > ceiling) {
+        throw new ServiceError(`Opening offer cannot exceed your ${ceiling.toLocaleString('pl-PL')} zł total-cost ceiling after known costs.`, 400);
+      }
+    }
+
+    const context: NegotiationListingContext = {
+      marketplace,
+      title: String(row.title),
+      price: askingPrice,
+      condition: row.condition ? String(row.condition) : undefined,
+      location: row.location ? String(row.location) : undefined,
+      priceNegotiable: row.price_negotiable === null || row.price_negotiable === undefined ? null : Boolean(row.price_negotiable),
+      offerPrice: normalizedOffer,
+    };
+    let draft: { message: string };
+    try {
+      draft = await this.draftNegotiation(context, { apiKey: config.apiKey, model: config.model });
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : 'OpenRouter could not write a negotiation message').slice(0, 500);
+      throw new ServiceError(message, error instanceof DeepSeekError ? error.status : 502);
+    }
+
+    const createdAt = nowIso();
+    try {
+      await this.sendMarketplaceMessage(marketplace, String(row.url), draft.message);
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : `${marketplace} could not send the negotiation message`).slice(0, 500);
+      const failed = this.saveSellerMessage({ marketplace, listingId, listingTitle: String(row.title), listingUrl: String(row.url), message: draft.message, offerPrice: normalizedOffer, model: config.model, source, status: 'failed', error: message, createdAt });
+      this.emit('seller-message', { id: failed.id, key, status: failed.status });
+      const status = ((error instanceof OlxMessagingError || error instanceof AllegroMessagingError) && error.code === 'session') ? 409 : 502;
+      throw new ServiceError(message, status);
+    }
+
+    const sentAt = nowIso();
+    const sent = this.saveSellerMessage({ marketplace, listingId, listingTitle: String(row.title), listingUrl: String(row.url), message: draft.message, offerPrice: normalizedOffer, model: config.model, source, status: 'sent', createdAt, sentAt });
+    this.emit('seller-message', { id: sent.id, key, status: sent.status });
+    return { message: sent };
+  }
+
+  private claimAutomaticNegotiation(candidate: DealNotificationCandidate, recommendation: NegotiationRecommendation, config: AutoNegotiationConfig) {
+    if (config.maxTotalCost === null || recommendation.openingOffer === null) return false;
+    const now = nowIso();
+    return this.transaction(() => {
+      const existing = this.db.prepare('SELECT status FROM automatic_negotiations WHERE marketplace = ? AND listing_id = ?').get(candidate.listing.marketplace, candidate.listing.listingId) as { status?: string } | undefined;
+      if (existing) return false;
+      const attemptedToday = this.db.prepare('SELECT COUNT(*) AS count FROM automatic_negotiations WHERE created_at >= ?').get(this.currentDayStart()) as { count?: number } | undefined;
+      if (Number(attemptedToday?.count ?? 0) >= config.dailyLimit) return false;
+      this.db.prepare(`INSERT INTO automatic_negotiations (marketplace, listing_id, watch_id, status, asking_price_pln, offer_price_pln, max_total_cost_pln, known_costs_pln, discount_percent, created_at, updated_at)
+        VALUES (?, ?, ?, 'processing', ?, ?, ?, ?, ?, ?, ?)`).run(
+        candidate.listing.marketplace,
+        candidate.listing.listingId,
+        candidate.watchId,
+        recommendation.askingPrice,
+        recommendation.openingOffer,
+        config.maxTotalCost,
+        recommendation.knownCosts,
+        candidate.discountPercent,
+        now,
+        now,
+      );
+      return true;
+    });
+  }
+
+  private finishAutomaticNegotiation(key: string, status: 'sent' | 'failed', messageId: number | null, error?: unknown) {
+    const { marketplace, listingId } = parseListingKey(key);
+    const safeError = error === undefined || error === null ? null : (error instanceof Error ? error.message : String(error)).slice(0, 500);
+    this.db.prepare('UPDATE automatic_negotiations SET status = ?, message_id = ?, error = ?, updated_at = ? WHERE marketplace = ? AND listing_id = ?').run(status, messageId, safeError, nowIso(), marketplace, listingId);
+  }
+
+  private async automaticallyNegotiate(candidate: DealNotificationCandidate) {
+    const config = this.autoNegotiationConfig();
+    if (!config.enabled || (candidate.listing.marketplace !== 'OLX' && candidate.listing.marketplace !== 'Allegro Lokalnie') || config.maxTotalCost === null) return;
+    if (candidate.discountPercent < config.minimumDiscountPercent || candidate.listing.priceNegotiable !== true) return;
+    if (!this.deepSeekConfig().apiKey) return;
+    try {
+      if (!this.readMarketplaceSession(candidate.listing.marketplace)) return;
+    } catch {
+      return;
+    }
+
+    const key = `${candidate.listing.marketplace}:${candidate.listing.listingId}`;
+    let recommendation: NegotiationRecommendation;
+    try {
+      recommendation = this.recommendNegotiationPriceByKey(key, config.maxTotalCost, config.shippingCost, config.otherCosts, config.openingDiscountPercent);
+    } catch {
+      return;
+    }
+    if (recommendation.status !== 'ready' || recommendation.openingOffer === null) return;
+    if (!this.claimAutomaticNegotiation(candidate, recommendation, config)) return;
+
+    try {
+      const result = await this.negotiateAndSendByKey(key, recommendation.openingOffer, {
+        maxTotalCost: config.maxTotalCost,
+        shippingCost: config.shippingCost,
+        otherCosts: config.otherCosts,
+      }, 'automatic');
+      this.finishAutomaticNegotiation(key, 'sent', result.message.id);
+    } catch (error) {
+      this.finishAutomaticNegotiation(key, 'failed', null, error);
+    }
+  }
+
   async manualSearch(input: SearchFilters): Promise<ManualSearchResponse> {
     const tasks = input.sources.map(async (source) => {
       const started = Date.now();
       try {
         const adapter = createPublicAdapter(source, (url) => this.fetchPublicPage(url, source));
         const fetched = await adapter.fetchPublicSearch(buildMarketplaceSearchUrl(source, input.query, input));
-        const comparable = filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', {
-          condition: input.condition, location: input.location,
-        });
+        const deterministicFilters = { minPrice: input.minPrice, maxPrice: input.maxPrice, condition: input.condition, location: input.location, shippingOnly: false };
+        const comparable = filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters);
         await this.enrichShipping(comparable, source, { limit: 24 });
-        const filtered = filterListings(comparable, input.query, input.terms ?? '', input.excluded ?? '', { shippingOnly: input.shippingOnly });
+        const filtered = filterListings(comparable, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, shippingOnly: input.shippingOnly });
+        const relevance = await this.filterListingsByAiRelevance(filtered, {
+          query: input.query,
+          includedTerms: input.terms ?? '',
+          excludedTerms: input.excluded ?? '',
+        }, undefined, input.aiRelevance !== false);
+        const relevanceNote = [
+          relevance.excluded ? `${relevance.excluded} excluded by AI` : '',
+          relevance.unknown ? `${relevance.unknown} AI checks unknown` : '',
+          relevance.notConfigured ? 'AI relevance inactive' : '',
+        ].filter(Boolean).join(' · ');
         const pendingShipping = comparable.filter((listing) => listing.shippingAvailable === null).length;
         return {
-          listings: filtered.slice(0, 100).map((listing): Listing => ({
+          listings: relevance.listings.slice(0, 100).map((listing): Listing => ({
             id: `${listing.marketplace}:${listing.listingId}`, title: listing.title,
             subtitle: [listing.condition, listing.location].filter(Boolean).join(' · '), marketplace: listing.marketplace,
             price: listing.price, typical: null, belowTypical: null, observed: 'just now', observedAt: listing.observedAt,
             dealStrength: 1, dealLabel: 'Watch', image: listing.imageUrl ?? '', url: listing.url, watch: 'Manual search',
-            condition: listing.condition, location: listing.location, shippingAvailable: listing.shippingAvailable ?? null,
+            condition: listing.condition, location: listing.location, shippingAvailable: listing.shippingAvailable ?? null, priceNegotiable: listing.priceNegotiable ?? null,
           })),
-          status: { source, status: 'ok' as const, count: filtered.length, pendingShipping, durationMs: Date.now() - started, message: filtered.length ? `${filtered.length} matches` : 'No matching listings' },
+          status: { source, status: 'ok' as const, count: relevance.listings.length, pendingShipping, durationMs: Date.now() - started, message: relevance.listings.length ? `${relevance.listings.length} matches${relevanceNote ? ` · ${relevanceNote}` : ''}` : relevance.notConfigured ? `No matches${relevanceNote ? ` · ${relevanceNote}` : ''}` : relevanceNote || 'No matching listings' },
         };
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Search failed';
@@ -479,25 +1156,76 @@ export class ScoutService {
     return { listings: [...unique.values()].sort((a, b) => a.price - b.price), sources: results.map((result) => result.status) };
   }
 
-  marketResearch(): MarketResearchData {
+  private marketWatchVersion(row: WatchRow) {
+    const version = row.active_version_id
+      ? this.db.prepare('SELECT * FROM market_watch_versions WHERE id = ?').get(row.active_version_id) as WatchRow | undefined
+      : undefined;
+    return version ?? {
+      id: `${row.id}:legacy`, market_watch_id: row.id, query: row.query, included_terms: row.included_terms ?? '', excluded_terms: row.excluded_terms ?? '', location: row.location ?? 'Polska', condition: row.condition ?? 'Any', sources_json: row.sources_json, min_price_pln: row.min_price_pln, max_price_pln: row.max_price_pln, shipping_only: row.shipping_only,
+    };
+  }
+
+  private ensureMarketWatchVersion(row: WatchRow) {
+    if (row.active_version_id) return this.marketWatchVersion(row);
+    const versionId = `${row.id}:v1`;
+    const now = nowIso();
+    this.transaction(() => {
+      this.db.prepare('INSERT OR IGNORE INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, row.id, row.query, row.included_terms ?? '', row.excluded_terms ?? '', row.location ?? 'Polska', row.condition ?? 'Any', row.sources_json, row.min_price_pln, row.max_price_pln, row.shipping_only ? 1 : 0, now);
+      this.db.prepare("UPDATE market_listings SET version_id = ? WHERE market_watch_id = ? AND version_id IS NULL AND status <> 'superseded'").run(versionId, row.id);
+      this.db.prepare('UPDATE market_price_observations SET version_id = ? WHERE market_listing_id IN (SELECT id FROM market_listings WHERE market_watch_id = ?) AND version_id IS NULL').run(versionId, row.id);
+      this.db.prepare('UPDATE market_watches SET active_version_id = ? WHERE id = ? AND active_version_id IS NULL').run(versionId, row.id);
+    });
+    const refreshed = this.db.prepare('SELECT * FROM market_watches WHERE id = ?').get(row.id) as WatchRow;
+    return this.marketWatchVersion(refreshed);
+  }
+
+  marketResearch(options: { page?: number; pageSize?: number; watchId?: string; status?: 'active' | 'ended' | 'superseded' } = {}): MarketResearchData {
     const watchRows = this.db.prepare('SELECT * FROM market_watches ORDER BY created_at DESC').all() as WatchRow[];
     const watches = watchRows.map((row): MarketWatch => {
-      const counts = this.db.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN status = 'ended' THEN 1 ELSE 0 END) AS ended FROM market_listings WHERE market_watch_id = ?").get(row.id) as { total: number; active: number | null; ended: number | null };
-      const endedPrices = (this.db.prepare("SELECT last_price_pln FROM market_listings WHERE market_watch_id = ? AND status = 'ended'").all(row.id) as Array<{ last_price_pln: number }>).map((item) => Number(item.last_price_pln));
+      const version = this.marketWatchVersion(row);
+      const versionPredicate = row.active_version_id ? 'version_id = ?' : '(version_id = ? OR version_id IS NULL)';
+      const counts = this.db.prepare(`SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN status = 'ended' THEN 1 ELSE 0 END) AS ended FROM market_listings WHERE market_watch_id = ? AND ${versionPredicate} AND status IN ('active', 'ended')`).get(row.id, version.id) as { total: number; active: number | null; ended: number | null };
+      const endedPrices = (this.db.prepare(`SELECT last_price_pln FROM market_listings WHERE market_watch_id = ? AND ${versionPredicate} AND status = 'ended'`).all(row.id, version.id) as Array<{ last_price_pln: number }>).map((item) => Number(item.last_price_pln));
       return {
-        id: row.id, name: row.name, query: row.query, terms: row.included_terms ?? '', excluded: row.excluded_terms ?? '', location: row.location ?? 'Polska', condition: row.condition ?? 'Any', sources: parseJson<Marketplace[]>(row.sources_json, []),
-        intervalHours: Number(row.interval_hours), minPrice: row.min_price_pln === null || row.min_price_pln === undefined ? null : Number(row.min_price_pln), maxPrice: row.max_price_pln === null || row.max_price_pln === undefined ? null : Number(row.max_price_pln), shippingOnly: Boolean(row.shipping_only), enabled: Boolean(row.enabled), nextScan: Boolean(row.enabled) ? relativeTimeFuture(row.next_scan_at) : 'Paused',
+        id: row.id, name: row.name, query: version.query, terms: version.included_terms ?? '', excluded: version.excluded_terms ?? '', location: version.location ?? 'Polska', condition: version.condition ?? 'Any', sources: parseJson<Marketplace[]>(version.sources_json, []),
+        intervalHours: Number(row.interval_hours), minPrice: version.min_price_pln === null || version.min_price_pln === undefined ? null : Number(version.min_price_pln), maxPrice: version.max_price_pln === null || version.max_price_pln === undefined ? null : Number(version.max_price_pln), shippingOnly: Boolean(version.shipping_only), enabled: Boolean(row.enabled), nextScan: Boolean(row.enabled) ? relativeTimeFuture(row.next_scan_at) : 'Paused',
         lastScan: relativeTime(row.last_scan_at), totalListings: Number(counts.total ?? 0), activeListings: Number(counts.active ?? 0), endedListings: Number(counts.ended ?? 0),
         estimatedMedianPrice: endedPrices.length ? median(endedPrices) : null,
       };
     });
-    const listings = (this.db.prepare(`SELECT ml.*, mw.name AS watch_name, (SELECT COUNT(*) FROM market_price_observations mpo WHERE mpo.market_listing_id = ml.id) AS observations FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id ORDER BY CASE ml.status WHEN 'ended' THEN 0 ELSE 1 END, COALESCE(ml.ended_at, ml.last_seen_at) DESC LIMIT 400`).all() as Array<Record<string, any>>).map((row): MarketTrackedListing => ({
+    const applicable = [
+      "SELECT ml.last_price_pln FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ml.status = 'ended' AND (ml.version_id = mw.active_version_id OR (mw.active_version_id IS NULL AND ml.version_id IS NULL))",
+      ...(options.watchId ? ['AND ml.market_watch_id = ?'] : []),
+    ].join(' ');
+    const aggregateParams = options.watchId ? [options.watchId] : [];
+    const aggregatePrices = (this.db.prepare(applicable).all(...aggregateParams) as Array<{ last_price_pln: number }>).map((item) => Number(item.last_price_pln));
+    const aggregateCounts = this.db.prepare(`SELECT SUM(CASE WHEN ml.status = 'active' THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN ml.status = 'ended' THEN 1 ELSE 0 END) AS ended FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ml.status IN ('active', 'ended') AND (ml.version_id = mw.active_version_id OR (mw.active_version_id IS NULL AND ml.version_id IS NULL))${options.watchId ? ' AND ml.market_watch_id = ?' : ''}`).get(...aggregateParams) as { active?: number; ended?: number };
+
+    const page = Math.max(1, Math.floor(options.page ?? 1));
+    const pageSize = Math.max(1, Math.min(400, Math.floor(options.pageSize ?? 100)));
+    const predicates = ['1 = 1'];
+    const params: unknown[] = [];
+    if (options.watchId) { predicates.push('ml.market_watch_id = ?'); params.push(options.watchId); }
+    if (options.status) { predicates.push('ml.status = ?'); params.push(options.status); }
+    const total = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM market_listings ml WHERE ${predicates.join(' AND ')}`).get(...params) as { count?: number }).count ?? 0);
+    const rows = this.db.prepare(`SELECT ml.*, mw.name AS watch_name,
+      (SELECT COUNT(*) FROM market_price_observations mpo WHERE mpo.market_listing_id = ml.id AND (mpo.version_id = ml.version_id OR (ml.version_id IS NULL AND mpo.version_id IS NULL))) AS observations
+      FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id
+      WHERE ${predicates.join(' AND ')}
+      ORDER BY CASE ml.status WHEN 'ended' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, COALESCE(ml.ended_at, ml.last_seen_at) DESC
+      LIMIT ? OFFSET ?`).all(...params, pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
+    const listings = rows.map((row): MarketTrackedListing => ({
       id: Number(row.id), marketWatchId: row.market_watch_id, watchName: row.watch_name, marketplace: row.marketplace, listingId: row.listing_id,
       title: row.title, url: row.url, image: row.image_url ?? '', firstPrice: Number(row.first_price_pln), lastPrice: Number(row.last_price_pln), lowestPrice: Number(row.lowest_price_pln),
       priceChangePercent: Number(row.first_price_pln) > 0 ? ((Number(row.last_price_pln) - Number(row.first_price_pln)) / Number(row.first_price_pln)) * 100 : 0,
-      firstSeenAt: row.first_seen_at, lastSeenAt: row.last_seen_at, endedAt: row.ended_at, status: row.status, missingScans: Number(row.missing_scans), observations: Number(row.observations),
+      firstSeenAt: row.first_seen_at, lastSeenAt: row.last_seen_at, endedAt: row.ended_at, status: row.status, availabilityStatus: row.availability_status ?? null, endedReason: row.ended_reason ?? null, missingScans: Number(row.missing_scans), observations: Number(row.observations),
     }));
-    return { watches, listings };
+    return {
+      watches,
+      listings,
+      aggregates: { overallMedianPrice: aggregatePrices.length ? median(aggregatePrices) : null, endedCount: Number(aggregateCounts?.ended ?? 0), activeCount: Number(aggregateCounts?.active ?? 0) },
+      pagination: { page, pageSize, total, hasNext: page * pageSize < total },
+    };
   }
 
   queueMarketScan(id: string) {
@@ -505,6 +1233,85 @@ export class ScoutService {
     if (!row) throw new ServiceError('Enabled market watch not found', 404);
     void this.runMarketWatch(row);
     return { queued: true, message: `Queued ${row.name}` };
+  }
+
+  createMarketWatch(input: {
+    id: string;
+    name: string;
+    query: string;
+    terms: string;
+    excluded: string;
+    location: string;
+    condition: string;
+    sources: Marketplace[];
+    intervalHours: number;
+    minPrice: number | null;
+    maxPrice: number | null;
+    shippingOnly: boolean;
+  }) {
+    const now = nowIso();
+    const versionId = `${input.id}:v1`;
+    this.transaction(() => {
+      this.db.prepare('INSERT INTO market_watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, interval_hours, min_price_pln, max_price_pln, shipping_only, enabled, active_version_id, next_scan_at, last_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?)').run(input.id, input.name, input.query, input.terms, input.excluded, input.location, input.condition, JSON.stringify(input.sources), input.intervalHours, input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, versionId, now, now, now);
+      this.db.prepare('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, input.id, input.query, input.terms, input.excluded, input.location, input.condition, JSON.stringify(input.sources), input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, now);
+    });
+    return this.marketResearch().watches.find((watch) => watch.id === input.id)!;
+  }
+
+  updateMarketWatch(id: string, patch: {
+    name?: string;
+    query?: string;
+    enabled?: boolean;
+    intervalHours?: number;
+    terms?: string;
+    excluded?: string;
+    location?: string;
+    condition?: string;
+    sources?: Marketplace[];
+    minPrice?: number | null;
+    maxPrice?: number | null;
+    shippingOnly?: boolean;
+  }) {
+    const row = this.db.prepare('SELECT * FROM market_watches WHERE id = ?').get(id) as WatchRow | undefined;
+    if (!row) throw new ServiceError('Market watch not found', 404);
+    const currentVersion = this.marketWatchVersion(row);
+    const criteriaChanged = patch.query !== undefined || patch.terms !== undefined || patch.excluded !== undefined || patch.location !== undefined || patch.condition !== undefined || patch.sources !== undefined || patch.minPrice !== undefined || patch.maxPrice !== undefined || patch.shippingOnly !== undefined;
+    const now = nowIso();
+    this.transaction(() => {
+      const directFields: string[] = [];
+      const directValues: unknown[] = [];
+      if (patch.name !== undefined) { directFields.push('name = ?'); directValues.push(patch.name); }
+      if (patch.enabled !== undefined) { directFields.push('enabled = ?'); directValues.push(patch.enabled ? 1 : 0); }
+      if (patch.intervalHours !== undefined) { directFields.push('interval_hours = ?'); directValues.push(patch.intervalHours); }
+
+      if (criteriaChanged) {
+        const next = {
+          query: patch.query ?? String(currentVersion.query),
+          terms: patch.terms ?? String(currentVersion.included_terms ?? ''),
+          excluded: patch.excluded ?? String(currentVersion.excluded_terms ?? ''),
+          location: patch.location ?? String(currentVersion.location ?? 'Polska'),
+          condition: patch.condition ?? String(currentVersion.condition ?? 'Any'),
+          sources: patch.sources ?? parseJson<Marketplace[]>(currentVersion.sources_json, []),
+          minPrice: patch.minPrice === undefined ? (currentVersion.min_price_pln === null || currentVersion.min_price_pln === undefined ? null : Number(currentVersion.min_price_pln)) : patch.minPrice,
+          maxPrice: patch.maxPrice === undefined ? (currentVersion.max_price_pln === null || currentVersion.max_price_pln === undefined ? null : Number(currentVersion.max_price_pln)) : patch.maxPrice,
+          shippingOnly: patch.shippingOnly === undefined ? Boolean(currentVersion.shipping_only) : patch.shippingOnly,
+        };
+        const changed = next.query !== currentVersion.query || next.terms !== (currentVersion.included_terms ?? '') || next.excluded !== (currentVersion.excluded_terms ?? '') || next.location !== (currentVersion.location ?? 'Polska') || next.condition !== (currentVersion.condition ?? 'Any') || JSON.stringify(next.sources) !== String(currentVersion.sources_json) || next.minPrice !== (currentVersion.min_price_pln ?? null) || next.maxPrice !== (currentVersion.max_price_pln ?? null) || next.shippingOnly !== Boolean(currentVersion.shipping_only);
+        if (changed) {
+          const versionId = `${id}:v${Date.now()}-${randomBytes(3).toString('hex')}`;
+          if (row.active_version_id) this.db.prepare('UPDATE market_watch_versions SET closed_at = ? WHERE id = ? AND closed_at IS NULL').run(now, row.active_version_id);
+          this.db.prepare('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, id, next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, now);
+          this.db.prepare("UPDATE market_listings SET status = 'superseded' WHERE market_watch_id = ? AND (version_id = ? OR version_id IS NULL) AND status = 'active'").run(id, row.active_version_id ?? currentVersion.id);
+          directFields.push('query = ?', 'included_terms = ?', 'excluded_terms = ?', 'location = ?', 'condition = ?', 'sources_json = ?', 'min_price_pln = ?', 'max_price_pln = ?', 'shipping_only = ?', 'active_version_id = ?', 'next_scan_at = ?');
+          directValues.push(next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, versionId, now);
+        }
+      }
+      if (!directFields.length) throw new ServiceError('No supported fields', 400);
+      directValues.push(now, id);
+      this.db.prepare(`UPDATE market_watches SET ${directFields.join(', ')}, updated_at = ? WHERE id = ?`).run(...(directValues as any[]));
+    });
+    this.emit('market-watch', { refresh: true, id });
+    return { ok: true } as const;
   }
 
   deleteMarketWatch(id: string) {
@@ -517,32 +1324,50 @@ export class ScoutService {
     if (this.running.has(runningKey)) return;
     this.running.add(runningKey);
     const sources = parseJson<Marketplace[]>(row.sources_json, []);
+    const version = this.ensureMarketWatchVersion(row);
     try {
       await Promise.all(sources.map(async (source) => {
         const started = nowIso();
         const runId = this.recordRun(source, 'running', `Researching ${row.name}`, started, null);
+        const scanId = this.createScan(String(row.id), 'research', source, started);
         try {
           const adapter = createPublicAdapter(source, (url) => this.fetchPublicPage(url, source));
           const fetched = await adapter.fetchPublicSearch(buildMarketplaceSearchUrl(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' }));
-          const filters = { condition: row.condition, location: row.location };
+          const filters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, location: row.location, shippingOnly: false };
           const comparable = filterListings(fetched, row.query, row.included_terms ?? '', row.excluded_terms ?? '', filters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
           const filtered = filterListings(comparable, row.query, row.included_terms ?? '', row.excluded_terms ?? '', { ...filters, shippingOnly: Boolean(row.shipping_only) });
           const observedAt = nowIso();
-          const seen = new Set<string>();
-          for (const listing of filtered) {
-            seen.add(listing.listingId);
-            this.storeMarketListing(row.id, listing, observedAt);
+          const seen = new Set(filtered.map((listing) => listing.listingId));
+          const active = this.db.prepare("SELECT id, listing_id, url, missing_scans FROM market_listings WHERE market_watch_id = ? AND version_id = ? AND marketplace = ? AND status = 'active'").all(row.id, version.id, source) as Array<{ id: number; listing_id: string; url: string; missing_scans: number }>;
+          const missing = active.filter((listing) => !seen.has(listing.listing_id));
+          const verifiedMissing: Array<{ listing: typeof missing[number]; availability: ListingAvailability }> = [];
+          for (let offset = 0; offset < missing.length; offset += 2) {
+            const batch = await Promise.all(missing.slice(offset, offset + 2).map(async (candidate) => ({
+              listing: candidate,
+              availability: await adapter.verifyAvailability(candidate.url),
+            })));
+            verifiedMissing.push(...batch);
           }
-          const active = this.db.prepare("SELECT id, listing_id, missing_scans FROM market_listings WHERE market_watch_id = ? AND marketplace = ? AND status = 'active'").all(row.id, source) as Array<{ id: number; listing_id: string; missing_scans: number }>;
-          for (const listing of active) {
-            if (seen.has(listing.listing_id)) continue;
-            const next = marketStatusAfterMiss(Number(listing.missing_scans));
-            if (next.status === 'ended') this.db.prepare("UPDATE market_listings SET missing_scans = ?, status = 'ended', ended_at = ? WHERE id = ?").run(next.missingScans, observedAt, listing.id);
-            else this.db.prepare('UPDATE market_listings SET missing_scans = ? WHERE id = ?').run(next.missingScans, listing.id);
-          }
-          this.finishRun(runId, 'ok', `${filtered.length} research listings saved`);
+          this.transaction(() => {
+            for (const listing of filtered) {
+              this.storeMarketListing(row.id, version.id, listing, observedAt, scanId);
+            }
+            for (const { listing, availability } of verifiedMissing) {
+              if (availability.status === 'live') {
+                this.db.prepare("UPDATE market_listings SET missing_scans = 0, status = 'active', availability_status = 'live', ended_reason = NULL, last_verified_at = ?, ended_at = NULL WHERE id = ?").run(observedAt, listing.id);
+              } else if (availability.status === 'terminal') {
+                const next = marketStatusAfterMiss(Number(listing.missing_scans));
+                this.db.prepare("UPDATE market_listings SET missing_scans = ?, status = ?, ended_at = CASE WHEN ? = 'ended' THEN COALESCE(ended_at, ?) ELSE ended_at END, availability_status = 'terminal', ended_reason = ?, last_verified_at = ? WHERE id = ?").run(next.missingScans, next.status, next.status, observedAt, availability.reason, observedAt, listing.id);
+              } else {
+                this.db.prepare("UPDATE market_listings SET availability_status = 'unknown', last_verified_at = ? WHERE id = ?").run(observedAt, listing.id);
+              }
+            }
+            this.completeScan(scanId, `${filtered.length} research listings saved`);
+          });
+          this.finishRun(runId, 'ok', `${filtered.length} research listings saved${fetched.empty ? ' · valid empty page' : ''}`);
         } catch (error) {
+          this.failScan(scanId, error);
           this.finishRun(runId, 'error', error instanceof Error ? error.message : 'Research connector failed');
         }
       }));
@@ -553,10 +1378,12 @@ export class ScoutService {
     } finally { this.running.delete(runningKey); }
   }
 
-  private storeMarketListing(watchId: string, listing: NormalizedListing, observedAt: string) {
-    this.db.prepare(`INSERT INTO market_listings (market_watch_id, marketplace, listing_id, title, url, image_url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0) ON CONFLICT(market_watch_id, marketplace, listing_id) DO UPDATE SET title = excluded.title, url = excluded.url, image_url = COALESCE(excluded.image_url, market_listings.image_url), last_price_pln = excluded.last_price_pln, lowest_price_pln = MIN(market_listings.lowest_price_pln, excluded.last_price_pln), last_seen_at = excluded.last_seen_at, status = 'active', missing_scans = 0, ended_at = NULL`).run(watchId, listing.marketplace, listing.listingId, listing.title, listing.url, listing.imageUrl ?? null, listing.price, listing.price, listing.price, observedAt, observedAt);
-    const stored = this.db.prepare('SELECT id FROM market_listings WHERE market_watch_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, listing.marketplace, listing.listingId) as { id: number };
-    this.db.prepare('INSERT INTO market_price_observations (market_listing_id, price_pln, observed_at) VALUES (?, ?, ?)').run(stored.id, listing.price, observedAt);
+  private storeMarketListing(watchId: string, versionId: string, listing: NormalizedListing, observedAt: string, scanId: number) {
+    this.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, image_url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans, availability_status, ended_reason, last_verified_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, 'live', NULL, ?)
+      ON CONFLICT(market_watch_id, version_id, marketplace, listing_id) DO UPDATE SET title = excluded.title, url = excluded.url, image_url = COALESCE(excluded.image_url, market_listings.image_url), last_price_pln = excluded.last_price_pln, lowest_price_pln = MIN(market_listings.lowest_price_pln, excluded.last_price_pln), last_seen_at = excluded.last_seen_at, status = 'active', missing_scans = 0, ended_at = NULL, availability_status = 'live', ended_reason = NULL, last_verified_at = excluded.last_verified_at`).run(watchId, versionId, listing.marketplace, listing.listingId, listing.title, listing.url, listing.imageUrl ?? null, listing.price, listing.price, listing.price, observedAt, observedAt, observedAt);
+    const stored = this.db.prepare('SELECT id FROM market_listings WHERE market_watch_id = ? AND version_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, versionId, listing.marketplace, listing.listingId) as { id: number };
+    this.db.prepare('INSERT INTO market_price_observations (market_listing_id, version_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?)').run(stored.id, versionId, scanId, listing.price, observedAt);
   }
 
   getConnectors(): Connector[] {
@@ -603,6 +1430,7 @@ export class ScoutService {
       webhookConfigured,
       webhookMasked: webhookConfigured ? '••••••••••••••••' : null,
       discordMinimumPriority: this.discordMinimumPriority(),
+      dailyDigest: this.dailyDigestSettings(),
       ntfy: {
         configured: Boolean(ntfy),
         serverUrl: ntfy?.serverUrl ?? null,
@@ -610,6 +1438,12 @@ export class ScoutService {
         tokenConfigured: Boolean(ntfy?.token),
         minimumPriority: ntfy?.minimumPriority ?? 'exceptional',
       },
+      ai: {
+        configured: Boolean(this.deepSeekConfig().apiKey),
+        model: this.deepSeekModel(),
+        source: this.deepSeekConfig().source,
+      },
+      autoNegotiation: this.autoNegotiationSettings(),
       publicExposureWarning: process.env.SCOUT_PUBLIC === 'true',
       marketplaceSessions: this.marketplaceSessions(),
     };
@@ -621,8 +1455,19 @@ export class ScoutService {
     webhook?: string;
     clearWebhook?: boolean;
     discordMinimumPriority?: NotificationPriority;
+    dailyDigest?: { enabled?: boolean; time?: string; discord?: boolean; ntfy?: boolean };
     clearNtfy?: boolean;
     ntfy?: { serverUrl?: string; topic?: string; token?: string; minimumPriority?: NotificationPriority };
+    ai?: { apiKey?: string; clearApiKey?: boolean; model?: string };
+    autoNegotiation?: {
+      enabled?: boolean;
+      maxTotalCost?: number | null;
+      shippingCost?: number;
+      otherCosts?: number;
+      minimumDiscountPercent?: number;
+      openingDiscountPercent?: number;
+      dailyLimit?: number;
+    };
   }) {
     if (input.interval !== undefined) {
       if (!Number.isInteger(input.interval) || input.interval < 5 || input.interval > 1440) throw new ServiceError('Polling interval must be between 5 and 1440 minutes');
@@ -635,6 +1480,18 @@ export class ScoutService {
     if (input.clearWebhook) this.db.prepare("DELETE FROM settings WHERE key = 'discord_webhook'").run();
     if (input.webhook?.trim()) this.setSetting('discord_webhook', encryptSecret(validateDiscordWebhook(input.webhook.trim())));
     if (input.discordMinimumPriority !== undefined) this.setSetting('discord_minimum_priority', parseNotificationPriority(input.discordMinimumPriority, 'strong'));
+    if (input.dailyDigest !== undefined) {
+      const current = this.dailyDigestConfig();
+      const next = {
+        enabled: input.dailyDigest.enabled ?? current.enabled,
+        time: input.dailyDigest.time ?? current.time,
+        discord: input.dailyDigest.discord ?? current.discord,
+        ntfy: input.dailyDigest.ntfy ?? current.ntfy,
+      };
+      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(next.time)) throw new ServiceError('Daily digest time must use 24-hour HH:MM format.');
+      if (next.enabled && !next.discord && !next.ntfy) throw new ServiceError('Select Discord, ntfy, or both for daily digests.');
+      this.setSetting('daily_digest_config', JSON.stringify(next));
+    }
     if (input.clearNtfy) this.db.prepare("DELETE FROM settings WHERE key = 'ntfy_config'").run();
     if (input.ntfy !== undefined) {
       const current = this.ntfyConfig();
@@ -650,6 +1507,35 @@ export class ScoutService {
         throw new ServiceError(error instanceof Error ? error.message : 'Invalid ntfy configuration');
       }
     }
+    if (input.ai?.clearApiKey) this.db.prepare("DELETE FROM settings WHERE key IN ('openrouter_api_key', 'deepseek_api_key')").run();
+    if (input.ai?.apiKey?.trim()) {
+      this.db.prepare("DELETE FROM settings WHERE key = 'deepseek_api_key'").run();
+      this.setSetting('openrouter_api_key', encryptSecret(input.ai.apiKey.trim()));
+    }
+    if (input.ai?.model !== undefined) {
+      const model = input.ai.model.trim();
+      if (!model || model.length > 200 || /\s/.test(model)) throw new ServiceError('OpenRouter model must be a non-empty model slug without spaces');
+      this.setSetting('deepseek_model', model);
+    }
+    if (input.autoNegotiation !== undefined) {
+      const current = this.autoNegotiationConfig();
+      const next = {
+        enabled: input.autoNegotiation.enabled ?? current.enabled,
+        maxTotalCost: input.autoNegotiation.maxTotalCost === undefined ? current.maxTotalCost : input.autoNegotiation.maxTotalCost,
+        shippingCost: input.autoNegotiation.shippingCost ?? current.shippingCost,
+        otherCosts: input.autoNegotiation.otherCosts ?? current.otherCosts,
+        minimumDiscountPercent: input.autoNegotiation.minimumDiscountPercent ?? current.minimumDiscountPercent,
+        openingDiscountPercent: input.autoNegotiation.openingDiscountPercent ?? current.openingDiscountPercent,
+        dailyLimit: input.autoNegotiation.dailyLimit ?? current.dailyLimit,
+      };
+      if (next.maxTotalCost !== null && (!Number.isFinite(next.maxTotalCost) || next.maxTotalCost <= 0)) throw new ServiceError('Automatic negotiation maximum total cost must be positive when provided.');
+      if (![next.shippingCost, next.otherCosts].every((value) => Number.isFinite(value) && value >= 0)) throw new ServiceError('Automatic negotiation known costs must be zero or positive.');
+      if (!Number.isInteger(next.dailyLimit) || next.dailyLimit < 1 || next.dailyLimit > 50) throw new ServiceError('Automatic negotiation daily limit must be between 1 and 50 attempts.');
+      if (!Number.isFinite(next.minimumDiscountPercent) || next.minimumDiscountPercent < 18 || next.minimumDiscountPercent > 80) throw new ServiceError('Automatic negotiation minimum discount must be between 18% and 80%.');
+      if (!Number.isFinite(next.openingDiscountPercent) || next.openingDiscountPercent < 1 || next.openingDiscountPercent > 50) throw new ServiceError('Automatic negotiation opening discount must be between 1% and 50%.');
+      if (next.enabled && next.maxTotalCost === null) throw new ServiceError('Set a maximum total cost before enabling automatic negotiation.');
+      this.setSetting('auto_negotiation_config', JSON.stringify(next));
+    }
     return this.settings();
   }
 
@@ -659,7 +1545,8 @@ export class ScoutService {
       const payload = parseJson<Record<string, any>>(row.payload_json, {});
       const embed = payload.embeds?.[0];
       const below = embed?.fields?.find((field: any) => field.name === 'Below typical')?.value;
-      return { id: Number(row.id), title: embed?.title ?? payload.title ?? (payload.test ? `${payload.channel === 'ntfy' ? 'ntfy' : 'Discord'} test notification` : row.listing_key), reason: below ? `${below} below typical` : payload.test ? `${payload.channel === 'ntfy' ? 'ntfy' : 'Webhook'} connectivity test` : 'Deal alert', observedAt: row.sent_at ?? row.created_at, status: row.status };
+      const digest = payload._scoutDigest as { channel?: string; count?: number } | undefined;
+      return { id: Number(row.id), title: embed?.title ?? payload.title ?? (payload.test ? `${payload.channel === 'ntfy' ? 'ntfy' : 'Discord'} test notification` : row.listing_key), reason: digest ? `${digest.count ?? 0} deals · ${digest.channel ?? 'daily digest'}` : below ? `${below} below typical` : payload.test ? `${payload.channel === 'ntfy' ? 'ntfy' : 'Webhook'} connectivity test` : 'Deal alert', observedAt: row.sent_at ?? row.created_at, status: row.status };
     });
   }
 
@@ -671,6 +1558,15 @@ export class ScoutService {
   deleteWatch(id: string) {
     const result = this.db.prepare('DELETE FROM watches WHERE id = ?').run(id);
     if (!result.changes) throw new ServiceError('Watch not found', 404);
+  }
+
+  archiveWatch(id: string, archived: boolean) {
+    const now = nowIso();
+    const result = archived
+      ? this.db.prepare('UPDATE watches SET archived_at = ?, enabled = 0, updated_at = ? WHERE id = ?').run(now, now, id)
+      : this.db.prepare('UPDATE watches SET archived_at = NULL, enabled = 1, updated_at = ? WHERE id = ?').run(now, id);
+    if (!result.changes) throw new ServiceError('Watch not found', 404);
+    this.emit('watch', { id, archived });
   }
 
   async testWebhook() {
@@ -733,6 +1629,8 @@ export class ScoutService {
 
   queueDue() {
     this.pruneRetention();
+    void this.processNotificationRetries();
+    void this.processDailyDigest();
     const rows = this.db.prepare('SELECT * FROM watches WHERE enabled = 1 AND next_scan_at <= ?').all(nowIso()) as WatchRow[];
     for (const row of rows) void this.runWatch(row);
     const marketRows = this.db.prepare('SELECT * FROM market_watches WHERE enabled = 1 AND next_scan_at <= ?').all(nowIso()) as WatchRow[];
@@ -750,6 +1648,7 @@ export class ScoutService {
         if (latest?.backoff_until && Date.parse(latest.backoff_until) > Date.now()) return;
         const started = nowIso();
         const runId = this.recordRun(source, 'running', `Scanning ${row.name}`, started, null);
+        const scanId = this.createScan(String(row.id), 'watch', source, started);
         try {
           const matchingExact = exactUrls.filter((url) => validateSearchUrl(url, source).valid);
           const urls = matchingExact.length
@@ -757,18 +1656,43 @@ export class ScoutService {
             : [buildMarketplaceSearchUrl(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' })];
           const adapter = createPublicAdapter(source, (url) => this.fetchPublicPage(url, source));
           const fetched = (await Promise.all(urls.map((url) => adapter.fetchPublicSearch(url)))).flat();
-          const comparable = filterListings(fetched, row.query, row.included_terms, row.excluded_terms, {
-            ...(matchingExact.length ? { minPrice: row.min_price_pln, maxPrice: row.max_price_pln } : {}),
-            condition: row.condition,
-            location: row.location,
-          });
+          const deterministicFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, location: row.location, shippingOnly: false };
+          const comparable = filterListings(fetched, row.query, row.included_terms, row.excluded_terms, deterministicFilters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
-          const filtered = filterListings(comparable, row.query, row.included_terms, row.excluded_terms, { shippingOnly: Boolean(row.shipping_only) });
-          for (const listing of filtered) await this.storeListing(row, listing);
+          const filtered = filterListings(comparable, row.query, row.included_terms, row.excluded_terms, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) });
+          const relevance = await this.filterListingsByAiRelevance(filtered, {
+            query: row.query,
+            includedTerms: row.included_terms ?? '',
+            excludedTerms: row.excluded_terms ?? '',
+          }, row.id, row.ai_relevance === undefined ? true : Boolean(row.ai_relevance));
+          const candidates = this.transaction(() => {
+            const pendingCandidates: DealNotificationCandidate[] = [];
+            for (const listing of relevance.listings) {
+              const candidate = this.storeListing(row, listing, scanId);
+              if (candidate) pendingCandidates.push(candidate);
+            }
+            const pending = row.shipping_only ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
+            const relevanceNote = relevance.notConfigured && (row.ai_relevance === undefined || Boolean(row.ai_relevance))
+              ? ' · AI relevance inactive'
+              : relevance.unknown ? ` · ${relevance.unknown} AI checks unknown`
+                : relevance.excluded ? ` · ${relevance.excluded} excluded by AI` : '';
+            this.completeScan(scanId, row.shipping_only ? `${relevance.listings.length} shipping matches${pending ? ` · ${pending} pending checks` : ''}${relevanceNote}` : `${relevance.listings.length} listings normalized${relevanceNote}`);
+            return pendingCandidates;
+          });
+          for (const listing of relevance.listings) this.queueAiNormalization(listing.marketplace, listing.listingId);
+          for (const candidate of candidates) {
+            await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence);
+            await this.automaticallyNegotiate(candidate);
+          }
           const pending = row.shipping_only ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
-          this.finishRun(runId, 'ok', row.shipping_only ? `${filtered.length} shipping matches${pending ? ` · ${pending} pending checks` : ''}` : `${filtered.length} listings normalized`);
+          const relevanceNote = relevance.notConfigured && (row.ai_relevance === undefined || Boolean(row.ai_relevance))
+            ? ' · AI relevance inactive'
+            : relevance.unknown ? ` · ${relevance.unknown} AI checks unknown`
+              : relevance.excluded ? ` · ${relevance.excluded} excluded by AI` : '';
+          this.finishRun(runId, 'ok', row.shipping_only ? `${relevance.listings.length} shipping matches${pending ? ` · ${pending} pending checks` : ''}${relevanceNote}` : `${relevance.listings.length} listings normalized${relevanceNote}`);
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Connector failed';
+          this.failScan(scanId, error);
           const recent = this.db.prepare('SELECT status FROM connector_runs WHERE source = ? AND id != ? ORDER BY started_at DESC LIMIT 8').all(source, runId) as Array<{ status: string }>;
           const consecutiveFailures = recent.findIndex((run) => run.status !== 'error');
           const failureCount = consecutiveFailures === -1 ? recent.length : consecutiveFailures;
@@ -814,6 +1738,46 @@ export class ScoutService {
       throw new Error(`Public page returned ${response.status}`);
     }
     return response.text();
+  }
+
+  private async sendMarketplaceMessage(marketplace: 'OLX' | 'Allegro Lokalnie', listingUrl: string, message: string) {
+    if (marketplace === 'OLX' && this.sendOlxMessageOverride) return this.sendOlxMessageOverride(listingUrl, message);
+    if (marketplace === 'Allegro Lokalnie' && this.sendAllegroMessageOverride) return this.sendAllegroMessageOverride(listingUrl, message);
+    const storageState = this.readMarketplaceSession(marketplace);
+    if (!storageState) throw new ServiceError(`Connect your ${marketplace} account in Settings before sending seller messages.`, 409);
+
+    let browser: Browser | undefined;
+    let context: BrowserContext | undefined;
+    let ownsBrowser = false;
+    try {
+      if (process.env.SCOUT_BROWSER_WS) {
+        browser = await chromium.connectOverCDP(process.env.SCOUT_BROWSER_WS, { timeout: 8_000 });
+      } else {
+        const executablePath = process.env.SCOUT_CHROMIUM_PATH ?? ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'].find(existsSync);
+        if (!executablePath) {
+          const ErrorType = marketplace === 'OLX' ? OlxMessagingError : AllegroMessagingError;
+          throw new ErrorType('Chromium is not available; configure SCOUT_BROWSER_WS.', 'delivery');
+        }
+        browser = await chromium.launch({ executablePath, headless: true, args: ['--no-sandbox', '--disable-gpu'] });
+        ownsBrowser = true;
+      }
+      context = await browser.newContext({ locale: 'pl-PL', storageState: storageState as any });
+      const page = await context.newPage();
+      if (marketplace === 'OLX') await sendOlxMessageOnPage(page, listingUrl, message);
+      else await sendAllegroMessageOnPage(page, listingUrl, message);
+      this.touchMarketplaceSession(marketplace);
+    } catch (error) {
+      if ((error instanceof OlxMessagingError || error instanceof AllegroMessagingError) && error.code === 'session') {
+        this.setMarketplaceSessionError(marketplace, error.message);
+      }
+      throw error;
+    } finally {
+      try {
+        if (context) await context.close();
+      } finally {
+        if (ownsBrowser && browser) await browser.close();
+      }
+    }
   }
 
   private async renderPublicPage(url: string, marketplace: Marketplace, storageState?: MarketplaceStorageState) {
@@ -891,72 +1855,411 @@ export class ScoutService {
   private cacheShipping(listing: NormalizedListing) {
     if (listing.shippingAvailable === null) return;
     const checked = nowIso();
-    this.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(marketplace, listing_id) DO UPDATE SET shipping_available = excluded.shipping_available, last_seen_at = excluded.last_seen_at`).run(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable ? 1 : 0, checked, checked);
+    this.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(marketplace, listing_id) DO UPDATE SET shipping_available = excluded.shipping_available, price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), last_seen_at = excluded.last_seen_at`).run(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable ? 1 : 0, listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0, checked, checked);
   }
 
-  private async storeListing(row: WatchRow, listing: NormalizedListing) {
-    const existingPrices = (this.db.prepare('SELECT l.price_pln FROM listings l WHERE EXISTS (SELECT 1 FROM observations o WHERE o.listing_id = l.id AND o.watch_id = ?) AND (? = 0 OR l.shipping_available = 1) AND (? IS NULL OR l.price_pln >= ?) AND (? IS NULL OR l.price_pln <= ?) ORDER BY l.last_seen_at DESC LIMIT 250').all(row.id, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln) as Array<{ price_pln: number }>).map((item) => Number(item.price_pln));
-    const firstSeen = nowIso();
-    this.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(marketplace, listing_id) DO UPDATE SET title = excluded.title, price_pln = excluded.price_pln, url = excluded.url, image_url = COALESCE(excluded.image_url, listings.image_url), condition = COALESCE(excluded.condition, listings.condition), location = COALESCE(excluded.location, listings.location), shipping_available = COALESCE(excluded.shipping_available, listings.shipping_available), last_seen_at = excluded.last_seen_at`).run(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable === null ? null : listing.shippingAvailable ? 1 : 0, firstSeen, firstSeen);
+  private storeListing(row: WatchRow, listing: NormalizedListing, scanId: number): DealNotificationCandidate | null {
+    const existingPrices = (this.db.prepare(`SELECT o.price_pln
+      FROM observations o
+      JOIN listings l ON l.id = o.listing_id
+      WHERE o.watch_id = ?
+        AND (? = 0 OR NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))))
+        AND (? = 0 OR l.shipping_available = 1)
+        AND (? IS NULL OR o.price_pln >= ?)
+        AND (? IS NULL OR o.price_pln <= ?)
+      ORDER BY o.observed_at DESC, o.id DESC LIMIT 400`).all(row.id, row.ai_relevance === false || row.ai_relevance === 0 ? 0 : 1, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln) as Array<{ price_pln: number }>).map((item) => Number(item.price_pln));
+    const observedAt = nowIso();
+    this.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, availability_status, last_verified_at, first_seen_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, ?)
+      ON CONFLICT(marketplace, listing_id) DO UPDATE SET title = excluded.title, price_pln = excluded.price_pln, url = excluded.url, image_url = COALESCE(excluded.image_url, listings.image_url), condition = COALESCE(excluded.condition, listings.condition), location = COALESCE(excluded.location, listings.location), shipping_available = COALESCE(excluded.shipping_available, listings.shipping_available), price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), availability_status = 'live', ended_reason = NULL, last_verified_at = excluded.last_verified_at, last_seen_at = excluded.last_seen_at`).run(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable === null ? null : listing.shippingAvailable ? 1 : 0, listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0, observedAt, observedAt, observedAt);
+    const inputHash = listingNormalizationInputHash(listing);
+    this.db.prepare('UPDATE listings SET ai_normalization_json = NULL, ai_normalization_input_hash = NULL, ai_normalization_model = NULL, ai_normalization_at = NULL, ai_normalization_error = NULL WHERE marketplace = ? AND listing_id = ? AND ai_normalization_input_hash IS NOT NULL AND ai_normalization_input_hash <> ?').run(listing.marketplace, listing.listingId, inputHash);
     const stored = this.db.prepare('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get(listing.marketplace, listing.listingId) as { id: number };
-    this.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)').run(stored.id, row.id, listing.price, firstSeen);
-    const firstObservation = this.db.prepare('SELECT MIN(o.observed_at) AS first FROM observations o JOIN listings l ON l.id = o.listing_id WHERE o.watch_id = ? AND (? = 0 OR l.shipping_available = 1) AND (? IS NULL OR l.price_pln >= ?) AND (? IS NULL OR l.price_pln <= ?)').get(row.id, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln) as { first: string | null };
+    this.db.prepare(`INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(watch_id, listing_id) DO UPDATE SET last_seen_at = excluded.last_seen_at`).run(row.id, stored.id, observedAt, observedAt);
+    const association = this.db.prepare('SELECT id FROM watch_listings WHERE watch_id = ? AND listing_id = ?').get(row.id, stored.id) as { id: number };
+    const firstObservation = this.db.prepare(`SELECT MIN(o.observed_at) AS first
+      FROM observations o
+      JOIN listings l ON l.id = o.listing_id
+      WHERE o.watch_id = ?
+        AND (? = 0 OR NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))))
+        AND (? = 0 OR l.shipping_available = 1)
+        AND (? IS NULL OR o.price_pln >= ?)
+        AND (? IS NULL OR o.price_pln <= ?)`).get(row.id, row.ai_relevance === false || row.ai_relevance === 0 ? 0 : 1, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln) as { first: string | null };
     const observedHours = firstObservation.first ? Math.max(0, (Date.now() - Date.parse(firstObservation.first)) / 3_600_000) : 0;
     const score = scoreDeal(existingPrices, listing.price, { observedHours, sensitivity: Number(row.sensitivity ?? 1) });
-    if (score.isReady && score.typical !== null) this.db.prepare('UPDATE listings SET typical_pln = ? WHERE id = ?').run(score.typical, stored.id);
-    if (score.qualifies) await this.notifyDeal(listing, score.typical!, score.discountPercent!, score.confidence);
+    const observation = this.db.prepare('INSERT INTO observations (listing_id, watch_id, watch_listing_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?, ?)').run(stored.id, row.id, association.id, scanId, listing.price, observedAt);
+    const observationId = Number(observation.lastInsertRowid);
+    if (score.isReady && score.typical !== null) {
+      const discountPercent = score.discountPercent ?? 0;
+      const dealStrength = discountPercent >= 30 ? 5 : discountPercent >= 20 ? 4 : discountPercent >= 12 ? 3 : discountPercent > 0 ? 2 : 1;
+      const dealLabel: DealLabel = dealStrength >= 5 ? 'Exceptional' : dealStrength === 4 ? 'Very strong' : dealStrength === 3 ? 'Strong' : 'Watch';
+      this.db.prepare('UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, last_seen_at = ? WHERE id = ?').run(score.typical, dealStrength, dealLabel, observedAt, association.id);
+      this.db.prepare('UPDATE observations SET baseline_pln = ?, discount_percent = ?, deal_strength = ?, deal_label = ? WHERE id = ?').run(score.typical, discountPercent, dealStrength, dealLabel, observationId);
+      if (score.qualifies) return { watchId: String(row.id), listing, typical: score.typical, discountPercent, confidence: score.confidence };
+    } else {
+      this.db.prepare('UPDATE observations SET baseline_pln = NULL, discount_percent = NULL WHERE id = ?').run(observationId);
+    }
+    return null;
   }
 
-  private async notifyDeal(listing: NormalizedListing, typical: number, discountPercent: number, confidence: number) {
+  private queueDailyDigestCandidate(watchId: string, listing: NormalizedListing, typical: number, discountPercent: number, confidence: number, priority: NotificationPriority) {
+    const latest = this.db.prepare(`SELECT sequence, price_pln AS last_alerted_price_pln, priority AS last_priority
+      FROM daily_digest_candidates WHERE watch_id = ? AND marketplace = ? AND listing_id = ?
+      ORDER BY sequence DESC LIMIT 1`).get(watchId, listing.marketplace, listing.listingId) as { sequence?: number; last_alerted_price_pln?: number; last_priority?: NotificationPriority } | undefined;
+    if (!this.shouldAlert(latest, listing.price, priority)) return false;
+    const sequence = Number(latest?.sequence ?? 0) + 1;
+    this.db.prepare(`INSERT INTO daily_digest_candidates (
+      watch_id, marketplace, listing_id, sequence, title, url, image_url, price_pln,
+      typical_pln, discount_percent, confidence, priority, observed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      watchId, listing.marketplace, listing.listingId, sequence, listing.title, listing.url,
+      listing.imageUrl ?? null, listing.price, typical, discountPercent, confidence, priority, listing.observedAt || nowIso(),
+    );
+    return true;
+  }
+
+  private digestDiscordPayload(date: string, rows: DigestCandidateRow[]) {
+    const shown = rows.slice(0, 8);
+    const hidden = rows.length - shown.length;
+    return {
+      username: 'Scout',
+      embeds: [{
+        title: `Daily deal digest · ${date}`,
+        description: `${rows.length} new or meaningfully improved ${rows.length === 1 ? 'deal' : 'deals'} since the previous digest.${hidden ? ` Showing the strongest ${shown.length}.` : ''}`,
+        color: 0x1d61e8,
+        fields: shown.map((row) => ({
+          name: `${row.discount_percent.toFixed(1)}% below typical · ${row.marketplace} · ${row.watch_name}`.slice(0, 256),
+          value: `[${row.title.slice(0, 180)}](${row.url})\n${Number(row.price_pln).toLocaleString('pl-PL')} zł · typical ${Number(row.typical_pln).toLocaleString('pl-PL')} zł · ${row.confidence}% confidence`.slice(0, 1024),
+        })),
+        footer: { text: 'Scout · daily digest · asking prices' },
+        timestamp: nowIso(),
+      }],
+    };
+  }
+
+  private digestNtfyPayload(config: NtfyConfig, date: string, rows: DigestCandidateRow[]) {
+    const shown = rows.slice(0, 5);
+    const hidden = rows.length - shown.length;
+    return {
+      topic: config.topic,
+      title: `Scout daily digest · ${date} · ${rows.length} ${rows.length === 1 ? 'deal' : 'deals'}`,
+      message: [
+        ...shown.map((row) => `${row.discount_percent.toFixed(1)}% · ${row.title} · ${Number(row.price_pln).toLocaleString('pl-PL')} zł\n${row.url}`),
+        ...(hidden ? [`+ ${hidden} more deal${hidden === 1 ? '' : 's'} in Scout`] : []),
+      ].join('\n\n'),
+      priority: 3,
+      tags: ['moneybag', 'calendar'],
+      click: shown[0]?.url ?? config.serverUrl,
+    };
+  }
+
+  private async deliverClaimedDigest(input: { deliveryKey: string; eventKey: string; channel: DigestChannel; payload: Record<string, any>; attemptCount: number }) {
+    const started = nowIso();
+    const { _scoutDigest: _metadata, ...deliveryPayload } = input.payload;
+    try {
+      if (input.channel === 'Discord') {
+        const encrypted = this.getSetting('discord_webhook');
+        if (!encrypted) throw new Error('Discord webhook is not configured');
+        const response = await fetch(validateDiscordWebhook(decryptSecret(encrypted)), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(deliveryPayload), signal: AbortSignal.timeout(12_000) });
+        if (!response.ok) throw new Error(`Discord returned ${response.status}`);
+      } else {
+        const config = this.ntfyConfig();
+        if (!config) throw new Error('ntfy is not configured');
+        await publishNtfy(config, deliveryPayload as ReturnType<typeof this.digestNtfyPayload>);
+      }
+      const finished = nowIso();
+      this.transaction(() => {
+        this.db.prepare("UPDATE notification_deliveries SET status = 'delivered', sent_at = ?, next_attempt_at = NULL, updated_at = ? WHERE listing_key = ? AND channel = ?").run(finished, finished, input.deliveryKey, input.channel);
+        this.db.prepare("UPDATE notifications SET status = 'delivered', sent_at = ? WHERE listing_key = ?").run(finished, input.eventKey);
+        this.setSetting('daily_digest_last_sent_at', finished);
+      });
+      this.recordRun(input.channel, 'ok', `${input.channel} daily digest delivered`, started, finished);
+      this.emit('notification', { refresh: true });
+      return 'delivered' as const;
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : `${input.channel} digest delivery failed`).slice(0, 500);
+      const nextAttempt = input.attemptCount < 5 ? new Date(Date.now() + exponentialBackoff(input.attemptCount - 1, 30_000, 6 * 60 * 60_000)).toISOString() : null;
+      this.db.prepare("UPDATE notification_deliveries SET status = 'failed', message = ?, next_attempt_at = ?, updated_at = ? WHERE listing_key = ? AND channel = ?").run(message, nextAttempt, nowIso(), input.deliveryKey, input.channel);
+      this.db.prepare("UPDATE notifications SET status = 'failed' WHERE listing_key = ?").run(input.eventKey);
+      this.recordRun(input.channel, 'error', message, started, nowIso());
+      return 'failed' as const;
+    }
+  }
+
+  private async processDailyDigest() {
+    if (this.digestRunning) return;
+    const config = this.dailyDigestConfig();
+    if (!config.enabled) return;
+    const local = this.localDateAndTime();
+    if (local.time < config.time || this.getSetting('daily_digest_last_date') === local.date) return;
+    const encryptedDiscord = this.getSetting('discord_webhook');
+    const ntfy = this.ntfyConfig();
+    const channels: DigestChannel[] = [];
+    if (config.discord && encryptedDiscord) channels.push('Discord');
+    if (config.ntfy && ntfy) channels.push('ntfy');
+    if (!channels.length) return;
+    this.digestRunning = true;
+    try {
+      const candidates = this.db.prepare(`SELECT c.*, w.name AS watch_name
+        FROM daily_digest_candidates c JOIN watches w ON w.id = c.watch_id
+        WHERE c.digest_date IS NULL ORDER BY c.discount_percent DESC, c.observed_at ASC, c.id ASC`).all() as DigestCandidateRow[];
+      const planned: Array<{ channel: DigestChannel; eventKey: string; payload: Record<string, any> }> = [];
+      this.transaction(() => {
+        for (const channel of channels) {
+          const minimum = channel === 'Discord' ? this.discordMinimumPriority() : ntfy!.minimumPriority;
+          const eligible = candidates.filter((row) => meetsMinimumPriority(row.priority, minimum));
+          if (!eligible.length) continue;
+          const eventKey = `digest:${local.date}:${channel.toLowerCase()}`;
+          const payload = channel === 'Discord' ? this.digestDiscordPayload(local.date, eligible) : this.digestNtfyPayload(ntfy!, local.date, eligible);
+          const stored = { ...payload, _scoutDigest: { channel, date: local.date, count: eligible.length } };
+          this.db.prepare('INSERT OR IGNORE INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(eventKey, JSON.stringify(stored), 'pending', nowIso());
+          planned.push({ channel, eventKey, payload: stored });
+        }
+        if (planned.length) {
+          const eligibleIds = new Set<number>();
+          for (const row of candidates) {
+            if (channels.some((channel) => meetsMinimumPriority(row.priority, channel === 'Discord' ? this.discordMinimumPriority() : ntfy!.minimumPriority))) eligibleIds.add(Number(row.id));
+          }
+          const update = this.db.prepare('UPDATE daily_digest_candidates SET digest_date = ? WHERE id = ?');
+          for (const id of eligibleIds) update.run(local.date, id);
+        }
+        this.setSetting('daily_digest_last_date', local.date);
+      });
+      const claimed = planned.map((item) => ({ ...item, claim: this.claimNotificationDelivery(item.eventKey, item.channel) })).filter((item) => item.claim !== null);
+      await Promise.all(claimed.map((item) => this.deliverClaimedDigest({ deliveryKey: item.eventKey, eventKey: item.eventKey, channel: item.channel, payload: item.payload, attemptCount: item.claim!.attemptCount })));
+    } finally {
+      this.digestRunning = false;
+    }
+  }
+
+  private notificationEventKey(watchId: string, listing: NormalizedListing, sequence: number, legacy = false) {
+    return legacy ? notificationKey(listing) : `${watchId}|${listing.marketplace}|${listing.listingId}|alert:${sequence}`;
+  }
+
+  private notificationDeliveryKey(eventKey: string, channel: 'Discord' | 'ntfy', legacy = false) {
+    return legacy ? eventKey : `${eventKey}|channel:${channel}`;
+  }
+
+  private notificationMeta(payload: Record<string, any>) {
+    return payload._scout as {
+      watchId: string;
+      listing: NormalizedListing;
+      typical: number;
+      discountPercent: number;
+      confidence: number;
+      priority: NotificationPriority;
+      sequence: number;
+    } | undefined;
+  }
+
+  private claimNotificationDelivery(listingKey: string, channel: 'Discord' | 'ntfy', createdAt = nowIso()) {
+    const staleBefore = new Date(Date.now() - 15 * 60_000).toISOString();
+    const maxAttempts = 5;
+    return this.transaction(() => {
+      const existing = this.db.prepare('SELECT id, status, attempt_count, next_attempt_at, updated_at, created_at FROM notification_deliveries WHERE listing_key = ? AND channel = ?').get(listingKey, channel) as Record<string, any> | undefined;
+      if (existing) {
+        const attempts = Number(existing.attempt_count ?? 0);
+        const updatedAt = String(existing.updated_at ?? existing.created_at ?? '');
+        if (existing.status === 'delivered' || attempts >= maxAttempts) return null;
+        if (existing.status === 'failed' && existing.next_attempt_at && Date.parse(existing.next_attempt_at) > Date.now()) return null;
+        if (existing.status === 'pending' && updatedAt && Date.parse(updatedAt) > Date.parse(staleBefore)) return null;
+        const nextAttempt = attempts + 1;
+        this.db.prepare("UPDATE notification_deliveries SET status = 'pending', attempt_count = ?, next_attempt_at = NULL, updated_at = ? WHERE id = ?").run(nextAttempt, createdAt, existing.id);
+        return { id: Number(existing.id), attemptCount: nextAttempt };
+      }
+      const result = this.db.prepare("INSERT INTO notification_deliveries (listing_key, channel, status, attempt_count, next_attempt_at, updated_at, created_at) VALUES (?, ?, 'pending', 1, NULL, ?, ?)").run(listingKey, channel, createdAt, createdAt);
+      return { id: Number(result.lastInsertRowid), attemptCount: 1 };
+    });
+  }
+
+  private latestDeliveryForAlert(watchId: string, listing: NormalizedListing, channel: 'Discord' | 'ntfy') {
+    const prefix = `${watchId}|${listing.marketplace}|${listing.listingId}|alert:`;
+    return this.db.prepare("SELECT listing_key, status, attempt_count, next_attempt_at, updated_at, created_at FROM notification_deliveries WHERE channel = ? AND listing_key LIKE ? ORDER BY id DESC LIMIT 1").get(channel, `${prefix}%|channel:${channel}`) as Record<string, any> | undefined;
+  }
+
+  private alertState(watchId: string, listing: NormalizedListing, channel: 'Discord' | 'ntfy') {
+    return this.db.prepare('SELECT last_alerted_price_pln, last_priority, alert_sequence FROM watch_listing_alert_state WHERE watch_id = ? AND marketplace = ? AND listing_id = ? AND channel = ?').get(watchId, listing.marketplace, listing.listingId, channel) as { last_alerted_price_pln?: number; last_priority?: NotificationPriority; alert_sequence?: number } | undefined;
+  }
+
+  private shouldAlert(state: { last_alerted_price_pln?: number; last_priority?: NotificationPriority } | undefined, price: number, priority: NotificationPriority) {
+    if (!state) return true;
+    const priorityIncreased = state.last_priority && notificationPriorityRank[priority] > notificationPriorityRank[state.last_priority];
+    const priceDropped = Number.isFinite(state.last_alerted_price_pln) && price <= Number(state.last_alerted_price_pln) * 0.95;
+    return Boolean(priorityIncreased || priceDropped);
+  }
+
+  private async deliverClaimedNotification(input: {
+    deliveryKey: string;
+    eventKey: string;
+    channel: 'Discord' | 'ntfy';
+    watchId?: string;
+    sequence?: number;
+    listing: NormalizedListing;
+    typical: number;
+    discountPercent: number;
+    confidence: number;
+    priority: NotificationPriority;
+    attemptCount: number;
+    encryptedDiscord?: string;
+    ntfy: NtfyConfig | null;
+    legacy?: boolean;
+  }) {
+    const started = nowIso();
+    try {
+      if (input.channel === 'Discord') {
+        if (!input.encryptedDiscord) throw new Error('Discord webhook is not configured');
+        const response = await fetch(validateDiscordWebhook(decryptSecret(input.encryptedDiscord)), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(buildDiscordEmbed({ listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence })), signal: AbortSignal.timeout(12_000) });
+        if (!response.ok) throw new Error(`Discord returned ${response.status}`);
+      } else {
+        if (!input.ntfy) throw new Error('ntfy is not configured');
+        await publishNtfy(input.ntfy, buildNtfyPayload({ listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence }, input.ntfy.topic, input.priority));
+      }
+      const finished = nowIso();
+      this.transaction(() => {
+        this.db.prepare("UPDATE notification_deliveries SET status = 'delivered', sent_at = ?, next_attempt_at = NULL, updated_at = ? WHERE listing_key = ? AND channel = ?").run(finished, finished, input.deliveryKey, input.channel);
+        const canPersistWatchState = !input.legacy && input.watchId !== undefined && input.sequence !== undefined && Boolean(this.db.prepare('SELECT 1 FROM watches WHERE id = ?').get(input.watchId));
+        if (canPersistWatchState) {
+          this.db.prepare(`INSERT INTO watch_listing_alert_state (watch_id, marketplace, listing_id, channel, last_alerted_price_pln, last_priority, alert_sequence, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(watch_id, marketplace, listing_id, channel) DO UPDATE SET last_alerted_price_pln = excluded.last_alerted_price_pln, last_priority = excluded.last_priority, alert_sequence = excluded.alert_sequence, updated_at = excluded.updated_at`).run(input.watchId, input.listing.marketplace, input.listing.listingId, input.channel, input.listing.price, input.priority, input.sequence, finished);
+          this.db.prepare("UPDATE notifications SET status = 'delivered', sent_at = ? WHERE listing_key = ?").run(finished, input.eventKey);
+        } else {
+          this.db.prepare("UPDATE notifications SET status = 'delivered', sent_at = ? WHERE listing_key = ?").run(finished, input.eventKey);
+        }
+      });
+      this.recordRun(input.channel, 'ok', `${input.channel} notification delivered`, started, finished);
+      this.emit('notification', { refresh: true });
+      return 'delivered' as const;
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : `${input.channel} delivery failed`).slice(0, 500);
+      const nextAttempt = input.attemptCount < 5 ? new Date(Date.now() + exponentialBackoff(input.attemptCount - 1, 30_000, 6 * 60 * 60_000)).toISOString() : null;
+      this.db.prepare("UPDATE notification_deliveries SET status = 'failed', message = ?, next_attempt_at = ?, updated_at = ? WHERE listing_key = ? AND channel = ?").run(message, nextAttempt, nowIso(), input.deliveryKey, input.channel);
+      this.db.prepare("UPDATE notifications SET status = 'failed' WHERE listing_key = ? AND status <> 'delivered'").run(input.eventKey);
+      this.recordRun(input.channel, 'error', message, started, nowIso());
+      return 'failed' as const;
+    }
+  }
+
+  /**
+   * The first four arguments are kept backward-compatible for existing
+   * integrations/tests. New scan code always supplies watchId explicitly.
+   */
+  private async notifyDeal(
+    watchIdOrListing: string | NormalizedListing,
+    listingOrTypical: NormalizedListing | number,
+    typicalOrDiscount: number,
+    discountOrConfidence: number,
+    maybeConfidence?: number,
+  ) {
+    const legacy = typeof watchIdOrListing !== 'string';
+    const watchId = legacy ? '__legacy__' : watchIdOrListing;
+    const listing = (legacy ? watchIdOrListing : listingOrTypical) as NormalizedListing;
+    const typical = (legacy ? listingOrTypical : typicalOrDiscount) as number;
+    const discountPercent = legacy ? typicalOrDiscount : discountOrConfidence;
+    const confidence = legacy ? discountOrConfidence : maybeConfidence!;
     const priority = priorityFromDiscount(discountPercent);
     const encryptedDiscord = this.getSetting('discord_webhook');
     const ntfy = this.ntfyConfig();
-    const channels: Array<'Discord' | 'ntfy'> = [];
-    if (encryptedDiscord && meetsMinimumPriority(priority, this.discordMinimumPriority())) channels.push('Discord');
-    if (ntfy && meetsMinimumPriority(priority, ntfy.minimumPriority)) channels.push('ntfy');
-    if (!channels.length) return;
-    const key = notificationKey(listing);
-    const payload = buildDiscordEmbed({ listing, typical, discountPercent, confidence });
-    const created = nowIso();
-    const existing = this.db.prepare('SELECT id, status, payload_json, sent_at, created_at FROM notifications WHERE listing_key = ?').get(key) as { id?: number; status?: string; payload_json?: string; sent_at?: string; created_at?: string } | undefined;
-    if (!existing) {
-      this.db.prepare('INSERT INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(key, JSON.stringify(payload), 'pending', created);
-    } else if (channels.includes('Discord')) {
-      const oldPayload = parseJson<Record<string, any>>(existing.payload_json, {});
-      if (oldPayload.embeds?.length) {
-        this.db.prepare(`INSERT OR IGNORE INTO notification_deliveries (listing_key, channel, status, message, sent_at, created_at) VALUES (?, 'Discord', ?, ?, ?, ?)`).run(key, existing.status === 'failed' ? 'failed' : 'delivered', existing.status === 'failed' ? 'Previous delivery failed' : null, existing.sent_at ?? existing.created_at ?? created, existing.created_at ?? created);
-      }
+    const digest = this.dailyDigestConfig();
+    const digestSelected = (channel: DigestChannel) => digest.enabled && (channel === 'Discord' ? digest.discord : digest.ntfy);
+    if (!legacy && priority !== 'exceptional') {
+      const qualifiesForDigest = (digestSelected('Discord') && Boolean(encryptedDiscord) && meetsMinimumPriority(priority, this.discordMinimumPriority()))
+        || (digestSelected('ntfy') && Boolean(ntfy) && meetsMinimumPriority(priority, ntfy?.minimumPriority ?? 'exceptional'));
+      if (qualifiesForDigest) this.queueDailyDigestCandidate(watchId, listing, typical, discountPercent, confidence, priority);
     }
+    const channels: Array<'Discord' | 'ntfy'> = [];
+    if (encryptedDiscord && meetsMinimumPriority(priority, this.discordMinimumPriority()) && (priority === 'exceptional' || !digestSelected('Discord'))) channels.push('Discord');
+    if (ntfy && meetsMinimumPriority(priority, ntfy.minimumPriority) && (priority === 'exceptional' || !digestSelected('ntfy'))) channels.push('ntfy');
+    if (!channels.length) return;
 
-    const results = await Promise.all(channels.map(async (channel) => {
-      const claimed = this.db.prepare('INSERT OR IGNORE INTO notification_deliveries (listing_key, channel, status, created_at) VALUES (?, ?, ?, ?)').run(key, channel, 'pending', created);
-      if (!claimed.changes) return null;
-      const started = nowIso();
-      try {
-        if (channel === 'Discord') {
-          if (!encryptedDiscord) throw new Error('Discord webhook is not configured');
-          const response = await fetch(validateDiscordWebhook(decryptSecret(encryptedDiscord)), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(12_000) });
-          if (!response.ok) throw new Error(`Discord returned ${response.status}`);
-        } else {
-          if (!ntfy) throw new Error('ntfy is not configured');
-          await publishNtfy(ntfy, buildNtfyPayload({ listing, typical, discountPercent, confidence }, ntfy.topic, priority));
-        }
-        const finished = nowIso();
-        this.db.prepare("UPDATE notification_deliveries SET status = 'delivered', message = NULL, sent_at = ? WHERE listing_key = ? AND channel = ?").run(finished, key, channel);
-        this.recordRun(channel, 'ok', `${channel} notification delivered`, started, finished);
-        return 'delivered' as const;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : `${channel} delivery failed`;
-        this.db.prepare("UPDATE notification_deliveries SET status = 'failed', message = ? WHERE listing_key = ? AND channel = ?").run(message, key, channel);
-        this.recordRun(channel, 'error', message, started, nowIso());
-        return 'failed' as const;
+    const planned: Array<{ channel: 'Discord' | 'ntfy'; eventKey: string; deliveryKey: string; sequence?: number; claim: { id: number; attemptCount: number }; legacy: boolean }> = [];
+    for (const channel of channels) {
+      let sequence = 1;
+      let eventKey = notificationKey(listing);
+      let deliveryKey = eventKey;
+      if (!legacy) {
+        const state = this.alertState(watchId, listing, channel);
+        const latest = this.latestDeliveryForAlert(watchId, listing, channel);
+        const latestSequence = latest?.listing_key ? Number(latest.listing_key.match(/\|alert:(\d+)\|channel:/)?.[1] ?? 0) : 0;
+        const latestDue = latest && latest.status !== 'delivered' && Number(latest.attempt_count ?? 0) < 5
+          && !(latest.status === 'failed' && latest.next_attempt_at && Date.parse(latest.next_attempt_at) > Date.now())
+          && !(latest.status === 'pending' && latest.updated_at && Date.parse(latest.updated_at) > Date.now() - 15 * 60_000);
+        if (latestDue) sequence = latestSequence || Number(state?.alert_sequence ?? 1);
+        else if (latest && latest.status !== 'delivered' && Number(latest.attempt_count ?? 0) < 5) continue;
+        else if (!this.shouldAlert(state, listing.price, priority)) continue;
+        else sequence = Math.max(Number(state?.alert_sequence ?? 0), latestSequence) + 1;
+        eventKey = this.notificationEventKey(watchId, listing, sequence);
+        deliveryKey = this.notificationDeliveryKey(eventKey, channel);
       }
-    }));
-    const attempted = results.filter((result): result is 'delivered' | 'failed' => result !== null);
-    if (attempted.length) {
-      const delivered = attempted.includes('delivered');
-      this.db.prepare(`UPDATE notifications SET status = ?, sent_at = ? WHERE listing_key = ?`).run(delivered ? 'delivered' : 'failed', delivered ? nowIso() : null, key);
-      this.emit('notification', { refresh: true });
+      const payload = { ...buildDiscordEmbed({ listing, typical, discountPercent, confidence }), _scout: { watchId, listing, typical, discountPercent, confidence, priority, sequence } };
+      this.db.prepare('INSERT OR IGNORE INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(eventKey, JSON.stringify(payload), 'pending', nowIso());
+      const claim = this.claimNotificationDelivery(deliveryKey, channel);
+      if (claim) planned.push({ channel, eventKey, deliveryKey, sequence: legacy ? undefined : sequence, claim, legacy });
+    }
+    if (!planned.length) return;
+    await Promise.all(planned.map((item) => this.deliverClaimedNotification({
+      deliveryKey: item.deliveryKey,
+      eventKey: item.eventKey,
+      channel: item.channel,
+      watchId: legacy ? undefined : watchId,
+      sequence: item.sequence,
+      listing,
+      typical,
+      discountPercent,
+      confidence,
+      priority,
+      attemptCount: item.claim.attemptCount,
+      encryptedDiscord: encryptedDiscord ?? undefined,
+      ntfy,
+      legacy: item.legacy,
+    })));
+  }
+
+  private async processNotificationRetries() {
+    const now = nowIso();
+    const stale = new Date(Date.now() - 15 * 60_000).toISOString();
+    const rows = this.db.prepare(`SELECT nd.listing_key, nd.channel, nd.attempt_count, n.listing_key AS event_key, n.payload_json
+      FROM notification_deliveries nd
+      JOIN notifications n ON n.listing_key = CASE WHEN instr(nd.listing_key, '|channel:') > 0 THEN substr(nd.listing_key, 1, instr(nd.listing_key, '|channel:') - 1) ELSE nd.listing_key END
+      WHERE nd.attempt_count < 5 AND ((nd.status = 'failed' AND nd.next_attempt_at IS NOT NULL AND nd.next_attempt_at <= ?) OR (nd.status = 'pending' AND COALESCE(nd.updated_at, nd.created_at) <= ?))
+      ORDER BY nd.id ASC LIMIT 50`).all(now, stale) as Array<Record<string, any>>;
+    for (const row of rows) {
+      const payload = parseJson<Record<string, any>>(row.payload_json, {});
+      const digestMeta = payload._scoutDigest as { channel?: DigestChannel } | undefined;
+      if (digestMeta?.channel === 'Discord' || digestMeta?.channel === 'ntfy') {
+        const claim = this.claimNotificationDelivery(String(row.listing_key), digestMeta.channel);
+        if (!claim) continue;
+        await this.deliverClaimedDigest({
+          deliveryKey: String(row.listing_key),
+          eventKey: String(row.event_key),
+          channel: digestMeta.channel,
+          payload,
+          attemptCount: claim.attemptCount,
+        });
+        continue;
+      }
+      const meta = this.notificationMeta(payload);
+      if (!meta) continue;
+      const claim = this.claimNotificationDelivery(String(row.listing_key), row.channel as 'Discord' | 'ntfy');
+      if (!claim) continue;
+      await this.deliverClaimedNotification({
+        deliveryKey: String(row.listing_key),
+        eventKey: String(row.event_key),
+        channel: row.channel as 'Discord' | 'ntfy',
+        watchId: meta.watchId === '__legacy__' ? undefined : meta.watchId,
+        sequence: meta.sequence,
+        listing: meta.listing,
+        typical: Number(meta.typical),
+        discountPercent: Number(meta.discountPercent),
+        confidence: Number(meta.confidence),
+        priority: meta.priority,
+        attemptCount: claim.attemptCount,
+        encryptedDiscord: this.getSetting('discord_webhook') ?? undefined,
+        ntfy: this.ntfyConfig(),
+        legacy: meta.watchId === '__legacy__',
+      });
     }
   }
 

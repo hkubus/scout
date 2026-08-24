@@ -11,8 +11,26 @@ export interface NormalizedListing {
   condition?: string;
   location?: string;
   shippingAvailable?: boolean | null;
+  priceNegotiable?: boolean | null;
   observedAt: string;
 }
+
+export type ListingAvailability =
+  | { status: 'live' }
+  | { status: 'terminal'; reason: string }
+  | { status: 'unknown'; reason: string };
+
+export type MarketplaceSearchPageStatus = 'results' | 'empty';
+
+/**
+ * Search results remain array-compatible for callers from the first release,
+ * while the adapter also tells scans whether zero cards was a valid empty
+ * page. An arbitrary HTML response must never be treated as empty.
+ */
+export type MarketplaceSearchResult = NormalizedListing[] & {
+  pageStatus: MarketplaceSearchPageStatus;
+  empty: boolean;
+};
 
 export type MarketplaceSearchSort = 'newest';
 
@@ -37,6 +55,17 @@ function isAllowedHost(hostname: string, allowed: string[]) {
 
 export function isApprovedMarketplaceHost(marketplace: Marketplace, hostname: string) {
   return isAllowedHost(hostname.toLowerCase().replace(/\.$/, ''), hosts[marketplace]);
+}
+
+/**
+ * Allegro Lokalnie uses the main Allegro account for authentication. Keep
+ * public offer/search URLs restricted to Lokalnie, but accept the related
+ * Allegro auth origin in an imported browser session.
+ */
+export function isApprovedMarketplaceSessionHost(marketplace: Marketplace, hostname: string) {
+  const normalized = hostname.toLowerCase().replace(/\.$/, '');
+  return isApprovedMarketplaceHost(marketplace, normalized)
+    || (marketplace === 'Allegro Lokalnie' && isAllowedHost(normalized, ['allegro.pl', 'www.allegro.pl']));
 }
 
 export function validateSearchUrl(input: string, expectedMarketplace?: Marketplace) {
@@ -108,6 +137,29 @@ export function parsePolishPrice(value: string | number | null | undefined) {
   return Number.isFinite(amount) && amount >= 0 ? Math.round(amount * 100) / 100 : null;
 }
 
+function normalizeNegotiabilityText(value: string) {
+  return value
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[-_/]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Detect only explicit negotiation signals; an omitted signal remains unknown. */
+export function parsePriceNegotiability(value: string | null | undefined): boolean | null {
+  if (!value) return null;
+  const normalized = normalizeNegotiabilityText(value);
+  if (/\b(?:nie\s+do\s+negocjacji|bez\s+negocjacji|cena\s+(?:jest\s+)?sztywna|cena\s+nie\s+podlega\s+negocjacj\w*|brak\s+mozliwosci\s+negocjacji|non\s+negotiable|fixed\s+price)\b/i.test(normalized)) return false;
+  if (/\b(?:do\s+negocjacji|mozliwosc\s+negocjacji|podlega\s+negocjacji|negocjowal\w*|negotiable)\b/i.test(normalized)) return true;
+  return null;
+}
+
+function parsePriceNegotiabilityFromMarkup(fragment: string) {
+  return parsePriceNegotiability(`${textContent(fragment)} ${fragment}`);
+}
+
 export function normalizeListing(input: Omit<Partial<NormalizedListing>, 'marketplace' | 'listingId' | 'title' | 'price' | 'url'> & { marketplace: Marketplace; listingId: string; title: string; price: string | number; url: string }): NormalizedListing {
   const price = parsePolishPrice(input.price);
   if (price === null) throw new Error('Listing price is not a valid PLN amount');
@@ -124,6 +176,7 @@ export function normalizeListing(input: Omit<Partial<NormalizedListing>, 'market
     condition: input.condition?.trim(),
     location: input.location?.trim(),
     shippingAvailable: input.shippingAvailable ?? null,
+    priceNegotiable: input.priceNegotiable ?? null,
     observedAt: input.observedAt ?? new Date().toISOString(),
   };
 }
@@ -190,7 +243,7 @@ export function parseOlxCards(html: string) {
     const locationRaw = chunk.match(/<p[^>]*data-testid=["']location-date["'][^>]*>([\s\S]*?)<\/p>/i)?.[1];
     const badgeRaw = chunk.match(/<div[^>]*data-nx-name=["']NexusBadge["'][^>]*>([\s\S]*?)<\/div>/i)?.[1];
     try {
-      listings.push(normalizeListing({ marketplace: 'OLX', listingId, title, price, url, imageUrl: imageTag ? attribute(imageTag, 'src') : undefined, condition: badgeRaw ? textContent(badgeRaw) : undefined, location: locationRaw ? textContent(locationRaw).split(' - ')[0] : undefined, shippingAvailable: /data-testid=["']card-delivery-badge["']/i.test(chunk) }));
+      listings.push(normalizeListing({ marketplace: 'OLX', listingId, title, price, url, imageUrl: imageTag ? attribute(imageTag, 'src') : undefined, condition: badgeRaw ? textContent(badgeRaw) : undefined, location: locationRaw ? textContent(locationRaw).split(' - ')[0] : undefined, shippingAvailable: /data-testid=["']card-delivery-badge["']/i.test(chunk), priceNegotiable: parsePriceNegotiabilityFromMarkup(chunk) }));
     } catch { /* malformed or off-domain cards are ignored */ }
   }
   return listings;
@@ -224,7 +277,7 @@ export function parseAllegroCards(html: string) {
     if (!listingId) continue;
     const imageTag = chunk.match(/<img[^>]*itemprop=["']image["'][^>]*>/i)?.[0] ?? chunk.match(/<img[^>]*>/i)?.[0];
     try {
-      listings.push(normalizeListing({ marketplace: 'Allegro Lokalnie', listingId, title, price, url, imageUrl: imageTag ? attribute(imageTag, 'src') : undefined, shippingAvailable }));
+      listings.push(normalizeListing({ marketplace: 'Allegro Lokalnie', listingId, title, price, url, imageUrl: imageTag ? attribute(imageTag, 'src') : undefined, shippingAvailable, priceNegotiable: parsePriceNegotiabilityFromMarkup(chunk) }));
     } catch { /* malformed or off-domain cards are ignored */ }
   }
   return listings;
@@ -249,7 +302,7 @@ export function parseVintedCards(html: string) {
     const imageTag = imageTags.at(-1)?.[0];
     const condition = label.match(/,\s*Stan:\s*([^,]+)/i)?.[1]?.trim();
     try {
-      listings.push(normalizeListing({ marketplace: 'Vinted', listingId, title, price, url: new URL(href, 'https://www.vinted.pl').toString(), imageUrl: imageTag ? attribute(imageTag, 'src') : undefined, condition }));
+      listings.push(normalizeListing({ marketplace: 'Vinted', listingId, title, price, url: new URL(href, 'https://www.vinted.pl').toString(), imageUrl: imageTag ? attribute(imageTag, 'src') : undefined, condition, priceNegotiable: parsePriceNegotiabilityFromMarkup(`${tag} ${label}`) }));
     } catch { /* malformed or off-domain cards are ignored */ }
   }
   return listings;
@@ -258,6 +311,60 @@ export function parseVintedCards(html: string) {
 function visiblePageText(html: string) {
   return textContent(html.replace(/<script\b[\s\S]*?<\/script>/gi, ' ').replace(/<style\b[\s\S]*?<\/style>/gi, ' '));
 }
+
+function isBlockedMarkup(html: string) {
+  const text = visiblePageText(html).toLowerCase();
+  return /captcha|cloudflare|access denied|verify you are human|robot check|przejdz weryfikacje|zbyt wiele zapytan|too many requests|challenge page/.test(text)
+    || /(?:g-recaptcha|h-captcha|cf-chl-|challenge-platform)/i.test(html);
+}
+
+function hasExplicitEmptyState(html: string, marketplace: Marketplace) {
+  if (isBlockedMarkup(html)) return false;
+  const text = visiblePageText(html).toLowerCase();
+  if (/nie znaleziono(?:\s+żadnych)?\s+(?:ogłoszeń|ofert|przedmiotów|wyników)|brak\s+(?:ogłoszeń|ofert|wyników)|no\s+(?:results|listings|items|offers)/i.test(text)) return true;
+  if (marketplace === 'OLX') return /data-testid=["'](?:no-results|empty-state|search-results)["']/i.test(html) || /data-cy=["'](?:no-results|search-results)["']/i.test(html);
+  if (marketplace === 'Allegro Lokalnie') return /data-testid=["'][^"']*(?:empty|no-results)[^"']*["']/i.test(html) || /mlc-(?:empty|search-results)/i.test(html);
+  return /data-testid=["'][^"']*(?:empty|no-results|catalog)[^"']*["']/i.test(html) || /catalog-(?:empty|no-results)/i.test(html);
+}
+
+export function parseSearchPage(html: string, marketplace: Marketplace): MarketplaceSearchResult {
+  if (!html) throw new Error('Public page returned no usable markup');
+  const listings = parseStructuredListings(html, marketplace) as MarketplaceSearchResult;
+  const withStatus = (pageStatus: MarketplaceSearchPageStatus, empty: boolean) => {
+    Object.defineProperties(listings, {
+      pageStatus: { configurable: true, enumerable: false, value: pageStatus },
+      empty: { configurable: true, enumerable: false, value: empty },
+    });
+    return listings;
+  };
+  if (listings.length) return withStatus('results', false);
+  if (hasExplicitEmptyState(html, marketplace)) return withStatus('empty', true);
+  throw new Error('Public page has no supported listing or empty-state markup');
+}
+
+function availabilityUnknown(reason: string): ListingAvailability {
+  return { status: 'unknown', reason: reason.slice(0, 240) };
+}
+
+/** Classify a detail response without interpreting disappearance as a sale. */
+export function parseListingAvailability(html: string, marketplace: Marketplace, httpStatus?: number): ListingAvailability {
+  if (httpStatus === 404 || httpStatus === 410) return { status: 'terminal', reason: `Marketplace returned HTTP ${httpStatus}` };
+  if (httpStatus !== undefined && (httpStatus === 401 || httpStatus === 403 || httpStatus === 408 || httpStatus === 429 || httpStatus >= 500)) {
+    return availabilityUnknown(`Marketplace returned HTTP ${httpStatus}`);
+  }
+  if (!html || html.length < 80) return availabilityUnknown('Detail page returned no usable markup');
+  if (isBlockedMarkup(html)) return availabilityUnknown('Marketplace returned a block or challenge page');
+  const text = visiblePageText(html).toLowerCase();
+  if (/ogłoszenie\s+(?:zostało\s+)?(?:usunięte|zakończone|jest\s+niedostępne)|oferta\s+(?:została\s+)?(?:usunięta|zakończona|jest\s+niedostępna)|(?:ogłoszenie|oferta)\s+niedostępne|przedmiot\s+został\s+sprzedany|sprzedane|sprzedany|sold|item\s+has\s+been\s+removed|listing\s+not\s+found|offer\s+not\s+found|listing\s+is\s+no\s+longer\s+available|offer\s+is\s+no\s+longer\s+available|no\s+longer\s+available|nie\s+istnieje/i.test(text)) {
+    return { status: 'terminal', reason: 'The marketplace explicitly marks the listing as unavailable' };
+  }
+  if (parseStructuredListings(html, marketplace).length || /data-testid=["'](?:ad-card-title|item-title|offer-title|product-item-id-[^"']+--overlay-link)["']/i.test(html) || /(?:add-to-cart|chat-button|contact-seller|kup teraz|wyślij wiadomość|wysyłka)/i.test(text)) {
+    return { status: 'live' };
+  }
+  return availabilityUnknown('Detail markup did not expose a definitive live or terminal state');
+}
+
+export const determineListingAvailability = parseListingAvailability;
 
 /** Read shipping availability from a marketplace detail page when the search card omits it. */
 export function parseShippingAvailability(html: string, marketplace: Marketplace): boolean | null {
@@ -293,7 +400,8 @@ export function parseStructuredListings(html: string, marketplace: Marketplace) 
         const listingId = item.sku ?? item.productID ?? item.identifier ?? (typeof url === 'string' ? url.split('/').filter(Boolean).at(-1) : undefined);
         if (!url || !title || price === undefined || !listingId) continue;
         try {
-          listings.push(normalizeListing({ marketplace, listingId: String(listingId), title: String(title), price, url: String(url), imageUrl: structuredImage(item.image), condition: typeof offer?.itemCondition === 'string' ? offer.itemCondition : undefined, location: typeof item.address?.addressLocality === 'string' ? item.address.addressLocality : undefined }));
+          const description = [item.description, offer?.description].filter((value): value is string => typeof value === 'string').join(' ');
+          listings.push(normalizeListing({ marketplace, listingId: String(listingId), title: String(title), price, url: String(url), imageUrl: structuredImage(item.image), condition: typeof offer?.itemCondition === 'string' ? offer.itemCondition : undefined, location: typeof item.address?.addressLocality === 'string' ? item.address.addressLocality : undefined, priceNegotiable: parsePriceNegotiability(description) }));
         } catch { /* invalid/off-domain structured data is ignored */ }
       }
     } catch { /* malformed JSON-LD is common in blocked pages */ }
@@ -301,7 +409,13 @@ export function parseStructuredListings(html: string, marketplace: Marketplace) 
   const unique = new Map<string, NormalizedListing>();
   const cardListings = marketplace === 'OLX' ? parseOlxCards(html) : marketplace === 'Allegro Lokalnie' ? parseAllegroCards(html) : parseVintedCards(html);
   for (const listing of cardListings) listings.push(listing);
-  for (const listing of listings) unique.set(dedupeKey(listing), listing);
+  for (const listing of listings) {
+    const key = dedupeKey(listing);
+    const previous = unique.get(key);
+    unique.set(key, previous && listing.priceNegotiable === null && previous.priceNegotiable !== null && previous.priceNegotiable !== undefined
+      ? { ...listing, priceNegotiable: previous.priceNegotiable }
+      : listing);
+  }
   return [...unique.values()];
 }
 
@@ -312,7 +426,8 @@ export function exponentialBackoff(failures: number, baseMs = 5 * 60_000, maxMs 
 
 export interface ConnectorAdapter {
   marketplace: Marketplace;
-  fetchPublicSearch(url: string): Promise<NormalizedListing[]>;
+  fetchPublicSearch(url: string): Promise<MarketplaceSearchResult>;
+  verifyAvailability(url: string): Promise<ListingAvailability>;
 }
 
 /**
@@ -327,10 +442,19 @@ export function createPublicAdapter(marketplace: Marketplace, fetcher: (url: str
       const validation = validateSearchUrl(url, marketplace);
       if (!validation.valid) throw new Error(validation.reason);
       const html = await fetcher(validation.url);
-      if (!html || html.length < 80) throw new Error('Public page returned no usable markup');
-      const listings = parseStructuredListings(html, marketplace);
-      if (!listings.length) throw new Error('Public page has no supported listing markup');
-      return listings;
+      return parseSearchPage(html, marketplace);
+    },
+    async verifyAvailability(url) {
+      const validation = validateSearchUrl(url, marketplace);
+      if (!validation.valid) return availabilityUnknown(validation.reason);
+      try {
+        const html = await fetcher(validation.url);
+        return parseListingAvailability(html, marketplace);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Detail page verification failed';
+        if (/\b(?:404|410)\b/.test(message)) return { status: 'terminal', reason: message.slice(0, 240) };
+        return availabilityUnknown(message);
+      }
     },
   };
 }

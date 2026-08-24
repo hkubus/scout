@@ -1,12 +1,39 @@
 export type Theme = 'light' | 'dark' | 'system';
-export type View = 'overview' | 'search' | 'watches' | 'market-research' | 'listings' | 'connectors' | 'settings';
+export type View = 'overview' | 'search' | 'watches' | 'market-research' | 'listings' | 'messages' | 'connectors' | 'settings';
 export type Marketplace = 'OLX' | 'Allegro Lokalnie' | 'Vinted';
 export type DealLabel = 'Exceptional' | 'Very strong' | 'Strong' | 'Watch';
 export type NotificationPriority = 'strong' | 'very-strong' | 'exceptional';
 export type ListingDecision = 'buy' | 'watch' | 'pass';
 
+export type ListingNormalizationCondition = 'new' | 'like-new' | 'very-good' | 'good' | 'acceptable' | 'for-parts' | 'unknown';
+
+export interface ListingNormalizationAttribute {
+  name: string;
+  value: string;
+}
+
+export interface ListingNormalization {
+  canonicalTitle: string;
+  category: string;
+  brand: string | null;
+  model: string | null;
+  variant: string | null;
+  attributes: ListingNormalizationAttribute[];
+  condition: ListingNormalizationCondition;
+  conditionNotes: string[];
+  flags: string[];
+  confidence: number;
+  evidence: string[];
+}
+
 export interface Listing {
   id: string;
+  /** Global marketplace identity, safe for external links and triage actions. */
+  marketplaceListingKey?: string;
+  /** Watch-specific identity used by the UI and detail requests. */
+  associationId?: string;
+  watchId?: string | null;
+  watchListingId?: number | null;
   title: string;
   subtitle: string;
   marketplace: Marketplace;
@@ -23,9 +50,13 @@ export interface Listing {
   condition?: string;
   location?: string;
   shippingAvailable: boolean | null;
+  priceNegotiable?: boolean | null;
   listingId?: string;
   decision?: ListingDecision | null;
   note?: string;
+  aiNormalization?: ListingNormalization | null;
+  aiNormalizationAt?: string | null;
+  aiNormalizationError?: string | null;
 }
 
 export interface PriceHistoryPoint {
@@ -47,6 +78,43 @@ export interface ListingDetail {
   lastSeenAt: string;
 }
 
+export type SellerMessageStatus = 'sent' | 'failed';
+export type SellerMessageSource = 'manual' | 'automatic';
+
+export interface SellerMessage {
+  id: number;
+  marketplace: Marketplace;
+  listingId: string;
+  listingTitle: string;
+  listingUrl: string;
+  message: string;
+  offerPrice: number | null;
+  model: string;
+  source: SellerMessageSource;
+  status: SellerMessageStatus;
+  error: string | null;
+  createdAt: string;
+  sentAt: string | null;
+}
+
+export interface NegotiationResult {
+  message: SellerMessage;
+}
+
+export type NegotiationRecommendationStatus = 'ready' | 'budget-required' | 'not-negotiable' | 'manual-review' | 'budget-too-low' | 'no-room';
+
+export interface NegotiationRecommendation {
+  status: NegotiationRecommendationStatus;
+  askingPrice: number;
+  maxTotalCost: number | null;
+  knownCosts: number;
+  ceilingPrice: number | null;
+  openingOffer: number | null;
+  counterOffers: number[];
+  openingDiscountPercent: number | null;
+  rationale: string;
+}
+
 export interface Watch {
   id: string;
   name: string;
@@ -60,15 +128,17 @@ export interface Watch {
   targetSamples: number;
   observationHours: number;
   readiness: number;
-  status: 'Learning' | 'Ready' | 'Paused';
+  status: 'Learning' | 'Ready' | 'Paused' | 'Archived';
   interval: number;
   nextScan: string;
   enabled: boolean;
   exactUrls: string[];
   sensitivity: number;
   shippingOnly: boolean;
+  aiRelevance: boolean;
   minPrice: number | null;
   maxPrice: number | null;
+  archivedAt?: string | null;
 }
 
 export interface WatchAnalyticsPoint {
@@ -116,6 +186,7 @@ export interface SearchFilters {
   minPrice?: number | null;
   maxPrice?: number | null;
   shippingOnly?: boolean;
+  aiRelevance?: boolean;
   condition?: string;
   location?: string;
 }
@@ -154,6 +225,7 @@ export interface MarketWatch {
   activeListings: number;
   endedListings: number;
   estimatedMedianPrice: number | null;
+  activeVersionId?: string | null;
 }
 
 export type MarketWatchInput = Pick<MarketWatch, 'name' | 'query' | 'terms' | 'excluded' | 'location' | 'condition' | 'sources' | 'intervalHours' | 'minPrice' | 'maxPrice' | 'shippingOnly'>;
@@ -174,7 +246,9 @@ export interface MarketTrackedListing {
   firstSeenAt: string;
   lastSeenAt: string;
   endedAt: string | null;
-  status: 'active' | 'ended';
+  status: 'active' | 'ended' | 'superseded';
+  availabilityStatus?: 'live' | 'terminal' | 'unknown' | null;
+  endedReason?: string | null;
   missingScans: number;
   observations: number;
 }
@@ -182,6 +256,17 @@ export interface MarketTrackedListing {
 export interface MarketResearchData {
   watches: MarketWatch[];
   listings: MarketTrackedListing[];
+  aggregates?: {
+    overallMedianPrice: number | null;
+    endedCount: number;
+    activeCount: number;
+  };
+  pagination?: {
+    page: number;
+    pageSize: number;
+    total: number;
+    hasNext: boolean;
+  };
 }
 
 export interface Connector {
@@ -225,9 +310,38 @@ export interface SettingsData {
   webhookConfigured: boolean;
   webhookMasked: string | null;
   discordMinimumPriority: NotificationPriority;
+  dailyDigest: DailyDigestSettings;
   ntfy: NtfySettings;
+  ai: AiSettings;
+  autoNegotiation: AutoNegotiationSettings;
   publicExposureWarning: boolean;
   marketplaceSessions: MarketplaceSession[];
+}
+
+export interface DailyDigestSettings {
+  enabled: boolean;
+  time: string;
+  discord: boolean;
+  ntfy: boolean;
+  lastSentAt: string | null;
+}
+
+export interface AiSettings {
+  configured: boolean;
+  model: string;
+  source: 'settings' | 'environment' | 'none';
+}
+
+export interface AutoNegotiationSettings {
+  enabled: boolean;
+  maxTotalCost: number | null;
+  shippingCost: number;
+  otherCosts: number;
+  minimumDiscountPercent: number;
+  openingDiscountPercent: number;
+  dailyLimit: number;
+  sentToday: number;
+  attemptedToday: number;
 }
 
 export interface NtfySettings {

@@ -1,4 +1,4 @@
-import { isApprovedMarketplaceHost, type Marketplace } from './marketplaces';
+import { isApprovedMarketplaceSessionHost, type Marketplace } from './marketplaces';
 
 export type SameSite = 'Strict' | 'Lax' | 'None';
 
@@ -65,7 +65,7 @@ export function parseMarketplaceStorageState(input: unknown, marketplace: Market
     const cookieValue = text(value.value, `Cookie ${index + 1} value`, 32_768);
     const domain = text(value.domain, `Cookie ${index + 1} domain`, 255).trim();
     const normalizedDomain = domain.replace(/^\.+/, '').toLowerCase();
-    if (!normalizedDomain || !isApprovedMarketplaceHost(marketplace, normalizedDomain)) fail(`Cookie ${index + 1} belongs outside ${marketplace}`);
+    if (!normalizedDomain || !isApprovedMarketplaceSessionHost(marketplace, normalizedDomain)) fail(`Cookie ${index + 1} belongs outside ${marketplace}`);
     const path = text(value.path, `Cookie ${index + 1} path`, 2_048);
     if (!path.startsWith('/')) fail(`Cookie ${index + 1} path must start with /`);
     if (value.expires !== undefined && (typeof value.expires !== 'number' || !Number.isFinite(value.expires))) fail(`Cookie ${index + 1} expires must be a finite number`);
@@ -85,7 +85,7 @@ export function parseMarketplaceStorageState(input: unknown, marketplace: Market
     const rawOrigin = text(value.origin, `Origin ${index + 1}`, 512);
     let parsedOrigin: URL;
     try { parsedOrigin = new URL(rawOrigin); } catch { fail(`Origin ${index + 1} must be a valid URL`); }
-    if (parsedOrigin.protocol !== 'https:' || parsedOrigin.username || parsedOrigin.password || parsedOrigin.port || parsedOrigin.pathname !== '/' || parsedOrigin.search || parsedOrigin.hash || !isApprovedMarketplaceHost(marketplace, parsedOrigin.hostname)) {
+    if (parsedOrigin.protocol !== 'https:' || parsedOrigin.username || parsedOrigin.password || parsedOrigin.port || parsedOrigin.pathname !== '/' || parsedOrigin.search || parsedOrigin.hash || !isApprovedMarketplaceSessionHost(marketplace, parsedOrigin.hostname)) {
       fail(`Origin ${index + 1} is outside the approved ${marketplace} HTTPS origin`);
     }
     const rawStorage = value.localStorage;
