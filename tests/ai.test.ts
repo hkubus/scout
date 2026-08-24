@@ -136,20 +136,20 @@ test('classifies accessories and broken items as irrelevant through DeepSeek JSO
     { apiKey: 'sk-or-v1-test', model: 'deepseek/deepseek-v4-flash' },
     (_input, init) => {
       requestInit = init;
-      return Promise.resolve(Response.json({ choices: [{ message: { content: JSON.stringify({ relevant: false, reason: 'To wentylator do GPU, a nie karta graficzna.' }) } }] }));
+      return Promise.resolve(Response.json({ choices: [{ message: { content: JSON.stringify({ relevant: false }) } }] }));
     },
   );
 
-  assert.deepEqual(result, { relevant: false, reason: 'To wentylator do GPU, a nie karta graficzna.' });
+  assert.deepEqual(result, { relevant: false });
   const body = JSON.parse(String(requestInit?.body)) as Record<string, any>;
   assert.equal(body.response_format.type, 'json_schema');
   assert.equal(body.response_format.json_schema.name, 'listing_relevance');
   assert.equal(body.response_format.json_schema.strict, true);
-  assert.deepEqual(body.response_format.json_schema.schema.required, ['relevant', 'reason']);
+  assert.deepEqual(body.response_format.json_schema.schema.required, ['relevant']);
   assert.deepEqual(body.provider, { require_parameters: true });
   assert.deepEqual(body.reasoning, { effort: 'none' });
   assert.equal(body.session_id, 'scout:listing-relevance:v4');
-  assert.equal(body.max_tokens, 100);
+  assert.equal(body.max_tokens, 32);
   assert.equal(body.thinking, undefined);
   assert.equal(body.stream, false);
   assert.equal(body.messages[1].content.includes('gpu'), true);

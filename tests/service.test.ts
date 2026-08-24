@@ -394,9 +394,7 @@ test('filters and caches irrelevant listings per watch', async () => {
   const context = fixture({
     classifyListingRelevance: async (listing) => {
       requests += 1;
-      return listing.title.toLowerCase().includes('fan')
-        ? { relevant: false, reason: 'Accessory, not the requested graphics card.' }
-        : { relevant: true, reason: 'This is the requested graphics card.' };
+      return { relevant: !listing.title.toLowerCase().includes('fan') };
     },
   });
   try {
@@ -431,9 +429,7 @@ test('does not apply the AI relevance gate to one-off marketplace search results
   const context = fixture({
     classifyListingRelevance: async (listing) => {
       requests += 1;
-      return listing.title.toLowerCase().includes('fan')
-        ? { relevant: false, reason: 'Accessory, not the requested graphics card.' }
-        : { relevant: true, reason: 'This is the requested graphics card.' };
+      return { relevant: !listing.title.toLowerCase().includes('fan') };
     },
   });
   try {

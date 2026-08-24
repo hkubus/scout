@@ -236,11 +236,7 @@ export class ScoutService {
   private emit: (event: string, payload: unknown) => void;
   private running = new Set<string>();
   private lastSchedulerTickAt: string | null = null;
-  private aiNormalizationQueue: Array<{ marketplace: Marketplace; listingId: string }> = [];
-  private aiNormalizationKeys = new Set<string>();
-  private activeAiNormalizations = 0;
   private digestRunning = false;
-  private readonly maxConcurrentAiNormalizations = 2;
   private readonly classifyListingRelevance: typeof classifyListingRelevanceWithDeepSeek;
   private readonly draftNegotiation: typeof draftNegotiationMessageWithDeepSeek;
   private readonly sendOlxMessageOverride?: (listingUrl: string, message: string) => Promise<void>;
@@ -467,7 +463,7 @@ export class ScoutService {
     const config = this.deepSeekConfig();
     if (!config.apiKey) return { listings, excluded: 0, failed: 0, unknown: 0, notConfigured: true };
     const apiKey = config.apiKey;
-    const pendingClassifications = new Map<string, Promise<{ relevant: boolean; reason: string }>>();
+    const pendingClassifications = new Map<string, Promise<{ relevant: boolean }>>();
 
     const classified: Array<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> = [];
     for (let offset = 0; offset < listings.length; offset += 4) {
@@ -511,7 +507,7 @@ export class ScoutService {
           }
           const result = await classification;
           const status: 'relevant' | 'irrelevant' = result.relevant ? 'relevant' : 'irrelevant';
-          if (watchId) this.saveListingRelevance({ watchId, listing, inputHash, model: config.model, relevant: result.relevant, status, reason: result.reason });
+          if (watchId) this.saveListingRelevance({ watchId, listing, inputHash, model: config.model, relevant: result.relevant, status, reason: result.relevant ? 'AI classified listing as relevant' : 'AI classified listing as irrelevant' });
           return { listing, status };
         } catch (error) {
           const message = (error instanceof Error ? error.message : 'OpenRouter could not classify listing relevance').slice(0, 500);
@@ -875,42 +871,6 @@ export class ScoutService {
       if (error instanceof ServiceError) throw error;
       throw new ServiceError(message, error instanceof DeepSeekError ? 502 : 500);
     }
-  }
-
-  private drainAiNormalizationQueue() {
-    while (this.activeAiNormalizations < this.maxConcurrentAiNormalizations && this.aiNormalizationQueue.length) {
-      const job = this.aiNormalizationQueue.shift()!;
-      this.activeAiNormalizations += 1;
-      void this.normalizeStoredListing(job.marketplace, job.listingId)
-        .catch(() => undefined)
-        .finally(() => {
-          this.activeAiNormalizations -= 1;
-          this.aiNormalizationKeys.delete(`${job.marketplace}:${job.listingId}`);
-          this.drainAiNormalizationQueue();
-        });
-    }
-  }
-
-  private queueAiNormalization(marketplace: Marketplace, listingId: string) {
-    const config = this.deepSeekConfig();
-    if (!config.apiKey) return;
-    const key = `${marketplace}:${listingId}`;
-    if (this.aiNormalizationKeys.has(key)) return;
-    const row = this.db.prepare('SELECT title, condition, location, ai_normalization_json, ai_normalization_input_hash, ai_normalization_model, ai_normalization_at, ai_normalization_error FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as Record<string, any> | undefined;
-    if (row) {
-      const inputHash = listingNormalizationInputHash({ marketplace, title: String(row.title ?? ''), condition: row.condition ? String(row.condition) : undefined, location: row.location ? String(row.location) : undefined });
-      const legacyInputHash = legacyListingNormalizationInputHash({ marketplace, title: String(row.title ?? ''), condition: row.condition ? String(row.condition) : undefined, location: row.location ? String(row.location) : undefined });
-      const sameInput = row.ai_normalization_input_hash === inputHash && row.ai_normalization_model === config.model;
-      if (sameInput && parseStoredListingNormalization(row.ai_normalization_json)) return;
-      if (row.ai_normalization_input_hash === legacyInputHash && row.ai_normalization_model === config.model && parseStoredListingNormalization(row.ai_normalization_json)) {
-        this.db.prepare('UPDATE listings SET ai_normalization_input_hash = ? WHERE marketplace = ? AND listing_id = ?').run(inputHash, marketplace, listingId);
-        return;
-      }
-      if (sameInput && row.ai_normalization_error && row.ai_normalization_at && Date.now() - Date.parse(row.ai_normalization_at) < 6 * 60 * 60_000) return;
-    }
-    this.aiNormalizationKeys.add(key);
-    this.aiNormalizationQueue.push({ marketplace, listingId });
-    this.drainAiNormalizationQueue();
   }
 
   async normalizeListingByKey(key: string, force = false) {
@@ -1699,7 +1659,6 @@ export class ScoutService {
             this.completeScan(scanId, row.shipping_only ? `${relevance.listings.length} shipping matches${pending ? ` · ${pending} pending checks` : ''}${relevanceNote}` : `${relevance.listings.length} listings normalized${relevanceNote}`);
             return pendingCandidates;
           });
-          for (const listing of relevance.listings) this.queueAiNormalization(listing.marketplace, listing.listingId);
           for (const candidate of candidates) {
             await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence);
             await this.automaticallyNegotiate(candidate);
