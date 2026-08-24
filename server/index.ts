@@ -62,7 +62,11 @@ app.setErrorHandler((error, _request, reply) => {
   return reply.code(500).send({ error: 'Internal server error' });
 });
 
-app.get('/api/health', async () => ({ status: 'ok', service: 'scout', version: '1.0.0', database: 'ok', scheduler: 'running', now: nowIso() }));
+app.get('/api/health', async () => ({ status: 'ok', service: 'scout', version: '1.0.0', now: nowIso() }));
+app.get('/api/ready', async (_request, reply) => {
+  const readiness = service.readiness();
+  return reply.code(readiness.status === 'ready' ? 200 : 503).send(readiness);
+});
 app.get('/api/dashboard', async () => service.dashboard());
 app.get('/api/listings', async (request, reply) => {
   const parsed = z.object({ marketplace: marketplaceParam.optional(), q: z.string().max(240).optional() }).strict().safeParse(request.query);
@@ -72,9 +76,38 @@ app.get('/api/listings', async (request, reply) => {
   return { ...payload, listings: payload.listings.filter((listing) => (!query.marketplace || listing.marketplace === query.marketplace) && (!query.q || `${listing.title} ${listing.subtitle}`.toLowerCase().includes(query.q.toLowerCase()))) };
 });
 app.get('/api/listing-detail', async (request, reply) => {
-  const parsed = z.object({ key: z.string().min(3).max(500) }).safeParse(request.query);
+  const parsed = z.object({ key: z.string().min(3).max(500), watchId: z.string().trim().min(1).max(160).optional() }).safeParse(request.query);
   if (!parsed.success) return reply.code(400).send({ error: 'A listing key is required' });
-  return service.listingDetail(parsed.data.key);
+  return service.listingDetail(parsed.data.key, parsed.data.watchId);
+});
+app.post('/api/ai/normalize-listing', async (request, reply) => {
+  const parsed = z.object({ key: z.string().min(3).max(500), force: z.boolean().optional().default(false) }).strict().safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'A valid listing key is required' });
+  return service.normalizeListingByKey(parsed.data.key, parsed.data.force);
+});
+app.get('/api/messages', async () => ({ messages: service.messages() }));
+app.post('/api/negotiation/recommendation', async (request, reply) => {
+  const parsed = z.object({
+    key: z.string().min(3).max(500),
+    maxTotalCost: z.number().positive().nullable().optional().default(null),
+    shippingCost: z.number().nonnegative().optional().default(0),
+    otherCosts: z.number().nonnegative().optional().default(0),
+  }).strict().safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'A valid listing key, maximum total cost, and non-negative known costs are required' });
+  const { key, maxTotalCost, shippingCost, otherCosts } = parsed.data;
+  return service.recommendNegotiationPriceByKey(key, maxTotalCost, shippingCost, otherCosts);
+});
+app.post('/api/ai/negotiate', async (request, reply) => {
+  const parsed = z.object({
+    key: z.string().min(3).max(500),
+    offerPrice: z.number().positive().nullable().optional().default(null),
+    maxTotalCost: z.number().positive().nullable().optional().default(null),
+    shippingCost: z.number().nonnegative().optional().default(0),
+    otherCosts: z.number().nonnegative().optional().default(0),
+  }).strict().safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'A valid listing key and optional opening offer are required' });
+  const budget = parsed.data.maxTotalCost === null ? undefined : { maxTotalCost: parsed.data.maxTotalCost, shippingCost: parsed.data.shippingCost, otherCosts: parsed.data.otherCosts };
+  return reply.code(201).send(await service.negotiateAndSendByKey(parsed.data.key, parsed.data.offerPrice, budget));
 });
 app.get('/api/listing-actions', async (request, reply) => {
   const parsed = z.object({ key: z.string().min(3).max(500) }).safeParse(request.query);
@@ -91,7 +124,11 @@ app.patch('/api/listing-actions', async (request, reply) => {
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid listing action', details: parsed.error.flatten() });
   return { action: service.updateListingAction(parsed.data.key, parsed.data.decision, parsed.data.note) };
 });
-app.get('/api/watches', async () => ({ watches: service.getWatches() }));
+app.get('/api/watches', async (request, reply) => {
+  const parsed = z.object({ includeArchived: z.coerce.boolean().optional().default(false) }).strict().safeParse(request.query);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid watch filters' });
+  return { watches: parsed.data.includeArchived ? service.allWatches() : service.getWatches() };
+});
 app.get('/api/watches/:id/analytics', async (request, reply) => {
   const params = resourceIdParams.safeParse(request.params);
   if (!params.success) return reply.code(400).send({ error: 'A valid watch id is required' });
@@ -132,6 +169,7 @@ const watchInput = z.object({
   exactUrls: z.array(z.string().url()).max(20).optional().default([]),
   sensitivity: z.number().min(0.6).max(1.6).optional().default(1),
   shippingOnly: z.boolean().optional().default(false),
+  aiRelevance: z.boolean().optional().default(true),
   minPrice: z.number().nonnegative().nullable().optional().default(null),
   maxPrice: z.number().positive().nullable().optional().default(null),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
@@ -146,7 +184,7 @@ app.post('/api/watches', async (request, reply) => {
   }
   const id = value.id ?? `watch-${randomUUID()}`;
   const now = nowIso();
-  db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, sensitivity, shipping_only, min_price_pln, max_price_pln, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, value.sensitivity, value.shippingOnly ? 1 : 0, value.minPrice, value.maxPrice, 1, now, now, now);
+  db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, sensitivity, shipping_only, ai_relevance, min_price_pln, max_price_pln, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, value.sensitivity, value.shippingOnly ? 1 : 0, value.aiRelevance ? 1 : 0, value.minPrice, value.maxPrice, 1, now, now, now);
   emit('watch', { id, name: value.name });
   const created = service.getWatches().find((watch) => watch.id === id);
   return reply.code(201).send({ watch: created });
@@ -157,6 +195,8 @@ app.patch('/api/watches/:id', async (request, reply) => {
   if (!params.success) return reply.code(400).send({ error: 'A valid watch id is required' });
   const patchInput = z.object({
     enabled: z.boolean().optional(), interval: z.number().int().min(5).max(1440).optional(), shippingOnly: z.boolean().optional(),
+    aiRelevance: z.boolean().optional(),
+    archived: z.boolean().optional(),
     minPrice: z.number().nonnegative().nullable().optional(), maxPrice: z.number().positive().nullable().optional(),
   }).strict().safeParse(request.body);
   if (!patchInput.success) return reply.code(400).send({ error: 'Invalid watch update', details: patchInput.error.flatten() });
@@ -172,12 +212,22 @@ app.patch('/api/watches/:id', async (request, reply) => {
   if (typeof body.enabled === 'boolean') { fields.push('enabled = ?'); values.push(body.enabled ? 1 : 0); }
   if (body.interval !== undefined) { fields.push('interval_minutes = ?'); values.push(body.interval); }
   if (typeof body.shippingOnly === 'boolean') { fields.push('shipping_only = ?'); values.push(body.shippingOnly ? 1 : 0); }
+  if (typeof body.aiRelevance === 'boolean') { fields.push('ai_relevance = ?'); values.push(body.aiRelevance ? 1 : 0); }
   if (body.minPrice !== undefined) { fields.push('min_price_pln = ?'); values.push(body.minPrice); }
   if (body.maxPrice !== undefined) { fields.push('max_price_pln = ?'); values.push(body.maxPrice); }
+  if (body.archived !== undefined) {
+    fields.push('archived_at = ?');
+    values.push(body.archived ? nowIso() : null);
+    if (body.enabled === undefined) {
+      fields.push('enabled = ?');
+      values.push(body.archived ? 0 : 1);
+    }
+  }
   if (!fields.length) return reply.code(400).send({ error: 'No supported fields' });
   values.push(nowIso(), params.data.id);
   const result = db.prepare(`UPDATE watches SET ${fields.join(', ')}, updated_at = ? WHERE id = ?`).run(...(values as any[]));
   if (!result.changes) return reply.code(404).send({ error: 'Watch not found' });
+  emit('watch', { id: params.data.id, archived: body.archived });
   return { ok: true };
 });
 
@@ -189,6 +239,7 @@ const searchInput = z.object({
   minPrice: z.number().nonnegative().nullable().optional().default(null),
   maxPrice: z.number().positive().nullable().optional().default(null),
   shippingOnly: z.boolean().optional().default(false),
+  aiRelevance: z.boolean().optional().default(true),
   condition: z.string().max(80).optional().default('Any'),
   location: z.string().max(120).optional().default(''),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
@@ -213,7 +264,11 @@ const marketWatchInput = z.object({
   shippingOnly: z.boolean().optional().default(false),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
 
-app.get('/api/market-watches', async () => service.marketResearch());
+app.get('/api/market-watches', async (request, reply) => {
+  const parsed = z.object({ page: z.coerce.number().int().min(1).optional(), pageSize: z.coerce.number().int().min(1).max(400).optional(), watchId: z.string().trim().min(1).max(160).optional(), status: z.enum(['active', 'ended', 'superseded']).optional() }).strict().safeParse(request.query);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid research history pagination' });
+  return service.marketResearch(parsed.data);
+});
 
 app.post('/api/market-watches', async (request, reply) => {
   const parsed = marketWatchInput.safeParse(request.body);
@@ -221,8 +276,7 @@ app.post('/api/market-watches', async (request, reply) => {
   const value = parsed.data;
   const id = `market-watch-${randomUUID()}`;
   const now = nowIso();
-  db.prepare('INSERT INTO market_watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, interval_hours, min_price_pln, max_price_pln, shipping_only, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), value.intervalHours, value.minPrice, value.maxPrice, value.shippingOnly ? 1 : 0, now, now, now);
-  const watch = service.marketResearch().watches.find((item) => item.id === id)!;
+  const watch = service.createMarketWatch({ id, name: value.name, query: value.query, terms: value.terms, excluded: value.excluded, location: value.location, condition: value.condition, sources: value.sources, intervalHours: value.intervalHours, minPrice: value.minPrice, maxPrice: value.maxPrice, shippingOnly: value.shippingOnly });
   service.queueMarketScan(id);
   emit('market-watch', { refresh: true, id });
   return reply.code(201).send({ watch });
@@ -251,26 +305,7 @@ app.patch('/api/market-watches/:id', async (request, reply) => {
   const nextMin = parsed.data.minPrice === undefined ? current.min_price_pln : parsed.data.minPrice;
   const nextMax = parsed.data.maxPrice === undefined ? current.max_price_pln : parsed.data.maxPrice;
   if (nextMin !== null && nextMax !== null && nextMin > nextMax) return reply.code(400).send({ error: 'Minimum price cannot exceed maximum price' });
-  const fields: string[] = [];
-  const values: unknown[] = [];
-  if (parsed.data.name !== undefined) { fields.push('name = ?'); values.push(parsed.data.name); }
-  if (parsed.data.query !== undefined) { fields.push('query = ?'); values.push(parsed.data.query); }
-  if (parsed.data.enabled !== undefined) { fields.push('enabled = ?'); values.push(parsed.data.enabled ? 1 : 0); }
-  if (parsed.data.intervalHours !== undefined) { fields.push('interval_hours = ?'); values.push(parsed.data.intervalHours); }
-  if (parsed.data.terms !== undefined) { fields.push('included_terms = ?'); values.push(parsed.data.terms); }
-  if (parsed.data.excluded !== undefined) { fields.push('excluded_terms = ?'); values.push(parsed.data.excluded); }
-  if (parsed.data.location !== undefined) { fields.push('location = ?'); values.push(parsed.data.location); }
-  if (parsed.data.condition !== undefined) { fields.push('condition = ?'); values.push(parsed.data.condition); }
-  if (parsed.data.sources !== undefined) { fields.push('sources_json = ?'); values.push(JSON.stringify(parsed.data.sources)); }
-  if (parsed.data.minPrice !== undefined) { fields.push('min_price_pln = ?'); values.push(parsed.data.minPrice); }
-  if (parsed.data.maxPrice !== undefined) { fields.push('max_price_pln = ?'); values.push(parsed.data.maxPrice); }
-  if (parsed.data.shippingOnly !== undefined) { fields.push('shipping_only = ?'); values.push(parsed.data.shippingOnly ? 1 : 0); }
-  if (!fields.length) return reply.code(400).send({ error: 'No supported fields' });
-  values.push(nowIso(), params.data.id);
-  const result = db.prepare(`UPDATE market_watches SET ${fields.join(', ')}, updated_at = ? WHERE id = ?`).run(...(values as any[]));
-  if (!result.changes) return reply.code(404).send({ error: 'Market watch not found' });
-  emit('market-watch', { refresh: true, id: params.data.id });
-  return { ok: true };
+  return service.updateMarketWatch(params.data.id, parsed.data);
 });
 
 app.post('/api/market-watches/:id/scan', async (request, reply) => {
@@ -308,12 +343,32 @@ const settingsInput = z.object({
   webhook: z.string().max(512).optional(),
   clearWebhook: z.boolean().optional(),
   discordMinimumPriority: notificationPriority.optional(),
+  dailyDigest: z.object({
+    enabled: z.boolean().optional(),
+    time: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional(),
+    discord: z.boolean().optional(),
+    ntfy: z.boolean().optional(),
+  }).strict().optional(),
   clearNtfy: z.boolean().optional(),
   ntfy: z.object({
     serverUrl: z.string().max(512).optional(),
     topic: z.string().max(64).optional(),
     token: z.string().max(512).optional(),
     minimumPriority: notificationPriority.optional(),
+  }).strict().optional(),
+  ai: z.object({
+    apiKey: z.string().max(512).optional(),
+    clearApiKey: z.boolean().optional(),
+    model: z.string().trim().max(200).optional(),
+  }).strict().optional(),
+  autoNegotiation: z.object({
+    enabled: z.boolean().optional(),
+    maxTotalCost: z.number().positive().nullable().optional(),
+    shippingCost: z.number().nonnegative().optional(),
+    otherCosts: z.number().nonnegative().optional(),
+    minimumDiscountPercent: z.number().min(18).max(80).optional(),
+    openingDiscountPercent: z.number().min(1).max(50).optional(),
+    dailyLimit: z.number().int().min(1).max(50).optional(),
   }).strict().optional(),
 }).strict();
 
@@ -364,7 +419,7 @@ if (existsSync(distPath)) {
 }
 
 const scheduler = setInterval(() => {
-  service.queueDue();
+  service.schedulerTick();
 }, 30_000);
 const sseHeartbeat = setInterval(() => {
   emit('ping', { now: nowIso() });
@@ -382,3 +437,4 @@ const shutdown = async (signal: string) => {
 process.once('SIGTERM', () => { void shutdown('SIGTERM'); });
 process.once('SIGINT', () => { void shutdown('SIGINT'); });
 await app.listen({ port, host });
+service.schedulerTick();

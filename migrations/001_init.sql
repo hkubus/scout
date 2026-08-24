@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS watches (
   interval_minutes INTEGER NOT NULL DEFAULT 5,
   sensitivity REAL NOT NULL DEFAULT 1,
   shipping_only INTEGER NOT NULL DEFAULT 0,
+  ai_relevance INTEGER NOT NULL DEFAULT 1,
   min_price_pln REAL,
   max_price_pln REAL,
   enabled INTEGER NOT NULL DEFAULT 1,
@@ -37,6 +38,12 @@ CREATE TABLE IF NOT EXISTS listings (
   condition TEXT,
   location TEXT,
   shipping_available INTEGER,
+  price_negotiable INTEGER,
+  ai_normalization_json TEXT,
+  ai_normalization_input_hash TEXT,
+  ai_normalization_model TEXT,
+  ai_normalization_at TEXT,
+  ai_normalization_error TEXT,
   first_seen_at TEXT NOT NULL,
   last_seen_at TEXT NOT NULL,
   UNIQUE (marketplace, listing_id)
@@ -58,6 +65,19 @@ CREATE TABLE IF NOT EXISTS observations (
   watch_id TEXT NOT NULL REFERENCES watches(id) ON DELETE CASCADE,
   price_pln REAL NOT NULL,
   observed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS listing_relevance (
+  watch_id TEXT NOT NULL REFERENCES watches(id) ON DELETE CASCADE,
+  marketplace TEXT NOT NULL,
+  listing_id TEXT NOT NULL,
+  input_hash TEXT NOT NULL,
+  model TEXT NOT NULL,
+  relevant INTEGER NOT NULL CHECK (relevant IN (0, 1)),
+  reason TEXT NOT NULL,
+  error TEXT,
+  checked_at TEXT NOT NULL,
+  PRIMARY KEY (watch_id, marketplace, listing_id)
 );
 
 CREATE TABLE IF NOT EXISTS connector_runs (
@@ -104,6 +124,21 @@ CREATE TABLE IF NOT EXISTS marketplace_sessions (
   updated_at TEXT NOT NULL,
   last_used_at TEXT,
   last_error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS seller_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  marketplace TEXT NOT NULL,
+  listing_id TEXT NOT NULL,
+  listing_title TEXT NOT NULL,
+  listing_url TEXT NOT NULL,
+  message TEXT NOT NULL,
+  offer_price_pln REAL,
+  model TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('sent', 'failed')),
+  error TEXT,
+  created_at TEXT NOT NULL,
+  sent_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS market_watches (
@@ -153,8 +188,10 @@ CREATE TABLE IF NOT EXISTS market_price_observations (
 );
 
 CREATE INDEX IF NOT EXISTS observations_watch_time ON observations (watch_id, observed_at);
+CREATE INDEX IF NOT EXISTS listing_relevance_watch ON listing_relevance (watch_id, relevant, checked_at);
 CREATE INDEX IF NOT EXISTS listings_last_seen ON listings (last_seen_at);
 CREATE INDEX IF NOT EXISTS listing_actions_key ON listing_actions (marketplace, listing_id);
+CREATE INDEX IF NOT EXISTS seller_messages_created ON seller_messages (created_at);
 CREATE INDEX IF NOT EXISTS notification_deliveries_listing ON notification_deliveries (listing_key);
 CREATE INDEX IF NOT EXISTS market_watches_due ON market_watches (enabled, next_scan_at);
 CREATE INDEX IF NOT EXISTS market_listings_watch_status ON market_listings (market_watch_id, status);

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
   AlertTriangle,
+  Archive,
   ArrowRight,
   BarChart3,
   Calculator,
@@ -16,6 +17,7 @@ import {
   Info,
   ListFilter,
   LoaderCircle,
+  MessageSquare,
   Menu,
   Moon,
   MoreHorizontal,
@@ -52,10 +54,12 @@ import type {
   MarketTrackedListing,
   MarketWatch,
   MarketWatchInput,
+  NegotiationRecommendation,
   NotificationPriority,
   PriceHistoryPoint,
   NotificationRecord,
   SearchSourceStatus,
+  SellerMessage,
   SettingsData,
   Theme,
   View,
@@ -69,6 +73,7 @@ const navItems: Array<{ id: View; label: string; icon: typeof Grid2X2 }> = [
   { id: "watches", label: "Watches", icon: Bell },
   { id: "market-research", label: "Market research", icon: BarChart3 },
   { id: "listings", label: "Listings", icon: Tag },
+  { id: "messages", label: "Messages", icon: MessageSquare },
   { id: "connectors", label: "Connectors", icon: PlugZap },
   { id: "settings", label: "Settings", icon: Settings2 },
 ];
@@ -116,7 +121,8 @@ function App() {
   const [editingWatch, setEditingWatch] = useState<Watch | null>(null);
   const [showHistory, setShowHistory] = useState(false);
   const [marketRefreshKey, setMarketRefreshKey] = useState(0);
-  const [selectedWatchName, setSelectedWatchName] = useState<string | null>(
+  const [messagesRefreshKey, setMessagesRefreshKey] = useState(0);
+  const [selectedWatchId, setSelectedWatchId] = useState<string | null>(
     null,
   );
   const [analyticsWatch, setAnalyticsWatch] = useState<Watch | null>(null);
@@ -159,7 +165,9 @@ function App() {
     source.addEventListener("watch", refresh);
     source.addEventListener("notification", refresh);
     source.addEventListener("listing-action", refresh);
+    source.addEventListener("ai-normalization", refresh);
     source.addEventListener("market-watch", () => setMarketRefreshKey((value) => value + 1));
+    source.addEventListener("seller-message", () => setMessagesRefreshKey((value) => value + 1));
     source.onerror = () => setConnection("offline");
     return () => source.close();
   }, [refreshData]);
@@ -170,7 +178,7 @@ function App() {
   }, [toast]);
 
   const openView = (nextView: View) => {
-    if (nextView === "listings") setSelectedWatchName(null);
+    if (nextView === "listings") setSelectedWatchId(null);
     setView(nextView);
     setSidebarOpen(false);
   };
@@ -236,6 +244,18 @@ function App() {
         notify(errorMessage(error), "error");
       }
     });
+  const toggleAiRelevance = (watch: Watch) =>
+    withBusyWatch(watch, async () => {
+      try {
+        await api.updateWatch(watch.id, { aiRelevance: !watch.aiRelevance });
+        await refreshData(false);
+        notify(
+          `AI relevance filter ${watch.aiRelevance ? "disabled" : "enabled"} for ${watch.name}.`,
+        );
+      } catch (error) {
+        notify(errorMessage(error), "error");
+      }
+    });
   const updatePriceRange = async (
     watch: Watch,
     minPrice: number | null,
@@ -252,16 +272,27 @@ function App() {
         throw error;
       }
     });
-  const deleteWatch = (watch: Watch) =>
+  const archiveWatch = (watch: Watch) =>
     withBusyWatch(watch, async () => {
       if (
-        !window.confirm(`Delete “${watch.name}”? Listing history will be kept.`)
+        !window.confirm(`Archive “${watch.name}”? Its observations and analytics will be kept.`)
       )
         return;
       try {
+        await api.updateWatch(watch.id, { archived: true });
+        await refreshData(false);
+        notify(`${watch.name} archived. Its history is still retained.`);
+      } catch (error) {
+        notify(errorMessage(error), "error");
+      }
+    });
+  const deleteWatch = (watch: Watch) =>
+    withBusyWatch(watch, async () => {
+      if (!window.confirm(`Permanently delete “${watch.name}”? All observations and analytics will be removed.`)) return;
+      try {
         await api.deleteWatch(watch.id);
         await refreshData(false);
-        notify(`${watch.name} deleted.`);
+        notify(`${watch.name} permanently deleted.`);
       } catch (error) {
         notify(errorMessage(error), "error");
       }
@@ -269,7 +300,7 @@ function App() {
   const scanWatch = (watch: Watch) =>
     withBusyWatch(watch, async () => requestScan(watch.id));
   const showWatchListings = (watch: Watch) => {
-    setSelectedWatchName(watch.name);
+    setSelectedWatchId(watch.id);
     setView("listings");
   };
   const updateListingAction = useCallback((listing: Listing) => {
@@ -342,7 +373,9 @@ function App() {
             onNewWatch={() => setShowWatchDialog(true)}
             onToggle={toggleWatch}
             onToggleShipping={toggleShipping}
+            onToggleAiRelevance={toggleAiRelevance}
             onEdit={setEditingWatch}
+            onArchive={archiveWatch}
             onDelete={deleteWatch}
             onScan={scanWatch}
             onViewListings={showWatchListings}
@@ -355,11 +388,12 @@ function App() {
         {view === "listings" ? (
           <ListingsPage
             listings={data.listings}
-            selectedWatchName={selectedWatchName}
-            onClearWatch={() => setSelectedWatchName(null)}
+            selectedWatchId={selectedWatchId}
+            onClearWatch={() => setSelectedWatchId(null)}
             onSelectListing={setSelectedListing}
           />
         ) : null}
+        {view === "messages" ? <MessagesPage refreshKey={messagesRefreshKey} /> : null}
         {view === "connectors" ? (
           <ConnectorsPage
             connectors={data.connectors}
@@ -743,7 +777,7 @@ function SelectControl({
   onChange,
 }: {
   value: string;
-  options: string[];
+  options: Array<string | { value: string; label: string }>;
   onChange: (value: string) => void;
 }) {
   return (
@@ -753,9 +787,10 @@ function SelectControl({
         value={value}
         onChange={(event) => onChange(event.target.value)}
       >
-        {options.map((option) => (
-          <option key={option}>{option}</option>
-        ))}
+        {options.map((option) => {
+          const item = typeof option === "string" ? { value: option, label: option } : option;
+          return <option key={item.value} value={item.value}>{item.label}</option>;
+        })}
       </select>
       <ChevronDown size={16} />
     </label>
@@ -803,7 +838,7 @@ function ListingTable({
         <span aria-label="Open listing" />
       </div>
       {listings.map((listing) => (
-        <ListingRow key={listing.id} listing={listing} onSelect={onSelect} />
+        <ListingRow key={listing.associationId ?? listing.id} listing={listing} onSelect={onSelect} />
       ))}
     </div>
   );
@@ -986,6 +1021,7 @@ function SearchPage({ onSelectListing }: { onSelectListing: (listing: Listing) =
   const [condition, setCondition] = useState("Any");
   const [location, setLocation] = useState("");
   const [shippingOnly, setShippingOnly] = useState(false);
+  const [aiRelevance, setAiRelevance] = useState(true);
   const [sources, setSources] = useState<Marketplace[]>([
     "OLX",
     "Allegro Lokalnie",
@@ -1027,6 +1063,7 @@ function SearchPage({ onSelectListing }: { onSelectListing: (listing: Listing) =
         minPrice: numericMin,
         maxPrice: numericMax,
         shippingOnly,
+        aiRelevance,
         condition,
         location: location.trim(),
       });
@@ -1160,6 +1197,17 @@ function SearchPage({ onSelectListing }: { onSelectListing: (listing: Listing) =
               <small>Hide pickup-only and unknown delivery results</small>
             </span>
           </label>
+          <label className="check-option">
+            <input
+              type="checkbox"
+              checked={aiRelevance}
+              onChange={(event) => setAiRelevance(event.target.checked)}
+            />
+            <span>
+              <strong>AI relevance filter</strong>
+              <small>Exclude accessories, parts, and unrelated listings</small>
+            </span>
+          </label>
         </div>
         {!validPrices ? (
           <div className="form-error" role="alert">
@@ -1247,7 +1295,7 @@ function SearchResultsTable({ listings, onSelect }: { listings: Listing[]; onSel
         <span />
       </div>
       {listings.map((listing) => (
-        <div className="search-table search-result-row" key={listing.id}>
+        <div className="search-table search-result-row" key={listing.associationId ?? listing.id}>
           <button
             type="button"
             className="listing-item listing-item--button"
@@ -1264,7 +1312,10 @@ function SearchResultsTable({ listings, onSelect }: { listings: Listing[]; onSel
             <i style={{ background: marketplaceColors[listing.marketplace] }} />
             {listing.marketplace}
           </div>
-          <strong className="price-cell">{formatPln(listing.price)}</strong>
+          <div className="price-cell search-price-cell">
+            <strong>{formatPln(listing.price)}</strong>
+            <PriceNegotiability listing={listing} />
+          </div>
           <span
             className={`shipping-state shipping-state--${listing.shippingAvailable === true ? "yes" : listing.shippingAvailable === false ? "no" : "unknown"}`}
           >
@@ -1294,13 +1345,22 @@ function SearchResultsTable({ listings, onSelect }: { listings: Listing[]; onSel
   );
 }
 
+function PriceNegotiability({ listing }: { listing: Listing }) {
+  const supported = listing.marketplace === "OLX" || listing.marketplace === "Allegro Lokalnie";
+  const state = !supported ? "unknown" : listing.priceNegotiable === true ? "yes" : listing.priceNegotiable === false ? "no" : "unknown";
+  const label = !supported ? "Not checked" : listing.priceNegotiable === true ? "Negotiable" : listing.priceNegotiable === false ? "Fixed price" : "Not indicated";
+  return <span className={`negotiability-state negotiability-state--${state}`}>{label}</span>;
+}
+
 function WatchesPage({
   watches,
   busyWatchIds,
   onNewWatch,
   onToggle,
   onToggleShipping,
+  onToggleAiRelevance,
   onEdit,
+  onArchive,
   onDelete,
   onScan,
   onViewListings,
@@ -1311,7 +1371,9 @@ function WatchesPage({
   onNewWatch: () => void;
   onToggle: (watch: Watch) => void;
   onToggleShipping: (watch: Watch) => void;
+  onToggleAiRelevance: (watch: Watch) => void;
   onEdit: (watch: Watch) => void;
+  onArchive: (watch: Watch) => void;
   onDelete: (watch: Watch) => void;
   onScan: (watch: Watch) => void;
   onViewListings: (watch: Watch) => void;
@@ -1354,7 +1416,9 @@ function WatchesPage({
               busy={busyWatchIds.has(watch.id)}
               onToggle={() => onToggle(watch)}
               onToggleShipping={() => onToggleShipping(watch)}
+              onToggleAiRelevance={() => onToggleAiRelevance(watch)}
               onEdit={() => onEdit(watch)}
+              onArchive={() => onArchive(watch)}
               onDelete={() => onDelete(watch)}
               onScan={() => onScan(watch)}
               onListings={() => onViewListings(watch)}
@@ -1397,7 +1461,9 @@ function WatchRow({
   busy,
   onToggle,
   onToggleShipping,
+  onToggleAiRelevance,
   onEdit,
+  onArchive,
   onDelete,
   onScan,
   onListings,
@@ -1407,7 +1473,9 @@ function WatchRow({
   busy: boolean;
   onToggle: () => void;
   onToggleShipping: () => void;
+  onToggleAiRelevance: () => void;
   onEdit: () => void;
+  onArchive: () => void;
   onDelete: () => void;
   onScan: () => void;
   onListings: () => void;
@@ -1454,6 +1522,7 @@ function WatchRow({
               </span>
             ) : null}
             {watch.shippingOnly ? <span>shipping only</span> : null}
+            {watch.aiRelevance ? <span>AI relevance</span> : null}
             {watch.exactUrls.length ? (
               <span>
                 {watch.exactUrls.length} exact URL
@@ -1560,6 +1629,29 @@ function WatchRow({
               </button>
               <button
                 role="menuitem"
+                disabled={busy}
+                onClick={() => {
+                  setMenuOpen(false);
+                  onToggleAiRelevance();
+                }}
+              >
+                <ListFilter size={15} />
+                {watch.aiRelevance ? "Allow broad matches" : "Use AI relevance filter"}
+              </button>
+              <button
+                role="menuitem"
+                className="danger-action"
+                disabled={busy}
+                onClick={() => {
+                  setMenuOpen(false);
+                  onArchive();
+                }}
+              >
+                <Archive size={15} />
+                Archive watch
+              </button>
+              <button
+                role="menuitem"
                 className="danger-action"
                 disabled={busy}
                 onClick={() => {
@@ -1568,7 +1660,7 @@ function WatchRow({
                 }}
               >
                 <Trash2 size={15} />
-                Delete watch
+                Permanently delete
               </button>
             </div>
           ) : null}
@@ -1736,14 +1828,22 @@ function MarketResearchPage({ refreshKey, onToast }: { refreshKey: number; onToa
   const [showDialog, setShowDialog] = useState(false);
   const [editingWatch, setEditingWatch] = useState<MarketWatch | null>(null);
   const [selectedWatch, setSelectedWatch] = useState<string>("All");
-  const [status, setStatus] = useState<"All" | "active" | "ended">("All");
+  const [status, setStatus] = useState<"All" | "active" | "ended" | "superseded">("All");
+  const [page, setPage] = useState(1);
   const [busyIds, setBusyIds] = useState<Set<string>>(() => new Set());
   const load = useCallback(async (showLoader = false) => {
     if (showLoader) setLoading(true);
-    try { setData(await api.marketResearch()); }
+    try {
+      setData(await api.marketResearch({
+        page,
+        pageSize: 100,
+        watchId: selectedWatch === "All" ? undefined : selectedWatch,
+        status: status === "All" ? undefined : status,
+      }));
+    }
     catch (error) { onToast(errorMessage(error), "error"); }
     finally { if (showLoader) setLoading(false); }
-  }, [onToast]);
+  }, [onToast, page, selectedWatch, status]);
   useEffect(() => { void load(true); }, [load]);
   useEffect(() => { if (refreshKey) void load(false); }, [load, refreshKey]);
   const withBusy = async (watch: MarketWatch, action: () => Promise<void>) => {
@@ -1764,17 +1864,16 @@ function MarketResearchPage({ refreshKey, onToast }: { refreshKey: number; onToa
   const scan = (watch: MarketWatch) => withBusy(watch, async () => { const result = await api.scanMarketWatch(watch.id); onToast(`${result.message}. Results will update shortly.`, "info"); });
   const remove = (watch: MarketWatch) => withBusy(watch, async () => { if (!window.confirm(`Delete “${watch.name}” and its saved research history?`)) return; await api.deleteMarketWatch(watch.id); if (selectedWatch === watch.id) setSelectedWatch("All"); await load(false); onToast(`${watch.name} deleted.`); });
   const visible = useMemo(() => data.listings.filter((listing) => selectedWatch === "All" || listing.marketWatchId === selectedWatch).filter((listing) => status === "All" || listing.status === status), [data.listings, selectedWatch, status]);
-  const totalEnded = data.watches.reduce((sum, watch) => sum + watch.endedListings, 0);
-  const totalActive = data.watches.reduce((sum, watch) => sum + watch.activeListings, 0);
-  const endedPrices = data.listings.filter((listing) => listing.status === "ended").map((listing) => listing.lastPrice).sort((a, b) => a - b);
-  const overallEstimate = endedPrices.length ? endedPrices[Math.floor(endedPrices.length / 2)] : null;
+  const totalEnded = data.aggregates?.endedCount ?? data.watches.reduce((sum, watch) => sum + watch.endedListings, 0);
+  const totalActive = data.aggregates?.activeCount ?? data.watches.reduce((sum, watch) => sum + watch.activeListings, 0);
+  const overallEstimate = data.aggregates?.overallMedianPrice ?? null;
   return <>
     <PageHeader title="Market research" description="Daily snapshots that reveal asking-price movement and estimate where listings leave the market." action="New research watch" onAction={openCreate} />
-    <div className="research-explainer"><BarChart3 size={22} /><div><strong>Track the market, separately from deal alerts.</strong><span>Scout records every observed asking price. After a listing is missing from three successful scans, it is marked ended and its last asking price becomes the sale estimate.</span></div></div>
-    <section className="research-stats" aria-label="Market research summary"><Stat label="Research watches" value={String(data.watches.length)} detail={`${data.watches.filter((watch) => watch.enabled).length} active`} /><Stat label="Live listings" value={String(totalActive)} detail="currently observed" /><Stat label="Ended listings" value={String(totalEnded)} detail="estimated outcomes" /><Stat label="Median estimate" value={overallEstimate === null ? "—" : formatPln(overallEstimate)} detail="last asking price" /></section>
+    <div className="research-explainer"><BarChart3 size={22} /><div><strong>Track the market, separately from deal alerts.</strong><span>Scout records every observed asking price. A listing is marked “no longer available” only after three verified terminal checks. A missing or blocked search result alone is never treated as a sale.</span></div></div>
+    <section className="research-stats" aria-label="Market research summary"><Stat label="Research watches" value={String(data.watches.length)} detail={`${data.watches.filter((watch) => watch.enabled).length} active`} /><Stat label="Live listings" value={String(totalActive)} detail="currently observed" /><Stat label="Ended listings" value={String(totalEnded)} detail="verified unavailable" /><Stat label="Median estimate" value={overallEstimate === null ? "—" : formatPln(overallEstimate)} detail="last asking price" /></section>
     <div className="research-section-heading"><h2>Research watches</h2><span>Default cadence: once every 24 hours</span></div>
     {loading ? <div className="table-loading"><LoaderCircle size={20} className="spin" />Loading market research…</div> : data.watches.length ? <div className="research-watch-list">{data.watches.map((watch) => <article className={`research-watch ${watch.enabled ? "" : "research-watch--paused"}`} key={watch.id}><div className="research-watch-heading"><div><strong>{watch.name}</strong><span>{watch.query}</span></div><span className={`state-chip state-chip--${watch.enabled ? "ready" : "paused"}`}><i />{watch.enabled ? "Active" : "Paused"}</span></div><div className="research-watch-sources">{watch.sources.map((source) => <span key={source}><i style={{ background: marketplaceColors[source] }} />{source}</span>)}</div><MarketWatchFilterSummary watch={watch} /><div className="research-watch-metrics"><div><span>Tracked</span><strong>{watch.totalListings}</strong></div><div><span>Ended</span><strong>{watch.endedListings}</strong></div><div><span>Median estimate</span><strong>{watch.estimatedMedianPrice === null ? "—" : formatPln(watch.estimatedMedianPrice)}</strong></div></div><div className="research-watch-footer"><span><Clock3 size={14} />Every {watch.intervalHours}h · Last {watch.lastScan} · Next {watch.nextScan}</span><div><button className="icon-button" title="Edit research filters" aria-label={`Edit ${watch.name}`} disabled={busyIds.has(watch.id)} onClick={() => openEdit(watch)}><SlidersHorizontal size={16} /></button><button className="icon-button" title="Scan research watch now" aria-label={`Scan ${watch.name} now`} disabled={busyIds.has(watch.id) || !watch.enabled} onClick={() => void scan(watch)}>{busyIds.has(watch.id) ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}</button><button className={`toggle ${watch.enabled ? "toggle--on" : ""}`} aria-label={watch.enabled ? `Pause ${watch.name}` : `Resume ${watch.name}`} disabled={busyIds.has(watch.id)} onClick={() => void toggle(watch)}>{watch.enabled ? <Pause size={13} /> : <Play size={13} />}</button><button className="icon-button danger-icon" title="Delete research watch" aria-label={`Delete ${watch.name}`} disabled={busyIds.has(watch.id)} onClick={() => void remove(watch)}><Trash2 size={16} /></button></div></div></article>)}</div> : <div className="page-empty"><BarChart3 size={28} /><strong>No market research watches yet</strong><span>Create one to start collecting daily asking-price snapshots.</span><button className="primary-button" onClick={openCreate}><Plus size={17} />New research watch</button></div>}
-    {data.watches.length ? <section className="research-history"><div className="section-heading-row"><h2>Saved listings</h2><div className="filters"><SelectControl value={selectedWatch === "All" ? "All research watches" : data.watches.find((watch) => watch.id === selectedWatch)?.name ?? "All research watches"} options={["All research watches", ...data.watches.map((watch) => watch.name)]} onChange={(value) => setSelectedWatch(value === "All research watches" ? "All" : data.watches.find((watch) => watch.name === value)?.id ?? "All")} /><SelectControl value={status === "All" ? "All statuses" : status === "active" ? "Active" : "Ended"} options={["All statuses", "Active", "Ended"]} onChange={(value) => setStatus(value === "Active" ? "active" : value === "Ended" ? "ended" : "All")} /></div></div><MarketResearchTable listings={visible} /></section> : null}
+    {data.watches.length ? <section className="research-history"><div className="section-heading-row"><h2>Saved listings</h2><div className="filters"><SelectControl value={selectedWatch} options={[{ value: "All", label: "All research watches" }, ...data.watches.map((watch) => ({ value: watch.id, label: watch.name }))]} onChange={(value) => { setSelectedWatch(value); setPage(1); }} /><SelectControl value={status} options={[{ value: "All", label: "All statuses" }, { value: "active", label: "Active" }, { value: "ended", label: "No longer available" }, { value: "superseded", label: "Previous series" }]} onChange={(value) => { setStatus(value as "All" | "active" | "ended" | "superseded"); setPage(1); }} /></div></div><MarketResearchTable listings={visible} />{data.pagination && (data.pagination.page > 1 || data.pagination.hasNext) ? <div className="research-pagination"><button className="outline-button" disabled={page <= 1 || loading} onClick={() => setPage((current) => Math.max(1, current - 1))}>Previous</button><span>Page {data.pagination.page} · {data.pagination.total.toLocaleString("pl-PL")} listings</span><button className="outline-button" disabled={!data.pagination.hasNext || loading} onClick={() => setPage((current) => current + 1)}>Next</button></div> : null}</section> : null}
     {showDialog ? <MarketWatchDialog key={editingWatch?.id ?? "new"} initialWatch={editingWatch} onClose={closeDialog} onSubmit={editingWatch ? update : create} /> : null}
   </>;
 }
@@ -1792,7 +1891,7 @@ function MarketWatchFilterSummary({ watch }: { watch: MarketWatch }) {
 
 function MarketResearchTable({ listings }: { listings: MarketTrackedListing[] }) {
   if (!listings.length) return <div className="empty-state"><Database size={24} /><strong>No saved listings in this view</strong><span>The first successful snapshot will populate this history.</span></div>;
-  return <div className="research-table-wrap"><div className="research-table research-table--head"><span>Listing</span><span>Status</span><span>First price</span><span>Last price</span><span>Change</span><span>Observations</span><span>Last seen / ended</span><span /></div>{listings.map((listing) => <div className="research-table research-listing-row" key={listing.id}><div className="research-listing"><MarketThumbnail listing={listing} /><div><strong>{listing.title}</strong><span><i style={{ background: marketplaceColors[listing.marketplace] }} />{listing.marketplace} · {listing.watchName}</span></div></div><span className={`research-status research-status--${listing.status}`}><i />{listing.status === "ended" ? "Ended" : listing.missingScans ? `Checking (${listing.missingScans}/3)` : "Active"}</span><span>{formatPln(listing.firstPrice)}</span><strong>{formatPln(listing.lastPrice)}{listing.status === "ended" ? <small>estimated sold</small> : null}</strong><span className={listing.priceChangePercent < 0 ? "price-down" : listing.priceChangePercent > 0 ? "price-up" : ""}>{listing.priceChangePercent === 0 ? "—" : `${listing.priceChangePercent > 0 ? "+" : ""}${listing.priceChangePercent.toFixed(1)}%`}</span><span>{listing.observations}</span><span>{new Date(listing.endedAt ?? listing.lastSeenAt).toLocaleDateString("pl-PL", { day: "2-digit", month: "short", year: "numeric" })}</span><a href={listing.url} target="_blank" rel="noreferrer" className="external-link" aria-label={`Open ${listing.title}`}><ExternalLink size={17} /></a></div>)}</div>;
+  return <div className="research-table-wrap"><div className="research-table research-table--head"><span>Listing</span><span>Status</span><span>First price</span><span>Last price</span><span>Change</span><span>Observations</span><span>Last seen / ended</span><span /></div>{listings.map((listing) => <div className="research-table research-listing-row" key={listing.id}><div className="research-listing"><MarketThumbnail listing={listing} /><div><strong>{listing.title}</strong><span><i style={{ background: marketplaceColors[listing.marketplace] }} />{listing.marketplace} · {listing.watchName}</span></div></div><span className={`research-status research-status--${listing.status}`}><i />{listing.status === "ended" ? "No longer available" : listing.status === "superseded" ? "Previous series" : listing.missingScans ? `Verifying (${listing.missingScans}/3)` : "Active"}</span><span>{formatPln(listing.firstPrice)}</span><strong>{formatPln(listing.lastPrice)}{listing.status === "ended" ? <small>last asking price · not a confirmed sale</small> : null}</strong><span className={listing.priceChangePercent < 0 ? "price-down" : listing.priceChangePercent > 0 ? "price-up" : ""}>{listing.priceChangePercent === 0 ? "—" : `${listing.priceChangePercent > 0 ? "+" : ""}${listing.priceChangePercent.toFixed(1)}%`}</span><span>{listing.observations}</span><span>{new Date(listing.endedAt ?? listing.lastSeenAt).toLocaleDateString("pl-PL", { day: "2-digit", month: "short", year: "numeric" })}</span><a href={listing.url} target="_blank" rel="noreferrer" className="external-link" aria-label={`Open ${listing.title}`}><ExternalLink size={17} /></a></div>)}</div>;
 }
 
 function MarketThumbnail({ listing }: { listing: MarketTrackedListing }) {
@@ -1828,17 +1927,17 @@ function MarketWatchDialog({ initialWatch, onClose, onSubmit }: { initialWatch: 
     catch (submitError) { setError(errorMessage(submitError)); setSubmitting(false); }
   };
   const editing = Boolean(initialWatch);
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !submitting && onClose()}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="market-watch-title"><div className="modal-header"><div><span className="modal-kicker">Market research</span><h2 id="market-watch-title">{editing ? "Edit research watch" : "New research watch"}</h2><p>{editing ? "Adjust the search and price filters used by future snapshots." : "Save recurring search snapshots and estimate where listings leave the market."}</p></div><button className="icon-button" disabled={submitting} onClick={onClose} aria-label="Close"><X size={20} /></button></div><div className="modal-body"><label className="field-label">Watch name<input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Used RTX 4070 market" /></label><label className="field-label">Search phrase<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="e.g. RTX 4070" /></label><div className="field-row"><label className="field-label">Included terms<input value={terms} onChange={(event) => setTerms(event.target.value)} placeholder="e.g. 12gb, founders edition" /></label><label className="field-label">Excluded terms<input value={excluded} onChange={(event) => setExcluded(event.target.value)} placeholder="e.g. broken, parts" /></label></div><div className="field-row"><label className="field-label">Location <span>where available</span><input value={location} onChange={(event) => setLocation(event.target.value)} placeholder="Anywhere" /></label><label className="field-label">Condition<select value={condition} onChange={(event) => setCondition(event.target.value)}><option>Any</option><option>New</option><option>Used</option><option>Like new</option><option>Very good</option><option>Good</option></select></label></div><div className="field-row"><label className="field-label">Minimum price <span>PLN · optional</span><input type="number" min="0" step="1" value={minPrice} onChange={(event) => setMinPrice(event.target.value)} placeholder="No minimum" /></label><label className="field-label">Maximum price <span>PLN · optional</span><input type="number" min="1" step="1" value={maxPrice} onChange={(event) => setMaxPrice(event.target.value)} placeholder="No maximum" /></label></div><div className="field-row"><label className="field-label">Snapshot interval <span>6–168 hours</span><input type="number" min="6" max="168" value={interval} onChange={(event) => setIntervalValue(event.target.value)} /></label><div className="field-label"><span>Sources</span><div className="source-options">{(["OLX", "Allegro Lokalnie", "Vinted"] as Marketplace[]).map((source) => <button type="button" key={source} className={`source-option ${sources.includes(source) ? "source-option--selected" : ""}`} onClick={() => toggleSource(source)}><i style={{ background: marketplaceColors[source] }} />{source}{sources.includes(source) ? <Check size={15} /> : null}</button>)}</div></div></div><label className="check-option check-option--modal"><input type="checkbox" checked={shippingOnly} onChange={(event) => setShippingOnly(event.target.checked)} /><span><strong>Require shipping</strong><small>Only save listings with confirmed delivery options</small></span></label>{error ? <div className="form-error" role="alert"><AlertTriangle size={15} />{error}</div> : null}{!validPrices ? <div className="form-error" role="alert"><AlertTriangle size={15} />Minimum price cannot exceed maximum price.</div> : null}<div className="modal-note"><Info size={16} /><span>Scout cannot see private checkout prices. “Estimated sold” means the last public asking price before three consecutive successful scans no longer found the listing.</span></div></div><div className="modal-footer"><button className="outline-button" disabled={submitting} onClick={onClose}>Cancel</button><button className="primary-button" disabled={!valid || submitting} onClick={submit}>{submitting ? <LoaderCircle size={17} className="spin" /> : editing ? <Check size={17} /> : <Plus size={17} />}{submitting ? "Saving…" : editing ? "Save research watch" : "Create research watch"}</button></div></section></div>;
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !submitting && onClose()}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="market-watch-title"><div className="modal-header"><div><span className="modal-kicker">Market research</span><h2 id="market-watch-title">{editing ? "Edit research watch" : "New research watch"}</h2><p>{editing ? "Changing search criteria starts a new comparable series; previous observations remain available." : "Save recurring search snapshots and compare asking-price history."}</p></div><button className="icon-button" disabled={submitting} onClick={onClose} aria-label="Close"><X size={20} /></button></div><div className="modal-body"><label className="field-label">Watch name<input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Used RTX 4070 market" /></label><label className="field-label">Search phrase<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="e.g. RTX 4070" /></label><div className="field-row"><label className="field-label">Included terms<input value={terms} onChange={(event) => setTerms(event.target.value)} placeholder="e.g. 12gb, founders edition" /></label><label className="field-label">Excluded terms<input value={excluded} onChange={(event) => setExcluded(event.target.value)} placeholder="e.g. broken, parts" /></label></div><div className="field-row"><label className="field-label">Location <span>where available</span><input value={location} onChange={(event) => setLocation(event.target.value)} placeholder="Anywhere" /></label><label className="field-label">Condition<select value={condition} onChange={(event) => setCondition(event.target.value)}><option>Any</option><option>New</option><option>Used</option><option>Like new</option><option>Very good</option><option>Good</option></select></label></div><div className="field-row"><label className="field-label">Minimum price <span>PLN · optional</span><input type="number" min="0" step="1" value={minPrice} onChange={(event) => setMinPrice(event.target.value)} placeholder="No minimum" /></label><label className="field-label">Maximum price <span>PLN · optional</span><input type="number" min="1" step="1" value={maxPrice} onChange={(event) => setMaxPrice(event.target.value)} placeholder="No maximum" /></label></div><div className="field-row"><label className="field-label">Snapshot interval <span>6–168 hours</span><input type="number" min="6" max="168" value={interval} onChange={(event) => setIntervalValue(event.target.value)} /></label><div className="field-label"><span>Sources</span><div className="source-options">{(["OLX", "Allegro Lokalnie", "Vinted"] as Marketplace[]).map((source) => <button type="button" key={source} className={`source-option ${sources.includes(source) ? "source-option--selected" : ""}`} onClick={() => toggleSource(source)}><i style={{ background: marketplaceColors[source] }} />{source}{sources.includes(source) ? <Check size={15} /> : null}</button>)}</div></div></div><label className="check-option check-option--modal"><input type="checkbox" checked={shippingOnly} onChange={(event) => setShippingOnly(event.target.checked)} /><span><strong>Require shipping</strong><small>Only save listings with confirmed delivery options</small></span></label>{error ? <div className="form-error" role="alert"><AlertTriangle size={15} />{error}</div> : null}{!validPrices ? <div className="form-error" role="alert"><AlertTriangle size={15} />Minimum price cannot exceed maximum price.</div> : null}<div className="modal-note"><Info size={16} /><span>Scout displays “no longer available” only after verified terminal checks. The retained last asking price is not a confirmed sale price.</span></div></div><div className="modal-footer"><button className="outline-button" disabled={submitting} onClick={onClose}>Cancel</button><button className="primary-button" disabled={!valid || submitting} onClick={submit}>{submitting ? <LoaderCircle size={17} className="spin" /> : editing ? <Check size={17} /> : <Plus size={17} />}{submitting ? "Saving…" : editing ? "Save research watch" : "Create research watch"}</button></div></section></div>;
 }
 
 function ListingsPage({
   listings,
-  selectedWatchName,
+  selectedWatchId,
   onClearWatch,
   onSelectListing,
 }: {
   listings: Listing[];
-  selectedWatchName: string | null;
+  selectedWatchId: string | null;
   onClearWatch: () => void;
   onSelectListing: (listing: Listing) => void;
 }) {
@@ -1855,7 +1954,7 @@ function ListingsPage({
         )
         .filter(
           (listing) =>
-            !selectedWatchName || listing.watch === selectedWatchName,
+            !selectedWatchId || listing.watchId === selectedWatchId,
         )
         .filter((listing) =>
           `${listing.title} ${listing.subtitle} ${listing.condition ?? ""} ${listing.location ?? ""}`
@@ -1871,7 +1970,7 @@ function ListingsPage({
               ? a.price - b.price
               : Date.parse(b.observedAt) - Date.parse(a.observedAt),
         ),
-    [listings, marketplace, search, selectedWatchName, sort, decision],
+    [listings, marketplace, search, selectedWatchId, sort, decision],
   );
   return (
     <>
@@ -1923,10 +2022,10 @@ function ListingsPage({
           onChange={(value) => setDecision(value === "Buy" ? "buy" : value === "Watch" ? "watch" : value === "Pass" ? "pass" : "All")}
         />
       </div>
-      {selectedWatchName ? (
+      {selectedWatchId ? (
         <div className="active-filter">
           <span>
-            Showing listings for <strong>{selectedWatchName}</strong>
+            Showing listings for <strong>{listings.find((listing) => listing.watchId === selectedWatchId)?.watch ?? selectedWatchId}</strong>
           </span>
           <button onClick={onClearWatch}>
             <X size={14} />
@@ -1940,6 +2039,87 @@ function ListingsPage({
         <span>
           Listing history is retained for 180 days. Thumbnail cache is pruned
           separately.
+        </span>
+      </div>
+    </>
+  );
+}
+
+function MessagesPage({ refreshKey }: { refreshKey: number }) {
+  const [messages, setMessages] = useState<SellerMessage[]>([]);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    api.messages()
+      .then((result) => {
+        if (!active) return;
+        setMessages(result.messages);
+        setSelectedId((current) => current && result.messages.some((message) => message.id === current) ? current : result.messages[0]?.id ?? null);
+        setError(null);
+      })
+      .catch((loadError) => {
+        if (active) setError(errorMessage(loadError));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [refreshKey]);
+
+  const selected = messages.find((message) => message.id === selectedId) ?? null;
+  const sentCount = messages.filter((message) => message.status === "sent").length;
+  return (
+    <>
+      <PageHeader
+        title="Messages"
+        description="Review the seller messages Scout has sent from your account."
+      />
+      <div className="messages-explainer">
+        <div className="messages-explainer-icon" aria-hidden="true">
+          <MessageSquare size={22} />
+        </div>
+        <div>
+          <strong>AI-assisted marketplace messaging is ready.</strong>
+          <span>
+            OpenRouter asks the configured DeepSeek model for one concise Polish
+            negotiation message, then Scout sends it through your authenticated OLX
+            or Allegro Lokalnie session. Automatic sends are opt-in and bounded in
+            Settings.
+          </span>
+        </div>
+        <span className="messages-status">OLX + Allegro Lokalnie</span>
+      </div>
+      <section className="messages-layout" aria-label="Seller messages">
+        <div className="messages-panel messages-inbox">
+          <div className="messages-panel-heading">
+            <div>
+              <span className="messages-kicker">Outbound</span>
+              <h2>Sent messages</h2>
+            </div>
+            <span className="messages-count">{sentCount}</span>
+          </div>
+          <div className="messages-filter-row" aria-label="Conversation filters">
+            <span className="messages-filter messages-filter--active">All</span>
+            <span className="messages-filter">OLX · Allegro Lokalnie</span>
+          </div>
+          {loading ? <div className="messages-empty"><LoaderCircle size={22} className="spin" /><span>Loading message history…</span></div> : error ? <div className="messages-empty"><AlertTriangle size={22} /><strong>Could not load messages</strong><span>{error}</span></div> : messages.length ? <div className="messages-thread-list">{messages.map((message) => <button key={message.id} className={`messages-thread ${selectedId === message.id ? "messages-thread--active" : ""}`} type="button" onClick={() => setSelectedId(message.id)}><i className={`messages-thread-dot messages-thread-dot--${message.status}`} /><div><strong>{message.listingTitle}</strong><span>{message.marketplace} · {message.source === "automatic" ? "Automatic · " : "Manual · "}{new Date(message.createdAt).toLocaleString("pl-PL", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</span><small>{message.message}</small></div><b>{message.status === "sent" ? "Sent" : "Failed"}</b></button>)}</div> : <div className="messages-empty"><div className="messages-empty-icon" aria-hidden="true"><MessageSquare size={24} /></div><strong>No messages yet</strong><span>Open a saved OLX or Allegro Lokalnie listing or enable automatic negotiation in Settings to start a seller conversation.</span></div>}
+        </div>
+        <aside className="messages-panel messages-detail">
+          {selected ? <><div className="messages-panel-heading"><div><span className="messages-kicker">Message detail</span><h2>{selected.listingTitle}</h2></div><MessageSquare size={18} aria-hidden="true" /></div><div className="messages-detail-body"><div className="messages-detail-meta"><span>{selected.marketplace} · {selected.source === "automatic" ? "Automatic" : "Manual"} · {new Date(selected.createdAt).toLocaleString("pl-PL", { dateStyle: "medium", timeStyle: "short" })}</span><strong className={`messages-delivery messages-delivery--${selected.status}`}>{selected.status === "sent" ? "Sent" : "Failed"}</strong></div><div className="messages-bubble"><span>You</span><p>{selected.message}</p></div>{selected.offerPrice !== null ? <div className="messages-offer"><span>Opening offer</span><strong>{formatPln(selected.offerPrice)}</strong></div> : null}{selected.error ? <div className="messages-error"><AlertTriangle size={15} />{selected.error}</div> : null}<a className="outline-button messages-listing-link" href={selected.listingUrl} target="_blank" rel="noreferrer"><ExternalLink size={15} />Open {selected.marketplace} listing</a></div></> : <><div className="messages-panel-heading"><div><span className="messages-kicker">Message detail</span><h2>Nothing selected</h2></div><MessageSquare size={18} aria-hidden="true" /></div><div className="messages-detail-empty"><MessageSquare size={28} aria-hidden="true" /><strong>Select a sent message to review it</strong><span>Replies are not imported yet. Continue the conversation on the marketplace.</span></div></>}
+        </aside>
+      </section>
+      <div className="soft-note messages-note">
+        <ShieldCheck size={17} />
+        <span>
+          Scout sends at most one automatic attempt per listing; manual
+          messages still require an explicit confirmation. Seller replies
+          remain in OLX for now.
         </span>
       </div>
     </>
@@ -1998,8 +2178,20 @@ function ListingDetailDrawer({
   const [resalePrice, setResalePrice] = useState(listing.typical === null ? "" : String(listing.typical));
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [normalizing, setNormalizing] = useState(false);
+  const [negotiating, setNegotiating] = useState(false);
+  const [recommending, setRecommending] = useState(false);
+  const [negotiationMaxTotal, setNegotiationMaxTotal] = useState("");
+  const [negotiationShippingCost, setNegotiationShippingCost] = useState("");
+  const [negotiationOtherCosts, setNegotiationOtherCosts] = useState("");
+  const [negotiationOffer, setNegotiationOffer] = useState("");
+  const [negotiationRecommendation, setNegotiationRecommendation] = useState<NegotiationRecommendation | null>(null);
+  const [lastNegotiation, setLastNegotiation] = useState<SellerMessage | null>(null);
+  const [storedListing, setStoredListing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const currentListing = detail.listing;
+  const marketplaceListingKey = currentListing.marketplaceListingKey ?? currentListing.id;
+  const canMessageMarketplace = currentListing.marketplace === "OLX" || currentListing.marketplace === "Allegro Lokalnie";
   const totalCost = currentListing.price + (Number(shippingCost) || 0) + (Number(extraCost) || 0);
   const expectedResale = resalePrice === "" ? null : Number(resalePrice);
   const expectedProfit = expectedResale === null || !Number.isFinite(expectedResale) ? null : expectedResale - totalCost;
@@ -2021,12 +2213,20 @@ function ListingDetailDrawer({
     setResalePrice(listing.typical === null ? "" : String(listing.typical));
     setShippingCost("");
     setExtraCost("");
+    setNegotiationOffer("");
+    setNegotiationMaxTotal("");
+    setNegotiationShippingCost("");
+    setNegotiationOtherCosts("");
+    setNegotiationRecommendation(null);
+    setLastNegotiation(null);
     setError(null);
     setLoading(true);
+    setStoredListing(false);
     api
-      .listingDetail(listing.id)
+      .listingDetail(listing.marketplaceListingKey ?? listing.id, listing.watchId)
       .then((result) => {
         if (!active) return;
+        setStoredListing(true);
         setDetail(result);
         setDecision(result.action.decision);
         setNote(result.action.note);
@@ -2035,7 +2235,7 @@ function ListingDetailDrawer({
       .catch(async () => {
         // Manual search results do not have stored observations yet, but their triage action can still persist.
         try {
-          const action = await api.listingAction(listing.id);
+          const action = await api.listingAction(listing.marketplaceListingKey ?? listing.id);
           if (!active) return;
           setDetail((current) => ({ ...current, action }));
           setDecision(action.decision);
@@ -2050,7 +2250,7 @@ function ListingDetailDrawer({
     return () => {
       active = false;
     };
-  }, [listing.id]);
+  }, [listing.id, listing.watchId, listing.marketplaceListingKey]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -2064,7 +2264,7 @@ function ListingDetailDrawer({
     setSaving(true);
     setError(null);
     try {
-      const result = await api.updateListingAction(listing.id, { decision: nextDecision, note });
+      const result = await api.updateListingAction(marketplaceListingKey, { decision: nextDecision, note });
       const updatedListing = { ...detail.listing, decision: result.action.decision, note: result.action.note };
       setDetail((current) => ({ ...current, listing: updatedListing, action: result.action }));
       setDecision(result.action.decision);
@@ -2074,6 +2274,81 @@ function ListingDetailDrawer({
       setError(errorMessage(saveError));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const normalizeWithAi = async () => {
+    setNormalizing(true);
+    setError(null);
+    try {
+      const result = await api.normalizeListing(marketplaceListingKey, Boolean(currentListing.aiNormalizationError));
+      setDetail(result);
+      setDecision(result.action.decision);
+      setNote(result.action.note);
+      onUpdated(result.listing);
+    } catch (normalizeError) {
+      setError(errorMessage(normalizeError));
+    } finally {
+      setNormalizing(false);
+    }
+  };
+
+  const suggestNegotiationOffer = async () => {
+    if (!canMessageMarketplace || !storedListing) return;
+    const maxTotalCost = Number(negotiationMaxTotal);
+    const shippingCost = negotiationShippingCost.trim() === "" ? 0 : Number(negotiationShippingCost);
+    const otherCosts = negotiationOtherCosts.trim() === "" ? 0 : Number(negotiationOtherCosts);
+    if (!Number.isFinite(maxTotalCost) || maxTotalCost <= 0) {
+      setError("Enter a positive maximum total cost before asking for a suggestion.");
+      return;
+    }
+    if (![shippingCost, otherCosts].every((value) => Number.isFinite(value) && value >= 0)) {
+      setError("Known delivery and fee costs must be zero or positive.");
+      return;
+    }
+    setRecommending(true);
+    setError(null);
+    try {
+      const result = await api.recommendNegotiation(marketplaceListingKey, { maxTotalCost, shippingCost, otherCosts });
+      setNegotiationRecommendation(result);
+      if (result.openingOffer !== null) setNegotiationOffer(String(result.openingOffer));
+    } catch (recommendationError) {
+      setError(errorMessage(recommendationError));
+    } finally {
+      setRecommending(false);
+    }
+  };
+
+  const negotiateWithAi = async () => {
+    if (!canMessageMarketplace || !storedListing) return;
+    const offerPrice = negotiationOffer.trim() === "" ? null : Number(negotiationOffer);
+    if (offerPrice !== null && (!Number.isFinite(offerPrice) || offerPrice <= 0 || offerPrice >= currentListing.price)) {
+      setError("Opening offer must be positive and lower than the listing price.");
+      return;
+    }
+    const maxTotalCost = negotiationMaxTotal.trim() === "" ? null : Number(negotiationMaxTotal);
+    const shippingCost = negotiationShippingCost.trim() === "" ? 0 : Number(negotiationShippingCost);
+    const otherCosts = negotiationOtherCosts.trim() === "" ? 0 : Number(negotiationOtherCosts);
+    if (maxTotalCost !== null && (!Number.isFinite(maxTotalCost) || maxTotalCost <= 0)) {
+      setError("Maximum total cost must be positive when provided.");
+      return;
+    }
+    if (![shippingCost, otherCosts].every((value) => Number.isFinite(value) && value >= 0)) {
+      setError("Known delivery and fee costs must be zero or positive.");
+      return;
+    }
+    const offerText = offerPrice === null ? "without a fixed offer" : `at ${formatPln(offerPrice)}`;
+    if (!window.confirm(`Generate a Polish negotiation message with AI and send it to this ${currentListing.marketplace} seller ${offerText}?`)) return;
+    setNegotiating(true);
+    setError(null);
+    try {
+      const budget = maxTotalCost === null ? undefined : { maxTotalCost, shippingCost, otherCosts };
+      const result = await api.negotiateAndSend(marketplaceListingKey, offerPrice, budget);
+      setLastNegotiation(result.message);
+    } catch (negotiationError) {
+      setError(errorMessage(negotiationError));
+    } finally {
+      setNegotiating(false);
     }
   };
 
@@ -2108,6 +2383,87 @@ function ListingDetailDrawer({
               <small>{currentListing.condition || "Condition not specified"}{currentListing.location ? ` · ${currentListing.location}` : ""}</small>
             </div>
           </div>
+
+          <section className="drawer-section drawer-section--ai">
+            <div className="drawer-section-heading">
+              <div><span className="drawer-section-kicker">AI enrichment</span><h3>Listing normalization</h3></div>
+              <Tag size={17} />
+            </div>
+            {currentListing.aiNormalization ? (
+              <>
+                <div className="ai-normalization-title">
+                  <strong>{currentListing.aiNormalization.canonicalTitle}</strong>
+                  <span>{currentListing.aiNormalization.category}{currentListing.aiNormalization.confidence < 0.65 ? " · low confidence" : ""}</span>
+                </div>
+                <div className="ai-normalization-fields">
+                  {[
+                    ["Brand", currentListing.aiNormalization.brand],
+                    ["Model", currentListing.aiNormalization.model],
+                    ["Variant", currentListing.aiNormalization.variant],
+                    ["Condition", currentListing.aiNormalization.condition],
+                  ].filter(([, value]) => value).map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong></div>)}
+                </div>
+                {currentListing.aiNormalization.attributes.length ? <div className="ai-normalization-tags">{currentListing.aiNormalization.attributes.map((attribute) => <span key={`${attribute.name}-${attribute.value}`}>{attribute.name}: {attribute.value}</span>)}</div> : null}
+                {currentListing.aiNormalization.flags.length ? <div className="ai-normalization-warning"><AlertTriangle size={14} />{currentListing.aiNormalization.flags.join(" · ")}</div> : null}
+                {currentListing.aiNormalization.conditionNotes.length ? <p className="drawer-section-copy">Condition signals: {currentListing.aiNormalization.conditionNotes.join(" · ")}</p> : null}
+                {currentListing.aiNormalization.evidence.length ? <p className="drawer-section-copy">Evidence: {currentListing.aiNormalization.evidence.join(" · ")}</p> : null}
+              </>
+            ) : (
+              <p className="drawer-section-copy">No normalized product identity has been stored for this listing yet.</p>
+            )}
+            {storedListing ? <button className="outline-button ai-normalize-button" type="button" disabled={normalizing} onClick={() => void normalizeWithAi()}>{normalizing ? <LoaderCircle size={15} className="spin" /> : <Tag size={15} />}{normalizing ? "Normalizing…" : currentListing.aiNormalizationError ? "Retry normalization" : currentListing.aiNormalization ? "Refresh normalization" : "Normalize with AI"}</button> : <span className="drawer-muted">AI normalization is available after a listing is saved by a watch.</span>}
+            {currentListing.aiNormalizationError ? <div className="ai-normalization-error"><AlertTriangle size={14} />{currentListing.aiNormalizationError}</div> : null}
+          </section>
+
+          <section className="drawer-section drawer-section--negotiation">
+            <div className="drawer-section-heading">
+              <div><span className="drawer-section-kicker">Seller contact</span><h3>Negotiate with AI</h3></div>
+              <Send size={17} />
+            </div>
+            {canMessageMarketplace ? <>
+              <p className="drawer-section-copy">Scout calculates the money first from the current asking price and your total-cost limit. OpenRouter only writes the final Polish message with the configured DeepSeek model.</p>
+              <div className="negotiation-budget-grid">
+                <label className="drawer-note-label negotiation-budget-label">
+                  Maximum total cost <span>required for a suggestion · PLN</span>
+                  <input type="number" min="1" step="1" value={negotiationMaxTotal} onChange={(event) => { setNegotiationMaxTotal(event.target.value); setNegotiationRecommendation(null); setNegotiationOffer(""); }} placeholder="e.g. 2100" disabled={!storedListing || recommending || negotiating} />
+                </label>
+                <label className="drawer-note-label negotiation-budget-label">
+                  Delivery and fees <span>optional · PLN</span>
+                  <input type="number" min="0" step="1" value={negotiationShippingCost} onChange={(event) => { setNegotiationShippingCost(event.target.value); setNegotiationRecommendation(null); setNegotiationOffer(""); }} placeholder="e.g. 15" disabled={!storedListing || recommending || negotiating} />
+                </label>
+              </div>
+              <label className="drawer-note-label negotiation-budget-label">
+                Other known costs <span>optional · PLN</span>
+                <input type="number" min="0" step="1" value={negotiationOtherCosts} onChange={(event) => { setNegotiationOtherCosts(event.target.value); setNegotiationRecommendation(null); setNegotiationOffer(""); }} placeholder="0" disabled={!storedListing || recommending || negotiating} />
+              </label>
+              <button className="outline-button negotiation-suggest-button" type="button" disabled={!storedListing || recommending || negotiating} onClick={() => void suggestNegotiationOffer()}>
+                {recommending ? <LoaderCircle size={15} className="spin" /> : <Calculator size={15} />}
+                {recommending ? "Calculating…" : "Suggest an offer"}
+              </button>
+              {negotiationRecommendation ? <div className={`negotiation-recommendation negotiation-recommendation--${negotiationRecommendation.status}`} aria-live="polite">
+                <div className="negotiation-recommendation-heading">
+                  <div>
+                    <span className="drawer-section-kicker">Deterministic price policy</span>
+                    <strong>{negotiationRecommendation.status === "ready" ? "Suggested opening offer" : negotiationRecommendation.status === "budget-required" ? "Budget needed" : negotiationRecommendation.status === "not-negotiable" ? "Fixed-price listing" : negotiationRecommendation.status === "manual-review" ? "Manual review needed" : negotiationRecommendation.status === "budget-too-low" ? "Budget is too low" : "No safe offer"}</strong>
+                  </div>
+                  {negotiationRecommendation.openingOffer !== null ? <b>{formatPln(negotiationRecommendation.openingOffer)}</b> : null}
+                </div>
+                {negotiationRecommendation.openingOffer !== null ? <div className="negotiation-recommendation-metrics"><span>Current ask <strong>{formatPln(negotiationRecommendation.askingPrice)}</strong></span><span>Ceiling <strong>{formatPln(negotiationRecommendation.ceilingPrice)}</strong></span><span>Opening gap <strong>{negotiationRecommendation.openingDiscountPercent?.toFixed(1)}%</strong></span></div> : null}
+                <p>{negotiationRecommendation.rationale}</p>
+                {negotiationRecommendation.counterOffers.length ? <small>Possible path: {negotiationRecommendation.counterOffers.map((offer) => formatPln(offer)).join(" → ")}</small> : null}
+              </div> : null}
+              <label className="drawer-note-label negotiation-offer-label">
+                Opening offer <span>optional · PLN</span>
+                <input type="number" min="1" max={Math.max(1, currentListing.price - 0.01)} step="0.01" value={negotiationOffer} onChange={(event) => setNegotiationOffer(event.target.value)} placeholder="Ask for a reduction without naming a price" disabled={!storedListing || recommending || negotiating} />
+              </label>
+              <button className="primary-button drawer-negotiate-button" type="button" disabled={!storedListing || negotiating || saving} onClick={() => void negotiateWithAi()}>
+                {negotiating ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}
+                {negotiating ? "Writing and sending…" : "Negotiate with AI"}
+              </button>
+              {!storedListing ? <span className="drawer-muted">Save this listing through a watch before contacting the seller.</span> : null}
+              {lastNegotiation ? <div className="negotiation-success"><CheckCircle2 size={15} /><div><strong>Message sent</strong><p>{lastNegotiation.message}</p></div></div> : null}
+            </> : <p className="drawer-section-copy">AI seller negotiation is currently available for OLX and Allegro Lokalnie listings.</p>}
+          </section>
 
           <section className="drawer-section drawer-section--decision">
             <div className="drawer-section-heading">
@@ -2426,10 +2782,23 @@ function SettingsPage({
   const [webhook, setWebhook] = useState("");
   const [interval, setIntervalValue] = useState("5");
   const [nightInterval, setNightInterval] = useState("30");
+  const [aiModel, setAiModel] = useState("");
+  const [aiApiKey, setAiApiKey] = useState("");
+  const [autoNegotiationEnabled, setAutoNegotiationEnabled] = useState(false);
+  const [autoNegotiationMaxTotal, setAutoNegotiationMaxTotal] = useState("");
+  const [autoNegotiationShipping, setAutoNegotiationShipping] = useState("0");
+  const [autoNegotiationOtherCosts, setAutoNegotiationOtherCosts] = useState("0");
+  const [autoNegotiationMinimumDiscount, setAutoNegotiationMinimumDiscount] = useState("18");
+  const [autoNegotiationOpeningDiscount, setAutoNegotiationOpeningDiscount] = useState("12");
+  const [autoNegotiationDailyLimit, setAutoNegotiationDailyLimit] = useState("3");
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testingNtfy, setTestingNtfy] = useState(false);
   const [discordMinimumPriority, setDiscordMinimumPriority] = useState<NotificationPriority>("strong");
+  const [dailyDigestEnabled, setDailyDigestEnabled] = useState(false);
+  const [dailyDigestTime, setDailyDigestTime] = useState("08:00");
+  const [dailyDigestDiscord, setDailyDigestDiscord] = useState(true);
+  const [dailyDigestNtfy, setDailyDigestNtfy] = useState(false);
   const [ntfyServerUrl, setNtfyServerUrl] = useState("https://ntfy.sh");
   const [ntfyTopic, setNtfyTopic] = useState("");
   const [ntfyToken, setNtfyToken] = useState("");
@@ -2445,7 +2814,19 @@ function SettingsPage({
       setSettings(result);
       setIntervalValue(String(result.defaultInterval));
       setNightInterval(String(result.nightInterval));
+      setAiModel(result.ai?.model ?? "");
+      setAutoNegotiationEnabled(result.autoNegotiation?.enabled ?? false);
+      setAutoNegotiationMaxTotal(result.autoNegotiation?.maxTotalCost === null || result.autoNegotiation?.maxTotalCost === undefined ? "" : String(result.autoNegotiation.maxTotalCost));
+      setAutoNegotiationShipping(String(result.autoNegotiation?.shippingCost ?? 0));
+      setAutoNegotiationOtherCosts(String(result.autoNegotiation?.otherCosts ?? 0));
+      setAutoNegotiationMinimumDiscount(String(result.autoNegotiation?.minimumDiscountPercent ?? 18));
+      setAutoNegotiationOpeningDiscount(String(result.autoNegotiation?.openingDiscountPercent ?? 12));
+      setAutoNegotiationDailyLimit(String(result.autoNegotiation?.dailyLimit ?? 3));
       setDiscordMinimumPriority(result.discordMinimumPriority);
+      setDailyDigestEnabled(result.dailyDigest?.enabled ?? false);
+      setDailyDigestTime(result.dailyDigest?.time ?? "08:00");
+      setDailyDigestDiscord(result.dailyDigest?.discord ?? true);
+      setDailyDigestNtfy(result.dailyDigest?.ntfy ?? false);
       setNtfyServerUrl(result.ntfy?.serverUrl ?? "https://ntfy.sh");
       setNtfyMinimumPriority(result.ntfy?.minimumPriority ?? "exceptional");
     } catch (error) {
@@ -2474,6 +2855,40 @@ function SettingsPage({
       onToast("Night polling interval must be between 5 and 1440 minutes.", "error");
       return;
     }
+    const autoMaxTotal = autoNegotiationMaxTotal.trim() === "" ? null : Number(autoNegotiationMaxTotal);
+    const autoShipping = autoNegotiationShipping.trim() === "" ? 0 : Number(autoNegotiationShipping);
+    const autoOtherCosts = autoNegotiationOtherCosts.trim() === "" ? 0 : Number(autoNegotiationOtherCosts);
+    const autoMinimumDiscount = Number(autoNegotiationMinimumDiscount);
+    const autoOpeningDiscount = Number(autoNegotiationOpeningDiscount);
+    const autoDailyLimit = Number(autoNegotiationDailyLimit);
+    if (autoNegotiationEnabled && (autoMaxTotal === null || !Number.isFinite(autoMaxTotal) || autoMaxTotal <= 0)) {
+      onToast("Set a positive maximum total cost before enabling automatic negotiation.", "error");
+      return;
+    }
+    if (![autoShipping, autoOtherCosts].every((value) => Number.isFinite(value) && value >= 0)) {
+      onToast("Automatic negotiation known costs must be zero or positive.", "error");
+      return;
+    }
+    if (!Number.isFinite(autoMinimumDiscount) || autoMinimumDiscount < 18 || autoMinimumDiscount > 80) {
+      onToast("Minimum deal discount must be between 18% and 80%.", "error");
+      return;
+    }
+    if (!Number.isFinite(autoOpeningDiscount) || autoOpeningDiscount < 1 || autoOpeningDiscount > 50) {
+      onToast("Opening discount must be between 1% and 50%.", "error");
+      return;
+    }
+    if (!Number.isInteger(autoDailyLimit) || autoDailyLimit < 1 || autoDailyLimit > 50) {
+      onToast("Daily attempt limit must be between 1 and 50.", "error");
+      return;
+    }
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(dailyDigestTime)) {
+      onToast("Choose a valid daily digest time.", "error");
+      return;
+    }
+    if (dailyDigestEnabled && !dailyDigestDiscord && !dailyDigestNtfy) {
+      onToast("Select Discord, ntfy, or both for daily digests.", "error");
+      return;
+    }
     setSaving(true);
     try {
       const ntfyTouched = Boolean(
@@ -2487,6 +2902,25 @@ function SettingsPage({
         nightInterval: numericNightInterval,
         webhook: webhook.trim() || undefined,
         discordMinimumPriority,
+        dailyDigest: {
+          enabled: dailyDigestEnabled,
+          time: dailyDigestTime,
+          discord: dailyDigestDiscord,
+          ntfy: dailyDigestNtfy,
+        },
+        ai: {
+          model: aiModel.trim() || undefined,
+          apiKey: aiApiKey.trim() || undefined,
+        },
+        autoNegotiation: {
+          enabled: autoNegotiationEnabled,
+          maxTotalCost: autoMaxTotal,
+          shippingCost: autoShipping,
+          otherCosts: autoOtherCosts,
+          minimumDiscountPercent: autoMinimumDiscount,
+          openingDiscountPercent: autoOpeningDiscount,
+          dailyLimit: autoDailyLimit,
+        },
         ntfy: ntfyTouched
           ? {
               serverUrl: ntfyServerUrl.trim() || undefined,
@@ -2500,6 +2934,19 @@ function SettingsPage({
       setIntervalValue(String(result.defaultInterval));
       setNightInterval(String(result.nightInterval));
       setWebhook("");
+      setAiApiKey("");
+      setAiModel(result.ai?.model ?? "");
+      setDailyDigestEnabled(result.dailyDigest?.enabled ?? false);
+      setDailyDigestTime(result.dailyDigest?.time ?? "08:00");
+      setDailyDigestDiscord(result.dailyDigest?.discord ?? true);
+      setDailyDigestNtfy(result.dailyDigest?.ntfy ?? false);
+      setAutoNegotiationEnabled(result.autoNegotiation?.enabled ?? false);
+      setAutoNegotiationMaxTotal(result.autoNegotiation?.maxTotalCost === null || result.autoNegotiation?.maxTotalCost === undefined ? "" : String(result.autoNegotiation.maxTotalCost));
+      setAutoNegotiationShipping(String(result.autoNegotiation?.shippingCost ?? 0));
+      setAutoNegotiationOtherCosts(String(result.autoNegotiation?.otherCosts ?? 0));
+      setAutoNegotiationMinimumDiscount(String(result.autoNegotiation?.minimumDiscountPercent ?? 18));
+      setAutoNegotiationOpeningDiscount(String(result.autoNegotiation?.openingDiscountPercent ?? 12));
+      setAutoNegotiationDailyLimit(String(result.autoNegotiation?.dailyLimit ?? 3));
       setNtfyTopic("");
       setNtfyToken("");
       setNtfyServerUrl(result.ntfy?.serverUrl ?? "https://ntfy.sh");
@@ -2552,6 +2999,23 @@ function SettingsPage({
       setNtfyToken("");
       setNtfyMinimumPriority(result.ntfy?.minimumPriority ?? "exceptional");
       onToast("ntfy configuration removed.");
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+    } finally {
+      setSaving(false);
+    }
+  };
+  const clearAiApiKey = async () => {
+    if (!window.confirm("Remove the saved OpenRouter API key?")) return;
+    setSaving(true);
+    try {
+      const result = await api.saveSettings({
+        interval: Number(interval),
+        ai: { clearApiKey: true },
+      });
+      setSettings(result);
+      setAiApiKey("");
+      onToast("Saved OpenRouter API key removed.");
     } catch (error) {
       onToast(errorMessage(error), "error");
     } finally {
@@ -2611,6 +3075,10 @@ function SettingsPage({
   };
   const configured = settings?.webhookConfigured ?? false;
   const ntfyConfigured = settings?.ntfy?.configured ?? false;
+  const aiConfigured = settings?.ai?.configured ?? false;
+  const autoNegotiation = settings?.autoNegotiation;
+  const olxSessionConnected = settings?.marketplaceSessions.find((session) => session.marketplace === "OLX")?.connected ?? false;
+  const allegroSessionConnected = settings?.marketplaceSessions.find((session) => session.marketplace === "Allegro Lokalnie")?.connected ?? false;
   const settingsLoaded = settings !== null;
   return (
     <>
@@ -2685,6 +3153,115 @@ function SettingsPage({
             <Info size={15} />
             Night polling is a floor: watches that already run slower will not
             be accelerated. The default is 30 minutes overnight.
+          </div>
+        </section>
+        <section className="settings-section settings-section--wide">
+          <div className="settings-section-heading">
+            <div className="settings-symbol settings-symbol--blue">
+              <Zap size={18} />
+            </div>
+            <div>
+              <h2>AI listing intelligence</h2>
+              <p>Use a DeepSeek model through OpenRouter to normalize listings and filter out accessories, parts, and unrelated matches.</p>
+            </div>
+            <span className={`settings-status ${aiConfigured ? "" : "settings-status--idle"}`}>
+              <i />
+              {settingsLoaded ? aiConfigured ? (settings?.ai?.source === "environment" ? "Environment" : "Configured") : "Not configured" : "Loading…"}
+            </span>
+          </div>
+          <div className="field-row">
+            <label className="field-label">
+              OpenRouter model <span>uses JSON output</span>
+              <input
+                autoComplete="off"
+                disabled={!settingsLoaded}
+                value={aiModel}
+                onChange={(event) => setAiModel(event.target.value)}
+                placeholder="deepseek/deepseek-v4-flash"
+              />
+            </label>
+            <label className="field-label">
+              API token <span>{settings?.ai?.source === "environment" ? "environment token is active" : "encrypted at rest"}</span>
+              <input
+                type="password"
+                autoComplete="new-password"
+                disabled={!settingsLoaded}
+                value={aiApiKey}
+                onChange={(event) => setAiApiKey(event.target.value)}
+                placeholder={settings?.ai?.source === "settings" ? "Saved token" : "sk-or-v1-…"}
+              />
+            </label>
+          </div>
+          <div className="settings-actions">
+            {settings?.ai?.source === "settings" ? <button className="outline-button danger-outline" disabled={saving} onClick={() => void clearAiApiKey()}><Trash2 size={15} />Remove saved token</button> : null}
+            <span className="settings-inline-note">New or changed watched listings are normalized in the background with a two-request concurrency limit.</span>
+          </div>
+          <div className="security-note">
+            <ShieldCheck size={17} />
+            <span>The token is encrypted with SCOUT_SECRET and never returned to the browser. Headless deployments can use SCOUT_OPENROUTER_API_KEY and SCOUT_OPENROUTER_MODEL instead.</span>
+          </div>
+        </section>
+        <section className={`settings-section settings-section--wide ${autoNegotiationEnabled ? "auto-negotiation-section--active" : ""}`}>
+          <div className="settings-section-heading">
+            <div className="settings-symbol settings-symbol--blue">
+              <Send size={18} />
+            </div>
+            <div>
+              <h2>Automatic marketplace negotiation</h2>
+              <p>Send one AI-written opening message when a saved OLX or Allegro Lokalnie listing becomes a qualifying deal.</p>
+            </div>
+            <span className={`settings-status ${autoNegotiationEnabled ? "" : "settings-status--idle"}`}>
+              <i />
+              {settingsLoaded ? autoNegotiationEnabled ? "Enabled" : "Off" : "Loading…"}
+            </span>
+          </div>
+          <label className="auto-negotiation-toggle">
+            <input type="checkbox" checked={autoNegotiationEnabled} disabled={!settingsLoaded || saving} onChange={(event) => setAutoNegotiationEnabled(event.target.checked)} />
+            <span>
+              <strong>Enable automatic seller messages</strong>
+              <small>Opt in only after checking the budget, session, and message limit below.</small>
+            </span>
+          </label>
+          <div className="field-row">
+            <label className="field-label">
+              Maximum total cost <span>required · PLN</span>
+              <input type="number" min="1" step="1" value={autoNegotiationMaxTotal} disabled={!settingsLoaded || saving} onChange={(event) => setAutoNegotiationMaxTotal(event.target.value)} placeholder="e.g. 2100" />
+            </label>
+            <label className="field-label">
+              Delivery and fees <span>optional · PLN</span>
+              <input type="number" min="0" step="1" value={autoNegotiationShipping} disabled={!settingsLoaded || saving} onChange={(event) => setAutoNegotiationShipping(event.target.value)} placeholder="0" />
+            </label>
+          </div>
+          <div className="field-row">
+            <label className="field-label">
+              Other known costs <span>optional · PLN</span>
+              <input type="number" min="0" step="1" value={autoNegotiationOtherCosts} disabled={!settingsLoaded || saving} onChange={(event) => setAutoNegotiationOtherCosts(event.target.value)} placeholder="0" />
+            </label>
+            <label className="field-label">
+              Minimum deal discount <span>18–80% below typical</span>
+              <input type="number" min="18" max="80" step="1" value={autoNegotiationMinimumDiscount} disabled={!settingsLoaded || saving} onChange={(event) => setAutoNegotiationMinimumDiscount(event.target.value)} />
+            </label>
+          </div>
+          <div className="field-row">
+            <label className="field-label">
+              Opening discount <span>1–50% below current ask</span>
+              <input type="number" min="1" max="50" step="1" value={autoNegotiationOpeningDiscount} disabled={!settingsLoaded || saving} onChange={(event) => setAutoNegotiationOpeningDiscount(event.target.value)} />
+            </label>
+            <label className="field-label">
+              Daily attempt limit <span>1–50 listings</span>
+              <input type="number" min="1" max="50" step="1" value={autoNegotiationDailyLimit} disabled={!settingsLoaded || saving} onChange={(event) => setAutoNegotiationDailyLimit(event.target.value)} />
+            </label>
+          </div>
+          <div className="field-help">
+            <Info size={15} />
+            Automatic messages require OpenRouter with a DeepSeek model, an authenticated OLX or Allegro Lokalnie session, an explicit negotiable-price signal, and a qualifying deal. Fixed or unspecified prices are never contacted automatically.
+          </div>
+          <div className="auto-negotiation-status">
+            <span>Today: <strong>{autoNegotiation?.attemptedToday ?? 0}/{autoNegotiation?.dailyLimit ?? autoNegotiationDailyLimit} attempts</strong></span>
+            <span><strong>{autoNegotiation?.sentToday ?? 0}</strong> sent</span>
+            <span className={aiConfigured ? "auto-negotiation-status--ready" : ""}>{aiConfigured ? "OpenRouter ready" : "OpenRouter not configured"}</span>
+            <span className={olxSessionConnected ? "auto-negotiation-status--ready" : ""}>{olxSessionConnected ? "OLX session ready" : "OLX session missing"}</span>
+            <span className={allegroSessionConnected ? "auto-negotiation-status--ready" : ""}>{allegroSessionConnected ? "Allegro Lokalnie session ready" : "Allegro Lokalnie session missing"}</span>
           </div>
         </section>
         <section className="settings-section settings-section--wide">
@@ -2773,6 +3350,52 @@ function SettingsPage({
               Do not paste a raw Cookie header or share the JSON.
             </span>
           </div>
+        </section>
+        <section className={`settings-section settings-section--wide ${dailyDigestEnabled ? "auto-negotiation-section--active" : ""}`}>
+          <div className="settings-section-heading">
+            <div className="settings-symbol settings-symbol--blue">
+              <Clock3 size={18} />
+            </div>
+            <div>
+              <h2>Daily deal digest</h2>
+              <p>Bundle Strong and Very strong deals into one quiet daily summary. Exceptional deals remain immediate.</p>
+            </div>
+            <span className={`settings-status ${dailyDigestEnabled ? "" : "settings-status--idle"}`}>
+              <i />
+              {settingsLoaded ? dailyDigestEnabled ? "Enabled" : "Off" : "Loading…"}
+            </span>
+          </div>
+          <label className="auto-negotiation-toggle">
+            <input type="checkbox" checked={dailyDigestEnabled} disabled={!settingsLoaded || saving} onChange={(event) => setDailyDigestEnabled(event.target.checked)} />
+            <span>
+              <strong>Send a daily digest</strong>
+              <small>Empty digests are suppressed. Delivery uses the server's local timezone.</small>
+            </span>
+          </label>
+          <div className="field-row">
+            <label className="field-label">
+              Delivery time <span>server local time</span>
+              <input type="time" value={dailyDigestTime} disabled={!settingsLoaded || saving} onChange={(event) => setDailyDigestTime(event.target.value)} />
+            </label>
+            <div className="field-label">
+              <span>Delivery channels</span>
+              <div className="source-options">
+                <button type="button" className={`source-option ${dailyDigestDiscord ? "source-option--selected" : ""}`} disabled={!settingsLoaded || saving} onClick={() => setDailyDigestDiscord((value) => !value)}>
+                  <i style={{ background: "#5865f2" }} />Discord{dailyDigestDiscord ? <Check size={15} /> : null}
+                </button>
+                <button type="button" className={`source-option ${dailyDigestNtfy ? "source-option--selected" : ""}`} disabled={!settingsLoaded || saving} onClick={() => setDailyDigestNtfy((value) => !value)}>
+                  <i style={{ background: "#4f9da6" }} />ntfy{dailyDigestNtfy ? <Check size={15} /> : null}
+                </button>
+              </div>
+            </div>
+          </div>
+          <div className="field-help">
+            <Info size={15} />
+            Each channel keeps its own minimum-priority filter. A meaningful price drop or priority increase can add a listing to a later digest; unchanged repeats are suppressed.
+          </div>
+          {settings?.dailyDigest?.lastSentAt ? (
+            <div className="settings-inline-note">Last digest delivered {new Date(settings.dailyDigest.lastSentAt).toLocaleString("pl-PL")}.</div>
+          ) : null}
         </section>
         <section className="settings-section settings-section--wide">
           <div className="settings-section-heading">
@@ -3003,6 +3626,7 @@ function WatchDialog({
   const [minPrice, setMinPrice] = useState("");
   const [maxPrice, setMaxPrice] = useState("");
   const [shippingOnly, setShippingOnly] = useState(false);
+  const [aiRelevance, setAiRelevance] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const numericInterval = Number(interval);
@@ -3056,6 +3680,7 @@ function WatchDialog({
           .filter(Boolean),
         sensitivity: Number(sensitivity),
         shippingOnly,
+        aiRelevance,
         minPrice: numericMin,
         maxPrice: numericMax,
       });
@@ -3215,6 +3840,10 @@ function WatchDialog({
           <label className="check-option check-option--modal">
             <input type="checkbox" checked={shippingOnly} onChange={(event) => setShippingOnly(event.target.checked)} />
             <span><strong>Require shipping</strong><small>Only learn from and alert on listings with confirmed shipping</small></span>
+          </label>
+          <label className="check-option check-option--modal">
+            <input type="checkbox" checked={aiRelevance} onChange={(event) => setAiRelevance(event.target.checked)} />
+            <span><strong>Use AI relevance filtering</strong><small>Exclude accessories, replacement parts, services, and unrelated listings when OpenRouter is configured</small></span>
           </label>
           <label className="field-label">
             Exact search URLs <span>optional · one per line</span>

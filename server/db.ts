@@ -3,16 +3,77 @@
 // resume after a home-server restart.
 // @ts-ignore node:sqlite is present in the supported Node 22+ runtime.
 import { DatabaseSync } from 'node:sqlite';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
 export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data/scout.sqlite') {
   const absolutePath = resolve(databasePath);
   mkdirSync(dirname(absolutePath), { recursive: true });
   const db = new DatabaseSync(absolutePath);
-  const migration = resolve(process.cwd(), 'migrations/001_init.sql');
-  if (existsSync(migration)) db.exec(readFileSync(migration, 'utf8'));
-  db.prepare('INSERT OR IGNORE INTO migrations (id, applied_at) VALUES (?, ?)').run('001_init', new Date().toISOString());
+  const migrationDirectory = resolve(process.cwd(), 'migrations');
+  const migrationFiles = existsSync(migrationDirectory)
+    ? readdirSync(migrationDirectory)
+      .filter((file) => file.endsWith('.sql'))
+      .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }))
+    : [];
+
+  // Older Scout databases already contain the migrations table and a row for
+  // 001_init. New databases get the same row as part of the first migration.
+  // Keep each file atomic so a failed upgrade can be retried safely.
+  db.exec('PRAGMA foreign_keys = OFF;');
+  const ensureLegacyColumns = () => {
+    const hasTable = (name: string) => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
+    if (hasTable('watches')) {
+      const columns = new Set((db.prepare('PRAGMA table_info(watches)').all() as Array<{ name: string }>).map((column) => column.name));
+      if (!columns.has('shipping_only')) db.exec('ALTER TABLE watches ADD COLUMN shipping_only INTEGER NOT NULL DEFAULT 0');
+      if (!columns.has('ai_relevance')) db.exec('ALTER TABLE watches ADD COLUMN ai_relevance INTEGER NOT NULL DEFAULT 1');
+      if (!columns.has('min_price_pln')) db.exec('ALTER TABLE watches ADD COLUMN min_price_pln REAL');
+      if (!columns.has('max_price_pln')) db.exec('ALTER TABLE watches ADD COLUMN max_price_pln REAL');
+    }
+    if (hasTable('listings')) {
+      const columns = new Set((db.prepare('PRAGMA table_info(listings)').all() as Array<{ name: string }>).map((column) => column.name));
+      if (!columns.has('shipping_available')) db.exec('ALTER TABLE listings ADD COLUMN shipping_available INTEGER');
+      if (!columns.has('price_negotiable')) db.exec('ALTER TABLE listings ADD COLUMN price_negotiable INTEGER');
+      if (!columns.has('ai_normalization_json')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_json TEXT');
+      if (!columns.has('ai_normalization_input_hash')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_input_hash TEXT');
+      if (!columns.has('ai_normalization_model')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_model TEXT');
+      if (!columns.has('ai_normalization_at')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_at TEXT');
+      if (!columns.has('ai_normalization_error')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_error TEXT');
+    }
+    if (hasTable('market_watches')) {
+      const columns = new Set((db.prepare('PRAGMA table_info(market_watches)').all() as Array<{ name: string }>).map((column) => column.name));
+      if (!columns.has('included_terms')) db.exec("ALTER TABLE market_watches ADD COLUMN included_terms TEXT NOT NULL DEFAULT ''");
+      if (!columns.has('excluded_terms')) db.exec("ALTER TABLE market_watches ADD COLUMN excluded_terms TEXT NOT NULL DEFAULT ''");
+      if (!columns.has('location')) db.exec("ALTER TABLE market_watches ADD COLUMN location TEXT NOT NULL DEFAULT 'Polska'");
+      if (!columns.has('condition')) db.exec("ALTER TABLE market_watches ADD COLUMN condition TEXT NOT NULL DEFAULT 'Any'");
+      if (!columns.has('min_price_pln')) db.exec('ALTER TABLE market_watches ADD COLUMN min_price_pln REAL');
+      if (!columns.has('max_price_pln')) db.exec('ALTER TABLE market_watches ADD COLUMN max_price_pln REAL');
+      if (!columns.has('shipping_only')) db.exec('ALTER TABLE market_watches ADD COLUMN shipping_only INTEGER NOT NULL DEFAULT 0');
+    }
+  };
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'migrations'").get()) ensureLegacyColumns();
+  for (const file of migrationFiles) {
+    const id = file.replace(/\.sql$/i, '');
+    const applied = db.prepare('SELECT 1 AS applied FROM sqlite_master WHERE type = \'table\' AND name = \'migrations\'').get() as { applied?: number } | undefined;
+    if (applied?.applied !== 1) {
+      if (id !== '001_init') continue;
+    } else {
+      const existing = db.prepare('SELECT 1 AS applied FROM migrations WHERE id = ?').get(id) as { applied?: number } | undefined;
+      if (existing?.applied === 1) continue;
+    }
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.exec(readFileSync(resolve(migrationDirectory, file), 'utf8'));
+      db.prepare('CREATE TABLE IF NOT EXISTS migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)').run();
+      db.prepare('INSERT OR IGNORE INTO migrations (id, applied_at) VALUES (?, ?)').run(id, new Date().toISOString());
+      db.exec('COMMIT');
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* preserve the original migration error */ }
+      db.exec('PRAGMA foreign_keys = ON;');
+      throw error;
+    }
+  }
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
   db.exec(`CREATE TABLE IF NOT EXISTS marketplace_sessions (
     marketplace TEXT PRIMARY KEY,
@@ -35,10 +96,17 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
   )`);
   const watchColumns = new Set((db.prepare('PRAGMA table_info(watches)').all() as Array<{ name: string }>).map((column) => column.name));
   if (!watchColumns.has('shipping_only')) db.exec('ALTER TABLE watches ADD COLUMN shipping_only INTEGER NOT NULL DEFAULT 0');
+  if (!watchColumns.has('ai_relevance')) db.exec('ALTER TABLE watches ADD COLUMN ai_relevance INTEGER NOT NULL DEFAULT 1');
   if (!watchColumns.has('min_price_pln')) db.exec('ALTER TABLE watches ADD COLUMN min_price_pln REAL');
   if (!watchColumns.has('max_price_pln')) db.exec('ALTER TABLE watches ADD COLUMN max_price_pln REAL');
   const listingColumns = new Set((db.prepare('PRAGMA table_info(listings)').all() as Array<{ name: string }>).map((column) => column.name));
   if (!listingColumns.has('shipping_available')) db.exec('ALTER TABLE listings ADD COLUMN shipping_available INTEGER');
+  if (!listingColumns.has('price_negotiable')) db.exec('ALTER TABLE listings ADD COLUMN price_negotiable INTEGER');
+  if (!listingColumns.has('ai_normalization_json')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_json TEXT');
+  if (!listingColumns.has('ai_normalization_input_hash')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_input_hash TEXT');
+  if (!listingColumns.has('ai_normalization_model')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_model TEXT');
+  if (!listingColumns.has('ai_normalization_at')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_at TEXT');
+  if (!listingColumns.has('ai_normalization_error')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_error TEXT');
   const marketWatchColumns = new Set((db.prepare('PRAGMA table_info(market_watches)').all() as Array<{ name: string }>).map((column) => column.name));
   if (!marketWatchColumns.has('included_terms')) db.exec("ALTER TABLE market_watches ADD COLUMN included_terms TEXT NOT NULL DEFAULT ''");
   if (!marketWatchColumns.has('excluded_terms')) db.exec("ALTER TABLE market_watches ADD COLUMN excluded_terms TEXT NOT NULL DEFAULT ''");
@@ -49,6 +117,9 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
   if (!marketWatchColumns.has('shipping_only')) db.exec('ALTER TABLE market_watches ADD COLUMN shipping_only INTEGER NOT NULL DEFAULT 0');
   db.prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run('default_interval', '5', new Date().toISOString());
   db.prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run('night_interval', '30', new Date().toISOString());
+  if (db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'scans'").get()) {
+    db.prepare("UPDATE scans SET status = 'interrupted', completed_at = ?, error = COALESCE(error, 'Process restarted before scan completed') WHERE status = 'running'").run(new Date().toISOString());
+  }
   return db;
 }
 

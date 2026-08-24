@@ -13,6 +13,7 @@
     "build": "tsc -b && vite build",
     "start": "tsx server/index.ts",
     "marketplace:login": "tsx scripts/marketplace-login.ts",
+    "test:compose": "bash scripts/compose-smoke.sh",
     "test": "node --import tsx --test tests/**/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
