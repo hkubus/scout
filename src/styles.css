@@ -811,6 +811,20 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .ai-normalization-tags span { padding: 4px 7px; border-radius: 999px; background: var(--blue-soft); color: var(--blue); font-size: 10px; }
 .ai-normalization-warning, .ai-normalization-error { display: flex; align-items: flex-start; gap: 6px; margin-top: 10px; color: var(--orange); font-size: 10px; line-height: 1.45; }
 .ai-normalization-warning svg, .ai-normalization-error svg { flex: 0 0 auto; margin-top: 1px; }
+.description-verification-result { display: flex; align-items: center; gap: 7px; margin-top: 13px; padding: 10px 11px; border-radius: 7px; font-size: 11px; line-height: 1.4; }
+.description-verification-result strong { color: var(--text-strong); }
+.description-verification-result span { color: var(--muted); }
+.description-verification-result svg { flex: 0 0 auto; }
+.description-verification-result--pass { background: rgba(58, 171, 97, .1); color: var(--green); }
+.description-verification-result--reject, .description-verification-result--unknown { background: rgba(241, 90, 53, .09); color: var(--orange); }
+.description-verification-result--pending { background: var(--blue-soft); color: var(--blue); }
+.listing-description-snapshot { margin-top: 12px; padding: 10px 11px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-muted); }
+.listing-description-snapshot-heading, .listing-description-snapshot-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.listing-description-snapshot-heading strong { color: var(--text-strong); font-size: 11px; }
+.listing-description-snapshot-heading span, .listing-description-snapshot-meta { color: var(--muted); font-size: 10px; }
+.listing-description-snapshot-meta { justify-content: flex-start; flex-wrap: wrap; margin-top: 7px; }
+.listing-description-snapshot-meta span + span::before { content: "·"; margin-right: 7px; color: var(--line-strong); }
+.listing-description-snapshot p { margin: 9px 0 0; color: var(--text); font-size: 11px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 .ai-normalize-button { min-height: 34px; margin-top: 12px; font-size: 11px; }
 .calculator-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
 .calculator-fields .field-label:last-child { grid-column: 1 / -1; }

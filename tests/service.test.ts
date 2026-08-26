@@ -325,8 +325,8 @@ test('aggregates watch analytics by daily listing snapshots', () => {
 test('returns listing price history and persists Buy/Watch/Pass triage actions', () => {
   const context = fixture();
   try {
-    const firstSeen = '2026-08-21T10:00:00.000Z';
-    const lastSeen = '2026-08-22T10:00:00.000Z';
+    const firstSeen = new Date(Date.now() - 24 * 60 * 60_000).toISOString();
+    const lastSeen = new Date().toISOString();
     context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run('triage-watch', 'Triage watch', 'headphones', '["OLX"]', 1, lastSeen, firstSeen, lastSeen);
     context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, price_negotiable, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run('OLX', 'triage-listing', 'Headphones', 400, 1, 'https://www.olx.pl/d/oferta/triage-listing', firstSeen, lastSeen);
     const listing = context.db.prepare('SELECT id FROM listings WHERE listing_id = ?').get('triage-listing') as { id: number };
@@ -383,6 +383,61 @@ test('normalizes and caches a stored listing through the configured DeepSeek cli
     const cached = await context.service.normalizeListingByKey('OLX:ai-listing');
     assert.equal(cached.listing.aiNormalization?.model, 'WH-1000XM5');
     assert.equal(requests, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.close();
+  }
+});
+
+test('fetches and verifies descriptions for very strong and exceptional deals before alerting', async () => {
+  let verificationRequests = 0;
+  const context = fixture({
+    classifyListingRelevance: async () => ({ relevant: true }),
+    verifyListingDescription: async (listing) => {
+      verificationRequests += 1;
+      assert.match(listing.description ?? '', /fully working/i);
+      return { decision: 'reject', confidence: 0.98, summary: 'The description discloses a material problem.', issues: ['The item is not safe to surface as an exceptional deal.'], evidence: ['The description says it is broken.'] };
+    },
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(null, { status: 204 })) as typeof fetch;
+  try {
+    const now = new Date().toISOString();
+    const baselineAt = new Date(Date.now() - 8 * 60 * 60_000).toISOString();
+    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' }, webhook: 'https://discord.com/api/webhooks/123/token' });
+    seedWatch(context.db, 'exceptional-watch');
+    const insertListing = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+    const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    for (let index = 0; index < 30; index += 1) {
+      insertListing.run('OLX', `baseline-${index}`, `CPU reference ${index}`, 1000, `https://www.olx.pl/d/oferta/baseline-${index}`, baselineAt, baselineAt);
+      const listing = context.db.prepare('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get('OLX', `baseline-${index}`) as { id: number };
+      insertObservation.run(listing.id, 'exceptional-watch', 1000, baselineAt);
+    }
+    (context.service as any).fetchPublicPage = async (url: string) => url.includes('/exceptional-listing') || url.includes('/very-strong-listing')
+      ? '<div data-testid="description">Fully working, but broken screen and sold for parts.</div>'
+      : `<script type="application/ld+json">${JSON.stringify({ '@type': 'ItemList', itemListElement: [
+        { '@type': 'Product', name: 'CPU very strong', sku: 'very-strong-listing', url: 'https://www.olx.pl/d/oferta/very-strong-listing', offers: { price: '750' } },
+        { '@type': 'Product', name: 'CPU exceptional', sku: 'exceptional-listing', url: 'https://www.olx.pl/d/oferta/exceptional-listing', offers: { price: '650' } },
+      ] })}</script>`;
+
+    const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('exceptional-watch');
+    await (context.service as any).runWatch(row);
+
+    assert.equal(verificationRequests, 2);
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM notifications').get() as { count: number }).count, 0);
+    const stored = (context.db.prepare('SELECT listing_id, ai_description_verification_status FROM listings WHERE listing_id IN (?, ?) ORDER BY listing_id').all('exceptional-listing', 'very-strong-listing') as Array<{ listing_id: string; ai_description_verification_status: string }>).map((row) => ({ ...row }));
+    assert.deepEqual(stored, [
+      { listing_id: 'exceptional-listing', ai_description_verification_status: 'reject' },
+      { listing_id: 'very-strong-listing', ai_description_verification_status: 'reject' },
+    ]);
+    const snapshot = context.service.listingDetail('OLX:very-strong-listing', 'exceptional-watch').descriptionSnapshot;
+    assert.equal(snapshot?.price, 750);
+    assert.equal(snapshot?.description, 'Fully working, but broken screen and sold for parts.');
+    assert.equal(snapshot?.verificationStatus, 'reject');
+    assert.ok(snapshot?.capturedAt);
+    await (context.service as any).runWatch(row);
+    assert.equal(verificationRequests, 2);
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM listing_detail_snapshots').get() as { count: number }).count, 2);
   } finally {
     globalThis.fetch = originalFetch;
     context.close();
@@ -681,7 +736,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -728,6 +783,29 @@ test('keeps shared listings associated with each watch and archives without dele
   } finally { context.close(); }
 });
 
+test('hides match associations that have not been seen in the last twelve hours', () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    const fresh = new Date(Date.now() - 11 * 60 * 60_000).toISOString();
+    const stale = new Date(Date.now() - 13 * 60 * 60_000).toISOString();
+    seedWatch(context.db, 'freshness-watch');
+    const insertListing = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`);
+    const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    insertListing.run('OLX', 'fresh-listing', 'Fresh CPU', 900, 'https://www.olx.pl/d/oferta/fresh-listing', fresh, fresh);
+    insertListing.run('OLX', 'stale-listing', 'Stale CPU', 800, 'https://www.olx.pl/d/oferta/stale-listing', stale, stale);
+    const freshId = (context.db.prepare("SELECT id FROM listings WHERE listing_id = 'fresh-listing'").get() as { id: number }).id;
+    const staleId = (context.db.prepare("SELECT id FROM listings WHERE listing_id = 'stale-listing'").get() as { id: number }).id;
+    insertObservation.run(freshId, 'freshness-watch', 900, fresh);
+    insertObservation.run(staleId, 'freshness-watch', 800, stale);
+
+    assert.deepEqual(context.service.getListings().map((listing) => listing.listingId), ['fresh-listing']);
+    assert.deepEqual(context.service.dashboard().listings.map((listing) => listing.listingId), ['fresh-listing']);
+    assert.ok(Date.parse(now) > Date.parse(fresh));
+  } finally { context.close(); }
+});
+
 test('keeps AI failures visible as unknown instead of silently excluding listings', async () => {
   let requests = 0;
   const context = fixture({
@@ -765,6 +843,22 @@ test('applies manual price filters after marketplace parsing rather than trustin
     })}</script>`;
     const result = await context.service.manualSearch({ query: 'cpu', sources: ['OLX'], minPrice: 100, maxPrice: 200, terms: '', excluded: '', shippingOnly: false, condition: 'Any', location: '' });
     assert.deepEqual(result.listings.map((listing) => listing.price), [150]);
+  } finally { context.close(); }
+});
+
+test('does not fetch listing details for shipping when manual search does not require it', async () => {
+  const context = fixture();
+  const fetchedUrls: string[] = [];
+  try {
+    (context.service as any).fetchPublicPage = async (url: string) => {
+      fetchedUrls.push(url);
+      return `<script type="application/ld+json">${JSON.stringify({
+        '@type': 'Product', name: 'CPU', sku: 'cpu-vinted', url: 'https://www.vinted.pl/items/123', offers: { price: '150' },
+      })}</script>`;
+    };
+    const result = await context.service.manualSearch({ query: 'cpu', sources: ['Vinted'], minPrice: null, maxPrice: null, terms: '', excluded: '', shippingOnly: false, condition: 'Any', location: '' });
+    assert.equal(fetchedUrls.length, 1);
+    assert.equal(result.sources[0].pendingShipping, 0);
   } finally { context.close(); }
 });
 
@@ -900,6 +994,6 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 6);
+    assert.equal(after.migrations.count, 8);
   } finally { context.close(); }
 });

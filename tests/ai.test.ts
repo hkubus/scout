@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyListingRelevanceWithDeepSeek, draftNegotiationMessageWithDeepSeek, listingNormalizationInputHash, listingRelevanceInputHash, normalizeListingWithDeepSeek } from '../server/ai';
+import { classifyListingRelevanceWithDeepSeek, draftNegotiationMessageWithDeepSeek, listingDescriptionVerificationInputHash, listingNormalizationInputHash, listingRelevanceInputHash, normalizeListingWithDeepSeek, verifyListingDescriptionWithDeepSeek } from '../server/ai';
 
 const normalized = {
   canonicalTitle: 'Steam Deck OLED',
@@ -154,4 +154,33 @@ test('classifies accessories and broken items as irrelevant through DeepSeek JSO
   assert.equal(body.stream, false);
   assert.equal(body.messages[1].content.includes('gpu'), true);
   assert.match(body.messages[0].content, /broken, damaged.*non-working.*for repair.*parts only/i);
+});
+
+test('conservatively verifies an exceptional listing description through DeepSeek JSON output', async () => {
+  let requestInit: RequestInit | undefined;
+  const context = {
+    marketplace: 'OLX' as const,
+    title: 'Steam Deck OLED 512GB',
+    condition: 'Używany',
+    description: 'W pełni sprawny, wszystkie przyciski działają. W zestawie oryginalna ładowarka.',
+  };
+  const result = await verifyListingDescriptionWithDeepSeek(
+    context,
+    { apiKey: 'sk-or-v1-test', model: 'deepseek-v4-flash' },
+    (_input, init) => {
+      requestInit = init;
+      return Promise.resolve(Response.json({ choices: [{ message: { content: JSON.stringify({
+        decision: 'pass', confidence: 0.94, summary: 'The description explicitly says the item works.', issues: [], evidence: ['W pełni sprawny', 'wszystkie przyciski działają'],
+      }) } }] }));
+    },
+  );
+
+  assert.deepEqual(result.decision, 'pass');
+  const body = JSON.parse(String(requestInit?.body)) as Record<string, any>;
+  assert.equal(body.session_id, 'scout:listing-description-verification:v1');
+  assert.equal(body.max_tokens, 220);
+  assert.equal(body.response_format.json_schema.name, 'listing_description_verification');
+  assert.deepEqual(body.response_format.json_schema.schema.required, ['decision', 'confidence', 'summary', 'issues', 'evidence']);
+  assert.equal(body.messages[1].content.includes(context.description), true);
+  assert.equal(listingDescriptionVerificationInputHash(context), listingDescriptionVerificationInputHash({ ...context, description: '  W PEŁNI   SPRAWNY, wszystkie przyciski działają. W zestawie oryginalna ładowarka. ' }));
 });

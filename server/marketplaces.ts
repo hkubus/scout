@@ -366,6 +366,49 @@ export function parseListingAvailability(html: string, marketplace: Marketplace,
 
 export const determineListingAvailability = parseListingAvailability;
 
+function normalizeDescriptionCandidate(value: unknown) {
+  if (typeof value !== 'string') return null;
+  const normalized = textContent(value).slice(0, 8_000).trim();
+  return normalized || null;
+}
+
+/** Extract only listing-description fields from a marketplace detail page. */
+export function parseListingDescription(html: string, marketplace: Marketplace): string | null {
+  if (!html) return null;
+  const candidates: string[] = [];
+  const add = (value: unknown) => {
+    const normalized = normalizeDescriptionCandidate(value);
+    if (normalized && !candidates.includes(normalized)) candidates.push(normalized);
+  };
+
+  const scripts = html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
+  for (const match of scripts) {
+    try {
+      const parsed = JSON.parse(match[1].trim());
+      for (const item of flattenStructured(parsed)) {
+        add(item.description);
+        const offer = Array.isArray(item.offers) ? item.offers[0] : item.offers;
+        add(offer && typeof offer === 'object' ? (offer as Record<string, unknown>).description : undefined);
+      }
+    } catch {
+      // Malformed JSON-LD is common on partially rendered marketplace pages.
+    }
+  }
+
+  for (const match of html.matchAll(/<meta\b[^>]*>/gi)) {
+    const tag = match[0];
+    if (/(?:name|property)=["'](?:description|og:description)["']/i.test(tag)) add(attribute(tag, 'content'));
+  }
+
+  const descriptionPattern = /<(div|section|p)[^>]*(?:data-testid|data-cy|id|class)=["'][^"']*(?:description|opis)[^"']*["'][^>]*>([\s\S]*?)<\/\1>/gi;
+  for (const match of html.matchAll(descriptionPattern)) add(match[2]);
+
+  // Keep the marketplace argument in the parser contract so adapters can add
+  // marketplace-specific selectors without changing scan callers.
+  void marketplace;
+  return candidates[0] ?? null;
+}
+
 /** Read shipping availability from a marketplace detail page when the search card omits it. */
 export function parseShippingAvailability(html: string, marketplace: Marketplace): boolean | null {
   if (marketplace === 'Vinted') {

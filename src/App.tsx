@@ -166,6 +166,7 @@ function App() {
     source.addEventListener("notification", refresh);
     source.addEventListener("listing-action", refresh);
     source.addEventListener("ai-normalization", refresh);
+    source.addEventListener("ai-description-verification", refresh);
     source.addEventListener("market-watch", () => setMarketRefreshKey((value) => value + 1));
     source.addEventListener("seller-message", () => setMessagesRefreshKey((value) => value + 1));
     source.onerror = () => setConnection("offline");
@@ -2184,6 +2185,7 @@ function ListingDetailDrawer({
   const expectedProfit = expectedResale === null || !Number.isFinite(expectedResale) ? null : expectedResale - totalCost;
   const expectedMargin = expectedProfit === null || totalCost <= 0 ? null : (expectedProfit / totalCost) * 100;
   const typicalSavings = currentListing.typical === null ? null : currentListing.typical - totalCost;
+  const showDescriptionSafeguard = currentListing.dealStrength >= 4 || Boolean(detail.descriptionSnapshot);
 
   useEffect(() => {
     let active = true;
@@ -2401,6 +2403,27 @@ function ListingDetailDrawer({
             {storedListing ? <button className="outline-button ai-normalize-button" type="button" disabled={normalizing} onClick={() => void normalizeWithAi()}>{normalizing ? <LoaderCircle size={15} className="spin" /> : <Tag size={15} />}{normalizing ? "Normalizing…" : currentListing.aiNormalizationError ? "Retry normalization" : currentListing.aiNormalization ? "Refresh normalization" : "Normalize with AI"}</button> : <span className="drawer-muted">AI normalization is available after a listing is saved by a watch.</span>}
             {currentListing.aiNormalizationError ? <div className="ai-normalization-error"><AlertTriangle size={14} />{currentListing.aiNormalizationError}</div> : null}
           </section>
+
+          {showDescriptionSafeguard ? <section className="drawer-section drawer-section--verification">
+            <div className="drawer-section-heading">
+              <div><span className="drawer-section-kicker">High-priority deal safeguard</span><h3>Description verification</h3></div>
+              <ShieldCheck size={17} />
+            </div>
+            {currentListing.aiDescriptionVerificationStatus === "pass" ? <div className="description-verification-result description-verification-result--pass"><CheckCircle2 size={15} /><strong>Passed</strong><span>The description supports a functional item.</span></div> : null}
+            {currentListing.aiDescriptionVerificationStatus === "reject" ? <div className="description-verification-result description-verification-result--reject"><AlertTriangle size={15} /><strong>Alert held</strong><span>The description contains a material issue.</span></div> : null}
+            {currentListing.aiDescriptionVerificationStatus === "unknown" ? <div className="description-verification-result description-verification-result--unknown"><AlertTriangle size={15} /><strong>Alert held</strong><span>The listing could not be verified safely.</span></div> : null}
+            {currentListing.aiDescriptionVerificationStatus === "pending" ? <div className="description-verification-result description-verification-result--pending"><LoaderCircle size={15} className="spin" /><strong>Checking</strong><span>Fetching the detail page and description.</span></div> : null}
+            {currentListing.aiDescriptionVerificationStatus === "not-configured" || !currentListing.aiDescriptionVerificationStatus ? <p className="drawer-section-copy">OpenRouter is not configured for this safeguard, so the high-priority alert follows deterministic scoring.</p> : null}
+            {detail.descriptionSnapshot ? <div className="listing-description-snapshot">
+              <div className="listing-description-snapshot-heading"><strong>Saved listing state</strong><span>{new Date(detail.descriptionSnapshot.capturedAt).toLocaleString("pl-PL")}</span></div>
+              <div className="listing-description-snapshot-meta"><span>{formatPln(detail.descriptionSnapshot.price)}</span>{detail.descriptionSnapshot.condition ? <span>{detail.descriptionSnapshot.condition}</span> : null}{detail.descriptionSnapshot.location ? <span>{detail.descriptionSnapshot.location}</span> : null}</div>
+              <p>{detail.descriptionSnapshot.description || "No description was exposed on the detail page."}</p>
+            </div> : <p className="drawer-section-copy">No detail snapshot has been saved yet.</p>}
+            {currentListing.aiDescriptionVerification?.summary ? <p className="drawer-section-copy">{currentListing.aiDescriptionVerification.summary}</p> : null}
+            {currentListing.aiDescriptionVerification?.issues.length ? <div className="ai-normalization-warning"><AlertTriangle size={14} />{currentListing.aiDescriptionVerification.issues.join(" · ")}</div> : null}
+            {currentListing.aiDescriptionVerification?.evidence.length ? <p className="drawer-section-copy">Evidence: {currentListing.aiDescriptionVerification.evidence.join(" · ")}</p> : null}
+            {currentListing.aiDescriptionVerificationError ? <div className="ai-normalization-error"><AlertTriangle size={14} />{currentListing.aiDescriptionVerificationError}</div> : null}
+          </section> : null}
 
           <section className="drawer-section drawer-section--negotiation">
             <div className="drawer-section-heading">

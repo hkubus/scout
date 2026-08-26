@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildMarketplaceSearchUrl, dedupeKey, normalizeListing, parseAllegroCards, parseListingAvailability, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, validateSearchUrl } from '../server/marketplaces';
+import { buildMarketplaceSearchUrl, dedupeKey, normalizeListing, parseAllegroCards, parseListingAvailability, parseListingDescription, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, validateSearchUrl } from '../server/marketplaces';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { median, pruneBefore, scoreDeal } from '../server/scoring';
@@ -89,6 +89,13 @@ test('classifies listing details as live, terminal, or unknown without inferring
   assert.equal(parseListingAvailability('<html><body><h1>Checking your browser</h1><p>Cloudflare challenge</p></body></html>', 'OLX').status, 'unknown');
   assert.equal(parseListingAvailability('', 'OLX', 404).status, 'terminal');
   assert.equal(parseListingAvailability('', 'OLX', 503).status, 'unknown');
+});
+
+test('extracts a listing description from detail-page structured data and description markup', () => {
+  const structured = `<script type="application/ld+json">${JSON.stringify({ '@type': 'Product', name: 'Steam Deck', description: 'Działa bez zastrzeżeń. W zestawie ładowarka.', offers: { price: '1200' } })}</script>`;
+  assert.equal(parseListingDescription(structured, 'OLX'), 'Działa bez zastrzeżeń. W zestawie ładowarka.');
+  assert.equal(parseListingDescription('<div data-testid="item-description"><p>Sprawny, bez blokady konta.</p></div>', 'Vinted'), 'Sprawny, bez blokady konta.');
+  assert.equal(parseListingDescription('<html><body><h1>Steam Deck</h1></body></html>', 'OLX'), null);
 });
 
 test('normalizes object-shaped JSON-LD images before storage', () => {

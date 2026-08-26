@@ -1,0 +1,27 @@
+[Unit]
+Description=Scout marketplace deal monitor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/scout
+ExecStart=/usr/bin/npm run start
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+Environment=NODE_ENV=production
+Environment=SCOUT_HOST=127.0.0.1
+Environment=TZ=Europe/Warsaw
+Environment=SCOUT_DB_PATH=/root/scout/data/scout.sqlite
+EnvironmentFile=-/etc/scout/scout.env
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

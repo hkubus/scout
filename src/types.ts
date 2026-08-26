@@ -26,6 +26,27 @@ export interface ListingNormalization {
   evidence: string[];
 }
 
+export type ListingDescriptionVerificationDecision = 'pass' | 'reject' | 'unknown';
+
+export interface ListingDescriptionVerification {
+  decision: ListingDescriptionVerificationDecision;
+  confidence: number;
+  summary: string;
+  issues: string[];
+  evidence: string[];
+}
+
+export interface ListingDetailSnapshot {
+  title: string;
+  price: number;
+  condition?: string | null;
+  location?: string | null;
+  url: string;
+  description: string | null;
+  capturedAt: string;
+  verificationStatus?: ListingDescriptionVerificationDecision | 'pending' | 'not-configured' | null;
+}
+
 export interface Listing {
   id: string;
   /** Global marketplace identity, safe for external links and triage actions. */
@@ -57,6 +78,10 @@ export interface Listing {
   aiNormalization?: ListingNormalization | null;
   aiNormalizationAt?: string | null;
   aiNormalizationError?: string | null;
+  aiDescriptionVerification?: ListingDescriptionVerification | null;
+  aiDescriptionVerificationAt?: string | null;
+  aiDescriptionVerificationStatus?: ListingDescriptionVerificationDecision | 'pending' | 'not-configured' | null;
+  aiDescriptionVerificationError?: string | null;
 }
 
 export interface PriceHistoryPoint {
@@ -74,6 +99,7 @@ export interface ListingDetail {
   listing: Listing;
   history: PriceHistoryPoint[];
   action: ListingAction;
+  descriptionSnapshot?: ListingDetailSnapshot | null;
   firstSeenAt: string;
   lastSeenAt: string;
 }

@@ -2,14 +2,14 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:
 import { existsSync } from 'node:fs';
 import { chromium, type Browser, type BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, validateNtfyConfig, type NtfyConfig } from './notifications';
-import { buildMarketplaceSearchUrl, createPublicAdapter, exponentialBackoff, parseShippingAvailability, validateSearchUrl, type ListingAvailability, type Marketplace, type NormalizedListing } from './marketplaces';
+import { buildMarketplaceSearchUrl, createPublicAdapter, exponentialBackoff, parseListingDescription, parseShippingAvailability, validateSearchUrl, type ListingAvailability, type Marketplace, type NormalizedListing } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
-import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, draftNegotiationMessageWithDeepSeek, legacyListingNormalizationInputHash, legacyListingRelevanceInputHash, listingNormalizationInputHash, listingRelevanceInputHash, normalizeListingWithDeepSeek, normalizeOpenRouterModel, DeepSeekError, parseStoredListingNormalization, type ListingRelevanceContext, type NegotiationListingContext } from './ai';
+import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, draftNegotiationMessageWithDeepSeek, legacyListingNormalizationInputHash, legacyListingRelevanceInputHash, listingDescriptionVerificationInputHash, listingNormalizationInputHash, listingRelevanceInputHash, normalizeListingWithDeepSeek, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseStoredListingNormalization, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type NegotiationListingContext } from './ai';
 import { OlxMessagingError, sendOlxMessageOnPage } from './olx-messaging';
 import { AllegroMessagingError, sendAllegroMessageOnPage } from './allegro-messaging';
 import { offerCeiling, recommendNegotiationPrice, type NegotiationRecommendation } from './negotiation';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, median, scoreDeal } from './scoring';
-import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDetail, ManualSearchResponse, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
+import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ManualSearchResponse, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -28,6 +28,7 @@ type DealNotificationCandidate = {
   typical: number;
   discountPercent: number;
   confidence: number;
+  requiresDescriptionVerification: boolean;
 };
 
 type AutoNegotiationConfig = Omit<AutoNegotiationSettings, 'sentToday' | 'attemptedToday'>;
@@ -78,6 +79,7 @@ const connectorDefinitions: Array<Pick<Connector, 'name' | 'kind' | 'color'>> = 
 ];
 const marketplaces: Marketplace[] = ['OLX', 'Allegro Lokalnie', 'Vinted'];
 export const DEFAULT_NIGHT_INTERVAL_MINUTES = 30;
+const MATCH_FRESHNESS_MS = 12 * 60 * 60_000;
 const NIGHT_START_HOUR = 22;
 const NIGHT_END_HOUR = 8;
 
@@ -92,6 +94,7 @@ export class ServiceError extends Error {
 
 export interface ScoutServiceDependencies {
   classifyListingRelevance?: typeof classifyListingRelevanceWithDeepSeek;
+  verifyListingDescription?: typeof verifyListingDescriptionWithDeepSeek;
   draftNegotiation?: typeof draftNegotiationMessageWithDeepSeek;
   sendOlxMessage?: (listingUrl: string, message: string) => Promise<void>;
   sendAllegroMessage?: (listingUrl: string, message: string) => Promise<void>;
@@ -235,9 +238,11 @@ export class ScoutService {
   private db: Database;
   private emit: (event: string, payload: unknown) => void;
   private running = new Set<string>();
+  private descriptionVerificationInFlight = new Map<string, Promise<boolean>>();
   private lastSchedulerTickAt: string | null = null;
   private digestRunning = false;
   private readonly classifyListingRelevance: typeof classifyListingRelevanceWithDeepSeek;
+  private readonly verifyListingDescription: typeof verifyListingDescriptionWithDeepSeek;
   private readonly draftNegotiation: typeof draftNegotiationMessageWithDeepSeek;
   private readonly sendOlxMessageOverride?: (listingUrl: string, message: string) => Promise<void>;
   private readonly sendAllegroMessageOverride?: (listingUrl: string, message: string) => Promise<void>;
@@ -246,6 +251,7 @@ export class ScoutService {
     this.db = db;
     this.emit = emit;
     this.classifyListingRelevance = dependencies.classifyListingRelevance ?? classifyListingRelevanceWithDeepSeek;
+    this.verifyListingDescription = dependencies.verifyListingDescription ?? verifyListingDescriptionWithDeepSeek;
     this.draftNegotiation = dependencies.draftNegotiation ?? draftNegotiationMessageWithDeepSeek;
     this.sendOlxMessageOverride = dependencies.sendOlxMessage;
     this.sendAllegroMessageOverride = dependencies.sendAllegroMessage;
@@ -527,6 +533,190 @@ export class ScoutService {
     };
   }
 
+  private saveDescriptionVerification(input: {
+    marketplace: Marketplace;
+    listingId: string;
+    status: 'pass' | 'reject' | 'unknown' | 'pending' | 'not-configured';
+    verification?: ListingDescriptionVerification | null;
+    inputHash?: string | null;
+    model?: string | null;
+    error?: string | null;
+  }) {
+    if (input.status === 'pending') {
+      this.db.prepare(`UPDATE listings SET
+        ai_description_verification_model = COALESCE(?, ai_description_verification_model),
+        ai_description_verification_at = ?,
+        ai_description_verification_status = ?
+        WHERE marketplace = ? AND listing_id = ?`).run(
+        input.model ?? null,
+        nowIso(),
+        input.status,
+        input.marketplace,
+        input.listingId,
+      );
+      return;
+    }
+    this.db.prepare(`UPDATE listings SET
+      ai_description_verification_json = ?,
+      ai_description_verification_input_hash = ?,
+      ai_description_verification_model = ?,
+      ai_description_verification_at = ?,
+      ai_description_verification_status = ?,
+      ai_description_verification_error = ?
+      WHERE marketplace = ? AND listing_id = ?`).run(
+      input.verification ? JSON.stringify(input.verification) : null,
+      input.inputHash ?? null,
+      input.model ?? null,
+      nowIso(),
+      input.status,
+      input.error?.slice(0, 500) ?? null,
+      input.marketplace,
+      input.listingId,
+    );
+  }
+
+  private captureListingDetailSnapshot(candidate: DealNotificationCandidate, description: string | null) {
+    const stored = this.db.prepare('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get(candidate.listing.marketplace, candidate.listing.listingId) as { id?: number } | undefined;
+    if (!stored?.id) return null;
+    const stateHash = createHash('sha256').update(JSON.stringify({
+      title: candidate.listing.title,
+      price: candidate.listing.price,
+      condition: candidate.listing.condition ?? null,
+      location: candidate.listing.location ?? null,
+      url: candidate.listing.url,
+      description,
+    })).digest('hex');
+    const capturedAt = nowIso();
+    this.db.prepare(`INSERT INTO listing_detail_snapshots (
+      listing_id, marketplace, external_listing_id, title, price_pln, url,
+      condition, location, description, state_hash, verification_status, captured_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+    ON CONFLICT(listing_id, state_hash) DO UPDATE SET verification_status = 'pending'`).run(
+      stored.id,
+      candidate.listing.marketplace,
+      candidate.listing.listingId,
+      candidate.listing.title,
+      candidate.listing.price,
+      candidate.listing.url,
+      candidate.listing.condition ?? null,
+      candidate.listing.location ?? null,
+      description,
+      stateHash,
+      capturedAt,
+    );
+    const snapshot = this.db.prepare('SELECT id FROM listing_detail_snapshots WHERE listing_id = ? AND state_hash = ?').get(stored.id, stateHash) as { id?: number } | undefined;
+    return snapshot?.id ? { id: Number(snapshot.id), stateHash } : null;
+  }
+
+  private updateListingDetailSnapshot(snapshotId: number | null, status: 'pass' | 'reject' | 'unknown' | 'not-configured', inputHash: string | null) {
+    if (!snapshotId) return;
+    this.db.prepare('UPDATE listing_detail_snapshots SET verification_status = ?, verification_input_hash = ? WHERE id = ?').run(status, inputHash, snapshotId);
+  }
+
+  private async verifyHighPriorityDealOnce(candidate: DealNotificationCandidate): Promise<boolean> {
+    const marketplace = candidate.listing.marketplace;
+    const listingId = candidate.listing.listingId;
+    const config = this.deepSeekConfig();
+    if (!config.apiKey) {
+      const snapshot = this.captureListingDetailSnapshot(candidate, null);
+      this.updateListingDetailSnapshot(snapshot?.id ?? null, 'not-configured', null);
+      this.saveDescriptionVerification({ marketplace, listingId, status: 'not-configured' });
+      return true;
+    }
+
+    this.saveDescriptionVerification({ marketplace, listingId, status: 'pending', model: config.model });
+
+    let description: string | null;
+    try {
+      const html = await this.fetchPublicPage(candidate.listing.url, marketplace);
+      description = parseListingDescription(html, marketplace);
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : 'Could not fetch the high-priority listing detail page').slice(0, 500);
+      const snapshot = this.captureListingDetailSnapshot(candidate, null);
+      this.updateListingDetailSnapshot(snapshot?.id ?? null, 'unknown', null);
+      this.saveDescriptionVerification({ marketplace, listingId, status: 'unknown', model: config.model, error: message });
+      this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: 'unknown' });
+      return false;
+    }
+
+    const context: ListingDescriptionVerificationContext = {
+      marketplace,
+      title: candidate.listing.title,
+      condition: candidate.listing.condition,
+      description,
+    };
+    const inputHash = listingDescriptionVerificationInputHash(context);
+    const snapshot = this.captureListingDetailSnapshot(candidate, description);
+    const row = this.db.prepare(`SELECT ai_description_verification_json, ai_description_verification_input_hash,
+      ai_description_verification_model, ai_description_verification_at, ai_description_verification_error
+      FROM listings WHERE marketplace = ? AND listing_id = ?`).get(marketplace, listingId) as Record<string, any> | undefined;
+    const cached = parseStoredListingDescriptionVerification(row?.ai_description_verification_json);
+    if (cached && row?.ai_description_verification_input_hash === inputHash && row.ai_description_verification_model === config.model) {
+      this.updateListingDetailSnapshot(snapshot?.id ?? null, cached.decision, inputHash);
+      this.saveDescriptionVerification({ marketplace, listingId, status: cached.decision, verification: cached, inputHash, model: config.model });
+      return cached.decision === 'pass';
+    }
+    if (row?.ai_description_verification_error && row.ai_description_verification_input_hash === inputHash
+      && row.ai_description_verification_model === config.model && row.ai_description_verification_at
+      && Date.now() - Date.parse(row.ai_description_verification_at) < 6 * 60 * 60_000) {
+      this.updateListingDetailSnapshot(snapshot?.id ?? null, 'unknown', inputHash);
+      this.saveDescriptionVerification({ marketplace, listingId, status: 'unknown', inputHash, model: config.model, error: row.ai_description_verification_error });
+      return false;
+    }
+
+    if (!description) {
+      const unknown: ListingDescriptionVerification = {
+        decision: 'unknown',
+        confidence: 0,
+        summary: 'The detail page did not expose a listing description.',
+        issues: ['No listing description was available to verify.'],
+        evidence: [],
+      };
+      this.updateListingDetailSnapshot(snapshot?.id ?? null, unknown.decision, inputHash);
+      this.saveDescriptionVerification({ marketplace, listingId, status: unknown.decision, verification: unknown, inputHash, model: config.model });
+      this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: unknown.decision });
+      return false;
+    }
+
+    const reusable = this.db.prepare(`SELECT ai_description_verification_json
+      FROM listings
+      WHERE ai_description_verification_input_hash = ?
+        AND ai_description_verification_model = ?
+        AND ai_description_verification_json IS NOT NULL
+      ORDER BY ai_description_verification_at DESC LIMIT 1`).get(inputHash, config.model) as { ai_description_verification_json?: string } | undefined;
+    const shared = parseStoredListingDescriptionVerification(reusable?.ai_description_verification_json);
+    if (shared) {
+      this.updateListingDetailSnapshot(snapshot?.id ?? null, shared.decision, inputHash);
+      this.saveDescriptionVerification({ marketplace, listingId, status: shared.decision, verification: shared, inputHash, model: config.model });
+      return shared.decision === 'pass';
+    }
+
+    try {
+      const verification = await this.verifyListingDescription(context, { apiKey: config.apiKey, model: config.model });
+      this.updateListingDetailSnapshot(snapshot?.id ?? null, verification.decision, inputHash);
+      this.saveDescriptionVerification({ marketplace, listingId, status: verification.decision, verification, inputHash, model: config.model });
+      this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: verification.decision });
+      return verification.decision === 'pass';
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : 'OpenRouter could not verify the listing description').slice(0, 500);
+      this.updateListingDetailSnapshot(snapshot?.id ?? null, 'unknown', inputHash);
+      this.saveDescriptionVerification({ marketplace, listingId, status: 'unknown', inputHash, model: config.model, error: message });
+      this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: 'unknown' });
+      return false;
+    }
+  }
+
+  private verifyHighPriorityDeal(candidate: DealNotificationCandidate) {
+    const key = `${candidate.listing.marketplace}:${candidate.listing.listingId}`;
+    const existing = this.descriptionVerificationInFlight.get(key);
+    if (existing) return existing;
+    const verification = this.verifyHighPriorityDealOnce(candidate).finally(() => {
+      if (this.descriptionVerificationInFlight.get(key) === verification) this.descriptionVerificationInFlight.delete(key);
+    });
+    this.descriptionVerificationInFlight.set(key, verification);
+    return verification;
+  }
+
   private discordMinimumPriority(): NotificationPriority {
     return parseNotificationPriority(this.getSetting('discord_minimum_priority'), 'strong');
   }
@@ -691,6 +881,16 @@ export class ScoutService {
       aiNormalization: parseStoredListingNormalization(row.ai_normalization_json),
       aiNormalizationAt: row.ai_normalization_at ?? null,
       aiNormalizationError: row.ai_normalization_error ?? null,
+      aiDescriptionVerification: parseStoredListingDescriptionVerification(row.ai_description_verification_json),
+      aiDescriptionVerificationAt: row.ai_description_verification_at ?? null,
+      aiDescriptionVerificationStatus: row.ai_description_verification_status === 'pass'
+        || row.ai_description_verification_status === 'reject'
+        || row.ai_description_verification_status === 'unknown'
+        || row.ai_description_verification_status === 'pending'
+        || row.ai_description_verification_status === 'not-configured'
+        ? row.ai_description_verification_status
+        : null,
+      aiDescriptionVerificationError: row.ai_description_verification_error ?? null,
     };
   }
 
@@ -776,6 +976,7 @@ export class ScoutService {
   }
 
   getListings() {
+    const freshnessCutoff = new Date(Date.now() - MATCH_FRESHNESS_MS).toISOString();
     const rows = this.db.prepare(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note
       FROM listings l
       JOIN watch_listings wl ON wl.listing_id = l.id
@@ -788,7 +989,8 @@ export class ScoutService {
             AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))
             AND w.ai_relevance = 1
         )
-      ORDER BY l.last_seen_at DESC, wl.id DESC LIMIT 200`).all() as Array<Record<string, any>>;
+        AND wl.last_seen_at > ?
+      ORDER BY wl.last_seen_at DESC, wl.id DESC LIMIT 200`).all(freshnessCutoff) as Array<Record<string, any>>;
     const watches = new Map(this.getWatches().map((watch) => [watch.id, watch]));
     return rows.filter((row) => {
       const watch = watches.get(row.watch_id);
@@ -811,10 +1013,30 @@ export class ScoutService {
     const watches = new Map(this.allWatches().map((watch) => [watch.id, watch]));
     const listing = this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100);
     const history = (this.db.prepare('SELECT price_pln, observed_at FROM observations WHERE listing_id = ? AND (? IS NULL OR watch_id = ?) ORDER BY observed_at DESC, id DESC LIMIT 120').all(row.id, row.watch_id ?? watchId ?? null, row.watch_id ?? watchId ?? null) as Array<{ price_pln: number; observed_at: string }>).reverse().map((point): PriceHistoryPoint => ({ price: Number(point.price_pln), observedAt: point.observed_at }));
+    const snapshotRow = this.db.prepare(`SELECT title, price_pln, condition, location, url, description, captured_at, verification_status
+      FROM listing_detail_snapshots WHERE listing_id = ? ORDER BY captured_at DESC, id DESC LIMIT 1`).get(row.id) as Record<string, any> | undefined;
+    const snapshotStatus = snapshotRow?.verification_status === 'pass'
+      || snapshotRow?.verification_status === 'reject'
+      || snapshotRow?.verification_status === 'unknown'
+      || snapshotRow?.verification_status === 'pending'
+      || snapshotRow?.verification_status === 'not-configured'
+      ? snapshotRow.verification_status
+      : null;
+    const descriptionSnapshot: ListingDetailSnapshot | null = snapshotRow ? {
+      title: String(snapshotRow.title),
+      price: Number(snapshotRow.price_pln),
+      condition: snapshotRow.condition ?? null,
+      location: snapshotRow.location ?? null,
+      url: String(snapshotRow.url),
+      description: snapshotRow.description ?? null,
+      capturedAt: String(snapshotRow.captured_at),
+      verificationStatus: snapshotStatus,
+    } : null;
     return {
       listing,
       history,
       action: { decision: listing.decision ?? null, note: listing.note ?? '', updatedAt: row.action_updated_at ?? null },
+      descriptionSnapshot,
       firstSeenAt: row.watch_first_seen_at ?? row.first_seen_at,
       lastSeenAt: row.watch_last_seen_at ?? row.last_seen_at,
     };
@@ -1112,9 +1334,9 @@ export class ScoutService {
         const fetched = await adapter.fetchPublicSearch(buildMarketplaceSearchUrl(source, input.query, input));
         const deterministicFilters = { minPrice: input.minPrice, maxPrice: input.maxPrice, condition: input.condition, location: input.location, shippingOnly: false };
         const comparable = filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters);
-        await this.enrichShipping(comparable, source, { limit: 24 });
+        if (input.shippingOnly) await this.enrichShipping(comparable, source, { limit: 24 });
         const filtered = filterListings(comparable, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, shippingOnly: input.shippingOnly });
-        const pendingShipping = comparable.filter((listing) => listing.shippingAvailable === null).length;
+        const pendingShipping = input.shippingOnly ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
         return {
           listings: filtered.slice(0, 100).map((listing): Listing => ({
             id: `${listing.marketplace}:${listing.listingId}`, title: listing.title,
@@ -1660,6 +1882,7 @@ export class ScoutService {
             return pendingCandidates;
           });
           for (const candidate of candidates) {
+            if (candidate.requiresDescriptionVerification && !await this.verifyHighPriorityDeal(candidate)) continue;
             await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence);
             await this.automaticallyNegotiate(candidate);
           }
@@ -1805,6 +2028,7 @@ export class ScoutService {
     if (lastPrune && Date.now() - Date.parse(lastPrune) < 24 * 60 * 60_000) return;
     const cutoff = new Date(Date.now() - 180 * 24 * 60 * 60_000).toISOString();
     this.db.prepare('DELETE FROM observations WHERE observed_at < ?').run(cutoff);
+    this.db.prepare('DELETE FROM listing_detail_snapshots WHERE captured_at < ?').run(cutoff);
     this.db.prepare('DELETE FROM listings WHERE last_seen_at < ? AND NOT EXISTS (SELECT 1 FROM observations WHERE observations.listing_id = listings.id)').run(cutoff);
     this.setSetting('last_prune', nowIso());
   }
@@ -1876,7 +2100,14 @@ export class ScoutService {
       const dealLabel: DealLabel = dealStrength >= 5 ? 'Exceptional' : dealStrength === 4 ? 'Very strong' : dealStrength === 3 ? 'Strong' : 'Watch';
       this.db.prepare('UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, last_seen_at = ? WHERE id = ?').run(score.typical, dealStrength, dealLabel, observedAt, association.id);
       this.db.prepare('UPDATE observations SET baseline_pln = ?, discount_percent = ?, deal_strength = ?, deal_label = ? WHERE id = ?').run(score.typical, discountPercent, dealStrength, dealLabel, observationId);
-      if (score.qualifies) return { watchId: String(row.id), listing, typical: score.typical, discountPercent, confidence: score.confidence };
+      if (score.qualifies) return {
+        watchId: String(row.id),
+        listing,
+        typical: score.typical,
+        discountPercent,
+        confidence: score.confidence,
+        requiresDescriptionVerification: dealStrength >= 4,
+      };
     } else {
       this.db.prepare('UPDATE observations SET baseline_pln = NULL, discount_percent = NULL WHERE id = ?').run(observationId);
     }
