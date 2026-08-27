@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase } from '../server/db';
 import { parseMarketplaceStorageState } from '../server/marketplace-sessions';
+import { DeepSeekError } from '../server/ai';
 import { ScoutService, ServiceError, decryptSecret, encryptSecret, filterListings, marketStatusAfterMiss, nextWatchScanAt, validateDiscordWebhook, type ScoutServiceDependencies } from '../server/service';
 
 function fixture(dependencies: ScoutServiceDependencies = {}) {
@@ -444,6 +445,52 @@ test('fetches and verifies descriptions for very strong and exceptional deals be
   }
 });
 
+test('sends a high-priority alert when OpenRouter verification fails technically', async () => {
+  let verificationRequests = 0;
+  const context = fixture({
+    verifyListingDescription: async () => {
+      verificationRequests += 1;
+      throw new DeepSeekError('OpenRouter returned verification that was not valid JSON', 502, 'format');
+    },
+  });
+  const originalFetch = globalThis.fetch;
+  let notificationRequests = 0;
+  globalThis.fetch = (async () => {
+    notificationRequests += 1;
+    return new Response(null, { status: 204 });
+  }) as typeof fetch;
+  try {
+    const now = new Date().toISOString();
+    context.service.saveSettings({
+      ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' },
+      webhook: 'https://discord.com/api/webhooks/123/token',
+    });
+    seedWatch(context.db, 'fallback-watch');
+    context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+      'OLX', 'fallback-listing', 'CPU', 650, 'https://www.olx.pl/d/oferta/fallback-listing', now, now,
+    );
+    (context.service as any).fetchPublicPage = async () => '<div data-testid="description">Fully working and complete.</div>';
+    const listing = { marketplace: 'OLX' as const, listingId: 'fallback-listing', title: 'CPU', price: 650, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/fallback-listing', observedAt: now };
+    const candidate = { watchId: 'fallback-watch', listing, typical: 1000, discountPercent: 35, confidence: 96, requiresDescriptionVerification: true };
+
+    const allowed = await (context.service as any).verifyHighPriorityDeal(candidate);
+    assert.equal(allowed, true);
+    assert.equal(verificationRequests, 1);
+    assert.equal((context.db.prepare('SELECT ai_description_verification_status FROM listings WHERE listing_id = ?').get('fallback-listing') as { ai_description_verification_status: string }).ai_description_verification_status, 'fallback');
+
+    await (context.service as any).notifyDeal('fallback-watch', listing, 1000, 35, 96);
+    assert.equal(notificationRequests, 1);
+    assert.equal((context.db.prepare('SELECT status FROM notification_deliveries').get() as { status: string }).status, 'delivered');
+
+    const reusedFallback = await (context.service as any).verifyHighPriorityDeal(candidate);
+    assert.equal(reusedFallback, true);
+    assert.equal(verificationRequests, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.close();
+  }
+});
+
 test('filters and caches irrelevant listings per watch', async () => {
   let requests = 0;
   const context = fixture({
@@ -479,7 +526,7 @@ test('filters and caches irrelevant listings per watch', async () => {
   } finally { context.close(); }
 });
 
-test('does not apply the AI relevance gate to one-off marketplace search results', async () => {
+test('applies the AI relevance gate to one-off marketplace search results', async () => {
   let requests = 0;
   const context = fixture({
     classifyListingRelevance: async (listing) => {
@@ -497,9 +544,9 @@ test('does not apply the AI relevance gate to one-off marketplace search results
       ],
     })}</script>`;
     const result = await context.service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
-    assert.deepEqual(result.listings.map((listing) => listing.title), ['GPU fan replacement', 'GPU graphics card RTX 4070']);
-    assert.equal(result.sources[0].message, '2 matches');
-    assert.equal(requests, 0);
+    assert.deepEqual(result.listings.map((listing) => listing.title), ['GPU graphics card RTX 4070']);
+    assert.equal(result.sources[0].message, '1 matches · 1 excluded by AI');
+    assert.equal(requests, 2);
   } finally { context.close(); }
 });
 
@@ -736,7 +783,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -783,12 +830,12 @@ test('keeps shared listings associated with each watch and archives without dele
   } finally { context.close(); }
 });
 
-test('hides match associations that have not been seen in the last twelve hours', () => {
+test('retains match associations for the documented 180-day history window', () => {
   const context = fixture();
   try {
     const now = new Date().toISOString();
     const fresh = new Date(Date.now() - 11 * 60 * 60_000).toISOString();
-    const stale = new Date(Date.now() - 13 * 60 * 60_000).toISOString();
+    const stale = new Date(Date.now() - 181 * 24 * 60 * 60_000).toISOString();
     seedWatch(context.db, 'freshness-watch');
     const insertListing = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)`);
@@ -994,6 +1041,6 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 8);
+    assert.equal(after.migrations.count, 9);
   } finally { context.close(); }
 });

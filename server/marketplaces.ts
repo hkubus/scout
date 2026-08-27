@@ -20,6 +20,11 @@ export type ListingAvailability =
   | { status: 'terminal'; reason: string }
   | { status: 'unknown'; reason: string };
 
+export interface ListingDetailResult {
+  availability: ListingAvailability;
+  listing?: NormalizedListing;
+}
+
 export type MarketplaceSearchPageStatus = 'results' | 'empty';
 
 /**
@@ -41,6 +46,7 @@ export interface MarketplaceSearchFilters {
   shippingOnly?: boolean;
   location?: string;
   sort?: MarketplaceSearchSort;
+  page?: number;
 }
 
 const hosts: Record<Marketplace, string[]> = {
@@ -102,6 +108,10 @@ function setMarketplaceSort(url: URL, marketplace: Marketplace, sort?: Marketpla
   else url.searchParams.set('order', 'newest_first');
 }
 
+function setMarketplacePage(url: URL, page?: number) {
+  if (page !== undefined && Number.isInteger(page) && page > 1 && page <= 10) url.searchParams.set('page', String(page));
+}
+
 /** Build a marketplace-native search URL before applying Scout's cross-site safety checks. */
 export function buildMarketplaceSearchUrl(marketplace: Marketplace, query: string, filters: MarketplaceSearchFilters = {}) {
   if (marketplace === 'OLX') {
@@ -109,6 +119,7 @@ export function buildMarketplaceSearchUrl(marketplace: Marketplace, query: strin
     setPriceParams(url, filters, 'search[filter_float_price:from]', 'search[filter_float_price:to]');
     if (filters.shippingOnly) url.searchParams.set('courier', 'on');
     setMarketplaceSort(url, marketplace, filters.sort);
+    setMarketplacePage(url, filters.page);
     return url.toString();
   }
 
@@ -118,6 +129,7 @@ export function buildMarketplaceSearchUrl(marketplace: Marketplace, query: strin
     setPriceParams(url, filters, 'price_from', 'price_to');
     if (filters.condition?.trim().toLowerCase() === 'new') url.searchParams.set('stan', 'nowe');
     setMarketplaceSort(url, marketplace, filters.sort);
+    setMarketplacePage(url, filters.page);
     return url.toString();
   }
 
@@ -126,15 +138,16 @@ export function buildMarketplaceSearchUrl(marketplace: Marketplace, query: strin
   setPriceParams(url, filters, 'price_from', 'price_to');
   for (const statusId of vintedConditionIds(filters.condition)) url.searchParams.append('status_ids[]', statusId);
   setMarketplaceSort(url, marketplace, filters.sort);
+  setMarketplacePage(url, filters.page);
   return url.toString();
 }
 
 export function parsePolishPrice(value: string | number | null | undefined) {
-  if (typeof value === 'number') return Number.isFinite(value) ? Math.round(value * 100) / 100 : null;
+  if (typeof value === 'number') return Number.isFinite(value) && value > 0 ? Math.round(value * 100) / 100 : null;
   if (!value) return null;
   const normalized = value.replace(/\u00a0/g, ' ').replace(/zł|PLN/gi, '').replace(/\s/g, '').replace(/,(?=\d{1,2}$)/, '.').replace(/[^\d.\-]/g, '');
   const amount = Number(normalized);
-  return Number.isFinite(amount) && amount >= 0 ? Math.round(amount * 100) / 100 : null;
+  return Number.isFinite(amount) && amount > 0 ? Math.round(amount * 100) / 100 : null;
 }
 
 function normalizeNegotiabilityText(value: string) {
@@ -165,6 +178,13 @@ export function normalizeListing(input: Omit<Partial<NormalizedListing>, 'market
   if (price === null) throw new Error('Listing price is not a valid PLN amount');
   const validated = validateSearchUrl(input.url, input.marketplace);
   if (!validated.valid) throw new Error(validated.reason);
+  let imageUrl: string | undefined;
+  if (input.imageUrl) {
+    try {
+      const candidate = new URL(input.imageUrl, validated.url);
+      if (candidate.protocol === 'https:') imageUrl = candidate.toString();
+    } catch { /* malformed image URLs are omitted */ }
+  }
   return {
     marketplace: input.marketplace,
     listingId: input.listingId.trim(),
@@ -172,7 +192,7 @@ export function normalizeListing(input: Omit<Partial<NormalizedListing>, 'market
     price,
     currency: 'PLN',
     url: validated.url,
-    imageUrl: input.imageUrl,
+    imageUrl,
     condition: input.condition?.trim(),
     location: input.location?.trim(),
     shippingAvailable: input.shippingAvailable ?? null,
@@ -470,6 +490,7 @@ export function exponentialBackoff(failures: number, baseMs = 5 * 60_000, maxMs 
 export interface ConnectorAdapter {
   marketplace: Marketplace;
   fetchPublicSearch(url: string): Promise<MarketplaceSearchResult>;
+  fetchDetail(url: string): Promise<ListingDetailResult>;
   verifyAvailability(url: string): Promise<ListingAvailability>;
 }
 
@@ -487,17 +508,22 @@ export function createPublicAdapter(marketplace: Marketplace, fetcher: (url: str
       const html = await fetcher(validation.url);
       return parseSearchPage(html, marketplace);
     },
-    async verifyAvailability(url) {
+    async fetchDetail(url) {
       const validation = validateSearchUrl(url, marketplace);
-      if (!validation.valid) return availabilityUnknown(validation.reason);
+      if (!validation.valid) return { availability: availabilityUnknown(validation.reason) };
       try {
         const html = await fetcher(validation.url);
-        return parseListingAvailability(html, marketplace);
+        const listings = parseStructuredListings(html, marketplace);
+        const availability = parseListingAvailability(html, marketplace);
+        return { availability, listing: listings[0] };
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Detail page verification failed';
-        if (/\b(?:404|410)\b/.test(message)) return { status: 'terminal', reason: message.slice(0, 240) };
-        return availabilityUnknown(message);
+        if (/\b(?:404|410)\b/.test(message)) return { availability: { status: 'terminal', reason: message.slice(0, 240) } };
+        return { availability: availabilityUnknown(message) };
       }
+    },
+    async verifyAvailability(url) {
+      return (await this.fetchDetail(url)).availability;
     },
   };
 }

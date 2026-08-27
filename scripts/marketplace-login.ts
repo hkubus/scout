@@ -1,6 +1,6 @@
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
-import { existsSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { chromium } from 'playwright-core';
 import { validateSearchUrl, type Marketplace } from '../server/marketplaces';
@@ -39,6 +39,9 @@ try {
   console.log('Complete any verification steps yourself; Scout does not capture passwords or bypass CAPTCHAs.');
   await prompt.question('Press Enter after the account is logged in to save the session…');
   await context.storageState({ path: outputPath });
+  try { chmodSync(outputPath, 0o600); } catch (error) {
+    throw new Error(`Saved the session but could not restrict its permissions: ${error instanceof Error ? error.message : String(error)}`);
+  }
   console.log(`Saved Playwright storage state to ${outputPath}. Import this file in Scout → Settings → Marketplace accounts.`);
 } finally {
   prompt.close();

@@ -1,4 +1,4 @@
-import type { ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, ManualSearchResponse, MarketResearchData, MarketWatch, MarketWatchInput, Marketplace, NegotiationRecommendation, NegotiationResult, NotificationPriority, NotificationRecord, SearchFilters, SellerMessage, SettingsData, Watch, WatchAnalytics } from './types';
+import type { ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, ManualSearchResponse, MarketResearchData, MarketWatch, MarketWatchInput, Marketplace, NegotiationDraft, NegotiationRecommendation, NegotiationResult, NotificationPriority, NotificationRecord, SearchFilters, SellerMessage, SettingsData, Watch, WatchAnalytics } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -11,10 +11,17 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, init);
-  const payload = await response.json().catch(() => ({})) as { error?: string };
-  if (!response.ok) throw new ApiError(payload.error ?? `Request failed (${response.status})`, response.status);
-  return payload as T;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 20_000);
+  const signal = init?.signal ? AbortSignal.any([controller.signal, init.signal]) : controller.signal;
+  try {
+    const response = await fetch(path, { ...init, signal });
+    const payload = await response.json().catch(() => ({})) as { error?: string };
+    if (!response.ok) throw new ApiError(payload.error ?? `Request failed (${response.status})`, response.status);
+    return payload as T;
+  } finally {
+    window.clearTimeout(timeout);
+  }
 }
 
 const json = (method: string, body?: unknown): RequestInit => body === undefined
@@ -23,9 +30,19 @@ const json = (method: string, body?: unknown): RequestInit => body === undefined
 
 export const api = {
   dashboard: () => request<DashboardData>('/api/dashboard'),
+  listings: (options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string } = {}) => {
+    const params = new URLSearchParams();
+    if (options.page !== undefined) params.set('page', String(options.page));
+    if (options.pageSize !== undefined) params.set('pageSize', String(options.pageSize));
+    if (options.marketplace) params.set('marketplace', options.marketplace);
+    if (options.q) params.set('q', options.q);
+    if (options.watchId) params.set('watchId', options.watchId);
+    return request<{ listings: DashboardData['listings']; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/listings${params.toString() ? `?${params}` : ''}`);
+  },
+  watches: (includeArchived = false) => request<{ watches: Watch[] }>(`/api/watches?includeArchived=${includeArchived ? 'true' : 'false'}`),
   watchAnalytics: (id: string, days = 30) => request<WatchAnalytics>(`/api/watches/${encodeURIComponent(id)}/analytics?days=${days}`),
   createWatch: (watch: Watch) => request<{ watch: Watch }>('/api/watches', json('POST', watch)),
-  updateWatch: (id: string, patch: Partial<Pick<Watch, 'enabled' | 'interval' | 'shippingOnly' | 'aiRelevance' | 'minPrice' | 'maxPrice'>> & { archived?: boolean }) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
+  updateWatch: (id: string, patch: Partial<Pick<Watch, 'name' | 'query' | 'terms' | 'excluded' | 'sources' | 'location' | 'condition' | 'interval' | 'exactUrls' | 'sensitivity' | 'shippingOnly' | 'aiRelevance' | 'minPrice' | 'maxPrice' | 'enabled'>> & { archived?: boolean }) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
   search: (filters: SearchFilters) => request<ManualSearchResponse>('/api/search', json('POST', filters)),
   marketResearch: (options: { page?: number; pageSize?: number; watchId?: string; status?: 'active' | 'ended' | 'superseded' } = {}) => {
     const params = new URLSearchParams();
@@ -44,8 +61,9 @@ export const api = {
   listingDetail: (key: string, watchId?: string | null) => request<ListingDetail>(`/api/listing-detail?key=${encodeURIComponent(key)}${watchId ? `&watchId=${encodeURIComponent(watchId)}` : ''}`),
   normalizeListing: (key: string, force = false) => request<ListingDetail>('/api/ai/normalize-listing', json('POST', { key, force })),
   recommendNegotiation: (key: string, input: { maxTotalCost: number | null; shippingCost?: number; otherCosts?: number }) => request<NegotiationRecommendation>('/api/negotiation/recommendation', json('POST', { key, ...input })),
-  negotiateAndSend: (key: string, offerPrice: number | null = null, budget?: { maxTotalCost: number; shippingCost?: number; otherCosts?: number }) => request<NegotiationResult>('/api/ai/negotiate', json('POST', { key, offerPrice, ...budget })),
-  messages: () => request<{ messages: SellerMessage[] }>('/api/messages'),
+  draftNegotiation: (key: string, offerPrice: number | null = null, budget?: { maxTotalCost: number; shippingCost?: number; otherCosts?: number }) => request<NegotiationDraft>('/api/ai/negotiate/draft', json('POST', { key, offerPrice, ...budget })),
+  negotiateAndSend: (key: string, offerPrice: number | null = null, budget?: { maxTotalCost: number; shippingCost?: number; otherCosts?: number }, message?: string) => request<NegotiationResult>('/api/ai/negotiate', json('POST', { key, offerPrice, message, ...budget })),
+  messages: (options: { page?: number; pageSize?: number } = {}) => request<{ messages: SellerMessage[]; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/messages?page=${options.page ?? 1}&pageSize=${options.pageSize ?? 100}`),
   listingAction: (key: string) => request<ListingAction>(`/api/listing-actions?key=${encodeURIComponent(key)}`),
   updateListingAction: (key: string, action: { decision: ListingDecision | null; note: string }) => request<{ action: ListingAction }>('/api/listing-actions', json('PATCH', { key, ...action })),
   scan: (watchId?: string) => request<{ queued: boolean; message: string }>('/api/scans', json('POST', watchId ? { watchId } : {})),
@@ -55,6 +73,8 @@ export const api = {
   deleteMarketplaceSession: (marketplace: Marketplace) => request<SettingsData>(`/api/marketplace-sessions/${encodeURIComponent(marketplace)}`, json('DELETE')),
   testWebhook: () => request<{ delivered: boolean }>('/api/settings/webhook/test', { method: 'POST' }),
   testNtfy: () => request<{ delivered: boolean }>('/api/settings/ntfy/test', { method: 'POST' }),
-  notifications: () => request<{ notifications: NotificationRecord[] }>('/api/notifications'),
-  connectorRuns: () => request<{ runs: ConnectorRun[] }>('/api/connector-runs'),
+  notifications: (options: { page?: number; pageSize?: number } = {}) => request<{ notifications: NotificationRecord[]; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/notifications?page=${options.page ?? 1}&pageSize=${options.pageSize ?? 100}`),
+  connectorRuns: (options: { page?: number; pageSize?: number } = {}) => request<{ runs: ConnectorRun[]; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/connector-runs?page=${options.page ?? 1}&pageSize=${options.pageSize ?? 100}`),
+  exportData: () => request<Record<string, unknown>>('/api/export'),
+  backup: () => request<{ backup: string; message: string }>('/api/backup', { method: 'POST' }),
 };

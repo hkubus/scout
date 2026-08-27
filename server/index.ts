@@ -3,24 +3,26 @@ import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 import { z } from 'zod';
 import { listings as seedListings, watches as seedWatches } from '../src/data';
+import type { Marketplace } from '../src/types';
 import { validateSearchUrl } from './marketplaces';
-import { openDatabase, seedDatabase } from './db';
+import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
+import { isPubliclyBoundHost, RateLimiter, securityHeaders } from './security';
 import { ScoutService, ServiceError } from './service';
-
-if (process.env.NODE_ENV === 'production') {
-  const configuredSecret = process.env.SCOUT_SECRET?.trim() ?? '';
-  if (configuredSecret.length < 32 || configuredSecret === 'change-me-in-production') {
-    throw new Error('SCOUT_SECRET must be set to a random value of at least 32 characters in production');
-  }
-}
 
 const port = Number(process.env.PORT ?? 3001);
 if (!Number.isInteger(port) || port < 1 || port > 65_535) {
   throw new Error('PORT must be an integer between 1 and 65535');
+}
+
+const host = process.env.SCOUT_HOST?.trim() || '127.0.0.1';
+const publicExposureWarning = isPubliclyBoundHost(host);
+const configuredSecret = process.env.SCOUT_SECRET?.trim() ?? '';
+if ((process.env.NODE_ENV === 'production' || publicExposureWarning) && (configuredSecret.length < 32 || configuredSecret === 'change-me-in-production' || configuredSecret === 'local-development-secret')) {
+  throw new Error('SCOUT_SECRET must be set to a random value of at least 32 characters before exposing Scout');
 }
 
 function configuredCorsOrigin() {
@@ -28,12 +30,41 @@ function configuredCorsOrigin() {
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean);
+  for (const origin of origins) {
+    let parsed: URL;
+    try { parsed = new URL(origin); } catch { throw new Error('SCOUT_CORS_ORIGIN must contain valid HTTP(S) origins'); }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) {
+      throw new Error('SCOUT_CORS_ORIGIN must contain explicit HTTP(S) origins without credentials or paths');
+    }
+  }
   if (!origins.length) return false;
   return origins.length === 1 ? origins[0] : origins;
 }
 
 const app = Fastify({ logger: true, bodyLimit: 1_048_576 });
 await app.register(cors, { origin: configuredCorsOrigin() });
+
+const rateLimiter = new RateLimiter();
+app.addHook('onRequest', async (request, reply) => {
+  const url = request.raw.url?.split('?', 1)[0] ?? '';
+  const isApi = url.startsWith('/api/');
+  const isEvents = url === '/events';
+  if (!isApi && !isEvents) return;
+
+  const expensive = /\/search$|\/scan$|\/scans$|\/negotiate(?:\/draft)?$|\/recommendation$|\/normalize-listing$|\/settings\/(?:webhook|ntfy)\/test$|\/backup$/.test(url);
+  const limit = expensive ? 30 : 240;
+  const bucket = rateLimiter.consume(`${request.ip}:${expensive ? 'expensive' : url}`, limit);
+  reply.header('X-RateLimit-Limit', String(limit));
+  reply.header('X-RateLimit-Remaining', String(bucket.remaining));
+  if (!bucket.allowed) {
+    reply.header('Retry-After', String(bucket.retryAfterSeconds));
+    return reply.code(429).send({ error: 'Too many requests. Try again later.' });
+  }
+});
+app.addHook('onSend', async (request, reply) => {
+  const secure = request.protocol === 'https' || request.headers['x-forwarded-proto'] === 'https';
+  for (const [name, value] of Object.entries(securityHeaders(secure))) reply.header(name, value);
+});
 
 const db = openDatabase();
 if (process.env.SCOUT_SEED_DEMO === 'true') seedDatabase(db, { watches: seedWatches, listings: seedListings });
@@ -47,7 +78,7 @@ function emit(event: string, payload: unknown) {
     try { client.write(message); } catch { clients.delete(client); }
   }
 }
-const service = new ScoutService(db, emit);
+const service = new ScoutService(db, emit, { publicExposureWarning });
 const marketplaceParam = z.enum(['OLX', 'Allegro Lokalnie', 'Vinted']);
 const marketplaceSources = z.array(marketplaceParam).min(1).max(3).refine((sources) => new Set(sources).size === sources.length, { message: 'Marketplace sources must be unique' });
 const resourceIdParams = z.object({ id: z.string().trim().min(1).max(160) });
@@ -62,18 +93,18 @@ app.setErrorHandler((error, _request, reply) => {
   return reply.code(500).send({ error: 'Internal server error' });
 });
 
-app.get('/api/health', async () => ({ status: 'ok', service: 'scout', version: '1.0.0', now: nowIso() }));
+app.get('/api/health', async () => ({ status: 'ok', service: 'scout', version: process.env.SCOUT_VERSION ?? '1.0.0', now: nowIso() }));
 app.get('/api/ready', async (_request, reply) => {
   const readiness = service.readiness();
   return reply.code(readiness.status === 'ready' ? 200 : 503).send(readiness);
 });
 app.get('/api/dashboard', async () => service.dashboard());
 app.get('/api/listings', async (request, reply) => {
-  const parsed = z.object({ marketplace: marketplaceParam.optional(), q: z.string().max(240).optional() }).strict().safeParse(request.query);
+  const parsed = z.object({ marketplace: marketplaceParam.optional(), q: z.string().max(240).optional(), watchId: z.string().trim().min(1).max(160).optional(), page: z.coerce.number().int().min(1).optional().default(1), pageSize: z.coerce.number().int().min(1).max(500).optional().default(200) }).strict().safeParse(request.query);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid listing filters' });
   const query = parsed.data;
-  const payload = service.dashboard();
-  return { ...payload, listings: payload.listings.filter((listing) => (!query.marketplace || listing.marketplace === query.marketplace) && (!query.q || `${listing.title} ${listing.subtitle}`.toLowerCase().includes(query.q.toLowerCase()))) };
+  const page = service.listingsPage({ marketplace: query.marketplace, q: query.q, watchId: query.watchId, page: query.page, pageSize: query.pageSize });
+  return { listings: page.listings, pagination: page.pagination };
 });
 app.get('/api/listing-detail', async (request, reply) => {
   const parsed = z.object({ key: z.string().min(3).max(500), watchId: z.string().trim().min(1).max(160).optional() }).safeParse(request.query);
@@ -85,7 +116,11 @@ app.post('/api/ai/normalize-listing', async (request, reply) => {
   if (!parsed.success) return reply.code(400).send({ error: 'A valid listing key is required' });
   return service.normalizeListingByKey(parsed.data.key, parsed.data.force);
 });
-app.get('/api/messages', async () => ({ messages: service.messages() }));
+app.get('/api/messages', async (request, reply) => {
+  const parsed = z.object({ page: z.coerce.number().int().min(1).optional().default(1), pageSize: z.coerce.number().int().min(1).max(200).optional().default(100) }).strict().safeParse(request.query);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid message history pagination' });
+  return service.messagesPage(parsed.data);
+});
 app.post('/api/negotiation/recommendation', async (request, reply) => {
   const parsed = z.object({
     key: z.string().min(3).max(500),
@@ -97,6 +132,19 @@ app.post('/api/negotiation/recommendation', async (request, reply) => {
   const { key, maxTotalCost, shippingCost, otherCosts } = parsed.data;
   return service.recommendNegotiationPriceByKey(key, maxTotalCost, shippingCost, otherCosts);
 });
+const negotiationInput = z.object({
+  key: z.string().min(3).max(500),
+  offerPrice: z.number().positive().nullable().optional().default(null),
+  maxTotalCost: z.number().positive().nullable().optional().default(null),
+  shippingCost: z.number().nonnegative().optional().default(0),
+  otherCosts: z.number().nonnegative().optional().default(0),
+}).strict();
+app.post('/api/ai/negotiate/draft', async (request, reply) => {
+  const parsed = negotiationInput.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'A valid listing key and optional opening offer are required' });
+  const budget = parsed.data.maxTotalCost === null ? undefined : { maxTotalCost: parsed.data.maxTotalCost, shippingCost: parsed.data.shippingCost, otherCosts: parsed.data.otherCosts };
+  return service.draftNegotiationByKey(parsed.data.key, parsed.data.offerPrice, budget);
+});
 app.post('/api/ai/negotiate', async (request, reply) => {
   const parsed = z.object({
     key: z.string().min(3).max(500),
@@ -104,10 +152,11 @@ app.post('/api/ai/negotiate', async (request, reply) => {
     maxTotalCost: z.number().positive().nullable().optional().default(null),
     shippingCost: z.number().nonnegative().optional().default(0),
     otherCosts: z.number().nonnegative().optional().default(0),
+    message: z.string().trim().min(1).max(600).optional(),
   }).strict().safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: 'A valid listing key and optional opening offer are required' });
   const budget = parsed.data.maxTotalCost === null ? undefined : { maxTotalCost: parsed.data.maxTotalCost, shippingCost: parsed.data.shippingCost, otherCosts: parsed.data.otherCosts };
-  return reply.code(201).send(await service.negotiateAndSendByKey(parsed.data.key, parsed.data.offerPrice, budget));
+  return reply.code(201).send(await service.negotiateAndSendByKey(parsed.data.key, parsed.data.offerPrice, budget, 'manual', parsed.data.message));
 });
 app.get('/api/listing-actions', async (request, reply) => {
   const parsed = z.object({ key: z.string().min(3).max(500) }).safeParse(request.query);
@@ -125,7 +174,8 @@ app.patch('/api/listing-actions', async (request, reply) => {
   return { action: service.updateListingAction(parsed.data.key, parsed.data.decision, parsed.data.note) };
 });
 app.get('/api/watches', async (request, reply) => {
-  const parsed = z.object({ includeArchived: z.coerce.boolean().optional().default(false) }).strict().safeParse(request.query);
+  const strictBoolean = z.union([z.boolean(), z.string().regex(/^(?:true|false)$/i).transform((value) => value.toLowerCase() === 'true')]);
+  const parsed = z.object({ includeArchived: strictBoolean.optional().default(false) }).strict().safeParse(request.query);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid watch filters' });
   return { watches: parsed.data.includeArchived ? service.allWatches() : service.getWatches() };
 });
@@ -137,10 +187,20 @@ app.get('/api/watches/:id/analytics', async (request, reply) => {
   return service.watchAnalytics(params.data.id, parsed.data.days);
 });
 app.get('/api/connectors', async () => ({ connectors: service.getConnectors() }));
-app.get('/api/notifications', async () => ({ notifications: service.notifications() }));
-app.get('/api/connector-runs', async () => ({ runs: service.connectorRuns() }));
+app.get('/api/notifications', async (request, reply) => {
+  const parsed = z.object({ page: z.coerce.number().int().min(1).optional().default(1), pageSize: z.coerce.number().int().min(1).max(200).optional().default(100) }).strict().safeParse(request.query);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid notification history pagination' });
+  return service.notificationsPage(parsed.data);
+});
+app.get('/api/connector-runs', async (request, reply) => {
+  const parsed = z.object({ page: z.coerce.number().int().min(1).optional().default(1), pageSize: z.coerce.number().int().min(1).max(200).optional().default(100) }).strict().safeParse(request.query);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid connector history pagination' });
+  return service.connectorRunsPage(parsed.data);
+});
 app.get('/api/settings', async () => service.settings());
 app.get('/api/marketplace-sessions', async () => ({ sessions: service.marketplaceSessions() }));
+app.get('/api/export', async (_request, reply) => reply.header('Content-Disposition', `attachment; filename="scout-export-${new Date().toISOString().slice(0, 10)}.json"`).type('application/json').send(service.exportData()));
+app.post('/api/backup', async (_request, reply) => reply.code(201).send({ backup: basename(backupDatabase(db)), message: 'SQLite backup created beside the configured database file.' }));
 
 app.put('/api/marketplace-sessions/:marketplace', async (request, reply) => {
   const params = z.object({ marketplace: marketplaceParam }).safeParse(request.params);
@@ -194,6 +254,10 @@ app.patch('/api/watches/:id', async (request, reply) => {
   const params = resourceIdParams.safeParse(request.params);
   if (!params.success) return reply.code(400).send({ error: 'A valid watch id is required' });
   const patchInput = z.object({
+    name: z.string().trim().min(1).max(120).optional(), query: z.string().trim().min(1).max(240).optional(),
+    terms: z.string().max(240).optional(), excluded: z.string().max(240).optional(), sources: marketplaceSources.optional(),
+    location: z.string().max(120).optional(), condition: z.string().max(80).optional(), exactUrls: z.array(z.string().url()).max(20).optional(),
+    sensitivity: z.number().min(0.6).max(1.6).optional(),
     enabled: z.boolean().optional(), interval: z.number().int().min(5).max(1440).optional(), shippingOnly: z.boolean().optional(),
     aiRelevance: z.boolean().optional(),
     archived: z.boolean().optional(),
@@ -202,13 +266,28 @@ app.patch('/api/watches/:id', async (request, reply) => {
   if (!patchInput.success) return reply.code(400).send({ error: 'Invalid watch update', details: patchInput.error.flatten() });
   const body = patchInput.data;
   if (body.interval !== undefined && (!Number.isInteger(body.interval) || body.interval < 5 || body.interval > 1440)) return reply.code(400).send({ error: 'Interval must be between 5 and 1440 minutes' });
-  const current = db.prepare('SELECT min_price_pln, max_price_pln FROM watches WHERE id = ?').get(params.data.id) as { min_price_pln: number | null; max_price_pln: number | null } | undefined;
+  const current = db.prepare('SELECT min_price_pln, max_price_pln, sources_json, exact_urls_json FROM watches WHERE id = ?').get(params.data.id) as { min_price_pln: number | null; max_price_pln: number | null; sources_json: string; exact_urls_json: string } | undefined;
   if (!current) return reply.code(404).send({ error: 'Watch not found' });
+  const sources = body.sources ?? JSON.parse(current.sources_json || '[]') as Marketplace[];
+  const exactUrls = body.exactUrls ?? JSON.parse(current.exact_urls_json || '[]') as string[];
+  for (const url of exactUrls) {
+    const valid = validateSearchUrl(url);
+    if (!valid.valid || !sources.includes(valid.marketplace)) return reply.code(400).send({ error: valid.valid ? 'Exact URL source is not selected' : valid.reason });
+  }
   const nextMin = body.minPrice === undefined ? current.min_price_pln : body.minPrice;
   const nextMax = body.maxPrice === undefined ? current.max_price_pln : body.maxPrice;
   if (nextMin !== null && nextMax !== null && nextMin > nextMax) return reply.code(400).send({ error: 'Minimum price cannot exceed maximum price' });
   const fields: string[] = [];
   const values: unknown[] = [];
+  if (body.name !== undefined) { fields.push('name = ?'); values.push(body.name); }
+  if (body.query !== undefined) { fields.push('query = ?'); values.push(body.query); }
+  if (body.terms !== undefined) { fields.push('included_terms = ?'); values.push(body.terms); }
+  if (body.excluded !== undefined) { fields.push('excluded_terms = ?'); values.push(body.excluded); }
+  if (body.sources !== undefined) { fields.push('sources_json = ?'); values.push(JSON.stringify(body.sources)); }
+  if (body.location !== undefined) { fields.push('location = ?'); values.push(body.location); }
+  if (body.condition !== undefined) { fields.push('condition = ?'); values.push(body.condition); }
+  if (body.exactUrls !== undefined) { fields.push('exact_urls_json = ?'); values.push(JSON.stringify(body.exactUrls)); }
+  if (body.sensitivity !== undefined) { fields.push('sensitivity = ?'); values.push(body.sensitivity); }
   if (typeof body.enabled === 'boolean') { fields.push('enabled = ?'); values.push(body.enabled ? 1 : 0); }
   if (body.interval !== undefined) { fields.push('interval_minutes = ?'); values.push(body.interval); }
   if (typeof body.shippingOnly === 'boolean') { fields.push('shipping_only = ?'); values.push(body.shippingOnly ? 1 : 0); }
@@ -424,7 +503,6 @@ const sseHeartbeat = setInterval(() => {
   emit('ping', { now: nowIso() });
 }, 25_000);
 
-const host = process.env.SCOUT_HOST?.trim() || (process.env.NODE_ENV === 'production' ? '127.0.0.1' : '0.0.0.0');
 app.addHook('onClose', async () => { clearInterval(scheduler); clearInterval(sseHeartbeat); for (const client of clients) client.end(); db.close(); });
 let shuttingDown = false;
 const shutdown = async (signal: string) => {

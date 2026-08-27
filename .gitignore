@@ -1,7 +1,10 @@
 node_modules
 dist
+dist-server
 data
 .env
 *.log
 *.tsbuildinfo
 *.storage-state.json
+*.restore-*.tmp
+*.before-restore-*

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -54,6 +54,7 @@ import type {
   MarketTrackedListing,
   MarketWatch,
   MarketWatchInput,
+  NegotiationDraft,
   NegotiationRecommendation,
   NotificationPriority,
   PriceHistoryPoint,
@@ -78,8 +79,34 @@ const navItems: Array<{ id: View; label: string; icon: typeof Grid2X2 }> = [
   { id: "settings", label: "Settings", icon: Settings2 },
 ];
 
+type WatchPreset = {
+  query: string;
+  terms: string;
+  excluded: string;
+  sources: Marketplace[];
+  location: string;
+  condition: string;
+  minPrice: number | null;
+  maxPrice: number | null;
+  shippingOnly: boolean;
+};
+
+function viewFromLocation(): View {
+  const candidate = window.location.pathname.replace(/^\//, "") as View;
+  return navItems.some((item) => item.id === candidate) ? candidate : "overview";
+}
+
 const formatPln = (value: number | null) =>
   value === null ? "Learning" : `${value.toLocaleString("pl-PL")} zł`;
+function safeImageUrl(value: string | null | undefined) {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
 type Toast = { message: string; type: "success" | "error" | "info" };
@@ -109,7 +136,7 @@ function useTheme() {
 
 function App() {
   const { theme, setTheme } = useTheme();
-  const [view, setView] = useState<View>("overview");
+  const [view, setView] = useState<View>(() => viewFromLocation());
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [data, setData] = useState<DashboardData>(emptyDashboard);
@@ -118,7 +145,9 @@ function App() {
     "loading" | "online" | "offline"
   >("loading");
   const [showWatchDialog, setShowWatchDialog] = useState(false);
+  const [watchPreset, setWatchPreset] = useState<WatchPreset | null>(null);
   const [editingWatch, setEditingWatch] = useState<Watch | null>(null);
+  const [editingFullWatch, setEditingFullWatch] = useState<Watch | null>(null);
   const [showHistory, setShowHistory] = useState(false);
   const [marketRefreshKey, setMarketRefreshKey] = useState(0);
   const [messagesRefreshKey, setMessagesRefreshKey] = useState(0);
@@ -132,6 +161,9 @@ function App() {
   );
   const [scanning, setScanning] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
+  const [allWatches, setAllWatches] = useState<Watch[] | null>(null);
+  const [watchRefreshKey, setWatchRefreshKey] = useState(0);
+  const refreshSequence = useRef(0);
 
   const notify = useCallback(
     (message: string, type: Toast["type"] = "success") =>
@@ -140,9 +172,12 @@ function App() {
   );
   const refreshData = useCallback(
     async (showLoader = false) => {
+      const sequence = ++refreshSequence.current;
       if (showLoader) setIsLoading(true);
       try {
-        setData(await api.dashboard());
+        const next = await api.dashboard();
+        if (sequence !== refreshSequence.current) return;
+        setData(next);
         setConnection("online");
       } catch (error) {
         setConnection("offline");
@@ -173,6 +208,56 @@ function App() {
     return () => source.close();
   }, [refreshData]);
   useEffect(() => {
+    if (view !== "watches") return;
+    void api.watches(true).then((result) => setAllWatches(result.watches)).catch((error) => notify(errorMessage(error), "error"));
+  }, [notify, view, watchRefreshKey]);
+  useEffect(() => {
+    const onPopState = () => setView(viewFromLocation());
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+  const modalOpen = Boolean(showWatchDialog || editingWatch || analyticsWatch || showHistory || selectedListing);
+  useEffect(() => {
+    if (!modalOpen) return;
+    const dialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]'));
+    const dialog = dialogs.at(-1);
+    const main = document.querySelector<HTMLElement>("main");
+    const sidebar = document.querySelector<HTMLElement>(".sidebar");
+    if (!dialog) return;
+    const previous = document.activeElement as HTMLElement | null;
+    if (main) main.inert = true;
+    if (sidebar) sidebar.inert = true;
+    const focusable = () => Array.from(dialog.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])')).filter((element) => element.offsetParent !== null);
+    const first = focusable()[0];
+    first?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        dialog.querySelector<HTMLButtonElement>('[aria-label^="Close"]')?.click();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusable();
+      if (!items.length) return;
+      const current = items.indexOf(document.activeElement as HTMLElement);
+      const next = event.shiftKey ? (current <= 0 ? items.length - 1 : current - 1) : (current === items.length - 1 ? 0 : current + 1);
+      if (current === -1 || next !== current) {
+        event.preventDefault();
+        items[next].focus();
+      }
+    };
+    dialog.addEventListener("keydown", onKeyDown);
+    return () => {
+      dialog.removeEventListener("keydown", onKeyDown);
+      if (main) main.inert = false;
+      if (sidebar) {
+        const mobileHidden = window.matchMedia("(max-width: 900px)").matches && !sidebarOpen;
+        sidebar.inert = mobileHidden;
+        sidebar.setAttribute("aria-hidden", String(mobileHidden));
+      }
+      previous?.focus();
+    };
+  }, [modalOpen, sidebarOpen]);
+  useEffect(() => {
     if (!toast) return;
     const timeout = window.setTimeout(() => setToast(null), 3600);
     return () => window.clearTimeout(timeout);
@@ -181,6 +266,7 @@ function App() {
   const openView = (nextView: View) => {
     if (nextView === "listings") setSelectedWatchId(null);
     setView(nextView);
+    window.history.pushState({}, "", nextView === "overview" ? "/" : `/${nextView}`);
     setSidebarOpen(false);
   };
   const requestScan = async (watchId?: string) => {
@@ -205,6 +291,9 @@ function App() {
       stats: { ...previous.stats, watching: previous.stats.watching + 1 },
     }));
     setShowWatchDialog(false);
+    setWatchPreset(null);
+    setAllWatches(null);
+    setWatchRefreshKey((value) => value + 1);
     notify(
       `${result.watch.name} is learning. Alerts begin after 30 listings and 6 hours.`,
     );
@@ -226,6 +315,7 @@ function App() {
       try {
         await api.updateWatch(watch.id, { enabled: !watch.enabled });
         await refreshData(false);
+        setWatchRefreshKey((value) => value + 1);
         notify(
           watch.enabled ? `${watch.name} paused.` : `${watch.name} resumed.`,
         );
@@ -238,6 +328,7 @@ function App() {
       try {
         await api.updateWatch(watch.id, { shippingOnly: !watch.shippingOnly });
         await refreshData(false);
+        setWatchRefreshKey((value) => value + 1);
         notify(
           `Shipping-only filter ${watch.shippingOnly ? "disabled" : "enabled"} for ${watch.name}.`,
         );
@@ -250,6 +341,7 @@ function App() {
       try {
         await api.updateWatch(watch.id, { aiRelevance: !watch.aiRelevance });
         await refreshData(false);
+        setWatchRefreshKey((value) => value + 1);
         notify(
           `AI relevance filter ${watch.aiRelevance ? "disabled" : "enabled"} for ${watch.name}.`,
         );
@@ -266,6 +358,7 @@ function App() {
       try {
         await api.updateWatch(watch.id, { minPrice, maxPrice });
         await refreshData(false);
+        setWatchRefreshKey((value) => value + 1);
         setEditingWatch(null);
         notify(`Price filter updated for ${watch.name}.`);
       } catch (error) {
@@ -273,16 +366,31 @@ function App() {
         throw error;
       }
     });
+  const updateWatch = async (watch: Watch) =>
+    withBusyWatch(watch, async () => {
+      try {
+        await api.updateWatch(watch.id, { name: watch.name, query: watch.query, terms: watch.terms, excluded: watch.excluded, sources: watch.sources, location: watch.location, condition: watch.condition, interval: watch.interval, exactUrls: watch.exactUrls, sensitivity: watch.sensitivity, shippingOnly: watch.shippingOnly, aiRelevance: watch.aiRelevance, minPrice: watch.minPrice, maxPrice: watch.maxPrice, enabled: watch.enabled });
+        await refreshData(false);
+        setEditingFullWatch(null);
+        setAllWatches(null);
+        setWatchRefreshKey((value) => value + 1);
+        notify(`${watch.name} updated.`);
+      } catch (error) {
+        notify(errorMessage(error), "error");
+        throw error;
+      }
+    });
   const archiveWatch = (watch: Watch) =>
     withBusyWatch(watch, async () => {
-      if (
-        !window.confirm(`Archive “${watch.name}”? Its observations and analytics will be kept.`)
-      )
+      const archived = Boolean(watch.archivedAt);
+      if (!window.confirm(`${archived ? "Restore" : "Archive"} “${watch.name}”? Its observations and analytics will be kept.`))
         return;
       try {
-        await api.updateWatch(watch.id, { archived: true });
+        await api.updateWatch(watch.id, { archived: !archived });
         await refreshData(false);
-        notify(`${watch.name} archived. Its history is still retained.`);
+        setAllWatches(null);
+        setWatchRefreshKey((value) => value + 1);
+        notify(`${watch.name} ${archived ? "restored" : "archived"}. Its history is still retained.`);
       } catch (error) {
         notify(errorMessage(error), "error");
       }
@@ -293,6 +401,7 @@ function App() {
       try {
         await api.deleteWatch(watch.id);
         await refreshData(false);
+        setWatchRefreshKey((value) => value + 1);
         notify(`${watch.name} permanently deleted.`);
       } catch (error) {
         notify(errorMessage(error), "error");
@@ -302,7 +411,7 @@ function App() {
     withBusyWatch(watch, async () => requestScan(watch.id));
   const showWatchListings = (watch: Watch) => {
     setSelectedWatchId(watch.id);
-    setView("listings");
+    openView("listings");
   };
   const updateListingAction = useCallback((listing: Listing) => {
     setData((previous) => ({
@@ -341,6 +450,8 @@ function App() {
         <button
           className="mobile-menu"
           aria-label="Open navigation"
+          aria-expanded={sidebarOpen}
+          aria-controls="primary-navigation"
           onClick={() => setSidebarOpen(true)}
         >
           <Menu size={21} />
@@ -360,22 +471,23 @@ function App() {
           data={data}
           isLoading={isLoading}
           scanning={scanning}
-          onNewWatch={() => setShowWatchDialog(true)}
+          onNewWatch={() => { setWatchPreset(null); setShowWatchDialog(true); }}
           onNavigate={openView}
           onScan={() => requestScan()}
           onSelectListing={setSelectedListing}
         />
         ) : null}
-        {view === "search" ? <SearchPage onSelectListing={setSelectedListing} /> : null}
+        {view === "search" ? <SearchPage onSelectListing={setSelectedListing} onSaveWatch={(preset) => { setWatchPreset(preset); setShowWatchDialog(true); }} /> : null}
         {view === "watches" ? (
           <WatchesPage
-            watches={data.watches}
+            watches={allWatches ?? data.watches}
             busyWatchIds={busyWatchIds}
-            onNewWatch={() => setShowWatchDialog(true)}
+            onNewWatch={() => { setWatchPreset(null); setShowWatchDialog(true); }}
             onToggle={toggleWatch}
             onToggleShipping={toggleShipping}
             onToggleAiRelevance={toggleAiRelevance}
-            onEdit={setEditingWatch}
+            onEdit={setEditingFullWatch}
+            onPriceEdit={setEditingWatch}
             onArchive={archiveWatch}
             onDelete={deleteWatch}
             onScan={scanWatch}
@@ -415,10 +527,13 @@ function App() {
       </main>
       {showWatchDialog ? (
         <WatchDialog
-          onClose={() => setShowWatchDialog(false)}
+          key="new-watch"
+          onClose={() => { setShowWatchDialog(false); setWatchPreset(null); }}
           onSubmit={createWatch}
+          preset={watchPreset}
         />
       ) : null}
+      {editingFullWatch ? <WatchDialog key={editingFullWatch.id} initialWatch={editingFullWatch} onClose={() => setEditingFullWatch(null)} onSubmit={updateWatch} /> : null}
       {editingWatch ? (
         <PriceFilterDialog
           watch={editingWatch}
@@ -476,8 +591,23 @@ function Sidebar({
   connection: "loading" | "online" | "offline";
   onCollapse: () => void;
 }) {
+  const sidebarRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 900px)");
+    const updateAccessibility = () => {
+      const mobileHidden = media.matches && !open;
+      if (sidebarRef.current) {
+        sidebarRef.current.inert = mobileHidden;
+        sidebarRef.current.setAttribute("aria-hidden", String(mobileHidden));
+      }
+    };
+    updateAccessibility();
+    media.addEventListener("change", updateAccessibility);
+    return () => media.removeEventListener("change", updateAccessibility);
+  }, [open]);
   return (
     <aside
+      ref={sidebarRef}
       className={`sidebar ${open ? "sidebar--open" : ""} ${collapsed ? "sidebar--collapsed" : ""}`}
     >
       <div className="brand-row">
@@ -487,13 +617,14 @@ function Sidebar({
         </div>
         {collapsed ? null : <span className="brand-name">Scout</span>}
       </div>
-      <nav className="sidebar-nav" aria-label="Primary navigation">
+      <nav id="primary-navigation" className="sidebar-nav" aria-label="Primary navigation">
         {navItems.map(({ id, label, icon: Icon }) => (
           <button
             key={id}
             className={`nav-item ${view === id ? "nav-item--active" : ""}`}
             onClick={() => onNavigate(id)}
             title={collapsed ? label : undefined}
+            aria-current={view === id ? "page" : undefined}
           >
             <Icon size={22} strokeWidth={1.9} />
             {collapsed ? null : <span>{label}</span>}
@@ -658,8 +789,8 @@ function Overview({
           <div>
             <Bell size={19} />
             <span>
-              <strong>Create your first watch</strong>Scout needs a search
-              before it can collect prices.
+              <strong>Create your first watch</strong>
+              <span>Scout needs a search before it can collect prices.</span>
             </span>
           </div>
           <button className="outline-button" onClick={onNewWatch}>
@@ -827,16 +958,18 @@ function ListingTable({
   return (
     <div
       className={`listing-table-wrap ${compact ? "listing-table-wrap--compact" : ""}`}
+      role="table"
+      aria-label="Saved marketplace listings"
     >
-      <div className="listing-table listing-table--head">
-        <span>Item</span>
-        <span>Marketplace</span>
-        <span>Price (PLN)</span>
-        <span>Typical (PLN)</span>
-        <span>Below typical</span>
-        <span>Observed</span>
-        <span>Deal strength</span>
-        <span aria-label="Open listing" />
+      <div className="listing-table listing-table--head" role="row">
+        <span role="columnheader">Item</span>
+        <span role="columnheader">Marketplace</span>
+        <span role="columnheader">Price (PLN)</span>
+        <span role="columnheader">Typical (PLN)</span>
+        <span role="columnheader">Below typical</span>
+        <span role="columnheader">Observed</span>
+        <span role="columnheader">Deal strength</span>
+        <span role="columnheader" aria-label="Open listing" />
       </div>
       {listings.map((listing) => (
         <ListingRow key={listing.associationId ?? listing.id} listing={listing} onSelect={onSelect} />
@@ -846,9 +979,10 @@ function ListingTable({
 }
 function ListingThumbnail({ listing }: { listing: Listing }) {
   const [failed, setFailed] = useState(false);
-  return listing.image && !failed ? (
+  const image = safeImageUrl(listing.image);
+  return image && !failed ? (
     <img
-      src={listing.image}
+      src={image}
       alt=""
       loading="lazy"
       onError={() => setFailed(true)}
@@ -861,7 +995,7 @@ function ListingThumbnail({ listing }: { listing: Listing }) {
 }
 function ListingRow({ listing, onSelect }: { listing: Listing; onSelect?: (listing: Listing) => void }) {
   return (
-    <div className="listing-table listing-row">
+    <div className="listing-table listing-row" role="row">
       <button
         type="button"
         className="listing-item listing-item--button"
@@ -884,19 +1018,19 @@ function ListingRow({ listing, onSelect }: { listing: Listing; onSelect?: (listi
           ) : null}
         </div>
       </button>
-      <div className="marketplace-cell">
+      <div className="marketplace-cell" role="cell">
         <i style={{ background: marketplaceColors[listing.marketplace] }} />
         {listing.marketplace}
       </div>
-      <strong className="price-cell">{formatPln(listing.price)}</strong>
-      <span>{formatPln(listing.typical)}</span>
-      <strong className="discount-cell">
+      <strong className="price-cell" role="cell">{formatPln(listing.price)}</strong>
+      <span role="cell">{formatPln(listing.typical)}</span>
+      <strong className="discount-cell" role="cell">
         {listing.belowTypical === null
           ? "—"
           : `${listing.belowTypical.toFixed(1)}%`}
       </strong>
-      <span className="observed-cell">{listing.observed}</span>
-      <div className="strength-cell">
+      <span className="observed-cell" role="cell">{listing.observed}</span>
+      <div className="strength-cell" role="cell">
         <DealBars strength={listing.dealStrength} />
         <span>{listing.typical === null ? "Learning" : listing.dealLabel}</span>
       </div>
@@ -1013,7 +1147,7 @@ function ConnectorPanel({
   );
 }
 
-function SearchPage({ onSelectListing }: { onSelectListing: (listing: Listing) => void }) {
+function SearchPage({ onSelectListing, onSaveWatch }: { onSelectListing: (listing: Listing) => void; onSaveWatch: (preset: WatchPreset) => void }) {
   const [query, setQuery] = useState("");
   const [terms, setTerms] = useState("");
   const [excluded, setExcluded] = useState("");
@@ -1175,6 +1309,7 @@ function SearchPage({ onSelectListing }: { onSelectListing: (listing: Listing) =
                     type="button"
                     key={source}
                     className={`source-option ${sources.includes(source) ? "source-option--selected" : ""}`}
+                    aria-pressed={sources.includes(source)}
                     onClick={() => toggleSource(source)}
                   >
                     <i style={{ background: marketplaceColors[source] }} />
@@ -1243,7 +1378,7 @@ function SearchPage({ onSelectListing }: { onSelectListing: (listing: Listing) =
               : "Results"}
           </h2>
           {searched && !loading ? (
-            <span className="toolbar-meta">Sorted by lowest price</span>
+            <div className="search-results-actions"><span className="toolbar-meta">Sorted by lowest price</span><button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, location: location.trim(), condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly })}><Bell size={15} />Save as watch</button></div>
           ) : null}
         </div>
         {loading ? (
@@ -1273,17 +1408,17 @@ function SearchPage({ onSelectListing }: { onSelectListing: (listing: Listing) =
 
 function SearchResultsTable({ listings, onSelect }: { listings: Listing[]; onSelect: (listing: Listing) => void }) {
   return (
-    <div className="search-table-wrap">
-      <div className="search-table search-table--head">
-        <span>Item</span>
-        <span>Marketplace</span>
-        <span>Price</span>
-        <span>Shipping</span>
-        <span>Condition / location</span>
-        <span />
+    <div className="search-table-wrap" role="table" aria-label="Manual search results">
+      <div className="search-table search-table--head" role="row">
+        <span role="columnheader">Item</span>
+        <span role="columnheader">Marketplace</span>
+        <span role="columnheader">Price</span>
+        <span role="columnheader">Shipping</span>
+        <span role="columnheader">Condition / location</span>
+        <span role="columnheader" />
       </div>
       {listings.map((listing) => (
-        <div className="search-table search-result-row" key={listing.associationId ?? listing.id}>
+        <div className="search-table search-result-row" role="row" key={listing.associationId ?? listing.id}>
           <button
             type="button"
             className="listing-item listing-item--button"
@@ -1296,16 +1431,17 @@ function SearchResultsTable({ listings, onSelect }: { listings: Listing[]; onSel
               <span>{listing.subtitle || "No extra details"}</span>
             </div>
           </button>
-          <div className="marketplace-cell">
+          <div className="marketplace-cell" role="cell">
             <i style={{ background: marketplaceColors[listing.marketplace] }} />
             {listing.marketplace}
           </div>
-          <div className="price-cell search-price-cell">
+          <div className="price-cell search-price-cell" role="cell">
             <strong>{formatPln(listing.price)}</strong>
             <PriceNegotiability listing={listing} />
           </div>
           <span
             className={`shipping-state shipping-state--${listing.shippingAvailable === true ? "yes" : listing.shippingAvailable === false ? "no" : "unknown"}`}
+            role="cell"
           >
             {listing.shippingAvailable === true
               ? "Available"
@@ -1313,7 +1449,7 @@ function SearchResultsTable({ listings, onSelect }: { listings: Listing[]; onSel
                 ? "Pickup only"
                 : "Unknown"}
           </span>
-          <span>
+          <span role="cell">
             {[listing.condition, listing.location]
               .filter(Boolean)
               .join(" · ") || "—"}
@@ -1348,6 +1484,7 @@ function WatchesPage({
   onToggleShipping,
   onToggleAiRelevance,
   onEdit,
+  onPriceEdit,
   onArchive,
   onDelete,
   onScan,
@@ -1361,6 +1498,7 @@ function WatchesPage({
   onToggleShipping: (watch: Watch) => void;
   onToggleAiRelevance: (watch: Watch) => void;
   onEdit: (watch: Watch) => void;
+  onPriceEdit: (watch: Watch) => void;
   onArchive: (watch: Watch) => void;
   onDelete: (watch: Watch) => void;
   onScan: (watch: Watch) => void;
@@ -1406,6 +1544,7 @@ function WatchesPage({
               onToggleShipping={() => onToggleShipping(watch)}
               onToggleAiRelevance={() => onToggleAiRelevance(watch)}
               onEdit={() => onEdit(watch)}
+              onPriceEdit={() => onPriceEdit(watch)}
               onArchive={() => onArchive(watch)}
               onDelete={() => onDelete(watch)}
               onScan={() => onScan(watch)}
@@ -1437,8 +1576,9 @@ function WatchesPage({
         <ShieldCheck size={18} />
         <span>
           Scout reads public pages by default. Optional authenticated sessions
-          can be configured in Settings; Scout never captures passwords,
-          bypasses CAPTCHAs, or contacts sellers.
+          can be configured in Settings; Scout never captures passwords or
+          bypasses CAPTCHAs. Seller messages are sent only after you review
+          and confirm them; automatic negotiation is off by default.
         </span>
       </div>
     </>
@@ -1451,6 +1591,7 @@ function WatchRow({
   onToggleShipping,
   onToggleAiRelevance,
   onEdit,
+  onPriceEdit,
   onArchive,
   onDelete,
   onScan,
@@ -1463,6 +1604,7 @@ function WatchRow({
   onToggleShipping: () => void;
   onToggleAiRelevance: () => void;
   onEdit: () => void;
+  onPriceEdit: () => void;
   onArchive: () => void;
   onDelete: () => void;
   onScan: () => void;
@@ -1557,7 +1699,7 @@ function WatchRow({
         </button>
         <button
           className={`toggle ${watch.enabled ? "toggle--on" : ""}`}
-          disabled={busy}
+          disabled={busy || Boolean(watch.archivedAt)}
           onClick={onToggle}
           aria-label={
             watch.enabled ? `Pause ${watch.name}` : `Resume ${watch.name}`
@@ -1575,6 +1717,8 @@ function WatchRow({
           <button
             className="icon-button"
             title="More actions"
+            aria-label={`More actions for ${watch.name}`}
+            aria-haspopup="menu"
             aria-expanded={menuOpen}
             onClick={() => setMenuOpen((value) => !value)}
           >
@@ -1584,7 +1728,7 @@ function WatchRow({
             <div className="action-menu" role="menu">
               <button
                 role="menuitem"
-                disabled={busy || !watch.enabled}
+                disabled={busy || !watch.enabled || Boolean(watch.archivedAt)}
                 onClick={() => {
                   setMenuOpen(false);
                   onScan();
@@ -1602,6 +1746,17 @@ function WatchRow({
                 }}
               >
                 <SlidersHorizontal size={15} />
+                Edit watch
+              </button>
+              <button
+                role="menuitem"
+                disabled={busy}
+                onClick={() => {
+                  setMenuOpen(false);
+                  onPriceEdit();
+                }}
+              >
+                <Calculator size={15} />
                 Edit price filter
               </button>
               <button
@@ -1636,7 +1791,7 @@ function WatchRow({
                 }}
               >
                 <Archive size={15} />
-                Archive watch
+                {watch.archivedAt ? "Restore watch" : "Archive watch"}
               </button>
               <button
                 role="menuitem"
@@ -1879,12 +2034,13 @@ function MarketWatchFilterSummary({ watch }: { watch: MarketWatch }) {
 
 function MarketResearchTable({ listings }: { listings: MarketTrackedListing[] }) {
   if (!listings.length) return <div className="empty-state"><Database size={24} /><strong>No saved listings in this view</strong><span>The first successful snapshot will populate this history.</span></div>;
-  return <div className="research-table-wrap"><div className="research-table research-table--head"><span>Listing</span><span>Status</span><span>First price</span><span>Last price</span><span>Change</span><span>Observations</span><span>Last seen / ended</span><span /></div>{listings.map((listing) => <div className="research-table research-listing-row" key={listing.id}><div className="research-listing"><MarketThumbnail listing={listing} /><div><strong>{listing.title}</strong><span><i style={{ background: marketplaceColors[listing.marketplace] }} />{listing.marketplace} · {listing.watchName}</span></div></div><span className={`research-status research-status--${listing.status}`}><i />{listing.status === "ended" ? "No longer available" : listing.status === "superseded" ? "Previous series" : listing.missingScans ? `Verifying (${listing.missingScans}/3)` : "Active"}</span><span>{formatPln(listing.firstPrice)}</span><strong>{formatPln(listing.lastPrice)}{listing.status === "ended" ? <small>last asking price · not a confirmed sale</small> : null}</strong><span className={listing.priceChangePercent < 0 ? "price-down" : listing.priceChangePercent > 0 ? "price-up" : ""}>{listing.priceChangePercent === 0 ? "—" : `${listing.priceChangePercent > 0 ? "+" : ""}${listing.priceChangePercent.toFixed(1)}%`}</span><span>{listing.observations}</span><span>{new Date(listing.endedAt ?? listing.lastSeenAt).toLocaleDateString("pl-PL", { day: "2-digit", month: "short", year: "numeric" })}</span><a href={listing.url} target="_blank" rel="noreferrer" className="external-link" aria-label={`Open ${listing.title}`}><ExternalLink size={17} /></a></div>)}</div>;
+  return <div className="research-table-wrap" role="table" aria-label="Market research listings"><div className="research-table research-table--head" role="row"><span role="columnheader">Listing</span><span role="columnheader">Status</span><span role="columnheader">First price</span><span role="columnheader">Last price</span><span role="columnheader">Change</span><span role="columnheader">Observations</span><span role="columnheader">Last seen / ended</span><span role="columnheader" /></div>{listings.map((listing) => <div className="research-table research-listing-row" role="row" key={listing.id}><div className="research-listing" role="cell"><MarketThumbnail listing={listing} /><div><strong>{listing.title}</strong><span><i style={{ background: marketplaceColors[listing.marketplace] }} />{listing.marketplace} · {listing.watchName}</span></div></div><span className={`research-status research-status--${listing.status}`} role="cell"><i />{listing.status === "ended" ? "No longer available" : listing.status === "superseded" ? "Previous series" : listing.missingScans ? `Verifying (${listing.missingScans}/3)` : "Active"}</span><span data-label="First price" role="cell">{formatPln(listing.firstPrice)}</span><strong data-label="Last price" role="cell">{formatPln(listing.lastPrice)}{listing.status === "ended" ? <small>last asking price · not a confirmed sale</small> : null}</strong><span data-label="Change" role="cell" className={listing.priceChangePercent < 0 ? "price-down" : listing.priceChangePercent > 0 ? "price-up" : ""}>{listing.priceChangePercent === 0 ? "—" : `${listing.priceChangePercent > 0 ? "+" : ""}${listing.priceChangePercent.toFixed(1)}%`}</span><span data-label="Observations" role="cell">{listing.observations}</span><span data-label="Last seen / ended" role="cell">{new Date(listing.endedAt ?? listing.lastSeenAt).toLocaleDateString("pl-PL", { day: "2-digit", month: "short", year: "numeric" })}</span><a role="cell" href={listing.url} target="_blank" rel="noreferrer" className="external-link" aria-label={`Open ${listing.title}`}><ExternalLink size={17} /></a></div>)}</div>;
 }
 
 function MarketThumbnail({ listing }: { listing: MarketTrackedListing }) {
   const [failed, setFailed] = useState(false);
-  return listing.image && !failed ? <img src={listing.image} alt="" loading="lazy" onError={() => setFailed(true)} /> : <div className="listing-thumb-placeholder"><Tag size={20} /></div>;
+  const image = safeImageUrl(listing.image);
+  return image && !failed ? <img src={image} alt="" loading="lazy" onError={() => setFailed(true)} /> : <div className="listing-thumb-placeholder"><Tag size={20} /></div>;
 }
 
 function MarketWatchDialog({ initialWatch, onClose, onSubmit }: { initialWatch: MarketWatch | null; onClose: () => void; onSubmit: (watch: MarketWatchInput) => Promise<void> }) {
@@ -1915,7 +2071,7 @@ function MarketWatchDialog({ initialWatch, onClose, onSubmit }: { initialWatch: 
     catch (submitError) { setError(errorMessage(submitError)); setSubmitting(false); }
   };
   const editing = Boolean(initialWatch);
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !submitting && onClose()}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="market-watch-title"><div className="modal-header"><div><span className="modal-kicker">Market research</span><h2 id="market-watch-title">{editing ? "Edit research watch" : "New research watch"}</h2><p>{editing ? "Changing search criteria starts a new comparable series; previous observations remain available." : "Save recurring search snapshots and compare asking-price history."}</p></div><button className="icon-button" disabled={submitting} onClick={onClose} aria-label="Close"><X size={20} /></button></div><div className="modal-body"><label className="field-label">Watch name<input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Used RTX 4070 market" /></label><label className="field-label">Search phrase<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="e.g. RTX 4070" /></label><div className="field-row"><label className="field-label">Included terms<input value={terms} onChange={(event) => setTerms(event.target.value)} placeholder="e.g. 12gb, founders edition" /></label><label className="field-label">Excluded terms<input value={excluded} onChange={(event) => setExcluded(event.target.value)} placeholder="e.g. broken, parts" /></label></div><div className="field-row"><label className="field-label">Location <span>where available</span><input value={location} onChange={(event) => setLocation(event.target.value)} placeholder="Anywhere" /></label><label className="field-label">Condition<select value={condition} onChange={(event) => setCondition(event.target.value)}><option>Any</option><option>New</option><option>Used</option><option>Like new</option><option>Very good</option><option>Good</option></select></label></div><div className="field-row"><label className="field-label">Minimum price <span>PLN · optional</span><input type="number" min="0" step="1" value={minPrice} onChange={(event) => setMinPrice(event.target.value)} placeholder="No minimum" /></label><label className="field-label">Maximum price <span>PLN · optional</span><input type="number" min="1" step="1" value={maxPrice} onChange={(event) => setMaxPrice(event.target.value)} placeholder="No maximum" /></label></div><div className="field-row"><label className="field-label">Snapshot interval <span>6–168 hours</span><input type="number" min="6" max="168" value={interval} onChange={(event) => setIntervalValue(event.target.value)} /></label><div className="field-label"><span>Sources</span><div className="source-options">{(["OLX", "Allegro Lokalnie", "Vinted"] as Marketplace[]).map((source) => <button type="button" key={source} className={`source-option ${sources.includes(source) ? "source-option--selected" : ""}`} onClick={() => toggleSource(source)}><i style={{ background: marketplaceColors[source] }} />{source}{sources.includes(source) ? <Check size={15} /> : null}</button>)}</div></div></div><label className="check-option check-option--modal"><input type="checkbox" checked={shippingOnly} onChange={(event) => setShippingOnly(event.target.checked)} /><span><strong>Require shipping</strong><small>Only save listings with confirmed delivery options</small></span></label>{error ? <div className="form-error" role="alert"><AlertTriangle size={15} />{error}</div> : null}{!validPrices ? <div className="form-error" role="alert"><AlertTriangle size={15} />Minimum price cannot exceed maximum price.</div> : null}<div className="modal-note"><Info size={16} /><span>Scout displays “no longer available” only after verified terminal checks. The retained last asking price is not a confirmed sale price.</span></div></div><div className="modal-footer"><button className="outline-button" disabled={submitting} onClick={onClose}>Cancel</button><button className="primary-button" disabled={!valid || submitting} onClick={submit}>{submitting ? <LoaderCircle size={17} className="spin" /> : editing ? <Check size={17} /> : <Plus size={17} />}{submitting ? "Saving…" : editing ? "Save research watch" : "Create research watch"}</button></div></section></div>;
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !submitting && onClose()}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="market-watch-title"><div className="modal-header"><div><span className="modal-kicker">Market research</span><h2 id="market-watch-title">{editing ? "Edit research watch" : "New research watch"}</h2><p>{editing ? "Changing search criteria starts a new comparable series; previous observations remain available." : "Save recurring search snapshots and compare asking-price history."}</p></div><button className="icon-button" disabled={submitting} onClick={onClose} aria-label="Close"><X size={20} /></button></div><div className="modal-body"><label className="field-label">Watch name<input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Used RTX 4070 market" /></label><label className="field-label">Search phrase<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="e.g. RTX 4070" /></label><div className="field-row"><label className="field-label">Included terms<input value={terms} onChange={(event) => setTerms(event.target.value)} placeholder="e.g. 12gb, founders edition" /></label><label className="field-label">Excluded terms<input value={excluded} onChange={(event) => setExcluded(event.target.value)} placeholder="e.g. broken, parts" /></label></div><div className="field-row"><label className="field-label">Location <span>where available</span><input value={location} onChange={(event) => setLocation(event.target.value)} placeholder="Anywhere" /></label><label className="field-label">Condition<select value={condition} onChange={(event) => setCondition(event.target.value)}><option>Any</option><option>New</option><option>Used</option><option>Like new</option><option>Very good</option><option>Good</option></select></label></div><div className="field-row"><label className="field-label">Minimum price <span>PLN · optional</span><input type="number" min="0" step="1" value={minPrice} onChange={(event) => setMinPrice(event.target.value)} placeholder="No minimum" /></label><label className="field-label">Maximum price <span>PLN · optional</span><input type="number" min="1" step="1" value={maxPrice} onChange={(event) => setMaxPrice(event.target.value)} placeholder="No maximum" /></label></div><div className="field-row"><label className="field-label">Snapshot interval <span>6–168 hours</span><input type="number" min="6" max="168" value={interval} onChange={(event) => setIntervalValue(event.target.value)} /></label><div className="field-label"><span>Sources</span><div className="source-options">{(["OLX", "Allegro Lokalnie", "Vinted"] as Marketplace[]).map((source) => <button type="button" key={source} aria-pressed={sources.includes(source)} className={`source-option ${sources.includes(source) ? "source-option--selected" : ""}`} onClick={() => toggleSource(source)}><i style={{ background: marketplaceColors[source] }} />{source}{sources.includes(source) ? <Check size={15} /> : null}</button>)}</div></div></div><label className="check-option check-option--modal"><input type="checkbox" checked={shippingOnly} onChange={(event) => setShippingOnly(event.target.checked)} /><span><strong>Require shipping</strong><small>Only save listings with confirmed delivery options</small></span></label>{error ? <div className="form-error" role="alert"><AlertTriangle size={15} />{error}</div> : null}{!validPrices ? <div className="form-error" role="alert"><AlertTriangle size={15} />Minimum price cannot exceed maximum price.</div> : null}<div className="modal-note"><Info size={16} /><span>Scout displays “no longer available” only after verified terminal checks. The retained last asking price is not a confirmed sale price.</span></div></div><div className="modal-footer"><button className="outline-button" disabled={submitting} onClick={onClose}>Cancel</button><button className="primary-button" disabled={!valid || submitting} onClick={submit}>{submitting ? <LoaderCircle size={17} className="spin" /> : editing ? <Check size={17} /> : <Plus size={17} />}{submitting ? "Saving…" : editing ? "Save research watch" : "Create research watch"}</button></div></section></div>;
 }
 
 function ListingsPage({
@@ -1933,9 +2089,35 @@ function ListingsPage({
   const [marketplace, setMarketplace] = useState<"All" | Marketplace>("All");
   const [sort, setSort] = useState<"Newest" | "Strongest" | "Price">("Newest");
   const [decision, setDecision] = useState<"All" | ListingDecision>("All");
+  const [page, setPage] = useState(1);
+  const [remoteListings, setRemoteListings] = useState<Listing[] | null>(null);
+  const [pagination, setPagination] = useState<{ page: number; pageSize: number; total: number; hasNext: boolean } | null>(null);
+  const [loadingPage, setLoadingPage] = useState(false);
+  useEffect(() => {
+    setPage(1);
+  }, [selectedWatchId]);
+  useEffect(() => {
+    let active = true;
+    setLoadingPage(true);
+    api.listings({ page, pageSize: 500, watchId: selectedWatchId ?? undefined })
+      .then((result) => {
+        if (!active) return;
+        setRemoteListings(result.listings);
+        setPagination(result.pagination);
+      })
+      .catch(() => {
+        if (active) {
+          setRemoteListings(null);
+          setPagination(null);
+        }
+      })
+      .finally(() => { if (active) setLoadingPage(false); });
+    return () => { active = false; };
+  }, [listings, page, selectedWatchId]);
+  const pageListings = remoteListings ?? listings;
   const filtered = useMemo(
     () =>
-      listings
+      pageListings
         .filter(
           (listing) =>
             marketplace === "All" || listing.marketplace === marketplace,
@@ -1958,13 +2140,13 @@ function ListingsPage({
               ? a.price - b.price
               : Date.parse(b.observedAt) - Date.parse(a.observedAt),
         ),
-    [listings, marketplace, search, selectedWatchId, sort, decision],
+    [pageListings, marketplace, search, selectedWatchId, sort, decision],
   );
   return (
     <>
       <PageHeader
         title="Listings"
-        description="Every normalized match, with the baseline behind the deal score."
+        description="Every saved match, with the baseline behind the deal score."
       />
       <div className="toolbar toolbar--listings">
         <label className="search-input">
@@ -2022,6 +2204,7 @@ function ListingsPage({
         </div>
       ) : null}
       <ListingTable listings={filtered} onSelect={onSelectListing} />
+      {pagination && (pagination.page > 1 || pagination.hasNext) ? <div className="research-pagination listings-pagination"><button className="outline-button" disabled={page <= 1 || loadingPage} onClick={() => setPage((current) => Math.max(1, current - 1))}>Previous</button><span>Page {pagination.page} · {pagination.total.toLocaleString("pl-PL")} saved matches</span><button className="outline-button" disabled={!pagination.hasNext || loadingPage} onClick={() => setPage((current) => current + 1)}>Next</button></div> : null}
       <div className="retention-note">
         <Database size={17} />
         <span>
@@ -2035,8 +2218,10 @@ function ListingsPage({
 
 function MessagesPage({ refreshKey }: { refreshKey: number }) {
   const [messages, setMessages] = useState<SellerMessage[]>([]);
+  const [pagination, setPagination] = useState<{ page: number; pageSize: number; total: number; hasNext: boolean } | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -2046,6 +2231,7 @@ function MessagesPage({ refreshKey }: { refreshKey: number }) {
       .then((result) => {
         if (!active) return;
         setMessages(result.messages);
+        setPagination(result.pagination);
         setSelectedId((current) => current && result.messages.some((message) => message.id === current) ? current : result.messages[0]?.id ?? null);
         setError(null);
       })
@@ -2061,7 +2247,7 @@ function MessagesPage({ refreshKey }: { refreshKey: number }) {
   }, [refreshKey]);
 
   const selected = messages.find((message) => message.id === selectedId) ?? null;
-  const sentCount = messages.filter((message) => message.status === "sent").length;
+  const sentCount = pagination?.total ?? messages.filter((message) => message.status === "sent").length;
   return (
     <>
       <PageHeader
@@ -2096,7 +2282,7 @@ function MessagesPage({ refreshKey }: { refreshKey: number }) {
             <span className="messages-filter messages-filter--active">All</span>
             <span className="messages-filter">OLX · Allegro Lokalnie</span>
           </div>
-          {loading ? <div className="messages-empty"><LoaderCircle size={22} className="spin" /><span>Loading message history…</span></div> : error ? <div className="messages-empty"><AlertTriangle size={22} /><strong>Could not load messages</strong><span>{error}</span></div> : messages.length ? <div className="messages-thread-list">{messages.map((message) => <button key={message.id} className={`messages-thread ${selectedId === message.id ? "messages-thread--active" : ""}`} type="button" onClick={() => setSelectedId(message.id)}><i className={`messages-thread-dot messages-thread-dot--${message.status}`} /><div><strong>{message.listingTitle}</strong><span>{message.marketplace} · {message.source === "automatic" ? "Automatic · " : "Manual · "}{new Date(message.createdAt).toLocaleString("pl-PL", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</span><small>{message.message}</small></div><b>{message.status === "sent" ? "Sent" : "Failed"}</b></button>)}</div> : <div className="messages-empty"><div className="messages-empty-icon" aria-hidden="true"><MessageSquare size={24} /></div><strong>No messages yet</strong><span>Open a saved OLX or Allegro Lokalnie listing or enable automatic negotiation in Settings to start a seller conversation.</span></div>}
+          {loading ? <div className="messages-empty"><LoaderCircle size={22} className="spin" /><span>Loading message history…</span></div> : error ? <div className="messages-empty"><AlertTriangle size={22} /><strong>Could not load messages</strong><span>{error}</span></div> : messages.length ? <><div className="messages-thread-list">{messages.map((message) => <button key={message.id} className={`messages-thread ${selectedId === message.id ? "messages-thread--active" : ""}`} type="button" onClick={() => setSelectedId(message.id)}><i className={`messages-thread-dot messages-thread-dot--${message.status}`} /><div><strong>{message.listingTitle}</strong><span>{message.marketplace} · {message.source === "automatic" ? "Automatic · " : "Manual · "}{new Date(message.createdAt).toLocaleString("pl-PL", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</span><small>{message.message}</small></div><b>{message.status === "sent" ? "Sent" : "Failed"}</b></button>)}</div>{pagination?.hasNext ? <button className="link-button messages-load-more" disabled={loadingOlder} onClick={async () => { setLoadingOlder(true); try { const result = await api.messages({ page: (pagination.page ?? 1) + 1 }); setMessages((current) => [...current, ...result.messages]); setPagination(result.pagination); } catch (loadError) { setError(errorMessage(loadError)); } finally { setLoadingOlder(false); } }}>{loadingOlder ? <LoaderCircle size={15} className="spin" /> : <ArrowRight size={15} />}{loadingOlder ? "Loading…" : "Load older messages"}</button> : null}</> : <div className="messages-empty"><div className="messages-empty-icon" aria-hidden="true"><MessageSquare size={24} /></div><strong>No messages yet</strong><span>Open a saved OLX or Allegro Lokalnie listing or enable automatic negotiation in Settings to start a seller conversation.</span></div>}
         </div>
         <aside className="messages-panel messages-detail">
           {selected ? <><div className="messages-panel-heading"><div><span className="messages-kicker">Message detail</span><h2>{selected.listingTitle}</h2></div><MessageSquare size={18} aria-hidden="true" /></div><div className="messages-detail-body"><div className="messages-detail-meta"><span>{selected.marketplace} · {selected.source === "automatic" ? "Automatic" : "Manual"} · {new Date(selected.createdAt).toLocaleString("pl-PL", { dateStyle: "medium", timeStyle: "short" })}</span><strong className={`messages-delivery messages-delivery--${selected.status}`}>{selected.status === "sent" ? "Sent" : "Failed"}</strong></div><div className="messages-bubble"><span>You</span><p>{selected.message}</p></div>{selected.offerPrice !== null ? <div className="messages-offer"><span>Opening offer</span><strong>{formatPln(selected.offerPrice)}</strong></div> : null}{selected.error ? <div className="messages-error"><AlertTriangle size={15} />{selected.error}</div> : null}<a className="outline-button messages-listing-link" href={selected.listingUrl} target="_blank" rel="noreferrer"><ExternalLink size={15} />Open {selected.marketplace} listing</a></div></> : <><div className="messages-panel-heading"><div><span className="messages-kicker">Message detail</span><h2>Nothing selected</h2></div><MessageSquare size={18} aria-hidden="true" /></div><div className="messages-detail-empty"><MessageSquare size={28} aria-hidden="true" /><strong>Select a sent message to review it</strong><span>Replies are not imported yet. Continue the conversation on the marketplace.</span></div></>}
@@ -2174,6 +2360,9 @@ function ListingDetailDrawer({
   const [negotiationOtherCosts, setNegotiationOtherCosts] = useState("");
   const [negotiationOffer, setNegotiationOffer] = useState("");
   const [negotiationRecommendation, setNegotiationRecommendation] = useState<NegotiationRecommendation | null>(null);
+  const [negotiationDraft, setNegotiationDraft] = useState<NegotiationDraft | null>(null);
+  const [draftMessage, setDraftMessage] = useState("");
+  const [drafting, setDrafting] = useState(false);
   const [lastNegotiation, setLastNegotiation] = useState<SellerMessage | null>(null);
   const [storedListing, setStoredListing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2207,6 +2396,8 @@ function ListingDetailDrawer({
     setNegotiationShippingCost("");
     setNegotiationOtherCosts("");
     setNegotiationRecommendation(null);
+    setNegotiationDraft(null);
+    setDraftMessage("");
     setLastNegotiation(null);
     setError(null);
     setLoading(true);
@@ -2326,14 +2517,38 @@ function ListingDetailDrawer({
       setError("Known delivery and fee costs must be zero or positive.");
       return;
     }
-    const offerText = offerPrice === null ? "without a fixed offer" : `at ${formatPln(offerPrice)}`;
-    if (!window.confirm(`Generate a Polish negotiation message with AI and send it to this ${currentListing.marketplace} seller ${offerText}?`)) return;
-    setNegotiating(true);
+    setDrafting(true);
     setError(null);
     try {
       const budget = maxTotalCost === null ? undefined : { maxTotalCost, shippingCost, otherCosts };
-      const result = await api.negotiateAndSend(marketplaceListingKey, offerPrice, budget);
+      const result = await api.draftNegotiation(marketplaceListingKey, offerPrice, budget);
+      setNegotiationDraft(result);
+      setDraftMessage(result.message);
+    } catch (draftError) {
+      setError(errorMessage(draftError));
+    } finally {
+      setDrafting(false);
+    }
+  };
+
+  const sendNegotiation = async () => {
+    if (!negotiationDraft || !draftMessage.trim()) return;
+    if (draftMessage.trim().length > 450) {
+      setError("Keep the reviewed message to 450 characters or fewer.");
+      return;
+    }
+    if (!window.confirm(`Send this reviewed message to the ${currentListing.marketplace} seller?\n\n${draftMessage.trim()}`)) return;
+    setNegotiating(true);
+    setError(null);
+    try {
+      const maxTotalCost = negotiationMaxTotal.trim() === "" ? null : Number(negotiationMaxTotal);
+      const shippingCost = negotiationShippingCost.trim() === "" ? 0 : Number(negotiationShippingCost);
+      const otherCosts = negotiationOtherCosts.trim() === "" ? 0 : Number(negotiationOtherCosts);
+      const budget = maxTotalCost === null ? undefined : { maxTotalCost, shippingCost, otherCosts };
+      const result = await api.negotiateAndSend(marketplaceListingKey, negotiationDraft.offerPrice, budget, draftMessage.trim());
       setLastNegotiation(result.message);
+      setNegotiationDraft(null);
+      setDraftMessage("");
     } catch (negotiationError) {
       setError(errorMessage(negotiationError));
     } finally {
@@ -2412,6 +2627,7 @@ function ListingDetailDrawer({
             {currentListing.aiDescriptionVerificationStatus === "pass" ? <div className="description-verification-result description-verification-result--pass"><CheckCircle2 size={15} /><strong>Passed</strong><span>The description supports a functional item.</span></div> : null}
             {currentListing.aiDescriptionVerificationStatus === "reject" ? <div className="description-verification-result description-verification-result--reject"><AlertTriangle size={15} /><strong>Alert held</strong><span>The description contains a material issue.</span></div> : null}
             {currentListing.aiDescriptionVerificationStatus === "unknown" ? <div className="description-verification-result description-verification-result--unknown"><AlertTriangle size={15} /><strong>Alert held</strong><span>The listing could not be verified safely.</span></div> : null}
+            {currentListing.aiDescriptionVerificationStatus === "fallback" ? <div className="description-verification-result description-verification-result--unknown"><AlertTriangle size={15} /><strong>Alert sent without AI check</strong><span>OpenRouter verification failed, so deterministic scoring was used.</span></div> : null}
             {currentListing.aiDescriptionVerificationStatus === "pending" ? <div className="description-verification-result description-verification-result--pending"><LoaderCircle size={15} className="spin" /><strong>Checking</strong><span>Fetching the detail page and description.</span></div> : null}
             {currentListing.aiDescriptionVerificationStatus === "not-configured" || !currentListing.aiDescriptionVerificationStatus ? <p className="drawer-section-copy">OpenRouter is not configured for this safeguard, so the high-priority alert follows deterministic scoring.</p> : null}
             {detail.descriptionSnapshot ? <div className="listing-description-snapshot">
@@ -2435,16 +2651,16 @@ function ListingDetailDrawer({
               <div className="negotiation-budget-grid">
                 <label className="drawer-note-label negotiation-budget-label">
                   Maximum total cost <span>required for a suggestion · PLN</span>
-                  <input type="number" min="1" step="1" value={negotiationMaxTotal} onChange={(event) => { setNegotiationMaxTotal(event.target.value); setNegotiationRecommendation(null); setNegotiationOffer(""); }} placeholder="e.g. 2100" disabled={!storedListing || recommending || negotiating} />
+                  <input type="number" min="1" step="1" value={negotiationMaxTotal} onChange={(event) => { setNegotiationMaxTotal(event.target.value); setNegotiationRecommendation(null); setNegotiationDraft(null); setDraftMessage(""); setNegotiationOffer(""); }} placeholder="e.g. 2100" disabled={!storedListing || recommending || drafting || negotiating} />
                 </label>
                 <label className="drawer-note-label negotiation-budget-label">
                   Delivery and fees <span>optional · PLN</span>
-                  <input type="number" min="0" step="1" value={negotiationShippingCost} onChange={(event) => { setNegotiationShippingCost(event.target.value); setNegotiationRecommendation(null); setNegotiationOffer(""); }} placeholder="e.g. 15" disabled={!storedListing || recommending || negotiating} />
+                  <input type="number" min="0" step="1" value={negotiationShippingCost} onChange={(event) => { setNegotiationShippingCost(event.target.value); setNegotiationRecommendation(null); setNegotiationDraft(null); setDraftMessage(""); setNegotiationOffer(""); }} placeholder="e.g. 15" disabled={!storedListing || recommending || drafting || negotiating} />
                 </label>
               </div>
               <label className="drawer-note-label negotiation-budget-label">
                 Other known costs <span>optional · PLN</span>
-                <input type="number" min="0" step="1" value={negotiationOtherCosts} onChange={(event) => { setNegotiationOtherCosts(event.target.value); setNegotiationRecommendation(null); setNegotiationOffer(""); }} placeholder="0" disabled={!storedListing || recommending || negotiating} />
+                <input type="number" min="0" step="1" value={negotiationOtherCosts} onChange={(event) => { setNegotiationOtherCosts(event.target.value); setNegotiationRecommendation(null); setNegotiationDraft(null); setDraftMessage(""); setNegotiationOffer(""); }} placeholder="0" disabled={!storedListing || recommending || drafting || negotiating} />
               </label>
               <button className="outline-button negotiation-suggest-button" type="button" disabled={!storedListing || recommending || negotiating} onClick={() => void suggestNegotiationOffer()}>
                 {recommending ? <LoaderCircle size={15} className="spin" /> : <Calculator size={15} />}
@@ -2464,12 +2680,17 @@ function ListingDetailDrawer({
               </div> : null}
               <label className="drawer-note-label negotiation-offer-label">
                 Opening offer <span>optional · PLN</span>
-                <input type="number" min="1" max={Math.max(1, currentListing.price - 0.01)} step="0.01" value={negotiationOffer} onChange={(event) => setNegotiationOffer(event.target.value)} placeholder="Ask for a reduction without naming a price" disabled={!storedListing || recommending || negotiating} />
+                <input type="number" min="1" max={Math.max(1, currentListing.price - 0.01)} step="0.01" value={negotiationOffer} onChange={(event) => { setNegotiationOffer(event.target.value); setNegotiationDraft(null); setDraftMessage(""); }} placeholder="Ask for a reduction without naming a price" disabled={!storedListing || recommending || drafting || negotiating} />
               </label>
-              <button className="primary-button drawer-negotiate-button" type="button" disabled={!storedListing || negotiating || saving} onClick={() => void negotiateWithAi()}>
-                {negotiating ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}
-                {negotiating ? "Writing and sending…" : "Negotiate with AI"}
+              <button className="primary-button drawer-negotiate-button" type="button" disabled={!storedListing || drafting || negotiating || saving} onClick={() => void negotiateWithAi()}>
+                {drafting ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}
+                {drafting ? "Writing draft…" : negotiationDraft ? "Regenerate draft" : "Draft message with AI"}
               </button>
+              {negotiationDraft ? <div className="negotiation-draft">
+                <div className="negotiation-draft-heading"><strong>Review before sending</strong><span>{negotiationDraft.model}</span></div>
+                <textarea aria-label="Reviewed negotiation message" maxLength={450} value={draftMessage} onChange={(event) => setDraftMessage(event.target.value)} disabled={negotiating} />
+                <div className="negotiation-draft-footer"><small>{draftMessage.length}/450 characters · Scout checks links, contact details, tone, and the approved offer before delivery.</small><button className="primary-button" type="button" disabled={negotiating || !draftMessage.trim()} onClick={() => void sendNegotiation()}>{negotiating ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}{negotiating ? "Sending…" : "Send reviewed message"}</button></div>
+              </div> : null}
               {!storedListing ? <span className="drawer-muted">Save this listing through a watch before contacting the seller.</span> : null}
               {lastNegotiation ? <div className="negotiation-success"><CheckCircle2 size={15} /><div><strong>Message sent</strong><p>{lastNegotiation.message}</p></div></div> : null}
             </> : <p className="drawer-section-copy">AI seller negotiation is currently available for OLX and Allegro Lokalnie listings.</p>}
@@ -2564,11 +2785,15 @@ function ConnectorsPage({
   onToast: (message: string, type?: Toast["type"]) => void;
 }) {
   const [runs, setRuns] = useState<ConnectorRun[]>([]);
+  const [runsPagination, setRunsPagination] = useState<{ page: number; pageSize: number; total: number; hasNext: boolean } | null>(null);
   const [loadingRuns, setLoadingRuns] = useState(true);
+  const [loadingOlderRuns, setLoadingOlderRuns] = useState(false);
   const [testing, setTesting] = useState(false);
   const loadRuns = useCallback(async () => {
     try {
-      setRuns((await api.connectorRuns()).runs);
+      const result = await api.connectorRuns();
+      setRuns(result.runs);
+      setRunsPagination(result.pagination);
     } catch (error) {
       onToast(errorMessage(error), "error");
     } finally {
@@ -2673,7 +2898,8 @@ function ConnectorsPage({
               Loading runs…
             </div>
           ) : runs.length ? (
-            runs.map((run) => (
+            <>
+            {runs.map((run) => (
               <div className="run-row" key={run.id}>
                 <span className="connector-name">
                   <i style={{ background: connectorColor(run.source) }} />
@@ -2697,7 +2923,9 @@ function ConnectorsPage({
                   })}
                 </span>
               </div>
-            ))
+            ))}
+            {runsPagination?.hasNext ? <button className="link-button messages-load-more" disabled={loadingOlderRuns} onClick={async () => { setLoadingOlderRuns(true); try { const result = await api.connectorRuns({ page: (runsPagination.page ?? 1) + 1 }); setRuns((current) => [...current, ...result.runs]); setRunsPagination(result.pagination); } catch (error) { onToast(errorMessage(error), "error"); } finally { setLoadingOlderRuns(false); } }}>{loadingOlderRuns ? <LoaderCircle size={15} className="spin" /> : <ArrowRight size={15} />}{loadingOlderRuns ? "Loading…" : "Load older runs"}</button> : null}
+            </>
           ) : (
             <div className="panel-empty panel-empty--large">
               No connector runs yet. Start a scan to test the selected sources.
@@ -2818,6 +3046,7 @@ function SettingsPage({
   const [storageStateInput, setStorageStateInput] = useState("");
   const [storageStateFile, setStorageStateFile] = useState("");
   const [savingSession, setSavingSession] = useState(false);
+  const [recoveryBusy, setRecoveryBusy] = useState(false);
   const loadSettings = useCallback(async () => {
     try {
       const result = await api.settings();
@@ -3083,6 +3312,36 @@ function SettingsPage({
       setSavingSession(false);
     }
   };
+  const exportData = async () => {
+    setRecoveryBusy(true);
+    try {
+      const payload = await api.exportData();
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `scout-export-${new Date().toISOString().slice(0, 10)}.json`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      onToast("Safe data export downloaded.");
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+    } finally {
+      setRecoveryBusy(false);
+    }
+  };
+  const createBackup = async () => {
+    if (!window.confirm("Create a SQLite backup beside the configured database?")) return;
+    setRecoveryBusy(true);
+    try {
+      const result = await api.backup();
+      onToast(`Backup created: ${result.backup}`);
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+    } finally {
+      setRecoveryBusy(false);
+    }
+  };
   const configured = settings?.webhookConfigured ?? false;
   const ntfyConfigured = settings?.ntfy?.configured ?? false;
   const aiConfigured = settings?.ai?.configured ?? false;
@@ -3172,7 +3431,7 @@ function SettingsPage({
             </div>
             <div>
               <h2>AI listing intelligence</h2>
-              <p>Use a DeepSeek model through OpenRouter to normalize listings and filter out accessories, parts, and unrelated matches.</p>
+              <p>Use a DeepSeek model through OpenRouter to filter out accessories, parts, and unrelated matches. Listing normalization stays manual and is off by default.</p>
             </div>
             <span className={`settings-status ${aiConfigured ? "" : "settings-status--idle"}`}>
               <i />
@@ -3204,7 +3463,7 @@ function SettingsPage({
           </div>
           <div className="settings-actions">
             {settings?.ai?.source === "settings" ? <button className="outline-button danger-outline" disabled={saving} onClick={() => void clearAiApiKey()}><Trash2 size={15} />Remove saved token</button> : null}
-            <span className="settings-inline-note">New or changed watched listings are normalized in the background with a two-request concurrency limit.</span>
+            <span className="settings-inline-note">Normalization is manual from a listing drawer and never runs automatically.</span>
           </div>
           <div className="security-note">
             <ShieldCheck size={17} />
@@ -3390,10 +3649,10 @@ function SettingsPage({
             <div className="field-label">
               <span>Delivery channels</span>
               <div className="source-options">
-                <button type="button" className={`source-option ${dailyDigestDiscord ? "source-option--selected" : ""}`} disabled={!settingsLoaded || saving} onClick={() => setDailyDigestDiscord((value) => !value)}>
+                <button type="button" aria-pressed={dailyDigestDiscord} className={`source-option ${dailyDigestDiscord ? "source-option--selected" : ""}`} disabled={!settingsLoaded || saving} onClick={() => setDailyDigestDiscord((value) => !value)}>
                   <i style={{ background: "#5865f2" }} />Discord{dailyDigestDiscord ? <Check size={15} /> : null}
                 </button>
-                <button type="button" className={`source-option ${dailyDigestNtfy ? "source-option--selected" : ""}`} disabled={!settingsLoaded || saving} onClick={() => setDailyDigestNtfy((value) => !value)}>
+                <button type="button" aria-pressed={dailyDigestNtfy} className={`source-option ${dailyDigestNtfy ? "source-option--selected" : ""}`} disabled={!settingsLoaded || saving} onClick={() => setDailyDigestNtfy((value) => !value)}>
                   <i style={{ background: "#4f9da6" }} />ntfy{dailyDigestNtfy ? <Check size={15} /> : null}
                 </button>
               </div>
@@ -3570,6 +3829,19 @@ function SettingsPage({
           </div>
         </section>
         <section
+          className="settings-section settings-section--wide"
+        >
+          <div className="settings-section-heading">
+            <div className="settings-symbol settings-symbol--blue"><Database size={18} /></div>
+            <div><h2>Data recovery</h2><p>Export readable history or create a WAL-aware SQLite restore point.</p></div>
+          </div>
+          <div className="settings-actions">
+            <button className="outline-button" disabled={recoveryBusy || !settingsLoaded} onClick={() => void exportData()}><Database size={15} />Download safe export</button>
+            <button className="outline-button" disabled={recoveryBusy || !settingsLoaded} onClick={() => void createBackup()}><ShieldCheck size={15} />Create database backup</button>
+          </div>
+          <div className="security-note"><ShieldCheck size={17} /><span>Exports omit encrypted credentials and marketplace sessions. Backups include the encrypted database and should be stored with the deployment secret.</span></div>
+        </section>
+        <section
           className={`settings-section warning-section ${settings?.publicExposureWarning ? "warning-section--active" : ""}`}
         >
           <div className="settings-section-heading">
@@ -3582,14 +3854,14 @@ function SettingsPage({
                 {!settingsLoaded
                   ? "Checking exposure configuration…"
                   : settings.publicExposureWarning
-                    ? "Public exposure is enabled. Add authentication before continuing."
-                    : "No public exposure was reported by this Scout instance."}
+                    ? "Scout is listening beyond loopback. Authentication is required for API access."
+                    : "Scout reports a loopback-only listening address."}
               </p>
             </div>
           </div>
           <div className="warning-copy">
-            Scout has no built-in authentication. Keep it behind your LAN, VPN,
-            or an authenticated reverse proxy.
+            Keep Scout behind your trusted LAN or VPN. Scout has no built-in
+            authentication, so do not expose it to the public internet.
           </div>
         </section>
       </div>
@@ -3613,30 +3885,34 @@ function SettingsPage({
 }
 
 function WatchDialog({
+  initialWatch = null,
+  preset = null,
   onClose,
   onSubmit,
 }: {
+  initialWatch?: Watch | null;
+  preset?: WatchPreset | null;
   onClose: () => void;
   onSubmit: (watch: Watch) => Promise<void>;
 }) {
-  const [name, setName] = useState("");
-  const [query, setQuery] = useState("");
-  const [terms, setTerms] = useState("");
-  const [excluded, setExcluded] = useState("");
-  const [location, setLocation] = useState("Polska");
-  const [condition, setCondition] = useState("Any");
-  const [interval, setIntervalValue] = useState("5");
-  const [sensitivity, setSensitivity] = useState("1");
-  const [exactUrls, setExactUrls] = useState("");
-  const [sources, setSources] = useState<Marketplace[]>([
+  const [name, setName] = useState(initialWatch?.name ?? (preset?.query ? `${preset.query} watch` : ""));
+  const [query, setQuery] = useState(initialWatch?.query ?? preset?.query ?? "");
+  const [terms, setTerms] = useState(initialWatch?.terms ?? preset?.terms ?? "");
+  const [excluded, setExcluded] = useState(initialWatch?.excluded ?? preset?.excluded ?? "");
+  const [location, setLocation] = useState(initialWatch?.location ?? preset?.location ?? "Polska");
+  const [condition, setCondition] = useState(initialWatch?.condition ?? preset?.condition ?? "Any");
+  const [interval, setIntervalValue] = useState(String(initialWatch?.interval ?? 5));
+  const [sensitivity, setSensitivity] = useState(String(initialWatch?.sensitivity ?? 1));
+  const [exactUrls, setExactUrls] = useState(initialWatch?.exactUrls.join("\n") ?? "");
+  const [sources, setSources] = useState<Marketplace[]>(initialWatch?.sources ?? preset?.sources ?? [
     "OLX",
     "Allegro Lokalnie",
     "Vinted",
   ]);
-  const [minPrice, setMinPrice] = useState("");
-  const [maxPrice, setMaxPrice] = useState("");
-  const [shippingOnly, setShippingOnly] = useState(false);
-  const [aiRelevance, setAiRelevance] = useState(true);
+  const [minPrice, setMinPrice] = useState(initialWatch?.minPrice === null || initialWatch?.minPrice === undefined ? preset?.minPrice === null || preset?.minPrice === undefined ? "" : String(preset.minPrice) : String(initialWatch.minPrice));
+  const [maxPrice, setMaxPrice] = useState(initialWatch?.maxPrice === null || initialWatch?.maxPrice === undefined ? preset?.maxPrice === null || preset?.maxPrice === undefined ? "" : String(preset.maxPrice) : String(initialWatch.maxPrice));
+  const [shippingOnly, setShippingOnly] = useState(initialWatch?.shippingOnly ?? preset?.shippingOnly ?? false);
+  const [aiRelevance, setAiRelevance] = useState(initialWatch?.aiRelevance ?? true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const numericInterval = Number(interval);
@@ -3668,7 +3944,7 @@ function WatchDialog({
     setError(null);
     try {
       await onSubmit({
-        id: `watch-${Date.now()}`,
+        id: initialWatch?.id ?? `watch-${Date.now()}`,
         name: name.trim(),
         query: query.trim(),
         terms: terms.trim(),
@@ -3676,14 +3952,14 @@ function WatchDialog({
         sources,
         location: location.trim() || "Polska",
         condition,
-        samples: 0,
-        targetSamples: 30,
-        observationHours: 0,
-        readiness: 0,
-        status: "Learning",
+        samples: initialWatch?.samples ?? 0,
+        targetSamples: initialWatch?.targetSamples ?? 30,
+        observationHours: initialWatch?.observationHours ?? 0,
+        readiness: initialWatch?.readiness ?? 0,
+        status: initialWatch?.status ?? "Learning",
         interval: numericInterval,
         nextScan: "due now",
-        enabled: true,
+        enabled: initialWatch?.enabled ?? true,
         exactUrls: exactUrls
           .split(/\r?\n/)
           .map((url) => url.trim())
@@ -3721,8 +3997,8 @@ function WatchDialog({
       >
         <div className="modal-header">
           <div>
-            <span className="modal-kicker">Create a search</span>
-            <h2 id="watch-dialog-title">New watch</h2>
+              <span className="modal-kicker">{initialWatch ? "Edit search" : "Create a search"}</span>
+            <h2 id="watch-dialog-title">{initialWatch ? "Edit watch" : "New watch"}</h2>
             <p>
               Scout learns first, then alerts when the price breaks its normal
               range.
@@ -3837,6 +4113,7 @@ function WatchDialog({
                     type="button"
                     key={source}
                     className={`source-option ${sources.includes(source) ? "source-option--selected" : ""}`}
+                    aria-pressed={sources.includes(source)}
                     onClick={() => toggleSource(source)}
                   >
                     <i style={{ background: marketplaceColors[source] }} />
@@ -3899,7 +4176,7 @@ function WatchDialog({
             ) : (
               <Plus size={17} />
             )}
-            {submitting ? "Creating…" : "Create watch"}
+            {submitting ? (initialWatch ? "Saving…" : "Creating…") : (initialWatch ? "Save watch" : "Create watch")}
           </button>
         </div>
       </section>
@@ -3922,6 +4199,8 @@ function PriceFilterDialog({ watch, onClose, onSubmit }: { watch: Watch; onClose
 
 function HistoryDialog({ onClose }: { onClose: () => void }) {
   const [rows, setRows] = useState<NotificationRecord[]>([]);
+  const [pagination, setPagination] = useState<{ page: number; pageSize: number; total: number; hasNext: boolean } | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
@@ -3929,7 +4208,10 @@ function HistoryDialog({ onClose }: { onClose: () => void }) {
     api
       .notifications()
       .then((result) => {
-        if (active) setRows(result.notifications);
+        if (active) {
+          setRows(result.notifications);
+          setPagination(result.pagination);
+        }
       })
       .catch((loadError) => {
         if (active) setError(errorMessage(loadError));
@@ -3982,7 +4264,8 @@ function HistoryDialog({ onClose }: { onClose: () => void }) {
               {error}
             </div>
           ) : rows.length ? (
-            rows.map((row) => (
+            <>
+            {rows.map((row) => (
               <div className="history-row" key={row.id}>
                 <div className="history-icon">
                   <Send size={15} />
@@ -4003,7 +4286,9 @@ function HistoryDialog({ onClose }: { onClose: () => void }) {
                   {row.status}
                 </em>
               </div>
-            ))
+            ))}
+            {pagination?.hasNext ? <button className="link-button messages-load-more" disabled={loadingOlder} onClick={async () => { setLoadingOlder(true); try { const result = await api.notifications({ page: (pagination.page ?? 1) + 1 }); setRows((current) => [...current, ...result.notifications]); setPagination(result.pagination); } catch (loadError) { setError(errorMessage(loadError)); } finally { setLoadingOlder(false); } }}>{loadingOlder ? <LoaderCircle size={15} className="spin" /> : <ArrowRight size={15} />}{loadingOlder ? "Loading…" : "Load older notifications"}</button> : null}
+            </>
           ) : (
             <div className="panel-empty panel-empty--large">
               No notifications have been sent yet.

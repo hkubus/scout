@@ -1,5 +1,3 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-
 :root {
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   color: #182133;
@@ -117,13 +115,19 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .stat small { align-self: end; padding-bottom: 1px; color: var(--muted); font-size: 13px; }
 .manage-callout { display: flex; align-items: center; justify-content: center; gap: 17px; padding: 0 12px; color: var(--muted); font-size: 13px; line-height: 1.5; }
 .manage-callout svg { color: #8993a5; }
-.manage-callout a { display: block; color: var(--blue); text-decoration: none; margin-top: 2px; }
-.manage-callout a:hover { text-decoration: underline; }
+.manage-callout a, .manage-callout button { display: block; margin-top: 2px; color: var(--blue); text-decoration: none; }
+.manage-callout button { border: 0; padding: 0; background: transparent; font: inherit; text-align: left; }
+.manage-callout a:hover, .manage-callout button:hover { text-decoration: underline; }
 
 .fresh-section, .overview-panels, .settings-grid, .connector-banner, .connector-cards, .connector-runs, .watch-list, .toolbar, .soft-note, .retention-note, .settings-footer, .manual-search-panel, .search-source-statuses, .search-error, .search-results, .research-explainer, .research-stats, .research-section-heading, .research-watch-list, .research-history, .messages-explainer, .messages-layout { max-width: 1240px; margin-left: auto; margin-right: auto; }
 .fresh-section { padding-top: 22px; }
-.setup-banner { max-width: 1240px; margin: 20px auto 0; padding: 15px 17px; border: 1px solid rgba(29, 97, 232, .25); border-radius: 8px; background: var(--blue-soft); color: var(--text); font-size: 13px; line-height: 1.5; }
+.setup-banner { max-width: 1240px; margin: 20px auto 0; padding: 15px 17px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border: 1px solid rgba(29, 97, 232, .25); border-radius: 8px; background: var(--blue-soft); color: var(--text); font-size: 13px; line-height: 1.5; }
+.setup-banner > div { display: flex; align-items: flex-start; gap: 10px; }
+.setup-banner > div > svg { flex: 0 0 auto; margin-top: 2px; color: var(--blue); }
+.setup-banner > div > span { display: grid; gap: 3px; }
+.setup-banner strong { color: var(--text-strong); }
 .section-heading-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 10px; }
+.search-results-actions { display: flex; align-items: center; gap: 12px; }
 .section-heading-row h2 { margin: 0; color: var(--text-strong); font-size: 21px; letter-spacing: -.55px; }
 .filters { display: flex; align-items: center; gap: 12px; }
 .select-control { position: relative; display: inline-flex; align-items: center; }
@@ -676,9 +680,9 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
   .research-table { min-width: 0; grid-template-columns: minmax(0, 1fr) auto auto 27px; gap: 8px; padding: 11px 7px; }
   .research-listing-row .research-listing { grid-column: 1 / -1; }
   .research-listing-row .research-status { grid-column: 1; }
-  .research-listing-row > span:nth-child(3), .research-listing-row > span:nth-child(5), .research-listing-row > span:nth-child(6), .research-listing-row > span:nth-child(7) { display: none; }
-  .research-listing-row > strong { grid-column: 2; }
-  .research-listing-row .external-link { grid-column: 4; }
+.research-listing-row > [data-label] { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; grid-column: 1 / -1; }
+.research-listing-row > [data-label]::before { content: attr(data-label); color: var(--muted); font-size: 10px; font-weight: 500; }
+.research-listing-row .external-link { grid-column: 2; justify-self: end; }
   .manual-search-panel { padding: 14px; }
   .manual-search-query { height: auto; padding: 10px; flex-wrap: wrap; }
   .manual-search-query input { flex-basis: calc(100% - 32px); }
@@ -693,7 +697,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
   .search-result-row .shipping-state { grid-column: 3; }
   .search-result-row > span:nth-child(5) { display: none; }
   .search-result-row .external-link { grid-column: 4; }
-  .toast { right: 13px; bottom: 13px; }
+.toast { right: 13px; bottom: 13px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

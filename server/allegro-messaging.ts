@@ -96,4 +96,8 @@ export async function sendAllegroMessageOnPage(page: Page, listingUrl: string, m
   if (/nie udało się wysłać wiadomości|nie można wysłać wiadomości|wystąpił błąd podczas wysyłania|spróbuj ponownie/i.test(visibleText)) {
     throw new AllegroMessagingError('Allegro Lokalnie could not send the message. Check the offer and your account limits.', 'delivery');
   }
+  const composerValue = await composer.inputValue().catch(async () => await composer.textContent().catch(() => ''));
+  if (!visibleText.includes(safeMessage) && String(composerValue ?? '').trim() !== '') {
+    throw new AllegroMessagingError('Allegro Lokalnie did not confirm that the message was delivered. Review the conversation before retrying.', 'delivery');
+  }
 }

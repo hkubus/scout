@@ -9,7 +9,7 @@ import { OlxMessagingError, sendOlxMessageOnPage } from './olx-messaging';
 import { AllegroMessagingError, sendAllegroMessageOnPage } from './allegro-messaging';
 import { offerCeiling, recommendNegotiationPrice, type NegotiationRecommendation } from './negotiation';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, median, scoreDeal } from './scoring';
-import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ManualSearchResponse, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
+import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, ManualSearchResponse, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -79,9 +79,10 @@ const connectorDefinitions: Array<Pick<Connector, 'name' | 'kind' | 'color'>> = 
 ];
 const marketplaces: Marketplace[] = ['OLX', 'Allegro Lokalnie', 'Vinted'];
 export const DEFAULT_NIGHT_INTERVAL_MINUTES = 30;
-const MATCH_FRESHNESS_MS = 12 * 60 * 60_000;
+const MATCH_FRESHNESS_MS = 180 * 24 * 60 * 60_000;
 const NIGHT_START_HOUR = 22;
 const NIGHT_END_HOUR = 8;
+const MAX_RESEARCH_DETAIL_CHECKS = 100;
 
 export class ServiceError extends Error {
   status: number;
@@ -98,6 +99,7 @@ export interface ScoutServiceDependencies {
   draftNegotiation?: typeof draftNegotiationMessageWithDeepSeek;
   sendOlxMessage?: (listingUrl: string, message: string) => Promise<void>;
   sendAllegroMessage?: (listingUrl: string, message: string) => Promise<void>;
+  publicExposureWarning?: boolean;
 }
 
 export function marketStatusAfterMiss(currentMissingScans: number, threshold = 3) {
@@ -201,12 +203,39 @@ function parseListingKey(key: string): { marketplace: Marketplace; listingId: st
   return { marketplace: marketplace as Marketplace, listingId };
 }
 
+function safePromptText(value: unknown, limit = 240) {
+  return String(value ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
+}
+
+export function validateNegotiationMessage(message: string, offerPrice: number | null = null) {
+  const safeMessage = message.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
+  if (!safeMessage) throw new ServiceError('The negotiation message is empty.', 400);
+  if (safeMessage.length > 450) throw new ServiceError('Negotiation messages must be 450 characters or fewer.', 400);
+  if (/(?:https?:\/\/|www\.|\b(?:email|e-mail|adres\s+e-mail|telefon|tel\.?|whatsapp|telegram|signal|przelew|poza\s+platforma)\b|@[a-z0-9._%+-]+\.[a-z]{2,})/i.test(safeMessage)) {
+    throw new ServiceError('Negotiation messages cannot include links, contact details, or off-platform payment instructions.', 400);
+  }
+  if (/\b(?:idiot|kretyn|debil|frajer|oszust|złodziej|kurwa|chuj|fuck|scam)\b/i.test(safeMessage)) {
+    throw new ServiceError('Negotiation messages must remain polite and non-abusive.', 400);
+  }
+  if (offerPrice !== null) {
+    const amount = Math.round(offerPrice * 100) / 100;
+    const digits = String(amount).replace(/\.0+$/, '').replace('.', '');
+    const messageDigits = safeMessage.replace(/[^0-9]/g, '');
+    if (!messageDigits.includes(digits)) throw new ServiceError('The message must state the approved opening offer.', 400);
+  } else if (/\d{2,}/.test(safeMessage.replace(/\s/g, ''))) {
+    throw new ServiceError('A message without an approved opening offer cannot introduce a new numeric amount.', 400);
+  }
+  return safeMessage;
+}
+
 function parseListingDecision(value: unknown): ListingDecision | null {
   return value === 'buy' || value === 'watch' || value === 'pass' ? value : null;
 }
 
+const runtimeSecret = process.env.SCOUT_SECRET?.trim() || randomBytes(32).toString('base64url');
+
 function secretKey() {
-  return createHash('sha256').update(process.env.SCOUT_SECRET ?? 'local-development-secret').digest();
+  return createHash('sha256').update(runtimeSecret).digest();
 }
 
 export function encryptSecret(value: string) {
@@ -228,7 +257,7 @@ export function validateDiscordWebhook(value: string) {
   let url: URL;
   try { url = new URL(value); } catch { throw new ServiceError('Enter a valid Discord webhook URL'); }
   const allowedHosts = new Set(['discord.com', 'discordapp.com', 'canary.discord.com', 'ptb.discord.com']);
-  if (url.protocol !== 'https:' || !allowedHosts.has(url.hostname) || !url.pathname.startsWith('/api/webhooks/')) {
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || !allowedHosts.has(url.hostname.toLowerCase()) || !/^\/api\/webhooks\/[^/]+\/[^/]+$/.test(url.pathname) || url.pathname.length > 512) {
     throw new ServiceError('Webhook must be an HTTPS Discord webhook URL');
   }
   return url.toString();
@@ -246,6 +275,10 @@ export class ScoutService {
   private readonly draftNegotiation: typeof draftNegotiationMessageWithDeepSeek;
   private readonly sendOlxMessageOverride?: (listingUrl: string, message: string) => Promise<void>;
   private readonly sendAllegroMessageOverride?: (listingUrl: string, message: string) => Promise<void>;
+  private readonly publicExposureWarning: boolean;
+  private readonly schedulerOwner = `scheduler-${process.pid}-${randomBytes(8).toString('hex')}`;
+  private activeManualSearches = 0;
+  private readonly messagingInFlight = new Set<string>();
 
   constructor(db: Database, emit: (event: string, payload: unknown) => void, dependencies: ScoutServiceDependencies = {}) {
     this.db = db;
@@ -255,6 +288,7 @@ export class ScoutService {
     this.draftNegotiation = dependencies.draftNegotiation ?? draftNegotiationMessageWithDeepSeek;
     this.sendOlxMessageOverride = dependencies.sendOlxMessage;
     this.sendAllegroMessageOverride = dependencies.sendAllegroMessage;
+    this.publicExposureWarning = dependencies.publicExposureWarning ?? false;
   }
 
   private transaction<T>(callback: () => T): T {
@@ -285,7 +319,21 @@ export class ScoutService {
 
   schedulerTick() {
     this.lastSchedulerTickAt = nowIso();
+    if (!this.tryAcquireSchedulerLease()) return;
     this.queueDue();
+  }
+
+  private tryAcquireSchedulerLease() {
+    const now = nowIso();
+    const expiresAt = new Date(Date.now() + 45_000).toISOString();
+    try {
+      const update = this.db.prepare('UPDATE scheduler_leases SET owner_id = ?, expires_at = ? WHERE id = 1 AND (owner_id = ? OR expires_at <= ?)').run(this.schedulerOwner, expiresAt, this.schedulerOwner, now);
+      if (Number(update.changes) > 0) return true;
+      const insert = this.db.prepare('INSERT OR IGNORE INTO scheduler_leases (id, owner_id, expires_at) VALUES (1, ?, ?)').run(this.schedulerOwner, expiresAt);
+      return Number(insert.changes) > 0;
+    } catch {
+      return false;
+    }
   }
 
   readiness() {
@@ -536,7 +584,7 @@ export class ScoutService {
   private saveDescriptionVerification(input: {
     marketplace: Marketplace;
     listingId: string;
-    status: 'pass' | 'reject' | 'unknown' | 'pending' | 'not-configured';
+    status: ListingDescriptionVerificationStatus;
     verification?: ListingDescriptionVerification | null;
     inputHash?: string | null;
     model?: string | null;
@@ -608,7 +656,7 @@ export class ScoutService {
     return snapshot?.id ? { id: Number(snapshot.id), stateHash } : null;
   }
 
-  private updateListingDetailSnapshot(snapshotId: number | null, status: 'pass' | 'reject' | 'unknown' | 'not-configured', inputHash: string | null) {
+  private updateListingDetailSnapshot(snapshotId: number | null, status: ListingDescriptionVerificationStatus, inputHash: string | null) {
     if (!snapshotId) return;
     this.db.prepare('UPDATE listing_detail_snapshots SET verification_status = ?, verification_input_hash = ? WHERE id = ?').run(status, inputHash, snapshotId);
   }
@@ -623,8 +671,6 @@ export class ScoutService {
       this.saveDescriptionVerification({ marketplace, listingId, status: 'not-configured' });
       return true;
     }
-
-    this.saveDescriptionVerification({ marketplace, listingId, status: 'pending', model: config.model });
 
     let description: string | null;
     try {
@@ -648,7 +694,8 @@ export class ScoutService {
     const inputHash = listingDescriptionVerificationInputHash(context);
     const snapshot = this.captureListingDetailSnapshot(candidate, description);
     const row = this.db.prepare(`SELECT ai_description_verification_json, ai_description_verification_input_hash,
-      ai_description_verification_model, ai_description_verification_at, ai_description_verification_error
+      ai_description_verification_model, ai_description_verification_at, ai_description_verification_error,
+      ai_description_verification_status
       FROM listings WHERE marketplace = ? AND listing_id = ?`).get(marketplace, listingId) as Record<string, any> | undefined;
     const cached = parseStoredListingDescriptionVerification(row?.ai_description_verification_json);
     if (cached && row?.ai_description_verification_input_hash === inputHash && row.ai_description_verification_model === config.model) {
@@ -659,9 +706,10 @@ export class ScoutService {
     if (row?.ai_description_verification_error && row.ai_description_verification_input_hash === inputHash
       && row.ai_description_verification_model === config.model && row.ai_description_verification_at
       && Date.now() - Date.parse(row.ai_description_verification_at) < 6 * 60 * 60_000) {
-      this.updateListingDetailSnapshot(snapshot?.id ?? null, 'unknown', inputHash);
-      this.saveDescriptionVerification({ marketplace, listingId, status: 'unknown', inputHash, model: config.model, error: row.ai_description_verification_error });
-      return false;
+      const status: ListingDescriptionVerificationStatus = row.ai_description_verification_status === 'fallback' ? 'fallback' : 'unknown';
+      this.updateListingDetailSnapshot(snapshot?.id ?? null, status, inputHash);
+      this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: config.model, error: row.ai_description_verification_error });
+      return status === 'fallback';
     }
 
     if (!description) {
@@ -692,6 +740,7 @@ export class ScoutService {
     }
 
     try {
+      this.saveDescriptionVerification({ marketplace, listingId, status: 'pending', model: config.model });
       const verification = await this.verifyListingDescription(context, { apiKey: config.apiKey, model: config.model });
       this.updateListingDetailSnapshot(snapshot?.id ?? null, verification.decision, inputHash);
       this.saveDescriptionVerification({ marketplace, listingId, status: verification.decision, verification, inputHash, model: config.model });
@@ -699,10 +748,11 @@ export class ScoutService {
       return verification.decision === 'pass';
     } catch (error) {
       const message = (error instanceof Error ? error.message : 'OpenRouter could not verify the listing description').slice(0, 500);
-      this.updateListingDetailSnapshot(snapshot?.id ?? null, 'unknown', inputHash);
-      this.saveDescriptionVerification({ marketplace, listingId, status: 'unknown', inputHash, model: config.model, error: message });
-      this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: 'unknown' });
-      return false;
+      const status: ListingDescriptionVerificationStatus = error instanceof DeepSeekError ? 'fallback' : 'unknown';
+      this.updateListingDetailSnapshot(snapshot?.id ?? null, status, inputHash);
+      this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: config.model, error: message });
+      this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status });
+      return status === 'fallback';
     }
   }
 
@@ -888,6 +938,7 @@ export class ScoutService {
         || row.ai_description_verification_status === 'unknown'
         || row.ai_description_verification_status === 'pending'
         || row.ai_description_verification_status === 'not-configured'
+        || row.ai_description_verification_status === 'fallback'
         ? row.ai_description_verification_status
         : null,
       aiDescriptionVerificationError: row.ai_description_verification_error ?? null,
@@ -975,29 +1026,39 @@ export class ScoutService {
     };
   }
 
-  getListings() {
+  listingsPage(options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string } = {}) {
     const freshnessCutoff = new Date(Date.now() - MATCH_FRESHNESS_MS).toISOString();
+    const predicates = [
+      'w.archived_at IS NULL',
+      'wl.last_seen_at > ?',
+      'NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = \'irrelevant\' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)',
+      '(w.shipping_only = 0 OR l.shipping_available = 1)',
+      '(w.min_price_pln IS NULL OR l.price_pln >= w.min_price_pln)',
+      '(w.max_price_pln IS NULL OR l.price_pln <= w.max_price_pln)',
+    ];
+    const params: unknown[] = [freshnessCutoff];
+    if (options.marketplace) { predicates.push('l.marketplace = ?'); params.push(options.marketplace); }
+    if (options.watchId) { predicates.push('w.id = ?'); params.push(options.watchId); }
+    const query = options.q?.trim().toLowerCase() ?? '';
+    if (query) { predicates.push("lower(COALESCE(l.title, '') || ' ' || COALESCE(l.subtitle, '')) LIKE ?"); params.push(`%${query}%`); }
+    const where = predicates.join(' AND ');
+    const total = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
+    const page = Math.max(1, Math.floor(options.page ?? 1));
+    const pageSize = Math.max(1, Math.min(500, Math.floor(options.pageSize ?? 200)));
     const rows = this.db.prepare(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note
       FROM listings l
       JOIN watch_listings wl ON wl.listing_id = l.id
       JOIN watches w ON w.id = wl.watch_id
       LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id
-      WHERE w.archived_at IS NULL
-        AND NOT EXISTS (
-          SELECT 1 FROM listing_relevance r
-          WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id
-            AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))
-            AND w.ai_relevance = 1
-        )
-        AND wl.last_seen_at > ?
-      ORDER BY wl.last_seen_at DESC, wl.id DESC LIMIT 200`).all(freshnessCutoff) as Array<Record<string, any>>;
+      WHERE ${where}
+      ORDER BY wl.last_seen_at DESC, wl.id DESC LIMIT ? OFFSET ?`).all(...params, pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
     const watches = new Map(this.getWatches().map((watch) => [watch.id, watch]));
-    return rows.filter((row) => {
-      const watch = watches.get(row.watch_id);
-      return (!watch?.shippingOnly || row.shipping_available === 1)
-        && (watch?.minPrice === null || watch?.minPrice === undefined || Number(row.price_pln) >= watch.minPrice)
-        && (watch?.maxPrice === null || watch?.maxPrice === undefined || Number(row.price_pln) <= watch.maxPrice);
-    }).map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100));
+    const listings = rows.map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100));
+    return { listings, pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
+  }
+
+  getListings() {
+    return this.listingsPage({ page: 1, pageSize: 500 }).listings;
   }
 
   listingDetail(key: string, watchId?: string | null): ListingDetail {
@@ -1020,6 +1081,7 @@ export class ScoutService {
       || snapshotRow?.verification_status === 'unknown'
       || snapshotRow?.verification_status === 'pending'
       || snapshotRow?.verification_status === 'not-configured'
+      || snapshotRow?.verification_status === 'fallback'
       ? snapshotRow.verification_status
       : null;
     const descriptionSnapshot: ListingDetailSnapshot | null = snapshotRow ? {
@@ -1139,8 +1201,15 @@ export class ScoutService {
   }
 
   messages(): SellerMessage[] {
-    const rows = this.db.prepare('SELECT * FROM seller_messages ORDER BY created_at DESC LIMIT 100').all() as Array<Record<string, any>>;
-    return rows.map((row) => this.sellerMessageFromRow(row));
+    return this.messagesPage().messages;
+  }
+
+  messagesPage(options: { page?: number; pageSize?: number } = {}) {
+    const page = Math.max(1, Math.floor(options.page ?? 1));
+    const pageSize = Math.max(1, Math.min(200, Math.floor(options.pageSize ?? 100)));
+    const total = Number((this.db.prepare('SELECT COUNT(*) AS count FROM seller_messages').get() as { count?: number }).count ?? 0);
+    const rows = this.db.prepare('SELECT * FROM seller_messages ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?').all(pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
+    return { messages: rows.map((row) => this.sellerMessageFromRow(row)), pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
   }
 
   private saveSellerMessage(input: {
@@ -1193,7 +1262,7 @@ export class ScoutService {
     }
   }
 
-  async negotiateAndSendByKey(key: string, offerPrice: number | null = null, budget?: { maxTotalCost: number; shippingCost?: number; otherCosts?: number }, source: SellerMessageSource = 'manual') {
+  private prepareNegotiation(key: string, offerPrice: number | null, budget: { maxTotalCost: number; shippingCost?: number; otherCosts?: number } | undefined, source: SellerMessageSource) {
     const { marketplace, listingId } = parseListingKey(key);
     if (marketplace !== 'OLX' && marketplace !== 'Allegro Lokalnie') throw new ServiceError('AI seller negotiation is currently available for OLX and Allegro Lokalnie only.', 409);
     const row = this.db.prepare('SELECT marketplace, listing_id, title, price_pln, url, condition, location, price_negotiable FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as Record<string, any> | undefined;
@@ -1201,14 +1270,9 @@ export class ScoutService {
 
     const config = this.deepSeekConfig();
     if (!config.apiKey) throw new ServiceError('OpenRouter is not configured. Add an API key in Settings or set SCOUT_OPENROUTER_API_KEY.', 409);
-    try {
-      if (!this.readMarketplaceSession(marketplace)) throw new ServiceError(`Connect your ${marketplace} account in Settings before sending seller messages.`, 409);
-    } catch (error) {
-      if (error instanceof ServiceError) throw error;
-      throw new ServiceError(error instanceof Error ? error.message : `The ${marketplace} session could not be read. Re-import it in Settings.`, 409);
-    }
 
     const askingPrice = Number(row.price_pln);
+    if (!Number.isFinite(askingPrice) || askingPrice <= 0) throw new ServiceError('The listing does not have a valid positive asking price.', 409);
     if (source === 'automatic' && row.price_negotiable !== 1) {
       throw new ServiceError('Automatic negotiation requires an explicit negotiable-price signal.', 409);
     }
@@ -1230,59 +1294,84 @@ export class ScoutService {
 
     const context: NegotiationListingContext = {
       marketplace,
-      title: String(row.title),
+      title: safePromptText(row.title, 180),
       price: askingPrice,
-      condition: row.condition ? String(row.condition) : undefined,
-      location: row.location ? String(row.location) : undefined,
+      condition: row.condition ? safePromptText(row.condition, 80) : undefined,
+      location: row.location ? safePromptText(row.location, 100) : undefined,
       priceNegotiable: row.price_negotiable === null || row.price_negotiable === undefined ? null : Boolean(row.price_negotiable),
       offerPrice: normalizedOffer,
     };
+    return { marketplace, listingId, row, config, askingPrice, normalizedOffer, context };
+  }
+
+  async draftNegotiationByKey(key: string, offerPrice: number | null = null, budget?: { maxTotalCost: number; shippingCost?: number; otherCosts?: number }) {
+    const prepared = this.prepareNegotiation(key, offerPrice, budget, 'manual');
     let draft: { message: string };
     try {
-      draft = await this.draftNegotiation(context, { apiKey: config.apiKey, model: config.model });
+      draft = await this.draftNegotiation(prepared.context, { apiKey: prepared.config.apiKey!, model: prepared.config.model });
     } catch (error) {
       const message = (error instanceof Error ? error.message : 'OpenRouter could not write a negotiation message').slice(0, 500);
       throw new ServiceError(message, error instanceof DeepSeekError ? error.status : 502);
     }
+    const message = validateNegotiationMessage(draft.message, prepared.normalizedOffer);
+    return { message, model: prepared.config.model, askingPrice: prepared.askingPrice, offerPrice: prepared.normalizedOffer, marketplace: prepared.marketplace, listingId: prepared.listingId, title: safePromptText(prepared.row.title, 240) };
+  }
 
-    const createdAt = nowIso();
+  async negotiateAndSendByKey(key: string, offerPrice: number | null = null, budget?: { maxTotalCost: number; shippingCost?: number; otherCosts?: number }, source: SellerMessageSource = 'manual', messageOverride?: string) {
+    const prepared = this.prepareNegotiation(key, offerPrice, budget, source);
+    const messageKey = `${prepared.marketplace}:${prepared.listingId}`;
+    if (this.messagingInFlight.has(messageKey)) throw new ServiceError('A message for this listing is already being delivered.', 409);
+    if (this.messagingInFlight.size >= 2) throw new ServiceError('Two marketplace messages are already being delivered. Try again shortly.', 429);
+    this.messagingInFlight.add(messageKey);
     try {
-      await this.sendMarketplaceMessage(marketplace, String(row.url), draft.message);
-    } catch (error) {
-      const message = (error instanceof Error ? error.message : `${marketplace} could not send the negotiation message`).slice(0, 500);
-      const failed = this.saveSellerMessage({ marketplace, listingId, listingTitle: String(row.title), listingUrl: String(row.url), message: draft.message, offerPrice: normalizedOffer, model: config.model, source, status: 'failed', error: message, createdAt });
-      this.emit('seller-message', { id: failed.id, key, status: failed.status });
-      const status = ((error instanceof OlxMessagingError || error instanceof AllegroMessagingError) && error.code === 'session') ? 409 : 502;
-      throw new ServiceError(message, status);
-    }
+      const draft = messageOverride === undefined
+        ? await this.draftNegotiationByKey(key, offerPrice, budget)
+        : { message: validateNegotiationMessage(messageOverride, prepared.normalizedOffer), model: prepared.config.model };
 
-    const sentAt = nowIso();
-    const sent = this.saveSellerMessage({ marketplace, listingId, listingTitle: String(row.title), listingUrl: String(row.url), message: draft.message, offerPrice: normalizedOffer, model: config.model, source, status: 'sent', createdAt, sentAt });
-    this.emit('seller-message', { id: sent.id, key, status: sent.status });
-    return { message: sent };
+      try {
+        if (!this.readMarketplaceSession(prepared.marketplace)) throw new ServiceError(`Connect your ${prepared.marketplace} account in Settings before sending seller messages.`, 409);
+      } catch (error) {
+        if (error instanceof ServiceError) throw error;
+        throw new ServiceError(error instanceof Error ? error.message : `The ${prepared.marketplace} session could not be read. Re-import it in Settings.`, 409);
+      }
+
+      const createdAt = nowIso();
+      try {
+        await this.sendMarketplaceMessage(prepared.marketplace, String(prepared.row.url), draft.message);
+      } catch (error) {
+        const message = (error instanceof Error ? error.message : `${prepared.marketplace} could not send the negotiation message`).slice(0, 500);
+        const failed = this.saveSellerMessage({ marketplace: prepared.marketplace, listingId: prepared.listingId, listingTitle: String(prepared.row.title), listingUrl: String(prepared.row.url), message: draft.message, offerPrice: prepared.normalizedOffer, model: prepared.config.model, source, status: 'failed', error: message, createdAt });
+        this.emit('seller-message', { id: failed.id, key, status: failed.status });
+        const status = ((error instanceof OlxMessagingError || error instanceof AllegroMessagingError) && error.code === 'session') ? 409 : 502;
+        throw new ServiceError(message, status);
+      }
+
+      const sentAt = nowIso();
+      const sent = this.saveSellerMessage({ marketplace: prepared.marketplace, listingId: prepared.listingId, listingTitle: String(prepared.row.title), listingUrl: String(prepared.row.url), message: draft.message, offerPrice: prepared.normalizedOffer, model: prepared.config.model, source, status: 'sent', createdAt, sentAt });
+      this.emit('seller-message', { id: sent.id, key, status: sent.status });
+      return { message: sent };
+    } finally {
+      this.messagingInFlight.delete(messageKey);
+    }
   }
 
   private claimAutomaticNegotiation(candidate: DealNotificationCandidate, recommendation: NegotiationRecommendation, config: AutoNegotiationConfig) {
     if (config.maxTotalCost === null || recommendation.openingOffer === null) return false;
     const now = nowIso();
     return this.transaction(() => {
-      const existing = this.db.prepare('SELECT status FROM automatic_negotiations WHERE marketplace = ? AND listing_id = ?').get(candidate.listing.marketplace, candidate.listing.listingId) as { status?: string } | undefined;
-      if (existing) return false;
+      const existing = this.db.prepare('SELECT status, attempt_count, updated_at FROM automatic_negotiations WHERE marketplace = ? AND listing_id = ?').get(candidate.listing.marketplace, candidate.listing.listingId) as { status?: string; attempt_count?: number; updated_at?: string } | undefined;
+      if (existing?.status === 'sent') return false;
+      if (existing?.status === 'processing' && existing.updated_at && Date.parse(existing.updated_at) > Date.now() - 15 * 60_000) return false;
+      if (existing && Number(existing.attempt_count ?? 0) >= 5) return false;
       const attemptedToday = this.db.prepare('SELECT COUNT(*) AS count FROM automatic_negotiations WHERE created_at >= ?').get(this.currentDayStart()) as { count?: number } | undefined;
       if (Number(attemptedToday?.count ?? 0) >= config.dailyLimit) return false;
-      this.db.prepare(`INSERT INTO automatic_negotiations (marketplace, listing_id, watch_id, status, asking_price_pln, offer_price_pln, max_total_cost_pln, known_costs_pln, discount_percent, created_at, updated_at)
-        VALUES (?, ?, ?, 'processing', ?, ?, ?, ?, ?, ?, ?)`).run(
-        candidate.listing.marketplace,
-        candidate.listing.listingId,
-        candidate.watchId,
-        recommendation.askingPrice,
-        recommendation.openingOffer,
-        config.maxTotalCost,
-        recommendation.knownCosts,
-        candidate.discountPercent,
-        now,
-        now,
-      );
+      if (existing) {
+        this.db.prepare(`UPDATE automatic_negotiations SET watch_id = ?, status = 'processing', asking_price_pln = ?, offer_price_pln = ?, max_total_cost_pln = ?, known_costs_pln = ?, discount_percent = ?, attempt_count = attempt_count + 1, error = NULL, updated_at = ?
+          WHERE marketplace = ? AND listing_id = ?`).run(candidate.watchId, recommendation.askingPrice, recommendation.openingOffer, config.maxTotalCost, recommendation.knownCosts, candidate.discountPercent, now, candidate.listing.marketplace, candidate.listing.listingId);
+      } else {
+        this.db.prepare(`INSERT INTO automatic_negotiations (marketplace, listing_id, watch_id, status, asking_price_pln, offer_price_pln, max_total_cost_pln, known_costs_pln, discount_percent, attempt_count, created_at, updated_at)
+          VALUES (?, ?, ?, 'processing', ?, ?, ?, ?, ?, 1, ?, ?)`).run(candidate.listing.marketplace, candidate.listing.listingId, candidate.watchId, recommendation.askingPrice, recommendation.openingOffer, config.maxTotalCost, recommendation.knownCosts, candidate.discountPercent, now, now);
+      }
       return true;
     });
   }
@@ -1326,36 +1415,57 @@ export class ScoutService {
     }
   }
 
+  private async fetchSearchPages(source: Marketplace, query: string, filters: Parameters<typeof buildMarketplaceSearchUrl>[2], maxPages = 3) {
+    const adapter = createPublicAdapter(source, (url) => this.fetchPublicPage(url, source));
+    const first = await adapter.fetchPublicSearch(buildMarketplaceSearchUrl(source, query, filters));
+    const listings = new Map(first.map((listing) => [`${listing.marketplace}:${listing.listingId}`, listing]));
+    if (first.length < 20 || first.empty) return [...listings.values()];
+    for (let page = 2; page <= maxPages; page += 1) {
+      const fetched = await adapter.fetchPublicSearch(buildMarketplaceSearchUrl(source, query, { ...filters, page }));
+      const before = listings.size;
+      for (const listing of fetched) listings.set(`${listing.marketplace}:${listing.listingId}`, listing);
+      if (fetched.empty || listings.size === before) break;
+    }
+    return [...listings.values()];
+  }
+
   async manualSearch(input: SearchFilters): Promise<ManualSearchResponse> {
-    const tasks = input.sources.map(async (source) => {
+    if (this.activeManualSearches >= 3) throw new ServiceError('Three manual searches are already running. Try again shortly.', 429);
+    this.activeManualSearches += 1;
+    try {
+      const tasks = input.sources.map(async (source) => {
       const started = Date.now();
       try {
-        const adapter = createPublicAdapter(source, (url) => this.fetchPublicPage(url, source));
-        const fetched = await adapter.fetchPublicSearch(buildMarketplaceSearchUrl(source, input.query, input));
+        const fetched = await this.fetchSearchPages(source, input.query, input, 3);
         const deterministicFilters = { minPrice: input.minPrice, maxPrice: input.maxPrice, condition: input.condition, location: input.location, shippingOnly: false };
         const comparable = filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters);
         if (input.shippingOnly) await this.enrichShipping(comparable, source, { limit: 24 });
         const filtered = filterListings(comparable, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, shippingOnly: input.shippingOnly });
+        const relevance = await this.filterListingsByAiRelevance(filtered, { query: input.query, includedTerms: input.terms ?? '', excludedTerms: input.excluded ?? '' }, undefined, true);
+        for (const listing of relevance.listings.slice(0, 100)) this.storeManualListing(listing);
         const pendingShipping = input.shippingOnly ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
         return {
-          listings: filtered.slice(0, 100).map((listing): Listing => ({
+          listings: relevance.listings.slice(0, 100).map((listing): Listing => ({
             id: `${listing.marketplace}:${listing.listingId}`, title: listing.title,
             subtitle: [listing.condition, listing.location].filter(Boolean).join(' · '), marketplace: listing.marketplace,
             price: listing.price, typical: null, belowTypical: null, observed: 'just now', observedAt: listing.observedAt,
             dealStrength: 1, dealLabel: 'Watch', image: listing.imageUrl ?? '', url: listing.url, watch: 'Manual search',
             condition: listing.condition, location: listing.location, shippingAvailable: listing.shippingAvailable ?? null, priceNegotiable: listing.priceNegotiable ?? null,
           })),
-          status: { source, status: 'ok' as const, count: filtered.length, pendingShipping, durationMs: Date.now() - started, message: filtered.length ? `${filtered.length} matches` : 'No matching listings' },
+          status: { source, status: 'ok' as const, count: relevance.listings.length, pendingShipping, durationMs: Date.now() - started, message: relevance.listings.length ? `${relevance.listings.length} matches${relevance.excluded ? ` · ${relevance.excluded} excluded by AI` : ''}` : 'No matching listings' },
         };
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Search failed';
         return { listings: [] as Listing[], status: { source, status: 'error' as const, count: 0, pendingShipping: 0, durationMs: Date.now() - started, message } };
       }
-    });
-    const results = await Promise.all(tasks);
-    const unique = new Map<string, Listing>();
-    for (const listing of results.flatMap((result) => result.listings)) unique.set(listing.id, listing);
-    return { listings: [...unique.values()].sort((a, b) => a.price - b.price), sources: results.map((result) => result.status) };
+      });
+      const results = await Promise.all(tasks);
+      const unique = new Map<string, Listing>();
+      for (const listing of results.flatMap((result) => result.listings)) unique.set(listing.id, listing);
+      return { listings: [...unique.values()].sort((a, b) => a.price - b.price), sources: results.map((result) => result.status) };
+    } finally {
+      this.activeManualSearches -= 1;
+    }
   }
 
   private marketWatchVersion(row: WatchRow) {
@@ -1387,7 +1497,7 @@ export class ScoutService {
       const version = this.marketWatchVersion(row);
       const versionPredicate = row.active_version_id ? 'version_id = ?' : '(version_id = ? OR version_id IS NULL)';
       const counts = this.db.prepare(`SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN status = 'ended' THEN 1 ELSE 0 END) AS ended FROM market_listings WHERE market_watch_id = ? AND ${versionPredicate} AND status IN ('active', 'ended')`).get(row.id, version.id) as { total: number; active: number | null; ended: number | null };
-      const endedPrices = (this.db.prepare(`SELECT last_price_pln FROM market_listings WHERE market_watch_id = ? AND ${versionPredicate} AND status = 'ended'`).all(row.id, version.id) as Array<{ last_price_pln: number }>).map((item) => Number(item.last_price_pln));
+      const endedPrices = (this.db.prepare(`SELECT last_price_pln FROM market_listings WHERE market_watch_id = ? AND ${versionPredicate} AND status = 'ended' AND last_price_pln > 0`).all(row.id, version.id) as Array<{ last_price_pln: number }>).map((item) => Number(item.last_price_pln));
       return {
         id: row.id, name: row.name, query: version.query, terms: version.included_terms ?? '', excluded: version.excluded_terms ?? '', location: version.location ?? 'Polska', condition: version.condition ?? 'Any', sources: parseJson<Marketplace[]>(version.sources_json, []),
         intervalHours: Number(row.interval_hours), minPrice: version.min_price_pln === null || version.min_price_pln === undefined ? null : Number(version.min_price_pln), maxPrice: version.max_price_pln === null || version.max_price_pln === undefined ? null : Number(version.max_price_pln), shippingOnly: Boolean(version.shipping_only), enabled: Boolean(row.enabled), nextScan: Boolean(row.enabled) ? relativeTimeFuture(row.next_scan_at) : 'Paused',
@@ -1396,7 +1506,7 @@ export class ScoutService {
       };
     });
     const applicable = [
-      "SELECT ml.last_price_pln FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ml.status = 'ended' AND (ml.version_id = mw.active_version_id OR (mw.active_version_id IS NULL AND ml.version_id IS NULL))",
+      "SELECT ml.last_price_pln FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ml.status = 'ended' AND ml.last_price_pln > 0 AND (ml.version_id = mw.active_version_id OR (mw.active_version_id IS NULL AND ml.version_id IS NULL))",
       ...(options.watchId ? ['AND ml.market_watch_id = ?'] : []),
     ].join(' ');
     const aggregateParams = options.watchId ? [options.watchId] : [];
@@ -1405,11 +1515,15 @@ export class ScoutService {
 
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(400, Math.floor(options.pageSize ?? 100)));
-    const predicates = ['1 = 1'];
+    const predicates = ['(ml.version_id = mw.active_version_id OR (mw.active_version_id IS NULL AND ml.version_id IS NULL))'];
     const params: unknown[] = [];
     if (options.watchId) { predicates.push('ml.market_watch_id = ?'); params.push(options.watchId); }
-    if (options.status) { predicates.push('ml.status = ?'); params.push(options.status); }
-    const total = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM market_listings ml WHERE ${predicates.join(' AND ')}`).get(...params) as { count?: number }).count ?? 0);
+    if (options.status === 'superseded') {
+      predicates[0] = '((mw.active_version_id IS NOT NULL AND ml.version_id IS NOT mw.active_version_id) OR (mw.active_version_id IS NULL AND ml.version_id IS NOT NULL))';
+    } else if (options.status) {
+      predicates.push('ml.status = ?'); params.push(options.status);
+    }
+    const total = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ${predicates.join(' AND ')}`).get(...params) as { count?: number }).count ?? 0);
     const rows = this.db.prepare(`SELECT ml.*, mw.name AS watch_name,
       (SELECT COUNT(*) FROM market_price_observations mpo WHERE mpo.market_listing_id = ml.id AND (mpo.version_id = ml.version_id OR (ml.version_id IS NULL AND mpo.version_id IS NULL))) AS observations
       FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id
@@ -1503,7 +1617,7 @@ export class ScoutService {
           const versionId = `${id}:v${Date.now()}-${randomBytes(3).toString('hex')}`;
           if (row.active_version_id) this.db.prepare('UPDATE market_watch_versions SET closed_at = ? WHERE id = ? AND closed_at IS NULL').run(now, row.active_version_id);
           this.db.prepare('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, id, next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, now);
-          this.db.prepare("UPDATE market_listings SET status = 'superseded' WHERE market_watch_id = ? AND (version_id = ? OR version_id IS NULL) AND status = 'active'").run(id, row.active_version_id ?? currentVersion.id);
+          this.db.prepare("UPDATE market_listings SET status = 'superseded', ended_at = COALESCE(ended_at, ?), ended_reason = COALESCE(ended_reason, 'Research criteria changed') WHERE market_watch_id = ? AND (version_id = ? OR version_id IS NULL) AND status <> 'superseded'").run(now, id, row.active_version_id ?? currentVersion.id);
           directFields.push('query = ?', 'included_terms = ?', 'excluded_terms = ?', 'location = ?', 'condition = ?', 'sources_json = ?', 'min_price_pln = ?', 'max_price_pln = ?', 'shipping_only = ?', 'active_version_id = ?', 'next_scan_at = ?');
           directValues.push(next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, versionId, now);
         }
@@ -1527,14 +1641,22 @@ export class ScoutService {
     this.running.add(runningKey);
     const sources = parseJson<Marketplace[]>(row.sources_json, []);
     const version = this.ensureMarketWatchVersion(row);
+    let latestBackoffUntil: string | null = null;
     try {
       await Promise.all(sources.map(async (source) => {
         const started = nowIso();
-        const runId = this.recordRun(source, 'running', `Researching ${row.name}`, started, null);
+        const latest = this.db.prepare('SELECT backoff_until FROM connector_runs WHERE source = ? ORDER BY started_at DESC LIMIT 1').get(source) as { backoff_until?: string } | undefined;
+        const backoffUntil = latest?.backoff_until && Date.parse(latest.backoff_until) > Date.now() ? latest.backoff_until : null;
+        if (backoffUntil && (!latestBackoffUntil || Date.parse(backoffUntil) > Date.parse(latestBackoffUntil))) latestBackoffUntil = backoffUntil;
+        const runId = this.recordRun(source, backoffUntil ? 'skipped' : 'running', backoffUntil ? `Skipped research for ${row.name}; connector backoff is active` : `Researching ${row.name}`, started, backoffUntil ? started : null);
         const scanId = this.createScan(String(row.id), 'research', source, started);
+        if (backoffUntil) {
+          this.db.prepare("UPDATE scans SET status = 'skipped', completed_at = ?, error = ? WHERE id = ?").run(started, `Connector backoff active until ${backoffUntil}`, scanId);
+          return;
+        }
         try {
           const adapter = createPublicAdapter(source, (url) => this.fetchPublicPage(url, source));
-          const fetched = await adapter.fetchPublicSearch(buildMarketplaceSearchUrl(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' }));
+          const fetched = await this.fetchSearchPages(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' }, 3);
           const filters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, location: row.location, shippingOnly: false };
           const comparable = filterListings(fetched, row.query, row.included_terms ?? '', row.excluded_terms ?? '', filters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
@@ -1543,21 +1665,38 @@ export class ScoutService {
           const seen = new Set(filtered.map((listing) => listing.listingId));
           const active = this.db.prepare("SELECT id, listing_id, url, missing_scans FROM market_listings WHERE market_watch_id = ? AND version_id = ? AND marketplace = ? AND status = 'active'").all(row.id, version.id, source) as Array<{ id: number; listing_id: string; url: string; missing_scans: number }>;
           const missing = active.filter((listing) => !seen.has(listing.listing_id));
-          const verifiedMissing: Array<{ listing: typeof missing[number]; availability: ListingAvailability }> = [];
-          for (let offset = 0; offset < missing.length; offset += 2) {
-            const batch = await Promise.all(missing.slice(offset, offset + 2).map(async (candidate) => ({
-              listing: candidate,
-              availability: await adapter.verifyAvailability(candidate.url),
-            })));
+          const deferredMissing = Math.max(0, missing.length - MAX_RESEARCH_DETAIL_CHECKS);
+          const verifiedMissing: Array<{ listing: typeof missing[number]; availability: ListingAvailability; refreshed?: NormalizedListing }> = [];
+          for (let offset = 0; offset < Math.min(missing.length, MAX_RESEARCH_DETAIL_CHECKS); offset += 2) {
+            const batch = await Promise.all(missing.slice(offset, Math.min(offset + 2, MAX_RESEARCH_DETAIL_CHECKS)).map(async (candidate) => {
+              const detail = await adapter.fetchDetail(candidate.url);
+              return {
+                listing: candidate,
+                availability: detail.availability,
+                refreshed: detail.listing?.listingId === candidate.listing_id && detail.listing.price > 0 ? detail.listing : undefined,
+              };
+            }));
             verifiedMissing.push(...batch);
           }
+          let discarded = false;
           this.transaction(() => {
+            const current = this.db.prepare('SELECT active_version_id FROM market_watches WHERE id = ?').get(row.id) as { active_version_id?: string | null } | undefined;
+            if (!current || current.active_version_id !== version.id) {
+              this.db.prepare("UPDATE scans SET status = 'superseded', completed_at = ?, error = ? WHERE id = ?").run(nowIso(), 'Research criteria changed while this scan was running', scanId);
+              discarded = true;
+              return;
+            }
             for (const listing of filtered) {
               this.storeMarketListing(row.id, version.id, listing, observedAt, scanId);
             }
-            for (const { listing, availability } of verifiedMissing) {
+            for (const { listing, availability, refreshed } of verifiedMissing) {
               if (availability.status === 'live') {
-                this.db.prepare("UPDATE market_listings SET missing_scans = 0, status = 'active', availability_status = 'live', ended_reason = NULL, last_verified_at = ?, ended_at = NULL WHERE id = ?").run(observedAt, listing.id);
+                if (refreshed) {
+                  this.db.prepare("UPDATE market_listings SET title = ?, url = ?, image_url = COALESCE(?, image_url), last_price_pln = ?, lowest_price_pln = MIN(lowest_price_pln, ?), missing_scans = 0, status = 'active', availability_status = 'live', ended_reason = NULL, last_verified_at = ?, ended_at = NULL WHERE id = ?").run(refreshed.title, refreshed.url, refreshed.imageUrl ?? null, refreshed.price, refreshed.price, observedAt, listing.id);
+                  this.db.prepare('INSERT INTO market_price_observations (market_listing_id, version_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?)').run(listing.id, version.id, scanId, refreshed.price, observedAt);
+                } else {
+                  this.db.prepare("UPDATE market_listings SET missing_scans = 0, status = 'active', availability_status = 'live', ended_reason = NULL, last_verified_at = ?, ended_at = NULL WHERE id = ?").run(observedAt, listing.id);
+                }
               } else if (availability.status === 'terminal') {
                 const next = marketStatusAfterMiss(Number(listing.missing_scans));
                 this.db.prepare("UPDATE market_listings SET missing_scans = ?, status = ?, ended_at = CASE WHEN ? = 'ended' THEN COALESCE(ended_at, ?) ELSE ended_at END, availability_status = 'terminal', ended_reason = ?, last_verified_at = ? WHERE id = ?").run(next.missingScans, next.status, next.status, observedAt, availability.reason, observedAt, listing.id);
@@ -1565,17 +1704,22 @@ export class ScoutService {
                 this.db.prepare("UPDATE market_listings SET availability_status = 'unknown', last_verified_at = ? WHERE id = ?").run(observedAt, listing.id);
               }
             }
-            this.completeScan(scanId, `${filtered.length} research listings saved`);
+            this.completeScan(scanId, `${filtered.length} research listings saved${deferredMissing ? ` · ${deferredMissing} detail checks deferred` : ''}`);
           });
-          this.finishRun(runId, 'ok', `${filtered.length} research listings saved${fetched.empty ? ' · valid empty page' : ''}`);
+          if (discarded) {
+            this.finishRun(runId, 'skipped', 'Discarded results from a superseded research definition');
+            return;
+          }
+          this.finishRun(runId, 'ok', `${filtered.length} research listings saved${deferredMissing ? ` · ${deferredMissing} detail checks deferred` : ''}`);
         } catch (error) {
           this.failScan(scanId, error);
           this.finishRun(runId, 'error', error instanceof Error ? error.message : 'Research connector failed');
         }
       }));
       const finished = nowIso();
-      const next = new Date(Date.now() + Math.max(6, Number(row.interval_hours)) * 3_600_000).toISOString();
-      this.db.prepare('UPDATE market_watches SET next_scan_at = ?, last_scan_at = ?, updated_at = ? WHERE id = ?').run(next, finished, finished, row.id);
+      const scheduled = new Date(Date.now() + Math.max(6, Number(row.interval_hours)) * 3_600_000).toISOString();
+      const next = latestBackoffUntil && Date.parse(latestBackoffUntil) > Date.parse(scheduled) ? latestBackoffUntil : scheduled;
+      this.db.prepare('UPDATE market_watches SET next_scan_at = ?, last_scan_at = ?, updated_at = ? WHERE id = ? AND active_version_id = ?').run(next, finished, finished, row.id, version.id);
       this.emit('market-watch', { refresh: true, id: row.id });
     } finally { this.running.delete(runningKey); }
   }
@@ -1623,6 +1767,34 @@ export class ScoutService {
     };
   }
 
+  exportData() {
+    const rows = (table: string) => this.db.prepare(`SELECT * FROM ${table}`).all() as Array<Record<string, unknown>>;
+    const settings = rows('settings').map((row) => {
+      const key = String(row.key);
+      return { key, configured: Boolean(row.value), value: /(?:webhook|ntfy_config|api_key)/i.test(key) ? null : row.value };
+    });
+    return {
+      exportedAt: nowIso(),
+      note: 'Encrypted credentials, browser sessions, and raw secret values are intentionally omitted. Use the authenticated database backup command for a complete restore point.',
+      watches: rows('watches'),
+      listings: rows('listings'),
+      observations: rows('observations'),
+      listingRelevance: rows('listing_relevance'),
+      scans: rows('scans'),
+      notificationDeliveries: rows('notification_deliveries'),
+      automaticNegotiations: rows('automatic_negotiations'),
+      marketWatches: rows('market_watches'),
+      marketWatchVersions: rows('market_watch_versions'),
+      marketListings: rows('market_listings'),
+      marketPriceObservations: rows('market_price_observations'),
+      listingActions: rows('listing_actions'),
+      sellerMessages: rows('seller_messages'),
+      notifications: rows('notifications'),
+      connectorRuns: rows('connector_runs'),
+      settings,
+    };
+  }
+
   settings(): SettingsData {
     const webhookConfigured = Boolean(this.getSetting('discord_webhook'));
     const ntfy = this.ntfyConfig();
@@ -1646,7 +1818,7 @@ export class ScoutService {
         source: this.deepSeekConfig().source,
       },
       autoNegotiation: this.autoNegotiationSettings(),
-      publicExposureWarning: process.env.SCOUT_PUBLIC === 'true',
+      publicExposureWarning: this.publicExposureWarning,
       marketplaceSessions: this.marketplaceSessions(),
     };
   }
@@ -1742,19 +1914,33 @@ export class ScoutService {
   }
 
   notifications(): NotificationRecord[] {
-    const rows = this.db.prepare('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 100').all() as Array<Record<string, any>>;
-    return rows.map((row) => {
+    return this.notificationsPage().notifications;
+  }
+
+  notificationsPage(options: { page?: number; pageSize?: number } = {}) {
+    const page = Math.max(1, Math.floor(options.page ?? 1));
+    const pageSize = Math.max(1, Math.min(200, Math.floor(options.pageSize ?? 100)));
+    const total = Number((this.db.prepare('SELECT COUNT(*) AS count FROM notifications').get() as { count?: number }).count ?? 0);
+    const rows = this.db.prepare('SELECT * FROM notifications ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?').all(pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
+    return { notifications: rows.map((row) => {
       const payload = parseJson<Record<string, any>>(row.payload_json, {});
       const embed = payload.embeds?.[0];
       const below = embed?.fields?.find((field: any) => field.name === 'Below typical')?.value;
       const digest = payload._scoutDigest as { channel?: string; count?: number } | undefined;
       return { id: Number(row.id), title: embed?.title ?? payload.title ?? (payload.test ? `${payload.channel === 'ntfy' ? 'ntfy' : 'Discord'} test notification` : row.listing_key), reason: digest ? `${digest.count ?? 0} deals · ${digest.channel ?? 'daily digest'}` : below ? `${below} below typical` : payload.test ? `${payload.channel === 'ntfy' ? 'ntfy' : 'Webhook'} connectivity test` : 'Deal alert', observedAt: row.sent_at ?? row.created_at, status: row.status };
-    });
+    }), pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
   }
 
   connectorRuns(): ConnectorRun[] {
-    const rows = this.db.prepare('SELECT * FROM connector_runs ORDER BY started_at DESC LIMIT 100').all() as Array<Record<string, any>>;
-    return rows.map((row) => ({ id: Number(row.id), source: row.source, status: row.status, message: row.message, startedAt: row.started_at, finishedAt: row.finished_at, duration: duration(row.started_at, row.finished_at) }));
+    return this.connectorRunsPage().runs;
+  }
+
+  connectorRunsPage(options: { page?: number; pageSize?: number } = {}) {
+    const page = Math.max(1, Math.floor(options.page ?? 1));
+    const pageSize = Math.max(1, Math.min(200, Math.floor(options.pageSize ?? 100)));
+    const total = Number((this.db.prepare('SELECT COUNT(*) AS count FROM connector_runs').get() as { count?: number }).count ?? 0);
+    const rows = this.db.prepare('SELECT * FROM connector_runs ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?').all(pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
+    return { runs: rows.map((row) => ({ id: Number(row.id), source: row.source, status: row.status, message: row.message, startedAt: row.started_at, finishedAt: row.finished_at, duration: duration(row.started_at, row.finished_at) })), pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
   }
 
   deleteWatch(id: string) {
@@ -1844,20 +2030,28 @@ export class ScoutService {
     this.running.add(row.id);
     const sources = parseJson<Marketplace[]>(row.sources_json, []);
     const exactUrls = parseJson<string[]>(row.exact_urls_json, []);
+    let latestBackoffUntil: string | null = null;
     try {
       await Promise.all(sources.map(async (source) => {
         const latest = this.db.prepare('SELECT backoff_until FROM connector_runs WHERE source = ? ORDER BY started_at DESC LIMIT 1').get(source) as { backoff_until?: string } | undefined;
-        if (latest?.backoff_until && Date.parse(latest.backoff_until) > Date.now()) return;
         const started = nowIso();
-        const runId = this.recordRun(source, 'running', `Scanning ${row.name}`, started, null);
+        const backoffUntil = latest?.backoff_until && Date.parse(latest.backoff_until) > Date.now() ? latest.backoff_until : null;
+        if (backoffUntil && (!latestBackoffUntil || Date.parse(backoffUntil) > Date.parse(latestBackoffUntil))) latestBackoffUntil = backoffUntil;
+        const runId = this.recordRun(source, backoffUntil ? 'skipped' : 'running', backoffUntil ? `Skipped ${row.name}; connector backoff is active` : `Scanning ${row.name}`, started, backoffUntil ? started : null);
         const scanId = this.createScan(String(row.id), 'watch', source, started);
+        if (backoffUntil) {
+          this.db.prepare("UPDATE scans SET status = 'skipped', completed_at = ?, error = ? WHERE id = ?").run(started, `Connector backoff active until ${backoffUntil}`, scanId);
+          return;
+        }
         try {
           const matchingExact = exactUrls.filter((url) => validateSearchUrl(url, source).valid);
           const urls = matchingExact.length
             ? matchingExact
             : [buildMarketplaceSearchUrl(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' })];
           const adapter = createPublicAdapter(source, (url) => this.fetchPublicPage(url, source));
-          const fetched = (await Promise.all(urls.map((url) => adapter.fetchPublicSearch(url)))).flat();
+          const fetched = matchingExact.length
+            ? (await Promise.all(urls.map((url) => adapter.fetchPublicSearch(url)))).flat()
+            : await this.fetchSearchPages(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' }, 3);
           const deterministicFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, location: row.location, shippingOnly: false };
           const comparable = filterListings(fetched, row.query, row.included_terms, row.excluded_terms, deterministicFilters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
@@ -1902,7 +2096,8 @@ export class ScoutService {
         }
       }));
       const finished = nowIso();
-      const next = nextWatchScanAt(finished, Number(row.interval_minutes), Number(this.getSetting('night_interval') ?? DEFAULT_NIGHT_INTERVAL_MINUTES));
+      const scheduled = nextWatchScanAt(finished, Number(row.interval_minutes), Number(this.getSetting('night_interval') ?? DEFAULT_NIGHT_INTERVAL_MINUTES));
+      const next = latestBackoffUntil && Date.parse(latestBackoffUntil) > Date.parse(scheduled) ? latestBackoffUntil : scheduled;
       this.db.prepare('UPDATE watches SET next_scan_at = ?, updated_at = ? WHERE id = ?').run(next, finished, row.id);
       this.setSetting('last_scan', JSON.stringify({ at: finished }));
       this.emit('scan', { refresh: true, watchId: row.id });
@@ -2029,6 +2224,17 @@ export class ScoutService {
     const cutoff = new Date(Date.now() - 180 * 24 * 60 * 60_000).toISOString();
     this.db.prepare('DELETE FROM observations WHERE observed_at < ?').run(cutoff);
     this.db.prepare('DELETE FROM listing_detail_snapshots WHERE captured_at < ?').run(cutoff);
+    this.db.prepare('DELETE FROM market_price_observations WHERE observed_at < ?').run(cutoff);
+    this.db.prepare('DELETE FROM listing_relevance WHERE checked_at < ?').run(cutoff);
+    this.db.prepare('DELETE FROM connector_runs WHERE started_at < ?').run(cutoff);
+    this.db.prepare('DELETE FROM scans WHERE started_at < ?').run(cutoff);
+    this.db.prepare('DELETE FROM seller_messages WHERE created_at < ?').run(cutoff);
+    this.db.prepare('DELETE FROM automatic_negotiations WHERE created_at < ?').run(cutoff);
+    this.db.prepare('DELETE FROM notification_deliveries WHERE created_at < ?').run(cutoff);
+    this.db.prepare('DELETE FROM notifications WHERE created_at < ?').run(cutoff);
+    this.db.prepare('DELETE FROM daily_digest_candidates WHERE (digest_date IS NOT NULL AND digest_date < ?) OR (digest_date IS NULL AND observed_at < ?)').run(cutoff.slice(0, 10), cutoff);
+    this.db.prepare("DELETE FROM market_listings WHERE status IN ('ended', 'superseded') AND last_seen_at < ?").run(cutoff);
+    this.db.prepare("DELETE FROM market_watch_versions WHERE closed_at IS NOT NULL AND closed_at < ? AND id NOT IN (SELECT active_version_id FROM market_watches WHERE active_version_id IS NOT NULL)").run(cutoff);
     this.db.prepare('DELETE FROM listings WHERE last_seen_at < ? AND NOT EXISTS (SELECT 1 FROM observations WHERE observations.listing_id = listings.id)').run(cutoff);
     this.setSetting('last_prune', nowIso());
   }
@@ -2061,16 +2267,33 @@ export class ScoutService {
     this.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(marketplace, listing_id) DO UPDATE SET shipping_available = excluded.shipping_available, price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), last_seen_at = excluded.last_seen_at`).run(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable ? 1 : 0, listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0, checked, checked);
   }
 
+  private storeManualListing(listing: NormalizedListing) {
+    const observedAt = nowIso();
+    this.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, availability_status, last_verified_at, first_seen_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, ?)
+      ON CONFLICT(marketplace, listing_id) DO UPDATE SET title = excluded.title, price_pln = excluded.price_pln, url = excluded.url, image_url = COALESCE(excluded.image_url, listings.image_url), condition = COALESCE(excluded.condition, listings.condition), location = COALESCE(excluded.location, listings.location), shipping_available = COALESCE(excluded.shipping_available, listings.shipping_available), price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), availability_status = 'live', last_verified_at = excluded.last_verified_at, last_seen_at = excluded.last_seen_at`).run(
+      listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null,
+      listing.shippingAvailable === null || listing.shippingAvailable === undefined ? null : listing.shippingAvailable ? 1 : 0,
+      listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0,
+      observedAt, observedAt, observedAt,
+    );
+  }
+
   private storeListing(row: WatchRow, listing: NormalizedListing, scanId: number): DealNotificationCandidate | null {
     const existingPrices = (this.db.prepare(`SELECT o.price_pln
       FROM observations o
       JOIN listings l ON l.id = o.listing_id
       WHERE o.watch_id = ?
+        AND NOT EXISTS (
+          SELECT 1 FROM observations newer
+          WHERE newer.watch_id = o.watch_id AND newer.listing_id = o.listing_id
+            AND (newer.observed_at > o.observed_at OR (newer.observed_at = o.observed_at AND newer.id > o.id))
+        )
         AND (? = 0 OR NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))))
         AND (? = 0 OR l.shipping_available = 1)
         AND (? IS NULL OR o.price_pln >= ?)
         AND (? IS NULL OR o.price_pln <= ?)
-      ORDER BY o.observed_at DESC, o.id DESC LIMIT 400`).all(row.id, row.ai_relevance === false || row.ai_relevance === 0 ? 0 : 1, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln) as Array<{ price_pln: number }>).map((item) => Number(item.price_pln));
+      ORDER BY o.observed_at DESC, o.id DESC LIMIT 400`).all(row.id, row.ai_relevance === false || row.ai_relevance === 0 ? 0 : 1, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln) as Array<{ price_pln: number }>).map((item) => Number(item.price_pln)).filter((price) => Number.isFinite(price) && price > 0);
     const observedAt = nowIso();
     this.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, availability_status, last_verified_at, first_seen_at, last_seen_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, ?)
@@ -2235,7 +2458,7 @@ export class ScoutService {
           const update = this.db.prepare('UPDATE daily_digest_candidates SET digest_date = ? WHERE id = ?');
           for (const id of eligibleIds) update.run(local.date, id);
         }
-        this.setSetting('daily_digest_last_date', local.date);
+        if (planned.length) this.setSetting('daily_digest_last_date', local.date);
       });
       const claimed = planned.map((item) => ({ ...item, claim: this.claimNotificationDelivery(item.eventKey, item.channel) })).filter((item) => item.claim !== null);
       await Promise.all(claimed.map((item) => this.deliverClaimedDigest({ deliveryKey: item.eventKey, eventKey: item.eventKey, channel: item.channel, payload: item.payload, attemptCount: item.claim!.attemptCount })));

@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.env.*
+node_modules
+data
+dist
+dist-server
+coverage
+*.log
+*.sqlite
+*.sqlite-*
+*.backup.sqlite
+*.storage-state.json
+NEXT_AGENT.md
+tests

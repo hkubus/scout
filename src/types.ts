@@ -27,6 +27,7 @@ export interface ListingNormalization {
 }
 
 export type ListingDescriptionVerificationDecision = 'pass' | 'reject' | 'unknown';
+export type ListingDescriptionVerificationStatus = ListingDescriptionVerificationDecision | 'pending' | 'not-configured' | 'fallback';
 
 export interface ListingDescriptionVerification {
   decision: ListingDescriptionVerificationDecision;
@@ -44,7 +45,7 @@ export interface ListingDetailSnapshot {
   url: string;
   description: string | null;
   capturedAt: string;
-  verificationStatus?: ListingDescriptionVerificationDecision | 'pending' | 'not-configured' | null;
+  verificationStatus?: ListingDescriptionVerificationStatus | null;
 }
 
 export interface Listing {
@@ -80,7 +81,7 @@ export interface Listing {
   aiNormalizationError?: string | null;
   aiDescriptionVerification?: ListingDescriptionVerification | null;
   aiDescriptionVerificationAt?: string | null;
-  aiDescriptionVerificationStatus?: ListingDescriptionVerificationDecision | 'pending' | 'not-configured' | null;
+  aiDescriptionVerificationStatus?: ListingDescriptionVerificationStatus | null;
   aiDescriptionVerificationError?: string | null;
 }
 
@@ -125,6 +126,16 @@ export interface SellerMessage {
 
 export interface NegotiationResult {
   message: SellerMessage;
+}
+
+export interface NegotiationDraft {
+  message: string;
+  model: string;
+  askingPrice: number;
+  offerPrice: number | null;
+  marketplace: Marketplace;
+  listingId: string;
+  title: string;
 }
 
 export type NegotiationRecommendationStatus = 'ready' | 'budget-required' | 'not-negotiable' | 'manual-review' | 'budget-too-low' | 'no-room';

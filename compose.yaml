@@ -2,6 +2,7 @@ services:
   scout:
     build: .
     restart: unless-stopped
+    init: true
     ports:
       - "3001:3001"
     environment:
@@ -9,30 +10,44 @@ services:
       SCOUT_HOST: 0.0.0.0
       SCOUT_DB_PATH: /app/data/scout.sqlite
       SCOUT_SECRET: ${SCOUT_SECRET:?Set SCOUT_SECRET in .env}
-      SCOUT_PUBLIC: ${SCOUT_PUBLIC:-false}
       SCOUT_OPENROUTER_API_KEY: ${SCOUT_OPENROUTER_API_KEY:-}
       SCOUT_OPENROUTER_MODEL: ${SCOUT_OPENROUTER_MODEL:-deepseek/deepseek-v4-flash}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       SCOUT_BROWSER_WS: ws://chromium:3000
     volumes:
       - scout-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     depends_on:
       chromium:
-        condition: service_started
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
+      start_period: 15s
       retries: 3
 
   chromium:
-    image: browserless/chrome:1.61.0
+    image: browserless/chrome:1.61-chrome-stable@sha256:efac47cfff3830d9a50b27d29f8bbb61949058ae336c823fbe9bd3c0d1debcc8
     restart: unless-stopped
+    init: true
     environment:
       CONNECTION_TIMEOUT: 60000
       MAX_CONCURRENT_SESSIONS: 2
     expose:
       - "3000"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/pressure').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
 
 volumes:
   scout-data:

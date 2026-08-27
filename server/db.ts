@@ -3,13 +3,17 @@
 // resume after a home-server restart.
 // @ts-ignore node:sqlite is present in the supported Node 22+ runtime.
 import { DatabaseSync } from 'node:sqlite';
-import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 
 export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data/scout.sqlite') {
+  try { process.umask(0o077); } catch { /* permissions are best-effort on non-POSIX runtimes */ }
   const absolutePath = resolve(databasePath);
   mkdirSync(dirname(absolutePath), { recursive: true });
+  try { chmodSync(dirname(absolutePath), 0o700); } catch { /* permissions are best-effort on non-POSIX filesystems */ }
   const db = new DatabaseSync(absolutePath);
+  try { chmodSync(absolutePath, 0o600); } catch { /* permissions are best-effort on non-POSIX filesystems */ }
   const migrationDirectory = resolve(process.cwd(), 'migrations');
   const migrationFiles = existsSync(migrationDirectory)
     ? readdirSync(migrationDirectory)
@@ -51,22 +55,40 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
       if (!columns.has('shipping_only')) db.exec('ALTER TABLE market_watches ADD COLUMN shipping_only INTEGER NOT NULL DEFAULT 0');
     }
   };
-  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'migrations'").get()) ensureLegacyColumns();
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'migrations'").get()) {
+    ensureLegacyColumns();
+    const migrationColumns = new Set((db.prepare('PRAGMA table_info(migrations)').all() as Array<{ name: string }>).map((column) => column.name));
+    if (!migrationColumns.has('checksum')) db.exec('ALTER TABLE migrations ADD COLUMN checksum TEXT');
+  }
   for (const file of migrationFiles) {
     const id = file.replace(/\.sql$/i, '');
+    const migrationPath = resolve(migrationDirectory, file);
+    const checksum = createHash('sha256').update(readFileSync(migrationPath)).digest('hex');
     const applied = db.prepare('SELECT 1 AS applied FROM sqlite_master WHERE type = \'table\' AND name = \'migrations\'').get() as { applied?: number } | undefined;
     if (applied?.applied !== 1) {
       if (id !== '001_init') continue;
     } else {
-      const existing = db.prepare('SELECT 1 AS applied FROM migrations WHERE id = ?').get(id) as { applied?: number } | undefined;
-      if (existing?.applied === 1) continue;
+      const existing = db.prepare('SELECT checksum FROM migrations WHERE id = ?').get(id) as { checksum?: string | null } | undefined;
+      if (existing) {
+        if (existing.checksum && existing.checksum !== checksum) throw new Error(`Migration checksum mismatch for ${id}`);
+        if (!existing.checksum) db.prepare('UPDATE migrations SET checksum = ? WHERE id = ?').run(checksum, id);
+        continue;
+      }
     }
 
+    if (existsSync(absolutePath) && process.env.SCOUT_SKIP_MIGRATION_BACKUP !== 'true') {
+      const backupPath = `${absolutePath}.pre-${id}-${Date.now()}-${randomBytes(3).toString('hex')}.sqlite`;
+      const escapedBackupPath = backupPath.replace(/'/g, "''");
+      db.exec(`VACUUM INTO '${escapedBackupPath}'`);
+      try { chmodSync(backupPath, 0o600); } catch { /* permissions are best-effort on non-POSIX filesystems */ }
+    }
     db.exec('BEGIN IMMEDIATE');
     try {
-      db.exec(readFileSync(resolve(migrationDirectory, file), 'utf8'));
+      db.exec(readFileSync(migrationPath, 'utf8'));
       db.prepare('CREATE TABLE IF NOT EXISTS migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)').run();
-      db.prepare('INSERT OR IGNORE INTO migrations (id, applied_at) VALUES (?, ?)').run(id, new Date().toISOString());
+      const migrationColumns = new Set((db.prepare('PRAGMA table_info(migrations)').all() as Array<{ name: string }>).map((column) => column.name));
+      if (!migrationColumns.has('checksum')) db.exec('ALTER TABLE migrations ADD COLUMN checksum TEXT');
+      db.prepare('INSERT OR IGNORE INTO migrations (id, applied_at, checksum) VALUES (?, ?, ?)').run(id, new Date().toISOString(), checksum);
       db.exec('COMMIT');
     } catch (error) {
       try { db.exec('ROLLBACK'); } catch { /* preserve the original migration error */ }
@@ -75,6 +97,7 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
     }
   }
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+  try { chmodSync(`${absolutePath}-wal`, 0o600); chmodSync(`${absolutePath}-shm`, 0o600); } catch { /* files may not exist until the first write */ }
   db.exec(`CREATE TABLE IF NOT EXISTS marketplace_sessions (
     marketplace TEXT PRIMARY KEY,
     label TEXT NOT NULL DEFAULT '',
@@ -93,6 +116,11 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
     sent_at TEXT,
     created_at TEXT NOT NULL,
     UNIQUE (listing_key, channel)
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS scheduler_leases (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    owner_id TEXT NOT NULL,
+    expires_at TEXT NOT NULL
   )`);
   const watchColumns = new Set((db.prepare('PRAGMA table_info(watches)').all() as Array<{ name: string }>).map((column) => column.name));
   if (!watchColumns.has('shipping_only')) db.exec('ALTER TABLE watches ADD COLUMN shipping_only INTEGER NOT NULL DEFAULT 0');
@@ -120,6 +148,9 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
   if (db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'scans'").get()) {
     db.prepare("UPDATE scans SET status = 'interrupted', completed_at = ?, error = COALESCE(error, 'Process restarted before scan completed') WHERE status = 'running'").run(new Date().toISOString());
   }
+  if (db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'automatic_negotiations'").get()) {
+    db.prepare("UPDATE automatic_negotiations SET status = 'failed', error = COALESCE(error, 'Process restarted before automatic negotiation completed'), updated_at = ? WHERE status = 'processing'").run(new Date().toISOString());
+  }
   return db;
 }
 
@@ -131,4 +162,14 @@ export function seedDatabase(db: any, seed: { watches: Array<any>; listings: Arr
   for (const watch of seed.watches) watchStmt.run(watch.id, watch.name, watch.query, watch.terms ?? '', watch.excluded ?? '', watch.location ?? 'Polska', watch.condition ?? 'Any', JSON.stringify(watch.sources ?? []), JSON.stringify(watch.exactUrls ?? []), watch.interval ?? 5, watch.sensitivity ?? 1, watch.shippingOnly ? 1 : 0, watch.minPrice ?? null, watch.maxPrice ?? null, watch.enabled ? 1 : 0, now, now, now);
   const listingStmt = db.prepare(`INSERT INTO listings (marketplace, listing_id, title, subtitle, price_pln, typical_pln, url, image_url, condition, location, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   for (const listing of seed.listings) listingStmt.run(listing.marketplace, listing.id, listing.title, listing.subtitle ?? '', listing.price, listing.typical, listing.url, listing.image, listing.condition ?? '', listing.location ?? '', now, now);
+}
+
+export function backupDatabase(db: any, databasePath = process.env.SCOUT_DB_PATH ?? './data/scout.sqlite') {
+  const absolutePath = resolve(databasePath);
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupPath = `${absolutePath}.${stamp}-${randomBytes(3).toString('hex')}.backup.sqlite`;
+  const escapedPath = backupPath.replace(/'/g, "''");
+  db.exec(`VACUUM INTO '${escapedPath}'`);
+  try { chmodSync(backupPath, 0o600); } catch { /* permissions are best-effort on non-POSIX filesystems */ }
+  return backupPath;
 }

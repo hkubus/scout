@@ -1,5 +1,9 @@
+import { isIP } from 'node:net';
+import { lookup } from 'node:dns/promises';
 import type { NormalizedListing } from './marketplaces';
 import type { NotificationPriority } from '../src/types';
+
+const processFetch = globalThis.fetch;
 
 export const notificationPriorityRank: Record<NotificationPriority, number> = {
   strong: 1,
@@ -62,17 +66,45 @@ export function validateNtfyConfig(input: {
   const serverValue = (input.serverUrl ?? 'https://ntfy.sh').trim();
   let server: URL;
   try { server = new URL(serverValue); } catch { throw new Error('Enter a valid ntfy server URL'); }
-  const localHttpHosts = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
-  if (server.protocol !== 'https:' && !(server.protocol === 'http:' && localHttpHosts.has(server.hostname))) {
-    throw new Error('ntfy server must use HTTPS (HTTP is allowed only for localhost)');
-  }
+  if (server.protocol !== 'https:') throw new Error('ntfy server must use HTTPS');
   if (server.username || server.password || server.search || server.hash) throw new Error('ntfy server URL cannot include credentials or query parameters');
+  if (!isSafeNetworkHost(server.hostname)) throw new Error('ntfy server cannot target a local or private network address');
   const serverUrl = `${server.origin}${server.pathname.replace(/\/+$/, '')}`;
   const topic = (input.topic ?? '').trim();
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(topic)) throw new Error('ntfy topic must be 1–64 letters, numbers, hyphens, or underscores');
   const token = (input.token ?? '').trim() || undefined;
   if (token && token.length > 512) throw new Error('ntfy access token is too long');
   return { serverUrl, topic, token, minimumPriority: parseNotificationPriority(input.minimumPriority, 'exceptional') };
+}
+
+function isPrivateAddress(hostname: string) {
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const ipv4 = host.split('.').map(Number);
+  if (isIP(host) === 4) {
+    return ipv4[0] === 0 || ipv4[0] === 10 || ipv4[0] === 127 || ipv4[0] === 169 && ipv4[1] === 254
+      || ipv4[0] === 172 && ipv4[1] >= 16 && ipv4[1] <= 31 || ipv4[0] === 192 && (ipv4[1] === 168 || ipv4[1] === 0 && ipv4[2] === 0 || ipv4[1] === 0 && ipv4[2] === 2)
+      || ipv4[0] === 100 && ipv4[1] >= 64 && ipv4[1] <= 127 || ipv4[0] === 198 && (ipv4[1] === 18 || ipv4[1] === 19 || ipv4[1] === 51)
+      || ipv4[0] === 203 && ipv4[1] === 0 && ipv4[2] === 113 || ipv4[0] >= 224;
+  }
+  if (isIP(host) === 6) {
+    if (host.startsWith('::ffff:')) return isPrivateAddress(host.slice('::ffff:'.length));
+    return host === '::' || host === '::1' || host.startsWith('fc') || host.startsWith('fd') || host.startsWith('fe8') || host.startsWith('fe9') || host.startsWith('fea') || host.startsWith('feb');
+  }
+  return false;
+}
+
+function isSafeNetworkHost(hostname: string) {
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.lan') || isPrivateAddress(host)) return false;
+  return true;
+}
+
+async function assertSafeNtfyDestination(serverUrl: string) {
+  const host = new URL(serverUrl).hostname;
+  if (!isSafeNetworkHost(host)) throw new Error('ntfy server cannot target a local or private network address');
+  if (isIP(host)) return;
+  const addresses = await lookup(host, { all: true, verbatim: true });
+  if (!addresses.length || addresses.some((address) => isPrivateAddress(address.address))) throw new Error('ntfy server resolved to a local or private network address');
 }
 
 export interface DealNotificationInput {
@@ -100,7 +132,8 @@ export function buildNtfyPayload(input: DealNotificationInput, topic: string, pr
   };
 }
 
-export async function publishNtfy(config: NtfyConfig, payload: NtfyPayload, fetcher: typeof fetch = fetch) {
+export async function publishNtfy(config: NtfyConfig, payload: NtfyPayload, fetcher: typeof fetch = globalThis.fetch) {
+  if (fetcher === processFetch) await assertSafeNtfyDestination(config.serverUrl);
   const response = await fetcher(`${config.serverUrl}/`, {
     method: 'POST',
     headers: {
@@ -115,13 +148,15 @@ export async function publishNtfy(config: NtfyConfig, payload: NtfyPayload, fetc
 
 export function buildDiscordEmbed(input: DealNotificationInput) {
   const { listing } = input;
+  const safeTitle = listing.title.replace(/[\r\n]+/g, ' ').trim().slice(0, 256) || 'Scout deal';
+  const safeImageUrl = listing.imageUrl && /^https:\/\//i.test(listing.imageUrl) ? listing.imageUrl.slice(0, 2_000) : undefined;
   return {
     username: 'Scout',
     embeds: [{
-      title: listing.title,
+      title: safeTitle,
       url: listing.url,
       color: input.discountPercent >= 30 ? 0xf15a35 : 0xf4b734,
-      thumbnail: listing.imageUrl ? { url: listing.imageUrl } : undefined,
+      thumbnail: safeImageUrl ? { url: safeImageUrl } : undefined,
       fields: [
         { name: 'Marketplace', value: listing.marketplace, inline: true },
         { name: 'Price', value: `${listing.price.toLocaleString('pl-PL')} zł`, inline: true },

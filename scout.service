@@ -5,10 +5,10 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=root
-Group=root
-WorkingDirectory=/root/scout
-ExecStart=/usr/bin/npm run start
+User=scout
+Group=scout
+WorkingDirectory=/opt/scout
+ExecStart=/usr/bin/node /opt/scout/dist-server/index.js
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
@@ -17,11 +17,21 @@ KillSignal=SIGTERM
 Environment=NODE_ENV=production
 Environment=SCOUT_HOST=127.0.0.1
 Environment=TZ=Europe/Warsaw
-Environment=SCOUT_DB_PATH=/root/scout/data/scout.sqlite
+Environment=SCOUT_DB_PATH=/var/lib/scout/scout.sqlite
 EnvironmentFile=-/etc/scout/scout.env
 
+UMask=0077
+StateDirectory=scout
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/scout
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target

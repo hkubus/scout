@@ -1,18 +1,21 @@
 {
   "name": "scout-deal-monitor",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "engines": {
     "node": ">=22.5.0"
   },
   "scripts": {
-    "dev": "concurrently -k \"vite --host 0.0.0.0\" \"tsx server/index.ts\"",
-    "dev:client": "vite --host 0.0.0.0",
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"tsx server/index.ts\"",
+    "dev:client": "vite --host 127.0.0.1",
     "dev:server": "tsx watch server/index.ts",
-    "build": "tsc -b && vite build",
-    "start": "tsx server/index.ts",
+    "build": "tsc -b && npm run build:server && vite build",
+    "build:server": "vite build --ssr server/index.ts --outDir dist-server --target node22",
+    "start": "node dist-server/index.js",
     "marketplace:login": "tsx scripts/marketplace-login.ts",
+    "db:backup": "tsx scripts/backup.ts",
+    "db:restore": "tsx scripts/restore.ts",
     "test:compose": "bash scripts/compose-smoke.sh",
     "test": "node --import tsx --test tests/**/*.test.ts",
     "typecheck": "tsc --noEmit"
@@ -25,7 +28,6 @@
     "playwright-core": "^1.62.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "tsx": "^4.19.2",
     "zod": "^3.24.1"
   },
   "devDependencies": {
@@ -34,6 +36,7 @@
     "@types/react-dom": "^19.0.2",
     "@vitejs/plugin-react": "^4.3.4",
     "concurrently": "^9.1.2",
+    "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vite": "^6.0.7"
   }

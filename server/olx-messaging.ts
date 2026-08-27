@@ -87,4 +87,8 @@ export async function sendOlxMessageOnPage(page: Page, listingUrl: string, messa
   if (/Nie można wysłać wiadomości|nie możesz rozpocząć nowych rozmów/i.test(visibleText)) {
     throw new OlxMessagingError('OLX could not send the message. Check the listing and your account limits.', 'delivery');
   }
+  const composerValue = await composer.inputValue().catch(async () => await composer.textContent().catch(() => ''));
+  if (!visibleText.includes(safeMessage) && String(composerValue ?? '').trim() !== '') {
+    throw new OlxMessagingError('OLX did not confirm that the message was delivered. Review the conversation before retrying.', 'delivery');
+  }
 }

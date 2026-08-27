@@ -21,18 +21,19 @@ export function median(values: number[]) {
 export function scoreDeal(prices: number[], price: number, options: { minSamples?: number; minHours?: number; observedHours?: number; sensitivity?: number } = {}): ScoreResult {
   const minSamples = options.minSamples ?? BASELINE_MIN_SAMPLES;
   const minHours = options.minHours ?? BASELINE_MIN_HOURS;
-  const typical = median(prices);
+  const usablePrices = prices.filter((value) => Number.isFinite(value) && value > 0);
+  const typical = median(usablePrices);
   if (typical === null || price <= 0) return { typical, mad: null, deviation: null, discountPercent: null, confidence: 0, isReady: false, qualifies: false };
-  const deviations = prices.map((value) => Math.abs(value - typical));
+  const deviations = usablePrices.map((value) => Math.abs(value - typical));
   const mad = median(deviations) ?? 0;
   const robustScale = Math.max(mad * 1.4826, typical * 0.035, 1);
   const deviation = (typical - price) / robustScale;
   const discountPercent = ((typical - price) / typical) * 100;
-  const sampleReadiness = Math.min(1, prices.length / minSamples);
+  const sampleReadiness = Math.min(1, usablePrices.length / minSamples);
   const timeReadiness = Math.min(1, (options.observedHours ?? 0) / minHours);
   const confidence = Math.round(Math.min(1, sampleReadiness * 0.62 + timeReadiness * 0.38) * 100);
   const sensitivity = options.sensitivity ?? 1;
-  const isReady = prices.length >= minSamples && (options.observedHours ?? 0) >= minHours;
+  const isReady = usablePrices.length >= minSamples && (options.observedHours ?? 0) >= minHours;
   const qualifies = isReady && deviation >= 3.1 / sensitivity && discountPercent >= 18;
   return { typical, mad, deviation, discountPercent, confidence, isReady, qualifies };
 }
