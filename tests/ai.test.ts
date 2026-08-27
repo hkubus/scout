@@ -177,10 +177,45 @@ test('conservatively verifies an exceptional listing description through DeepSee
 
   assert.deepEqual(result.decision, 'pass');
   const body = JSON.parse(String(requestInit?.body)) as Record<string, any>;
-  assert.equal(body.session_id, 'scout:listing-description-verification:v1');
-  assert.equal(body.max_tokens, 220);
+  assert.equal(body.session_id, 'scout:listing-description-verification:v2');
+  assert.equal(body.max_tokens, 360);
+  assert.deepEqual(body.plugins, [{ id: 'response-healing' }]);
   assert.equal(body.response_format.json_schema.name, 'listing_description_verification');
   assert.deepEqual(body.response_format.json_schema.schema.required, ['decision', 'confidence', 'summary', 'issues', 'evidence']);
   assert.equal(body.messages[1].content.includes(context.description), true);
   assert.equal(listingDescriptionVerificationInputHash(context), listingDescriptionVerificationInputHash({ ...context, description: '  W PEŁNI   SPRAWNY, wszystkie przyciski działają. W zestawie oryginalna ładowarka. ' }));
+});
+
+test('accepts a valid verification object wrapped in markdown or explanatory text', async () => {
+  const result = await verifyListingDescriptionWithDeepSeek(
+    { marketplace: 'OLX', title: 'Functional console', condition: 'Used', description: 'Fully working and complete.' },
+    { apiKey: 'sk-or-v1-test', model: 'deepseek-v4-flash' },
+    () => Promise.resolve(Response.json({ choices: [{ message: { content: [
+      { type: 'output_text', text: 'Result:\n```json\n' },
+      { type: 'output_text', text: JSON.stringify({ decision: 'pass', confidence: 0.9, summary: 'The item is explicitly described as functional.', issues: [], evidence: ['Fully working'] }) },
+      { type: 'output_text', text: '\n```' },
+    ] } }] })),
+  );
+
+  assert.equal(result.decision, 'pass');
+});
+
+test('retries once when verification output is malformed JSON', async () => {
+  let requests = 0;
+  const result = await verifyListingDescriptionWithDeepSeek(
+    { marketplace: 'OLX', title: 'Functional console', condition: 'Used', description: 'Fully working and complete.' },
+    { apiKey: 'sk-or-v1-test', model: 'deepseek-v4-flash' },
+    (_input, init) => {
+      requests += 1;
+      const body = JSON.parse(String(init?.body)) as Record<string, any>;
+      assert.deepEqual(body.plugins, [{ id: 'response-healing' }]);
+      const content = requests === 1
+        ? '{"decision":"pass","confidence":0.9,"summary":"The item is explicitly described as functional."'
+        : JSON.stringify({ decision: 'pass', confidence: 0.9, summary: 'The item is explicitly described as functional.', issues: [], evidence: ['Fully working'] });
+      return Promise.resolve(Response.json({ choices: [{ finish_reason: requests === 1 ? 'length' : 'stop', message: { content } }] }));
+    },
+  );
+
+  assert.equal(result.decision, 'pass');
+  assert.equal(requests, 2);
 });
