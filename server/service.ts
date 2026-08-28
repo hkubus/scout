@@ -79,7 +79,7 @@ const connectorDefinitions: Array<Pick<Connector, 'name' | 'kind' | 'color'>> = 
 ];
 const marketplaces: Marketplace[] = ['OLX', 'Allegro Lokalnie', 'Vinted'];
 export const DEFAULT_NIGHT_INTERVAL_MINUTES = 30;
-const MATCH_FRESHNESS_MS = 180 * 24 * 60 * 60_000;
+const MATCH_VISIBILITY_MS = 12 * 60 * 60_000;
 const NIGHT_START_HOUR = 22;
 const NIGHT_END_HOUR = 8;
 const MAX_RESEARCH_DETAIL_CHECKS = 100;
@@ -1027,7 +1027,7 @@ export class ScoutService {
   }
 
   listingsPage(options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string } = {}) {
-    const freshnessCutoff = new Date(Date.now() - MATCH_FRESHNESS_MS).toISOString();
+    const freshnessCutoff = new Date(Date.now() - MATCH_VISIBILITY_MS).toISOString();
     const predicates = [
       'w.archived_at IS NULL',
       'wl.last_seen_at > ?',

@@ -830,12 +830,12 @@ test('keeps shared listings associated with each watch and archives without dele
   } finally { context.close(); }
 });
 
-test('retains match associations for the documented 180-day history window', () => {
+test('hides matches after 12 hours while retaining their history', () => {
   const context = fixture();
   try {
     const now = new Date().toISOString();
     const fresh = new Date(Date.now() - 11 * 60 * 60_000).toISOString();
-    const stale = new Date(Date.now() - 181 * 24 * 60 * 60_000).toISOString();
+    const stale = new Date(Date.now() - 13 * 60 * 60_000).toISOString();
     seedWatch(context.db, 'freshness-watch');
     const insertListing = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)`);
@@ -849,6 +849,8 @@ test('retains match associations for the documented 180-day history window', () 
 
     assert.deepEqual(context.service.getListings().map((listing) => listing.listingId), ['fresh-listing']);
     assert.deepEqual(context.service.dashboard().listings.map((listing) => listing.listingId), ['fresh-listing']);
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM watch_listings WHERE watch_id = ?').get('freshness-watch') as { count: number }).count, 2);
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM observations WHERE watch_id = ?').get('freshness-watch') as { count: number }).count, 2);
     assert.ok(Date.parse(now) > Date.parse(fresh));
   } finally { context.close(); }
 });
