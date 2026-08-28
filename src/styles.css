@@ -138,6 +138,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .listing-table { min-width: 955px; display: grid; grid-template-columns: minmax(300px, 2.55fr) 1.18fr .95fr 1.02fr 1fr .82fr 1.35fr 34px; align-items: center; column-gap: 16px; padding: 10px 14px; }
 .listing-table--head { min-height: 34px; padding-top: 0; padding-bottom: 6px; color: var(--muted); font-size: 12px; font-weight: 500; }
 .listing-row { min-height: 64px; border-top: 1px solid var(--line); font-size: 13px; color: var(--text); }
+.listing-row, .research-listing-row, .messages-thread { content-visibility: auto; contain-intrinsic-size: auto 72px; }
 .listing-row:first-of-type { border-top-color: var(--line-strong); }
 .listing-row:hover { background: var(--surface-muted); }
 .listing-item { min-width: 0; display: flex; align-items: center; gap: 14px; }

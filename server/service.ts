@@ -845,15 +845,7 @@ export class ScoutService {
     return this.settings();
   }
 
-  private watchFromRow(row: WatchRow): Watch {
-    const stats = this.db.prepare(`SELECT COUNT(DISTINCT o.listing_id) AS samples, MIN(o.observed_at) AS first_observed
-      FROM observations o
-      JOIN listings l ON l.id = o.listing_id
-      WHERE o.watch_id = ?
-        AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND EXISTS (SELECT 1 FROM watches rw WHERE rw.id = r.watch_id AND rw.ai_relevance = 1))
-        AND (? = 0 OR l.shipping_available = 1)
-        AND (? IS NULL OR o.price_pln >= ?)
-        AND (? IS NULL OR o.price_pln <= ?)`).get(row.id, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln) as { samples: number; first_observed: string | null };
+  private watchFromRow(row: WatchRow, stats: { samples: number; first_observed: string | null } = { samples: 0, first_observed: null }): Watch {
     const samples = Number(stats?.samples ?? 0);
     const observationHours = stats?.first_observed ? Math.max(0, Math.floor((Date.now() - Date.parse(stats.first_observed)) / 3_600_000)) : 0;
     const readiness = Math.round(Math.min(1, samples / BASELINE_MIN_SAMPLES, observationHours / BASELINE_MIN_HOURS) * 100);
@@ -928,29 +920,50 @@ export class ScoutService {
       listingId: String(row.listing_id),
       decision: parseListingDecision(row.listing_decision),
       note: typeof row.listing_note === 'string' ? row.listing_note : '',
-      aiNormalization: parseStoredListingNormalization(row.ai_normalization_json),
-      aiNormalizationAt: row.ai_normalization_at ?? null,
-      aiNormalizationError: row.ai_normalization_error ?? null,
-      aiDescriptionVerification: parseStoredListingDescriptionVerification(row.ai_description_verification_json),
-      aiDescriptionVerificationAt: row.ai_description_verification_at ?? null,
-      aiDescriptionVerificationStatus: row.ai_description_verification_status === 'pass'
-        || row.ai_description_verification_status === 'reject'
-        || row.ai_description_verification_status === 'unknown'
-        || row.ai_description_verification_status === 'pending'
-        || row.ai_description_verification_status === 'not-configured'
-        || row.ai_description_verification_status === 'fallback'
-        ? row.ai_description_verification_status
-        : null,
-      aiDescriptionVerificationError: row.ai_description_verification_error ?? null,
+      ...(row.ai_normalization_json !== undefined ? {
+        aiNormalization: parseStoredListingNormalization(row.ai_normalization_json),
+        aiNormalizationAt: row.ai_normalization_at ?? null,
+        aiNormalizationError: row.ai_normalization_error ?? null,
+      } : {}),
+      ...(row.ai_description_verification_json !== undefined ? {
+        aiDescriptionVerification: parseStoredListingDescriptionVerification(row.ai_description_verification_json),
+        aiDescriptionVerificationAt: row.ai_description_verification_at ?? null,
+        aiDescriptionVerificationStatus: row.ai_description_verification_status === 'pass'
+          || row.ai_description_verification_status === 'reject'
+          || row.ai_description_verification_status === 'unknown'
+          || row.ai_description_verification_status === 'pending'
+          || row.ai_description_verification_status === 'not-configured'
+          || row.ai_description_verification_status === 'fallback'
+          ? row.ai_description_verification_status
+          : null,
+        aiDescriptionVerificationError: row.ai_description_verification_error ?? null,
+      } : {}),
     };
   }
 
+  private watches(includeArchived: boolean) {
+    const rows = this.db.prepare(`SELECT * FROM watches ${includeArchived ? '' : 'WHERE archived_at IS NULL '}ORDER BY created_at DESC`).all() as WatchRow[];
+    if (!rows.length) return [];
+    const statsRows = this.db.prepare(`SELECT o.watch_id, COUNT(DISTINCT o.listing_id) AS samples, MIN(o.observed_at) AS first_observed
+      FROM observations o
+      JOIN listings l ON l.id = o.listing_id
+      JOIN watches w ON w.id = o.watch_id
+      WHERE (? = 1 OR w.archived_at IS NULL)
+        AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)
+        AND (w.shipping_only = 0 OR l.shipping_available = 1)
+        AND (w.min_price_pln IS NULL OR o.price_pln >= w.min_price_pln)
+        AND (w.max_price_pln IS NULL OR o.price_pln <= w.max_price_pln)
+      GROUP BY o.watch_id`).all(includeArchived ? 1 : 0) as Array<{ watch_id: string; samples: number; first_observed: string | null }>;
+    const statsByWatch = new Map(statsRows.map((stats) => [stats.watch_id, stats]));
+    return rows.map((row) => this.watchFromRow(row, statsByWatch.get(row.id)));
+  }
+
   getWatches() {
-    return (this.db.prepare("SELECT * FROM watches WHERE archived_at IS NULL ORDER BY created_at DESC").all() as WatchRow[]).map((row) => this.watchFromRow(row));
+    return this.watches(false);
   }
 
   allWatches() {
-    return (this.db.prepare('SELECT * FROM watches ORDER BY created_at DESC').all() as WatchRow[]).map((row) => this.watchFromRow(row));
+    return this.watches(true);
   }
 
   watchAnalytics(id: string, rangeDays = 30): WatchAnalytics {
@@ -1026,7 +1039,7 @@ export class ScoutService {
     };
   }
 
-  listingsPage(options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string } = {}) {
+  listingsPage(options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string } = {}, knownWatches?: Watch[]) {
     const freshnessCutoff = new Date(Date.now() - MATCH_VISIBILITY_MS).toISOString();
     const predicates = [
       'w.archived_at IS NULL',
@@ -1045,20 +1058,20 @@ export class ScoutService {
     const total = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(500, Math.floor(options.pageSize ?? 200)));
-    const rows = this.db.prepare(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note
+    const rows = this.db.prepare(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note
       FROM listings l
       JOIN watch_listings wl ON wl.listing_id = l.id
       JOIN watches w ON w.id = wl.watch_id
       LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id
       WHERE ${where}
       ORDER BY wl.last_seen_at DESC, wl.id DESC LIMIT ? OFFSET ?`).all(...params, pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
-    const watches = new Map(this.getWatches().map((watch) => [watch.id, watch]));
+    const watches = new Map((knownWatches ?? this.getWatches()).map((watch) => [watch.id, watch]));
     const listings = rows.map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100));
     return { listings, pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
   }
 
-  getListings() {
-    return this.listingsPage({ page: 1, pageSize: 500 }).listings;
+  getListings(knownWatches?: Watch[]) {
+    return this.listingsPage({ page: 1, pageSize: 500 }, knownWatches).listings;
   }
 
   listingDetail(key: string, watchId?: string | null): ListingDetail {
@@ -1493,11 +1506,38 @@ export class ScoutService {
 
   marketResearch(options: { page?: number; pageSize?: number; watchId?: string; status?: 'active' | 'ended' | 'superseded' } = {}): MarketResearchData {
     const watchRows = this.db.prepare('SELECT * FROM market_watches ORDER BY created_at DESC').all() as WatchRow[];
+    const activeVersionIds = watchRows.flatMap((row) => row.active_version_id ? [row.active_version_id] : []);
+    const versionRows = activeVersionIds.length
+      ? this.db.prepare(`SELECT * FROM market_watch_versions WHERE id IN (${activeVersionIds.map(() => '?').join(',')})`).all(...activeVersionIds) as WatchRow[]
+      : [];
+    const versionsById = new Map(versionRows.map((version) => [version.id, version]));
+    const versionsByWatch = new Map(watchRows.map((row) => [row.id, versionsById.get(row.active_version_id ?? '') ?? {
+      id: `${row.id}:legacy`, market_watch_id: row.id, query: row.query, included_terms: row.included_terms ?? '', excluded_terms: row.excluded_terms ?? '', location: row.location ?? 'Polska', condition: row.condition ?? 'Any', sources_json: row.sources_json, min_price_pln: row.min_price_pln, max_price_pln: row.max_price_pln, shipping_only: row.shipping_only,
+    }]));
+    const versionFilter = '(ml.version_id = mw.active_version_id OR (mw.active_version_id IS NULL AND ml.version_id IS NULL))';
+    const watchStats = this.db.prepare(`SELECT ml.market_watch_id,
+        COUNT(*) AS total,
+        SUM(CASE WHEN ml.status = 'active' THEN 1 ELSE 0 END) AS active,
+        SUM(CASE WHEN ml.status = 'ended' THEN 1 ELSE 0 END) AS ended
+      FROM market_listings ml
+      JOIN market_watches mw ON mw.id = ml.market_watch_id
+      WHERE ml.status IN ('active', 'ended') AND ${versionFilter}
+      GROUP BY ml.market_watch_id`).all() as Array<{ market_watch_id: string; total: number; active: number | null; ended: number | null }>;
+    const statsByWatch = new Map(watchStats.map((stats) => [stats.market_watch_id, stats]));
+    const endedPriceRows = this.db.prepare(`SELECT ml.market_watch_id, ml.last_price_pln
+      FROM market_listings ml
+      JOIN market_watches mw ON mw.id = ml.market_watch_id
+      WHERE ml.status = 'ended' AND ml.last_price_pln > 0 AND ${versionFilter}`).all() as Array<{ market_watch_id: string; last_price_pln: number }>;
+    const endedPricesByWatch = new Map<string, number[]>();
+    for (const item of endedPriceRows) {
+      const prices = endedPricesByWatch.get(item.market_watch_id) ?? [];
+      prices.push(Number(item.last_price_pln));
+      endedPricesByWatch.set(item.market_watch_id, prices);
+    }
     const watches = watchRows.map((row): MarketWatch => {
-      const version = this.marketWatchVersion(row);
-      const versionPredicate = row.active_version_id ? 'version_id = ?' : '(version_id = ? OR version_id IS NULL)';
-      const counts = this.db.prepare(`SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN status = 'ended' THEN 1 ELSE 0 END) AS ended FROM market_listings WHERE market_watch_id = ? AND ${versionPredicate} AND status IN ('active', 'ended')`).get(row.id, version.id) as { total: number; active: number | null; ended: number | null };
-      const endedPrices = (this.db.prepare(`SELECT last_price_pln FROM market_listings WHERE market_watch_id = ? AND ${versionPredicate} AND status = 'ended' AND last_price_pln > 0`).all(row.id, version.id) as Array<{ last_price_pln: number }>).map((item) => Number(item.last_price_pln));
+      const version = versionsByWatch.get(row.id)!;
+      const counts = statsByWatch.get(row.id) ?? { total: 0, active: null, ended: null };
+      const endedPrices = endedPricesByWatch.get(row.id) ?? [];
       return {
         id: row.id, name: row.name, query: version.query, terms: version.included_terms ?? '', excluded: version.excluded_terms ?? '', location: version.location ?? 'Polska', condition: version.condition ?? 'Any', sources: parseJson<Marketplace[]>(version.sources_json, []),
         intervalHours: Number(row.interval_hours), minPrice: version.min_price_pln === null || version.min_price_pln === undefined ? null : Number(version.min_price_pln), maxPrice: version.max_price_pln === null || version.max_price_pln === undefined ? null : Number(version.max_price_pln), shippingOnly: Boolean(version.shipping_only), enabled: Boolean(row.enabled), nextScan: Boolean(row.enabled) ? relativeTimeFuture(row.next_scan_at) : 'Paused',
@@ -1506,16 +1546,16 @@ export class ScoutService {
       };
     });
     const applicable = [
-      "SELECT ml.last_price_pln FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ml.status = 'ended' AND ml.last_price_pln > 0 AND (ml.version_id = mw.active_version_id OR (mw.active_version_id IS NULL AND ml.version_id IS NULL))",
+      `SELECT ml.last_price_pln FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ml.status = 'ended' AND ml.last_price_pln > 0 AND ${versionFilter}`,
       ...(options.watchId ? ['AND ml.market_watch_id = ?'] : []),
     ].join(' ');
     const aggregateParams = options.watchId ? [options.watchId] : [];
     const aggregatePrices = (this.db.prepare(applicable).all(...aggregateParams) as Array<{ last_price_pln: number }>).map((item) => Number(item.last_price_pln));
-    const aggregateCounts = this.db.prepare(`SELECT SUM(CASE WHEN ml.status = 'active' THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN ml.status = 'ended' THEN 1 ELSE 0 END) AS ended FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ml.status IN ('active', 'ended') AND (ml.version_id = mw.active_version_id OR (mw.active_version_id IS NULL AND ml.version_id IS NULL))${options.watchId ? ' AND ml.market_watch_id = ?' : ''}`).get(...aggregateParams) as { active?: number; ended?: number };
+    const aggregateCounts = this.db.prepare(`SELECT SUM(CASE WHEN ml.status = 'active' THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN ml.status = 'ended' THEN 1 ELSE 0 END) AS ended FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ml.status IN ('active', 'ended') AND ${versionFilter}${options.watchId ? ' AND ml.market_watch_id = ?' : ''}`).get(...aggregateParams) as { active?: number; ended?: number };
 
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(400, Math.floor(options.pageSize ?? 100)));
-    const predicates = ['(ml.version_id = mw.active_version_id OR (mw.active_version_id IS NULL AND ml.version_id IS NULL))'];
+    const predicates = [versionFilter];
     const params: unknown[] = [];
     if (options.watchId) { predicates.push('ml.market_watch_id = ?'); params.push(options.watchId); }
     if (options.status === 'superseded') {
@@ -1735,32 +1775,45 @@ export class ScoutService {
   getConnectors(): Connector[] {
     const webhookConfigured = Boolean(this.getSetting('discord_webhook'));
     const ntfyConfigured = Boolean(this.ntfyConfig());
+    const healthRows = this.db.prepare(`SELECT * FROM (
+      SELECT connector_runs.*,
+        COUNT(*) OVER (PARTITION BY source) AS source_count,
+        MAX(CASE WHEN status = 'ok' THEN finished_at END) OVER (PARTITION BY source) AS last_success,
+        ROW_NUMBER() OVER (PARTITION BY source ORDER BY started_at DESC, id DESC) AS source_rank
+      FROM connector_runs
+    ) WHERE source_rank = 1`).all() as Array<Record<string, any>>;
+    const healthBySource = new Map(healthRows.map((row) => [String(row.source), row]));
     return connectorDefinitions.map((definition) => {
       if (definition.name === 'Discord' && !webhookConfigured) return { ...definition, status: 'Idle', detail: 'Webhook not configured', lastSuccess: 'Never', requests: 0, latency: '—' };
       if (definition.name === 'ntfy' && !ntfyConfigured) return { ...definition, status: 'Idle', detail: 'ntfy not configured', lastSuccess: 'Never', requests: 0, latency: '—' };
-      const last = this.db.prepare('SELECT * FROM connector_runs WHERE source = ? ORDER BY started_at DESC LIMIT 1').get(definition.name) as Record<string, any> | undefined;
-      const count = this.db.prepare('SELECT COUNT(*) AS count FROM connector_runs WHERE source = ?').get(definition.name) as { count: number };
-      const lastSuccess = this.db.prepare("SELECT finished_at FROM connector_runs WHERE source = ? AND status = 'ok' ORDER BY finished_at DESC LIMIT 1").get(definition.name) as { finished_at?: string } | undefined;
-      if (!last) return { ...definition, status: 'Idle', detail: definition.name === 'Discord' ? 'Webhook configured; no delivery yet' : definition.name === 'ntfy' ? 'ntfy configured; no delivery yet' : 'No connector run yet', lastSuccess: 'Never', requests: Number(count?.count ?? 0), latency: '—' };
+      const last = healthBySource.get(definition.name);
+      if (!last) return { ...definition, status: 'Idle', detail: definition.name === 'Discord' ? 'Webhook configured; no delivery yet' : definition.name === 'ntfy' ? 'ntfy configured; no delivery yet' : 'No connector run yet', lastSuccess: 'Never', requests: 0, latency: '—' };
       const status: Connector['status'] = last.status === 'ok' ? 'OK' : last.status === 'error' ? 'Degraded' : last.status === 'running' ? 'Warning' : 'Idle';
-      return { ...definition, status, detail: last.message || (status === 'OK' ? 'Last run completed' : 'Waiting for a run'), lastSuccess: relativeTime(lastSuccess?.finished_at), requests: Number(count?.count ?? 0), latency: duration(last.started_at, last.finished_at) };
+      return { ...definition, status, detail: last.message || (status === 'OK' ? 'Last run completed' : 'Waiting for a run'), lastSuccess: relativeTime(last.last_success), requests: Number(last.source_count), latency: duration(last.started_at, last.finished_at) };
     });
   }
 
   dashboard(): DashboardData {
     const watches = this.getWatches();
-    const listings = this.getListings();
+    const listings = this.getListings(watches);
     const today = new Date();
     today.setHours(0, 0, 0, 0);
+    const todayTime = today.getTime();
+    let newToday = 0;
+    let strongDeals = 0;
+    for (const listing of listings) {
+      if (Date.parse(listing.observedAt) >= todayTime) newToday += 1;
+      if (listing.dealStrength >= 4) strongDeals += 1;
+    }
     const lastScan = parseJson<{ at?: string }>(this.getSetting('last_scan'), {});
     return {
       watches,
       listings,
       connectors: this.getConnectors(),
       stats: {
-        watching: watches.filter((watch) => watch.enabled).length,
-        newToday: listings.filter((listing) => Date.parse(listing.observedAt) >= today.getTime()).length,
-        strongDeals: listings.filter((listing) => listing.dealStrength >= 4).length,
+        watching: watches.reduce((count, watch) => count + (watch.enabled ? 1 : 0), 0),
+        newToday,
+        strongDeals,
       },
       lastScan: relativeTime(lastScan.at),
       lastScanTime: timeOnly(lastScan.at),

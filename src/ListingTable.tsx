@@ -1,0 +1,138 @@
+import { useState } from "react";
+import { ExternalLink, RefreshCw, Search, Tag } from "lucide-react";
+import { marketplaceColors } from "./data";
+import type { Listing } from "./types";
+
+const formatPln = (value: number | null) =>
+  value === null ? "Learning" : `${value.toLocaleString("pl-PL")} zł`;
+
+function safeImageUrl(value: string | null | undefined) {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+export default function ListingTable({
+  listings,
+  compact = false,
+  isLoading = false,
+  onSelect,
+}: {
+  listings: Listing[];
+  compact?: boolean;
+  isLoading?: boolean;
+  onSelect?: (listing: Listing) => void;
+}) {
+  if (isLoading) {
+    return (
+      <div className="table-loading">
+        <RefreshCw size={20} className="spin" />
+        Loading matches…
+      </div>
+    );
+  }
+  if (!listings.length) {
+    return (
+      <div className="empty-state">
+        <Search size={25} />
+        <strong>No listings yet</strong>
+        <span>Run a watch to start building its price history.</span>
+      </div>
+    );
+  }
+  return (
+    <div
+      className={`listing-table-wrap ${compact ? "listing-table-wrap--compact" : ""}`}
+      role="table"
+      aria-label="Saved marketplace listings"
+    >
+      <div className="listing-table listing-table--head" role="row">
+        <span role="columnheader">Item</span>
+        <span role="columnheader">Marketplace</span>
+        <span role="columnheader">Price (PLN)</span>
+        <span role="columnheader">Typical (PLN)</span>
+        <span role="columnheader">Below typical</span>
+        <span role="columnheader">Observed</span>
+        <span role="columnheader">Deal strength</span>
+        <span role="columnheader" aria-label="Open listing" />
+      </div>
+      {listings.map((listing) => (
+        <ListingRow key={listing.associationId ?? listing.id} listing={listing} onSelect={onSelect} />
+      ))}
+    </div>
+  );
+}
+
+function ListingThumbnail({ listing }: { listing: Listing }) {
+  const [failed, setFailed] = useState(false);
+  const image = safeImageUrl(listing.image);
+  return image && !failed ? (
+    <img src={image} alt="" loading="lazy" onError={() => setFailed(true)} />
+  ) : (
+    <div className="listing-thumb-placeholder">
+      <Tag size={20} />
+    </div>
+  );
+}
+
+function ListingRow({ listing, onSelect }: { listing: Listing; onSelect?: (listing: Listing) => void }) {
+  return (
+    <div className="listing-table listing-row" role="row">
+      <button
+        type="button"
+        className="listing-item listing-item--button"
+        onClick={() => onSelect?.(listing)}
+        disabled={!onSelect}
+        aria-label={`View details for ${listing.title}`}
+      >
+        <ListingThumbnail listing={listing} />
+        <div>
+          <strong>{listing.title}</strong>
+          <span>{listing.subtitle || listing.watch}</span>
+          {listing.decision ? (
+            <em className={`decision-chip decision-chip--${listing.decision}`}>
+              {listing.decision === "buy" ? "Buy" : listing.decision === "watch" ? "Watch" : "Pass"}
+            </em>
+          ) : null}
+        </div>
+      </button>
+      <div className="marketplace-cell" role="cell">
+        <i style={{ background: marketplaceColors[listing.marketplace] }} />
+        {listing.marketplace}
+      </div>
+      <strong className="price-cell" role="cell">{formatPln(listing.price)}</strong>
+      <span role="cell">{formatPln(listing.typical)}</span>
+      <strong className="discount-cell" role="cell">
+        {listing.belowTypical === null ? "—" : `${listing.belowTypical.toFixed(1)}%`}
+      </strong>
+      <span className="observed-cell" role="cell">{listing.observed}</span>
+      <div className="strength-cell" role="cell">
+        <DealBars strength={listing.dealStrength} />
+        <span>{listing.typical === null ? "Learning" : listing.dealLabel}</span>
+      </div>
+      <a
+        href={listing.url}
+        target="_blank"
+        rel="noreferrer"
+        className="external-link"
+        aria-label={`Open ${listing.title}`}
+      >
+        <ExternalLink size={17} />
+      </a>
+    </div>
+  );
+}
+
+function DealBars({ strength }: { strength: number }) {
+  return (
+    <span className={`deal-bars deal-bars--${strength}`} aria-label={`${strength} of 5 deal strength`}>
+      {[1, 2, 3, 4, 5].map((bar) => (
+        <i key={bar} className={bar <= strength ? "is-filled" : ""} />
+      ))}
+    </span>
+  );
+}

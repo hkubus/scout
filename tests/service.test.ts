@@ -36,6 +36,89 @@ test('starts with truthful empty dashboard data and unconfigured notifications',
   } finally { context.close(); }
 });
 
+test('keeps dashboard database work bounded as watch count grows', () => {
+  const context = fixture();
+  try {
+    for (let index = 0; index < 40; index += 1) seedWatch(context.db, `bounded-watch-${index}`);
+    let prepareCalls = 0;
+    const measuredDb = new Proxy(context.db, {
+      get(target, property) {
+        if (property === 'prepare') return (sql: string) => { prepareCalls += 1; return target.prepare(sql); };
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const service = new ScoutService(measuredDb, () => {});
+    assert.equal(service.dashboard().watches.length, 40);
+    assert.ok(prepareCalls <= 12, `expected bounded dashboard queries, received ${prepareCalls}`);
+  } finally { context.close(); }
+});
+
+test('keeps market research aggregation bounded as watch count grows', () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    const insert = context.db.prepare(`INSERT INTO market_watches (id, name, query, sources_json, interval_hours, enabled, next_scan_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    for (let index = 0; index < 40; index += 1) {
+      insert.run(`market-bounded-${index}`, `Market ${index}`, 'cpu', '["OLX"]', 24, 1, now, now, now);
+    }
+    let prepareCalls = 0;
+    const measuredDb = new Proxy(context.db, {
+      get(target, property) {
+        if (property === 'prepare') return (sql: string) => { prepareCalls += 1; return target.prepare(sql); };
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const service = new ScoutService(measuredDb, () => {});
+    assert.equal(service.marketResearch().watches.length, 40);
+    assert.ok(prepareCalls <= 10, `expected bounded market research queries, received ${prepareCalls}`);
+  } finally { context.close(); }
+});
+
+test('reports the latest connector state from batched health queries', () => {
+  const context = fixture();
+  try {
+    const older = new Date(Date.now() - 60_000).toISOString();
+    const newer = new Date().toISOString();
+    context.db.prepare('INSERT INTO connector_runs (source, status, message, started_at, finished_at) VALUES (?, ?, ?, ?, ?)').run('OLX', 'ok', 'First pass', older, older);
+    context.db.prepare('INSERT INTO connector_runs (source, status, message, started_at, finished_at) VALUES (?, ?, ?, ?, ?)').run('OLX', 'error', 'Latest failure', newer, newer);
+    const connector = context.service.getConnectors().find((item) => item.name === 'OLX');
+    assert.deepEqual({ status: connector?.status, detail: connector?.detail, requests: connector?.requests }, { status: 'Degraded', detail: 'Latest failure', requests: 2 });
+    assert.notEqual(connector?.lastSuccess, 'Never');
+  } finally { context.close(); }
+});
+
+test('uses the recent-listing index for feed pagination order', () => {
+  const context = fixture();
+  try {
+    const cutoff = new Date(Date.now() - 12 * 60 * 60_000).toISOString();
+    const plan = context.db.prepare(`EXPLAIN QUERY PLAN
+      SELECT wl.id FROM watch_listings wl
+      WHERE wl.last_seen_at > ?
+      ORDER BY wl.last_seen_at DESC, wl.id DESC
+      LIMIT 500`).all(cutoff) as Array<{ detail: string }>;
+    assert.ok(plan.some((row) => row.detail.includes('watch_listings_recent')));
+    assert.equal(plan.some((row) => row.detail.includes('USE TEMP B-TREE')), false);
+  } finally { context.close(); }
+});
+
+test('uses one indexed scan for connector health aggregation', () => {
+  const context = fixture();
+  try {
+    const plan = context.db.prepare(`EXPLAIN QUERY PLAN SELECT * FROM (
+      SELECT connector_runs.*,
+        COUNT(*) OVER (PARTITION BY source) AS source_count,
+        MAX(CASE WHEN status = 'ok' THEN finished_at END) OVER (PARTITION BY source) AS last_success,
+        ROW_NUMBER() OVER (PARTITION BY source ORDER BY started_at DESC, id DESC) AS source_rank
+      FROM connector_runs
+    ) WHERE source_rank = 1`).all() as Array<{ detail: string }>;
+    assert.ok(plan.some((row) => row.detail.includes('connector_runs_source_latest')));
+    assert.equal(plan.some((row) => row.detail.includes('USE TEMP B-TREE')), false);
+  } finally { context.close(); }
+});
+
 test('slows normal watch polling overnight without skipping the morning boundary', () => {
   const minutesBetween = (from: string, to: string) => (Date.parse(to) - Date.parse(from)) / 60_000;
   const beforeNight = new Date(2026, 7, 23, 21, 55, 0, 0).toISOString();
@@ -330,6 +413,7 @@ test('returns listing price history and persists Buy/Watch/Pass triage actions',
     const lastSeen = new Date().toISOString();
     context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run('triage-watch', 'Triage watch', 'headphones', '["OLX"]', 1, lastSeen, firstSeen, lastSeen);
     context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, price_negotiable, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run('OLX', 'triage-listing', 'Headphones', 400, 1, 'https://www.olx.pl/d/oferta/triage-listing', firstSeen, lastSeen);
+    context.db.prepare("UPDATE listings SET ai_normalization_json = '{}' WHERE listing_id = 'triage-listing'").run();
     const listing = context.db.prepare('SELECT id FROM listings WHERE listing_id = ?').get('triage-listing') as { id: number };
     context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)').run(listing.id, 'triage-watch', 450, firstSeen);
     context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)').run(listing.id, 'triage-watch', 400, lastSeen);
@@ -337,9 +421,12 @@ test('returns listing price history and persists Buy/Watch/Pass triage actions',
     const saved = context.service.updateListingAction('OLX:triage-listing', 'buy', 'Ask for a battery screenshot');
     assert.deepEqual(saved.decision, 'buy');
     assert.equal(saved.note, 'Ask for a battery screenshot');
-    assert.equal(context.service.getListings()[0].decision, 'buy');
-    assert.equal(context.service.getListings()[0].priceNegotiable, true);
+    const feedListing = context.service.getListings()[0];
+    assert.equal(feedListing.decision, 'buy');
+    assert.equal(feedListing.priceNegotiable, true);
+    assert.equal(Object.hasOwn(feedListing, 'aiNormalization'), false);
     const detail = context.service.listingDetail('OLX:triage-listing');
+    assert.equal(Object.hasOwn(detail.listing, 'aiNormalization'), true);
     assert.deepEqual(detail.history.map((point) => point.price), [450, 400]);
     assert.equal(detail.action.decision, 'buy');
     assert.equal(detail.action.note, 'Ask for a battery screenshot');
@@ -783,7 +870,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1043,6 +1130,6 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 9);
+    assert.equal(after.migrations.count, 11);
   } finally { context.close(); }
 });

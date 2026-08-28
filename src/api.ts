@@ -10,7 +10,21 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+const inFlightGets = new Map<string, Promise<unknown>>();
+
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? new DOMException('The operation was aborted', 'AbortError'));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new DOMException('The operation was aborted', 'AbortError'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+      (error) => { signal.removeEventListener('abort', onAbort); reject(error); },
+    );
+  });
+}
+
+async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 20_000);
   const signal = init?.signal ? AbortSignal.any([controller.signal, init.signal]) : controller.signal;
@@ -24,20 +38,38 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 }
 
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const canDedupe = (init?.method ?? 'GET').toUpperCase() === 'GET';
+  if (!canDedupe) return fetchJson<T>(path, init);
+
+  const existing = inFlightGets.get(path);
+  if (existing) return init?.signal ? abortable(existing as Promise<T>, init.signal) : existing as Promise<T>;
+
+  // Keep the shared transport independent from any one component's abort signal.
+  // Each caller still gets an abortable view of the same response below.
+  const pending = fetchJson<T>(path);
+  inFlightGets.set(path, pending);
+  const clear = () => {
+    if (inFlightGets.get(path) === pending) inFlightGets.delete(path);
+  };
+  pending.then(clear, clear);
+  return init?.signal ? abortable(pending, init.signal) : pending;
+}
+
 const json = (method: string, body?: unknown): RequestInit => body === undefined
   ? { method }
   : { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) };
 
 export const api = {
-  dashboard: () => request<DashboardData>('/api/dashboard'),
-  listings: (options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string } = {}) => {
+  dashboard: (signal?: AbortSignal) => request<DashboardData>('/api/dashboard', { signal }),
+  listings: (options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string } = {}, signal?: AbortSignal) => {
     const params = new URLSearchParams();
     if (options.page !== undefined) params.set('page', String(options.page));
     if (options.pageSize !== undefined) params.set('pageSize', String(options.pageSize));
     if (options.marketplace) params.set('marketplace', options.marketplace);
     if (options.q) params.set('q', options.q);
     if (options.watchId) params.set('watchId', options.watchId);
-    return request<{ listings: DashboardData['listings']; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/listings${params.toString() ? `?${params}` : ''}`);
+    return request<{ listings: DashboardData['listings']; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/listings${params.toString() ? `?${params}` : ''}`, { signal });
   },
   watches: (includeArchived = false) => request<{ watches: Watch[] }>(`/api/watches?includeArchived=${includeArchived ? 'true' : 'false'}`),
   watchAnalytics: (id: string, days = 30) => request<WatchAnalytics>(`/api/watches/${encodeURIComponent(id)}/analytics?days=${days}`),
