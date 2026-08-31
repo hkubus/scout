@@ -24,9 +24,12 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
-async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
+async function fetchJson<T>(path: string, init?: RequestInit, timeoutMs = 20_000): Promise<T> {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 20_000);
+  const timeout = window.setTimeout(
+    () => controller.abort(new ApiError(`Request timed out after ${Math.round(timeoutMs / 1000)}s`, 0)),
+    timeoutMs,
+  );
   const signal = init?.signal ? AbortSignal.any([controller.signal, init.signal]) : controller.signal;
   try {
     const response = await fetch(path, { ...init, signal });
@@ -38,9 +41,9 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(path: string, init?: RequestInit, timeoutMs?: number): Promise<T> {
   const canDedupe = (init?.method ?? 'GET').toUpperCase() === 'GET';
-  if (!canDedupe) return fetchJson<T>(path, init);
+  if (!canDedupe) return fetchJson<T>(path, init, timeoutMs);
 
   const existing = inFlightGets.get(path);
   if (existing) return init?.signal ? abortable(existing as Promise<T>, init.signal) : existing as Promise<T>;
@@ -75,7 +78,7 @@ export const api = {
   watchAnalytics: (id: string, days = 30) => request<WatchAnalytics>(`/api/watches/${encodeURIComponent(id)}/analytics?days=${days}`),
   createWatch: (watch: Watch) => request<{ watch: Watch }>('/api/watches', json('POST', watch)),
   updateWatch: (id: string, patch: Partial<Pick<Watch, 'name' | 'query' | 'terms' | 'excluded' | 'sources' | 'location' | 'condition' | 'interval' | 'exactUrls' | 'sensitivity' | 'shippingOnly' | 'aiRelevance' | 'minPrice' | 'maxPrice' | 'enabled'>> & { archived?: boolean }) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
-  search: (filters: SearchFilters) => request<ManualSearchResponse>('/api/search', json('POST', filters)),
+  search: (filters: SearchFilters) => request<ManualSearchResponse>('/api/search', json('POST', filters), 60_000),
   marketResearch: (options: { page?: number; pageSize?: number; watchId?: string; status?: 'active' | 'ended' | 'superseded' } = {}) => {
     const params = new URLSearchParams();
     if (options.page !== undefined) params.set('page', String(options.page));

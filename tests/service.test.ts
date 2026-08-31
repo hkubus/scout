@@ -679,7 +679,7 @@ test('filters and caches irrelevant listings per watch', async () => {
   } finally { context.close(); }
 });
 
-test('applies the AI relevance gate to one-off marketplace search results', async () => {
+test('keeps one-off marketplace search deterministic and skips AI relevance classification', async () => {
   let requests = 0;
   const context = fixture({
     classifyListingRelevance: async (listing) => {
@@ -694,9 +694,9 @@ test('applies the AI relevance gate to one-off marketplace search results', asyn
       { id: 'GPU-2', url: 'https://www.olx.pl/d/oferta/gpu-2', title: 'GPU fan replacement', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 80, currency: 'PLN', negotiable: false } }] },
     ], metadata: { visible_total_count: 2 } } });
     const result = await context.service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
-    assert.deepEqual(result.listings.map((listing) => listing.title), ['GPU graphics card RTX 4070']);
-    assert.equal(result.sources[0].message, '1 matches · 1 excluded by AI');
-    assert.equal(requests, 2);
+    assert.deepEqual(result.listings.map((listing) => listing.title), ['GPU fan replacement', 'GPU graphics card RTX 4070']);
+    assert.equal(result.sources[0].message, '2 matches');
+    assert.equal(requests, 0);
   } finally { context.close(); }
 });
 

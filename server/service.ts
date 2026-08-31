@@ -1472,20 +1472,22 @@ export class ScoutService {
         const fetched = await this.fetchSearchPages(source, input.query, input);
         const deterministicFilters = { minPrice: input.minPrice, maxPrice: input.maxPrice, condition: input.condition, location: input.location, shippingOnly: false };
         const comparable = filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters);
-        if (input.shippingOnly) await this.enrichShipping(comparable, source, { limit: 24 });
+        // Cache-first like watch scans: only a few cold listings fetch an item
+        // page per search; the rest surface as pending delivery checks.
+        if (input.shippingOnly) await this.enrichShipping(comparable, source);
         const filtered = filterListings(comparable, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, shippingOnly: input.shippingOnly });
-        const relevance = await this.filterListingsByAiRelevance(filtered, { query: input.query, includedTerms: input.terms ?? '', excludedTerms: input.excluded ?? '' }, undefined, true);
-        for (const listing of relevance.listings.slice(0, 100)) this.storeManualListing(listing);
+        // One-off search stays deterministic: AI relevance is a watch-scan gate.
+        for (const listing of filtered.slice(0, 100)) this.storeManualListing(listing);
         const pendingShipping = input.shippingOnly ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
         return {
-          listings: relevance.listings.slice(0, 100).map((listing): Listing => ({
+          listings: filtered.slice(0, 100).map((listing): Listing => ({
             id: `${listing.marketplace}:${listing.listingId}`, title: listing.title,
             subtitle: [listing.condition, listing.location].filter(Boolean).join(' · '), marketplace: listing.marketplace,
             price: listing.price, typical: null, belowTypical: null, observed: 'just now', observedAt: listing.observedAt,
             dealStrength: 1, dealLabel: 'Watch', image: listing.imageUrl ?? '', url: listing.url, watch: 'Manual search',
             condition: listing.condition, location: listing.location, shippingAvailable: listing.shippingAvailable ?? null, priceNegotiable: listing.priceNegotiable ?? null,
           })),
-          status: { source, status: 'ok' as const, count: relevance.listings.length, pendingShipping, durationMs: Date.now() - started, message: relevance.listings.length ? `${relevance.listings.length} matches${relevance.excluded ? ` · ${relevance.excluded} excluded by AI` : ''}` : 'No matching listings' },
+          status: { source, status: 'ok' as const, count: filtered.length, pendingShipping, durationMs: Date.now() - started, message: filtered.length ? `${filtered.length} matches` : 'No matching listings' },
         };
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Search failed';
