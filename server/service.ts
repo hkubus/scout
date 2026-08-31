@@ -1433,18 +1433,15 @@ export class ScoutService {
     }
   }
 
-  private async fetchSearchPages(source: Marketplace, query: string, filters: Parameters<typeof buildMarketplaceSearchUrl>[2], maxPages = 3) {
+  /**
+   * Searches and scans fetch a single page. Listings arrive newest-first, so
+   * fresh offers are always on the first page; one OLX page carries 50 organic
+   * offers plus promoted ads.
+   */
+  private async fetchSearchPages(source: Marketplace, query: string, filters: Parameters<typeof buildMarketplaceSearchUrl>[2]) {
     const adapter = this.createConnectorAdapter(source);
     const first = await adapter.fetchPublicSearch(this.marketplaceSearchRequestUrl(source, query, filters));
-    const listings = new Map(first.map((listing) => [`${listing.marketplace}:${listing.listingId}`, listing]));
-    if (first.length < 20 || first.empty) return [...listings.values()];
-    for (let page = 2; page <= maxPages; page += 1) {
-      const fetched = await adapter.fetchPublicSearch(this.marketplaceSearchRequestUrl(source, query, { ...filters, page }));
-      const before = listings.size;
-      for (const listing of fetched) listings.set(`${listing.marketplace}:${listing.listingId}`, listing);
-      if (fetched.empty || listings.size === before) break;
-    }
-    return [...listings.values()];
+    return [...new Map(first.map((listing) => [`${listing.marketplace}:${listing.listingId}`, listing])).values()];
   }
 
   async manualSearch(input: SearchFilters): Promise<ManualSearchResponse> {
@@ -1454,7 +1451,7 @@ export class ScoutService {
       const tasks = input.sources.map(async (source) => {
       const started = Date.now();
       try {
-        const fetched = await this.fetchSearchPages(source, input.query, input, 3);
+        const fetched = await this.fetchSearchPages(source, input.query, input);
         const deterministicFilters = { minPrice: input.minPrice, maxPrice: input.maxPrice, condition: input.condition, location: input.location, shippingOnly: false };
         const comparable = filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters);
         if (input.shippingOnly) await this.enrichShipping(comparable, source, { limit: 24 });
@@ -1701,7 +1698,7 @@ export class ScoutService {
         }
         try {
           const adapter = this.createConnectorAdapter(source);
-          const fetched = await this.fetchSearchPages(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' }, 3);
+          const fetched = await this.fetchSearchPages(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' });
           const filters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, location: row.location, shippingOnly: false };
           const comparable = filterListings(fetched, row.query, row.included_terms ?? '', row.excluded_terms ?? '', filters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
@@ -2109,7 +2106,7 @@ export class ScoutService {
           const adapter = this.createConnectorAdapter(source);
           const fetched = matchingExact.length
             ? (await Promise.all(urls.map((url) => adapter.fetchPublicSearch(url)))).flat()
-            : await this.fetchSearchPages(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' }, 3);
+            : await this.fetchSearchPages(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' });
           const deterministicFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, location: row.location, shippingOnly: false };
           const comparable = filterListings(fetched, row.query, row.included_terms, row.excluded_terms, deterministicFilters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
