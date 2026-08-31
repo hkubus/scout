@@ -2145,9 +2145,13 @@ export class ScoutService {
             excludedTerms: row.excluded_terms ?? '',
           }, row.id, row.ai_relevance === undefined ? true : Boolean(row.ai_relevance));
           const candidates = this.transaction(() => {
+            // The baseline and first-observation queries are watch-wide: running
+            // them once per scan instead of per stored listing keeps the
+            // synchronous SQLite work flat as observation history grows.
+            const baseline = this.watchBaseline(row);
             const pendingCandidates: DealNotificationCandidate[] = [];
             for (const listing of relevance.listings) {
-              const candidate = this.storeListing(row, listing, scanId);
+              const candidate = this.storeListing(row, listing, scanId, baseline);
               if (candidate) pendingCandidates.push(candidate);
             }
             const pending = row.shipping_only ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
@@ -2519,21 +2523,40 @@ export class ScoutService {
     );
   }
 
-  private storeListing(row: WatchRow, listing: NormalizedListing, scanId: number): DealNotificationCandidate | null {
-    const existingPrices = (this.db.prepare(`SELECT o.price_pln
-      FROM observations o
+  /**
+   * Watch-wide inputs every listing in a scan scores against: the latest
+   * observed price per listing (the baseline distribution) and the watch's
+   * first qualifying observation. Both depend only on watch-level filters, so
+   * they are computed once per scan. The baseline uses a window function over
+   * the (watch_id, listing_id, observed_at, id) index — one linear pass —
+   * instead of a newest-first anti-join that degrades on recurring listings.
+   */
+  private watchBaseline(row: WatchRow): { prices: number[]; firstObservedAt: string | null } {
+    const baselineFilters = `
       JOIN listings l ON l.id = o.listing_id
       WHERE o.watch_id = ?
-        AND NOT EXISTS (
-          SELECT 1 FROM observations newer
-          WHERE newer.watch_id = o.watch_id AND newer.listing_id = o.listing_id
-            AND (newer.observed_at > o.observed_at OR (newer.observed_at = o.observed_at AND newer.id > o.id))
-        )
         AND (? = 0 OR NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))))
         AND (? = 0 OR l.shipping_available = 1)
         AND (? IS NULL OR o.price_pln >= ?)
-        AND (? IS NULL OR o.price_pln <= ?)
-      ORDER BY o.observed_at DESC, o.id DESC LIMIT 400`).all(row.id, row.ai_relevance === false || row.ai_relevance === 0 ? 0 : 1, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln) as Array<{ price_pln: number }>).map((item) => Number(item.price_pln)).filter((price) => Number.isFinite(price) && price > 0);
+        AND (? IS NULL OR o.price_pln <= ?)`;
+    const baselineParams = [
+      row.id,
+      row.ai_relevance === false || row.ai_relevance === 0 ? 0 : 1,
+      row.shipping_only ? 1 : 0,
+      row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln,
+    ] as unknown[];
+    const prices = (this.db.prepare(`SELECT price_pln FROM (
+        SELECT o.price_pln, o.observed_at, o.id, ROW_NUMBER() OVER (PARTITION BY o.listing_id ORDER BY o.observed_at DESC, o.id DESC) AS rank
+        FROM observations o ${baselineFilters}
+      ) WHERE rank <= 1 ORDER BY observed_at DESC, id DESC LIMIT 400`).all(...baselineParams) as Array<{ price_pln: number }>)
+      .map((item) => Number(item.price_pln))
+      .filter((price) => Number.isFinite(price) && price > 0);
+    const first = this.db.prepare(`SELECT MIN(o.observed_at) AS first FROM observations o ${baselineFilters}`).get(...baselineParams) as { first: string | null };
+    return { prices, firstObservedAt: first?.first ?? null };
+  }
+
+  private storeListing(row: WatchRow, listing: NormalizedListing, scanId: number, baseline: { prices: number[]; firstObservedAt: string | null }): DealNotificationCandidate | null {
+    const existingPrices = baseline.prices;
     const observedAt = nowIso();
     this.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, availability_status, last_verified_at, first_seen_at, last_seen_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, ?)
@@ -2545,15 +2568,7 @@ export class ScoutService {
       VALUES (?, ?, ?, ?)
       ON CONFLICT(watch_id, listing_id) DO UPDATE SET last_seen_at = excluded.last_seen_at`).run(row.id, stored.id, observedAt, observedAt);
     const association = this.db.prepare('SELECT id FROM watch_listings WHERE watch_id = ? AND listing_id = ?').get(row.id, stored.id) as { id: number };
-    const firstObservation = this.db.prepare(`SELECT MIN(o.observed_at) AS first
-      FROM observations o
-      JOIN listings l ON l.id = o.listing_id
-      WHERE o.watch_id = ?
-        AND (? = 0 OR NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))))
-        AND (? = 0 OR l.shipping_available = 1)
-        AND (? IS NULL OR o.price_pln >= ?)
-        AND (? IS NULL OR o.price_pln <= ?)`).get(row.id, row.ai_relevance === false || row.ai_relevance === 0 ? 0 : 1, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln) as { first: string | null };
-    const observedHours = firstObservation.first ? Math.max(0, (Date.now() - Date.parse(firstObservation.first)) / 3_600_000) : 0;
+    const observedHours = baseline.firstObservedAt ? Math.max(0, (Date.now() - Date.parse(baseline.firstObservedAt)) / 3_600_000) : 0;
     const score = scoreDeal(existingPrices, listing.price, { observedHours, sensitivity: Number(row.sensitivity ?? 1) });
     const observation = this.db.prepare('INSERT INTO observations (listing_id, watch_id, watch_listing_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?, ?)').run(stored.id, row.id, association.id, scanId, listing.price, observedAt);
     const observationId = Number(observation.lastInsertRowid);
