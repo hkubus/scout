@@ -347,18 +347,20 @@ function hasExplicitEmptyState(html: string, marketplace: Marketplace) {
   return /data-testid=["'][^"']*(?:empty|no-results|catalog)[^"']*["']/i.test(html) || /catalog-(?:empty|no-results)/i.test(html);
 }
 
+function withSearchStatus(listings: NormalizedListing[], pageStatus: MarketplaceSearchPageStatus, empty: boolean): MarketplaceSearchResult {
+  const result = listings as MarketplaceSearchResult;
+  Object.defineProperties(result, {
+    pageStatus: { configurable: true, enumerable: false, value: pageStatus },
+    empty: { configurable: true, enumerable: false, value: empty },
+  });
+  return result;
+}
+
 export function parseSearchPage(html: string, marketplace: Marketplace): MarketplaceSearchResult {
   if (!html) throw new Error('Public page returned no usable markup');
-  const listings = parseStructuredListings(html, marketplace) as MarketplaceSearchResult;
-  const withStatus = (pageStatus: MarketplaceSearchPageStatus, empty: boolean) => {
-    Object.defineProperties(listings, {
-      pageStatus: { configurable: true, enumerable: false, value: pageStatus },
-      empty: { configurable: true, enumerable: false, value: empty },
-    });
-    return listings;
-  };
-  if (listings.length) return withStatus('results', false);
-  if (hasExplicitEmptyState(html, marketplace)) return withStatus('empty', true);
+  const listings = parseStructuredListings(html, marketplace);
+  if (listings.length) return withSearchStatus(listings, 'results', false);
+  if (hasExplicitEmptyState(html, marketplace)) return withSearchStatus(listings, 'empty', true);
   throw new Error('Public page has no supported listing or empty-state markup');
 }
 
@@ -490,8 +492,13 @@ export function exponentialBackoff(failures: number, baseMs = 5 * 60_000, maxMs 
 export interface ConnectorAdapter {
   marketplace: Marketplace;
   fetchPublicSearch(url: string): Promise<MarketplaceSearchResult>;
-  fetchDetail(url: string): Promise<ListingDetailResult>;
-  verifyAvailability(url: string): Promise<ListingAvailability>;
+  /**
+   * `context.listingId` carries the marketplace's stored offer id for detail
+   * lookups whose public URL does not expose it (OLX API ids are numeric while
+   * current listing URLs carry a separate alphanumeric token).
+   */
+  fetchDetail(url: string, context?: { listingId?: string }): Promise<ListingDetailResult>;
+  verifyAvailability(url: string, context?: { listingId?: string }): Promise<ListingAvailability>;
 }
 
 /**
@@ -524,6 +531,193 @@ export function createPublicAdapter(marketplace: Marketplace, fetcher: (url: str
     },
     async verifyAvailability(url) {
       return (await this.fetchDetail(url)).availability;
+    },
+  };
+}
+
+/**
+ * OLX JSON API connector.
+ *
+ * OLX exposes a verified anonymous offers API (`GET /api/v1/offers/`) that needs
+ * no session, cookies, or Chromium. Only `User-Agent: <modern Chrome>` plus
+ * `Accept: application/json` are required. Risks and edge cases:
+ * - `price.value.type === 'free'` (value 0) offers are skipped because
+ *   `normalizeListing` rejects non-positive prices; this matches the HTML parser.
+ * - `price.value.type === 'arranged'` still carries a real price, so it is kept.
+ * - Photo links contain `{width}x{height}` placeholders that must be substituted.
+ * - `priceNegotiable: false` is a real non-negotiable value, not "unknown".
+ * - Empty detection must use `metadata.visible_total_count === 0` (or an empty
+ *   `data` array, e.g. pages past the end), never the array alone: gibberish
+ *   queries return loosely-related offers with a nonzero count.
+ * - The offers API has no shipping-only flag; `delivery.rock.active` is mapped
+ *   per offer and Scout's downstream `shippingOnly` filter narrows the results.
+ * - The API may rate-limit; non-2xx responses fail closed so the existing
+ *   `exponentialBackoff` / `connector_runs` handling takes over. Bot fences are
+ *   never bypassed.
+ */
+export interface OlxApiFetchResult {
+  status: number;
+  json: unknown;
+}
+
+const OLX_OFFERS_API_URL = 'https://www.olx.pl/api/v1/offers/';
+/** Server-verified maximum: the API rejects `limit` values above 50 (HTTP 400). */
+const OLX_API_PAGE_LIMIT = 50;
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Map Scout's cross-marketplace filters onto the verified OLX offers API params. */
+export function buildOlxSearchApiUrl(query: string, filters: MarketplaceSearchFilters = {}) {
+  const url = new URL(OLX_OFFERS_API_URL);
+  const trimmed = query.trim();
+  if (trimmed) url.searchParams.set('query', trimmed);
+  if (filters.minPrice !== null && filters.minPrice !== undefined) url.searchParams.set('filter_float_price:from', String(filters.minPrice));
+  if (filters.maxPrice !== null && filters.maxPrice !== undefined) url.searchParams.set('filter_float_price:to', String(filters.maxPrice));
+  const condition = filters.condition?.trim().toLowerCase();
+  if (condition === 'new' || condition === 'used') url.searchParams.set('filter_enum_state[0]', condition);
+  if (filters.sort === 'newest') url.searchParams.set('sort_by', 'created_at:desc');
+  const page = filters.page;
+  if (page !== undefined && Number.isInteger(page) && page > 1 && page <= 10) url.searchParams.set('offset', String((page - 1) * OLX_API_PAGE_LIMIT));
+  url.searchParams.set('limit', String(OLX_API_PAGE_LIMIT));
+  return url.toString();
+}
+
+/** Translate an OLX HTML search URL (e.g. a pasted exact URL) into an offers API URL. */
+function olxSearchApiUrlFromSearchPage(url: string) {
+  let parsed: URL;
+  try { parsed = new URL(url); } catch { return null; }
+  if (!isApprovedMarketplaceHost('OLX', parsed.hostname)) return null;
+  if (parsed.pathname.replace(/\/+$/, '').startsWith('/api/v1/offers')) return parsed.toString();
+  const query = parsed.pathname.split('/').map((segment) => { try { return decodeURIComponent(segment); } catch { return segment; } }).find((segment) => segment.startsWith('q-'))?.slice(2);
+  if (!query) return null;
+  const api = new URL(OLX_OFFERS_API_URL);
+  api.searchParams.set('query', query);
+  const from = parsed.searchParams.get('search[filter_float_price:from]');
+  const to = parsed.searchParams.get('search[filter_float_price:to]');
+  if (from) api.searchParams.set('filter_float_price:from', from);
+  if (to) api.searchParams.set('filter_float_price:to', to);
+  if (parsed.searchParams.get('search[order]') === 'created_at:desc') api.searchParams.set('sort_by', 'created_at:desc');
+  const page = Number(parsed.searchParams.get('page'));
+  if (Number.isInteger(page) && page > 1 && page <= 10) api.searchParams.set('offset', String((page - 1) * OLX_API_PAGE_LIMIT));
+  api.searchParams.set('limit', String(OLX_API_PAGE_LIMIT));
+  return api.toString();
+}
+
+function parseOlxOffer(offer: unknown): NormalizedListing | null {
+  if (!isRecord(offer)) return null;
+  const listingId = offer.id === undefined || offer.id === null ? '' : String(offer.id).trim();
+  const url = typeof offer.url === 'string' ? offer.url : undefined;
+  const title = typeof offer.title === 'string' ? offer.title : undefined;
+  const params = Array.isArray(offer.params) ? offer.params.filter(isRecord) : [];
+  const priceParam = params.find((param) => param.key === 'price');
+  const priceValue = priceParam && isRecord(priceParam.value) ? priceParam.value : undefined;
+  const price = priceValue && typeof priceValue.value === 'number' ? priceValue.value : undefined;
+  if (!listingId || !url || !title || price === undefined || priceValue?.type === 'free') return null;
+  const photos = Array.isArray(offer.photos) ? offer.photos.filter(isRecord) : [];
+  const photoLink = photos.find((photo) => typeof photo.link === 'string')?.link as string | undefined;
+  const imageUrl = photoLink?.replace('{width}x{height}', '320x240');
+  const stateParam = params.find((param) => param.key === 'state');
+  const condition = stateParam && isRecord(stateParam.value) && typeof stateParam.value.label === 'string' ? stateParam.value.label : undefined;
+  const locationRecord = isRecord(offer.location) ? offer.location : undefined;
+  const location = ['region', 'city', 'district'].map((part) => {
+    const value = locationRecord && isRecord(locationRecord[part]) ? locationRecord[part].name : undefined;
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+  }).filter(Boolean).join(', ') || undefined;
+  const rock = isRecord(offer.delivery) && isRecord(offer.delivery.rock) ? offer.delivery.rock : undefined;
+  const shippingAvailable = rock && typeof rock.active === 'boolean' ? rock.active : null;
+  const priceNegotiable = priceValue && typeof priceValue.negotiable === 'boolean' ? priceValue.negotiable : null;
+  const observedAt = typeof offer.created_time === 'string' && offer.created_time ? offer.created_time : undefined;
+  return normalizeListing({ marketplace: 'OLX', listingId, title, price, url, imageUrl, condition, location, shippingAvailable, priceNegotiable, observedAt });
+}
+
+/**
+ * Parse an OLX offers API search response. The `data` array must be present:
+ * error payloads without it fail closed instead of masquerading as empty pages.
+ */
+export function parseOlxOffersApi(json: unknown): MarketplaceSearchResult {
+  const payload = isRecord(json) ? json : undefined;
+  const data = payload && Array.isArray(payload.data) ? payload.data : undefined;
+  if (!data) throw new Error('OLX API search response did not contain a data array');
+  const listings: NormalizedListing[] = [];
+  for (const offer of data) {
+    try {
+      const listing = parseOlxOffer(offer);
+      if (listing) listings.push(listing);
+    } catch { /* malformed or off-domain offers are ignored, matching the HTML parser */ }
+  }
+  const metadata = payload && isRecord(payload.metadata) ? payload.metadata : undefined;
+  const visibleTotal = metadata && Number.isFinite(Number(metadata.visible_total_count)) ? Number(metadata.visible_total_count) : null;
+  const empty = data.length === 0 || visibleTotal === 0;
+  return withSearchStatus(listings, empty ? 'empty' : 'results', empty);
+}
+
+function olxApiErrorDetail(json: unknown) {
+  const error = isRecord(json) && isRecord(json.error) ? json.error : undefined;
+  const detail = error && typeof error.detail === 'string' ? error.detail.trim() : '';
+  return detail ? detail.slice(0, 240) : null;
+}
+
+/** Classify OLX API availability from the HTTP status; JSON bodies replace HTML heuristics. */
+export function parseOlxListingAvailabilityApi(json: unknown, httpStatus: number): ListingAvailability {
+  if (httpStatus === 404 || httpStatus === 410) {
+    return { status: 'terminal', reason: olxApiErrorDetail(json) ?? `Marketplace returned HTTP ${httpStatus}` };
+  }
+  if (httpStatus !== 200 && httpStatus !== 204) return availabilityUnknown(`Marketplace returned HTTP ${httpStatus}`);
+  const payload = isRecord(json) ? json : undefined;
+  if (payload?.error) return availabilityUnknown(olxApiErrorDetail(payload) ?? 'OLX API returned an error response');
+  const data = payload?.data;
+  if (!isRecord(data)) return availabilityUnknown('OLX detail response did not include the offer object');
+  if (typeof data.status === 'string' && data.status.toLowerCase() !== 'active') return availabilityUnknown(`OLX offer status is "${data.status}"`);
+  return { status: 'live' };
+}
+
+function olxListingIdFromUrl(url: string) {
+  return url.match(/-ID(\d+)\.html/i)?.[1] ?? null;
+}
+
+/**
+ * A dedicated OLX adapter over the anonymous offers API. The stored numeric
+ * listing id is preferred for detail lookups because current OLX URLs carry a
+ * separate alphanumeric token that the API rejects; ids without the API's
+ * numeric shape degrade to `unknown` rather than risking a false 404 terminal
+ * classification.
+ */
+export function createOlxJsonAdapter(marketplace: Marketplace, fetcher: (url: string) => Promise<OlxApiFetchResult>): ConnectorAdapter {
+  return {
+    marketplace,
+    async fetchPublicSearch(url) {
+      const apiUrl = olxSearchApiUrlFromSearchPage(url);
+      if (!apiUrl) throw new Error('OLX search URL could not be translated to the offers API');
+      const validation = validateSearchUrl(apiUrl, marketplace);
+      if (!validation.valid) throw new Error(validation.reason);
+      const { status, json } = await fetcher(validation.url);
+      if (status < 200 || status >= 300) throw new Error(`OLX offers API returned HTTP ${status}`);
+      return parseOlxOffersApi(json);
+    },
+    async fetchDetail(url, context) {
+      const validation = validateSearchUrl(url, marketplace);
+      if (!validation.valid) return { availability: availabilityUnknown(validation.reason) };
+      const listingId = context?.listingId?.trim() || olxListingIdFromUrl(validation.url);
+      if (!listingId || !/^\d+$/.test(listingId)) return { availability: availabilityUnknown('OLX offers API requires a numeric offer id') };
+      const detailUrl = `${OLX_OFFERS_API_URL}${encodeURIComponent(listingId)}/`;
+      let response: OlxApiFetchResult;
+      try {
+        response = await fetcher(detailUrl);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'OLX detail verification failed';
+        return { availability: availabilityUnknown(message) };
+      }
+      const availability = parseOlxListingAvailabilityApi(response.json, response.status);
+      let listing: NormalizedListing | undefined;
+      if (availability.status === 'live' && isRecord(response.json) && isRecord(response.json.data)) {
+        try { listing = parseOlxOffer(response.json.data) ?? undefined; } catch { listing = undefined; }
+      }
+      return { availability, listing };
+    },
+    async verifyAvailability(url, context) {
+      return (await this.fetchDetail(url, context)).availability;
     },
   };
 }

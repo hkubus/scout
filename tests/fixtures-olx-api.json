@@ -1,0 +1,116 @@
+{
+  "search": {
+    "data": [
+      {
+        "id": 1092728340,
+        "url": "https://www.olx.pl/d/oferta/iphon-13-128gb-100-baterii-black-CID99-ID1bVYyE.html",
+        "title": "Iphon 13 128GB 100% Baterii Black",
+        "created_time": "2026-08-20T19:40:08+02:00",
+        "last_refresh_time": "2026-08-31T16:51:09+02:00",
+        "description": "Witam, sprzedam iPhone 13 128GB. Stan bardzo dobry.",
+        "status": "active",
+        "offer_type": "offer",
+        "params": [
+          {
+            "key": "price",
+            "name": "Cena",
+            "type": "price",
+            "value": {
+              "value": 800,
+              "type": "price",
+              "arranged": false,
+              "budget": false,
+              "currency": "PLN",
+              "negotiable": false,
+              "label": "800 zł"
+            }
+          },
+          {
+            "key": "state",
+            "name": "Stan",
+            "type": "select",
+            "value": { "key": "used", "label": "Używane" }
+          },
+          {
+            "key": "phonemodel",
+            "name": "Model telefonu",
+            "type": "select",
+            "value": { "key": "iphone-13", "label": "iPhone 13" }
+          }
+        ],
+        "photos": [
+          {
+            "id": 11391658646,
+            "filename": "nl9i997bhz1g1-PL",
+            "width": 750,
+            "height": 1000,
+            "link": "https://ireland.apollo.olxcdn.com:443/v1/files/nl9i997bhz1g1-PL/image;s={width}x{height}"
+          },
+          {
+            "id": 11391658647,
+            "filename": "9wufekvmn989-PL",
+            "width": 750,
+            "height": 1000,
+            "link": "https://ireland.apollo.olxcdn.com:443/v1/files/9wufekvmn989-PL/image;s={width}x{height}"
+          }
+        ],
+        "location": {
+          "city": { "id": 89739, "name": "Łapanów", "normalized_name": "lapanow" },
+          "region": { "id": 4, "name": "Małopolskie", "normalized_name": "malopolskie" }
+        },
+        "delivery": {
+          "rock": {
+            "offer_id": "aaaaaaaa-0000-0000-0000-320312535604",
+            "active": true,
+            "mode": "BuyWithDelivery"
+          }
+        },
+        "category": { "id": 2298, "type": "electronics" },
+        "contact": { "name": "Łukasz", "phone": true, "chat": true }
+      },
+      {
+        "id": 1090000001,
+        "url": "https://www.olx.pl/d/oferta/darmowa-kanapa-ID1090000001.html",
+        "title": "Darmowa kanapa - oddam za darmo",
+        "created_time": "2026-08-29T10:12:00+02:00",
+        "status": "active",
+        "offer_type": "classified",
+        "params": [
+          {
+            "key": "price",
+            "name": "Cena",
+            "type": "price",
+            "value": {
+              "value": 0,
+              "type": "free",
+              "arranged": false,
+              "budget": false,
+              "currency": "PLN",
+              "negotiable": false,
+              "label": "Gratis"
+            }
+          }
+        ],
+        "photos": [],
+        "location": {
+          "city": { "id": 16976, "name": "Kraków", "normalized_name": "krakow" },
+          "region": { "id": 4, "name": "Małopolskie", "normalized_name": "malopolskie" }
+        }
+      }
+    ],
+    "metadata": {
+      "total_elements": 2,
+      "visible_total_count": 2,
+      "promoted": [],
+      "search_id": "53EE9121BEB5252150DF1498BCA13BCF",
+      "source": { "promoted": [], "organic": [0, 1] }
+    }
+  },
+  "notFound": {
+    "error": {
+      "status": 404,
+      "title": "Not Found",
+      "detail": "Ad not found."
+    }
+  }
+}
