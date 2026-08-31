@@ -503,10 +503,11 @@ test('fetches and verifies descriptions for very strong and exceptional deals be
     }
     (context.service as any).fetchPublicPage = async (url: string) => url.includes('/exceptional-listing') || url.includes('/very-strong-listing')
       ? '<div data-testid="description">Fully working, but broken screen and sold for parts.</div>'
-      : `<script type="application/ld+json">${JSON.stringify({ '@type': 'ItemList', itemListElement: [
-        { '@type': 'Product', name: 'CPU very strong', sku: 'very-strong-listing', url: 'https://www.olx.pl/d/oferta/very-strong-listing', offers: { price: '750' } },
-        { '@type': 'Product', name: 'CPU exceptional', sku: 'exceptional-listing', url: 'https://www.olx.pl/d/oferta/exceptional-listing', offers: { price: '650' } },
-      ] })}</script>`;
+      : '<html><body><h1>Steam Deck</h1></body></html>';
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'very-strong-listing', url: 'https://www.olx.pl/d/oferta/very-strong-listing', title: 'CPU very strong', created_time: baselineAt, params: [{ key: 'price', value: { value: 750, currency: 'PLN', negotiable: false } }] },
+      { id: 'exceptional-listing', url: 'https://www.olx.pl/d/oferta/exceptional-listing', title: 'CPU exceptional', created_time: baselineAt, params: [{ key: 'price', value: { value: 650, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 2 } } });
 
     const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('exceptional-watch');
     await (context.service as any).runWatch(row);
@@ -623,13 +624,10 @@ test('applies the AI relevance gate to one-off marketplace search results', asyn
   });
   try {
     context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' } });
-    (context.service as any).fetchPublicPage = async () => `<!doctype html><script type="application/ld+json">${JSON.stringify({
-      '@type': 'ItemList',
-      itemListElement: [
-        { '@type': 'Product', name: 'GPU graphics card RTX 4070', sku: 'GPU-1', url: 'https://www.olx.pl/d/oferta/gpu-1', offers: { '@type': 'Offer', price: '2000' } },
-        { '@type': 'Product', name: 'GPU fan replacement', sku: 'GPU-2', url: 'https://www.olx.pl/d/oferta/gpu-2', offers: { '@type': 'Offer', price: '80' } },
-      ],
-    })}</script>`;
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'GPU-1', url: 'https://www.olx.pl/d/oferta/gpu-1', title: 'GPU graphics card RTX 4070', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 2000, currency: 'PLN', negotiable: false } }] },
+      { id: 'GPU-2', url: 'https://www.olx.pl/d/oferta/gpu-2', title: 'GPU fan replacement', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 80, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 2 } } });
     const result = await context.service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
     assert.deepEqual(result.listings.map((listing) => listing.title), ['GPU graphics card RTX 4070']);
     assert.equal(result.sources[0].message, '1 matches · 1 excluded by AI');
@@ -970,13 +968,11 @@ test('keeps AI failures visible as unknown instead of silently excluding listing
 test('applies manual price filters after marketplace parsing rather than trusting URL parameters', async () => {
   const context = fixture();
   try {
-    (context.service as any).fetchPublicPage = async () => `<script type="application/ld+json">${JSON.stringify({
-      '@type': 'ItemList', itemListElement: [
-        { '@type': 'Product', name: 'CPU 50', sku: 'cpu-50', url: 'https://www.olx.pl/d/oferta/cpu-50', offers: { price: '50' } },
-        { '@type': 'Product', name: 'CPU 150', sku: 'cpu-150', url: 'https://www.olx.pl/d/oferta/cpu-150', offers: { price: '150' } },
-        { '@type': 'Product', name: 'CPU 250', sku: 'cpu-250', url: 'https://www.olx.pl/d/oferta/cpu-250', offers: { price: '250' } },
-      ],
-    })}</script>`;
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'cpu-50', url: 'https://www.olx.pl/d/oferta/cpu-50', title: 'CPU 50', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 50, currency: 'PLN', negotiable: false } }] },
+      { id: 'cpu-150', url: 'https://www.olx.pl/d/oferta/cpu-150', title: 'CPU 150', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 150, currency: 'PLN', negotiable: false } }] },
+      { id: 'cpu-250', url: 'https://www.olx.pl/d/oferta/cpu-250', title: 'CPU 250', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 250, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 3 } } });
     const result = await context.service.manualSearch({ query: 'cpu', sources: ['OLX'], minPrice: 100, maxPrice: 200, terms: '', excluded: '', shippingOnly: false, condition: 'Any', location: '' });
     assert.deepEqual(result.listings.map((listing) => listing.price), [150]);
   } finally { context.close(); }
@@ -1002,7 +998,7 @@ test('records failed scans and does not persist partial normal-watch data', asyn
   const context = fixture();
   try {
     seedWatch(context.db, 'failed-scan');
-    (context.service as any).fetchPublicPage = async () => '<html><body><p>Unsupported marketplace markup</p></body></html>';
+    (context.service as any).fetchOlxApi = async () => ({ status: 403, json: null });
     const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('failed-scan');
     await (context.service as any).runWatch(row);
     assert.equal((context.db.prepare("SELECT status FROM scans WHERE watch_id = ?").get('failed-scan') as { status: string }).status, 'failed');
@@ -1018,31 +1014,33 @@ test('verifies missing research listings before ending them and leaves transient
     const now = new Date().toISOString();
     const insert = context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans, availability_status, last_verified_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, 'live', ?)`);
-    insert.run('availability-watch', 'availability-watch:v1', 'OLX', 'terminal-listing', 'Terminal CPU', 'https://www.olx.pl/d/oferta/terminal-listing', 100, 100, 100, now, now, now);
-    insert.run('availability-watch', 'availability-watch:v1', 'OLX', 'transient-listing', 'Transient CPU', 'https://www.olx.pl/d/oferta/transient-listing', 100, 100, 100, now, now, now);
-    insert.run('availability-watch', 'availability-watch:v1', 'OLX', 'live-listing', 'Live CPU', 'https://www.olx.pl/d/oferta/live-listing', 100, 100, 100, now, now, now);
-    context.db.prepare("UPDATE market_listings SET missing_scans = 2 WHERE listing_id = 'transient-listing'").run();
+    insert.run('availability-watch', 'availability-watch:v1', 'OLX', '1001', 'Terminal CPU', 'https://www.olx.pl/d/oferta/terminal-listing-ID1001.html', 100, 100, 100, now, now, now);
+    insert.run('availability-watch', 'availability-watch:v1', 'OLX', '1002', 'Transient CPU', 'https://www.olx.pl/d/oferta/transient-listing-ID1002.html', 100, 100, 100, now, now, now);
+    insert.run('availability-watch', 'availability-watch:v1', 'OLX', '1003', 'Live CPU', 'https://www.olx.pl/d/oferta/live-listing-ID1003.html', 100, 100, 100, now, now, now);
+    context.db.prepare("UPDATE market_listings SET missing_scans = 2 WHERE listing_id = '1002'").run();
     let mode: 'terminal' | 'live' | 'failure' = 'terminal';
-    (context.service as any).fetchPublicPage = async (url: string) => {
+    (context.service as any).fetchOlxApi = async (url: string) => {
       if (mode === 'failure') throw new Error('Marketplace timeout');
-      if (url.includes('/oferta/terminal-listing')) return '<html><body><h1>Ogłoszenie jest niedostępne</h1><p>Ta oferta została usunięta z serwisu.</p></body></html>';
-      if (url.includes('/oferta/live-listing')) return '<html><body><div data-testid="ad-card-title">CPU</div><button>Wyślij wiadomość</button></body></html>';
-      return '<html><body><div data-testid="no-results">No results</div></body></html>';
+      if (url.includes('/api/v1/offers/?')) return { status: 200, json: { data: [], metadata: { visible_total_count: 0 } } };
+      if (url.endsWith('/api/v1/offers/1001/')) return { status: 404, json: { error: { status: 404, title: 'Not Found', detail: 'Ad not found.' } } };
+      if (url.endsWith('/api/v1/offers/1002/')) return { status: 503, json: null };
+      if (url.endsWith('/api/v1/offers/1003/')) return { status: 200, json: { data: { id: 1003, url: 'https://www.olx.pl/d/oferta/live-listing-ID1003.html', title: 'Live CPU', status: 'active', created_time: now, params: [{ key: 'price', value: { value: 100, currency: 'PLN', negotiable: false } }] } } };
+      return { status: 404, json: null };
     };
     const row = context.db.prepare('SELECT * FROM market_watches WHERE id = ?').get('availability-watch');
     for (let scan = 0; scan < 3; scan += 1) await (context.service as any).runMarketWatch(row);
-    const terminal = context.db.prepare("SELECT status, missing_scans, availability_status, ended_reason FROM market_listings WHERE listing_id = 'terminal-listing'").get() as { status: string; missing_scans: number; availability_status: string; ended_reason: string };
+    const terminal = context.db.prepare("SELECT status, missing_scans, availability_status, ended_reason FROM market_listings WHERE listing_id = '1001'").get() as { status: string; missing_scans: number; availability_status: string; ended_reason: string };
     assert.deepEqual({ status: terminal.status, missing_scans: terminal.missing_scans, availability_status: terminal.availability_status }, { status: 'ended', missing_scans: 3, availability_status: 'terminal' });
-    assert.match(terminal.ended_reason, /unavailable|HTTP/i);
+    assert.equal(terminal.ended_reason, 'Ad not found.');
 
     mode = 'failure';
     await (context.service as any).runMarketWatch(row);
-    const transient = context.db.prepare("SELECT status, missing_scans FROM market_listings WHERE listing_id = 'transient-listing'").get() as { status: string; missing_scans: number };
+    const transient = context.db.prepare("SELECT status, missing_scans FROM market_listings WHERE listing_id = '1002'").get() as { status: string; missing_scans: number };
     assert.equal(transient.status, 'active');
     assert.equal(transient.missing_scans, 2);
     mode = 'live';
     await (context.service as any).runMarketWatch(row);
-    const live = context.db.prepare("SELECT status, missing_scans, availability_status FROM market_listings WHERE listing_id = 'live-listing'").get() as { status: string; missing_scans: number; availability_status: string };
+    const live = context.db.prepare("SELECT status, missing_scans, availability_status FROM market_listings WHERE listing_id = '1003'").get() as { status: string; missing_scans: number; availability_status: string };
     assert.equal(live.status, 'active');
     assert.equal(live.missing_scans, 0);
     assert.equal(live.availability_status, 'live');

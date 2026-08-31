@@ -2,7 +2,7 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:
 import { existsSync } from 'node:fs';
 import { chromium, type Browser, type BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, validateNtfyConfig, type NtfyConfig } from './notifications';
-import { buildMarketplaceSearchUrl, createPublicAdapter, exponentialBackoff, parseListingDescription, parseShippingAvailability, validateSearchUrl, type ListingAvailability, type Marketplace, type NormalizedListing } from './marketplaces';
+import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createOlxJsonAdapter, createPublicAdapter, exponentialBackoff, parseListingDescription, parseShippingAvailability, validateSearchUrl, type ConnectorAdapter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, draftNegotiationMessageWithDeepSeek, legacyListingNormalizationInputHash, legacyListingRelevanceInputHash, listingDescriptionVerificationInputHash, listingNormalizationInputHash, listingRelevanceInputHash, normalizeListingWithDeepSeek, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseStoredListingNormalization, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type NegotiationListingContext } from './ai';
 import { OlxMessagingError, sendOlxMessageOnPage } from './olx-messaging';
@@ -83,6 +83,11 @@ const MATCH_VISIBILITY_MS = 12 * 60 * 60_000;
 const NIGHT_START_HOUR = 22;
 const NIGHT_END_HOUR = 8;
 const MAX_RESEARCH_DETAIL_CHECKS = 100;
+/**
+ * The OLX offers API rejects Scout's plain identifier UA; a modern Chrome UA
+ * plus `Accept: application/json` is the verified anonymous access contract.
+ */
+const OLX_API_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
 export class ServiceError extends Error {
   status: number;
@@ -1429,12 +1434,12 @@ export class ScoutService {
   }
 
   private async fetchSearchPages(source: Marketplace, query: string, filters: Parameters<typeof buildMarketplaceSearchUrl>[2], maxPages = 3) {
-    const adapter = createPublicAdapter(source, (url) => this.fetchPublicPage(url, source));
-    const first = await adapter.fetchPublicSearch(buildMarketplaceSearchUrl(source, query, filters));
+    const adapter = this.createConnectorAdapter(source);
+    const first = await adapter.fetchPublicSearch(this.marketplaceSearchRequestUrl(source, query, filters));
     const listings = new Map(first.map((listing) => [`${listing.marketplace}:${listing.listingId}`, listing]));
     if (first.length < 20 || first.empty) return [...listings.values()];
     for (let page = 2; page <= maxPages; page += 1) {
-      const fetched = await adapter.fetchPublicSearch(buildMarketplaceSearchUrl(source, query, { ...filters, page }));
+      const fetched = await adapter.fetchPublicSearch(this.marketplaceSearchRequestUrl(source, query, { ...filters, page }));
       const before = listings.size;
       for (const listing of fetched) listings.set(`${listing.marketplace}:${listing.listingId}`, listing);
       if (fetched.empty || listings.size === before) break;
@@ -1695,7 +1700,7 @@ export class ScoutService {
           return;
         }
         try {
-          const adapter = createPublicAdapter(source, (url) => this.fetchPublicPage(url, source));
+          const adapter = this.createConnectorAdapter(source);
           const fetched = await this.fetchSearchPages(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' }, 3);
           const filters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, location: row.location, shippingOnly: false };
           const comparable = filterListings(fetched, row.query, row.included_terms ?? '', row.excluded_terms ?? '', filters);
@@ -1709,7 +1714,7 @@ export class ScoutService {
           const verifiedMissing: Array<{ listing: typeof missing[number]; availability: ListingAvailability; refreshed?: NormalizedListing }> = [];
           for (let offset = 0; offset < Math.min(missing.length, MAX_RESEARCH_DETAIL_CHECKS); offset += 2) {
             const batch = await Promise.all(missing.slice(offset, Math.min(offset + 2, MAX_RESEARCH_DETAIL_CHECKS)).map(async (candidate) => {
-              const detail = await adapter.fetchDetail(candidate.url);
+              const detail = await adapter.fetchDetail(candidate.url, { listingId: candidate.listing_id });
               return {
                 listing: candidate,
                 availability: detail.availability,
@@ -2100,8 +2105,8 @@ export class ScoutService {
           const matchingExact = exactUrls.filter((url) => validateSearchUrl(url, source).valid);
           const urls = matchingExact.length
             ? matchingExact
-            : [buildMarketplaceSearchUrl(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' })];
-          const adapter = createPublicAdapter(source, (url) => this.fetchPublicPage(url, source));
+            : [this.marketplaceSearchRequestUrl(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' })];
+          const adapter = this.createConnectorAdapter(source);
           const fetched = matchingExact.length
             ? (await Promise.all(urls.map((url) => adapter.fetchPublicSearch(url)))).flat()
             : await this.fetchSearchPages(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' }, 3);
@@ -2157,6 +2162,40 @@ export class ScoutService {
     } finally {
       this.running.delete(row.id);
     }
+  }
+
+  /**
+   * OLX runs on its verified anonymous JSON offers API, so its connector needs
+   * no HTML rendering or Chromium at all; Allegro Lokalnie and Vinted keep the
+   * public-page adapter (with its browser fallback) unchanged.
+   */
+  private createConnectorAdapter(source: Marketplace): ConnectorAdapter {
+    return source === 'OLX'
+      ? createOlxJsonAdapter(source, (url) => this.fetchOlxApi(url))
+      : createPublicAdapter(source, (url) => this.fetchPublicPage(url, source));
+  }
+
+  /** Watches pass their original query and filters straight into the OLX API instead of round-tripping an HTML URL slug. */
+  private marketplaceSearchRequestUrl(source: Marketplace, query: string, filters: Parameters<typeof buildMarketplaceSearchUrl>[2]) {
+    return source === 'OLX' ? buildOlxSearchApiUrl(query, filters) : buildMarketplaceSearchUrl(source, query, filters);
+  }
+
+  private async fetchOlxApi(url: string): Promise<OlxApiFetchResult> {
+    const validation = validateSearchUrl(url, 'OLX');
+    if (!validation.valid) throw new Error(validation.reason);
+    const headers = { 'user-agent': OLX_API_USER_AGENT, accept: 'application/json' };
+    let response = await fetch(validation.url, { redirect: 'manual', headers, signal: AbortSignal.timeout(12_000) });
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      if (!location) throw new Error(`Unexpected redirect (${response.status})`);
+      const redirected = new URL(location, validation.url).toString();
+      const redirectValidation = validateSearchUrl(redirected, 'OLX');
+      if (!redirectValidation.valid) throw new Error('Marketplace redirected off the approved domain');
+      response = await fetch(redirectValidation.url, { redirect: 'manual', headers, signal: AbortSignal.timeout(12_000) });
+    }
+    let json: unknown = null;
+    try { json = await response.json(); } catch { /* non-JSON bodies (e.g. challenge pages) surface through the status */ }
+    return { status: response.status, json };
   }
 
   private async fetchPublicPage(url: string, marketplace: Marketplace) {

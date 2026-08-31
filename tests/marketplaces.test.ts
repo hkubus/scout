@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildMarketplaceSearchUrl, dedupeKey, normalizeListing, parseAllegroCards, parseListingAvailability, parseListingDescription, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, validateSearchUrl } from '../server/marketplaces';
+import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createOlxJsonAdapter, dedupeKey, normalizeListing, parseAllegroCards, parseListingAvailability, parseListingDescription, parseOlxListingAvailabilityApi, parseOlxOffersApi, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, validateSearchUrl } from '../server/marketplaces';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { median, pruneBefore, scoreDeal } from '../server/scoring';
@@ -116,6 +116,112 @@ test('parses rendered OLX cards without relying on generated class names', () =>
   assert.equal(listing.condition, 'Używane');
   assert.equal(listing.shippingAvailable, true);
   assert.equal(listing.priceNegotiable, true);
+});
+
+test('builds OLX offers API URLs from Scout query filters', () => {
+  const url = new URL(buildOlxSearchApiUrl('iphone 14', { minPrice: 500, maxPrice: 1500, condition: 'Used', sort: 'newest', page: 3 }));
+  assert.equal(url.origin + url.pathname, 'https://www.olx.pl/api/v1/offers/');
+  assert.equal(url.searchParams.get('query'), 'iphone 14');
+  assert.equal(url.searchParams.get('filter_float_price:from'), '500');
+  assert.equal(url.searchParams.get('filter_float_price:to'), '1500');
+  assert.equal(url.searchParams.get('filter_enum_state[0]'), 'used');
+  assert.equal(url.searchParams.get('sort_by'), 'created_at:desc');
+  assert.equal(url.searchParams.get('offset'), '100');
+  assert.equal(url.searchParams.get('limit'), '50');
+  const unfiltered = new URL(buildOlxSearchApiUrl('steam deck'));
+  assert.equal(unfiltered.searchParams.has('offset'), false);
+  assert.equal(unfiltered.searchParams.has('sort_by'), false);
+  assert.equal(unfiltered.searchParams.get('limit'), '50');
+});
+
+test('maps OLX offers API payloads onto normalized listings', () => {
+  const fixture = JSON.parse(readFileSync(resolve(import.meta.dirname, 'fixtures-olx-api.json'), 'utf8'));
+  const listings = parseOlxOffersApi(fixture.search);
+  assert.equal(listings.pageStatus, 'results');
+  assert.equal(listings.empty, false);
+  assert.equal(listings.length, 1);
+  const [listing] = listings;
+  assert.equal(listing.marketplace, 'OLX');
+  assert.equal(listing.listingId, '1092728340');
+  assert.equal(listing.title, 'Iphon 13 128GB 100% Baterii Black');
+  assert.equal(listing.price, 800);
+  assert.equal(listing.priceNegotiable, false);
+  assert.equal(listing.condition, 'Używane');
+  assert.equal(listing.location, 'Małopolskie, Łapanów');
+  assert.equal(listing.shippingAvailable, true);
+  assert.equal(listing.imageUrl, 'https://ireland.apollo.olxcdn.com/v1/files/nl9i997bhz1g1-PL/image;s=320x240');
+  assert.equal(listing.observedAt, '2026-08-20T19:40:08+02:00');
+  assert.equal(listing.url, 'https://www.olx.pl/d/oferta/iphon-13-128gb-100-baterii-black-CID99-ID1bVYyE.html');
+});
+
+test('treats zero visible totals and exhausted pages as explicit empty OLX searches', () => {
+  const empty = parseOlxOffersApi({ data: [], metadata: { visible_total_count: 0 } });
+  assert.equal(empty.pageStatus, 'empty');
+  assert.equal(empty.empty, true);
+  const exhausted = parseOlxOffersApi({ data: [], metadata: { visible_total_count: 145167 } });
+  assert.equal(exhausted.empty, true);
+  const gibberish = parseOlxOffersApi({ data: [{ id: 1, url: 'https://www.olx.pl/d/oferta/x-ID1.html', title: 'Loosely related', params: [{ key: 'price', value: { value: 40, currency: 'PLN' } }] }], metadata: { visible_total_count: 70 } });
+  assert.equal(gibberish.empty, false);
+  assert.equal(gibberish.length, 1);
+  assert.throws(() => parseOlxOffersApi({ error: { title: 'Not Found' } }), /data array/);
+});
+
+test('classifies OLX API availability from HTTP status and payload shape', () => {
+  const fixture = JSON.parse(readFileSync(resolve(import.meta.dirname, 'fixtures-olx-api.json'), 'utf8'));
+  assert.deepEqual(parseOlxListingAvailabilityApi(fixture.notFound, 404), { status: 'terminal', reason: 'Ad not found.' });
+  assert.deepEqual(parseOlxListingAvailabilityApi(null, 410), { status: 'terminal', reason: 'Marketplace returned HTTP 410' });
+  assert.equal(parseOlxListingAvailabilityApi(null, 403).status, 'unknown');
+  assert.equal(parseOlxListingAvailabilityApi(null, 429).status, 'unknown');
+  assert.equal(parseOlxListingAvailabilityApi(null, 503).status, 'unknown');
+  assert.equal(parseOlxListingAvailabilityApi(null, 200).status, 'unknown');
+  assert.equal(parseOlxListingAvailabilityApi({ error: { detail: 'Bot challenge' } }, 200).status, 'unknown');
+  const live = { data: { id: 1092728340, status: 'active', url: 'https://www.olx.pl/d/oferta/x-ID1bVYyE.html', title: 'X', params: [{ key: 'price', value: { value: 800, currency: 'PLN' } }] } };
+  assert.deepEqual(parseOlxListingAvailabilityApi(live, 200), { status: 'live' });
+  assert.equal(parseOlxListingAvailabilityApi({ data: { status: 'removed' } }, 200).status, 'unknown');
+});
+
+test('runs OLX searches and detail checks through the offers API adapter', async () => {
+  const fixture = JSON.parse(readFileSync(resolve(import.meta.dirname, 'fixtures-olx-api.json'), 'utf8'));
+  const requests: string[] = [];
+  const adapter = createOlxJsonAdapter('OLX', async (url) => {
+    requests.push(url);
+    if (url.endsWith('/api/v1/offers/1092728340/')) return { status: 200, json: { data: fixture.search.data[0] } };
+    if (url.endsWith('/api/v1/offers/99999999999/')) return { status: 404, json: fixture.notFound };
+    return { status: 200, json: fixture.search };
+  });
+  const search = await adapter.fetchPublicSearch('https://www.olx.pl/oferty/q-iphone/?search[filter_float_price:from]=500&search[order]=created_at:desc&page=2');
+  const requested = new URL(requests[0]);
+  assert.equal(requested.pathname, '/api/v1/offers/');
+  assert.equal(requested.searchParams.get('query'), 'iphone');
+  assert.equal(requested.searchParams.get('filter_float_price:from'), '500');
+  assert.equal(requested.searchParams.get('sort_by'), 'created_at:desc');
+  assert.equal(requested.searchParams.get('offset'), '50');
+  assert.equal(search.length, 1);
+  assert.equal(search[0].listingId, '1092728340');
+  assert.equal(search.empty, false);
+
+  const detail = await adapter.fetchDetail('https://www.olx.pl/d/oferta/iphon-13-128gb-100-baterii-black-CID99-ID1bVYyE.html', { listingId: '1092728340' });
+  assert.equal(requests[1], 'https://www.olx.pl/api/v1/offers/1092728340/');
+  assert.equal(detail.availability.status, 'live');
+  assert.equal(detail.listing?.listingId, '1092728340');
+  assert.equal(detail.listing?.price, 800);
+
+  const removed = await adapter.fetchDetail('https://www.olx.pl/d/oferta/gone-ID99999999999.html', { listingId: '99999999999' });
+  assert.deepEqual(removed.availability, { status: 'terminal', reason: 'Ad not found.' });
+
+  const nonNumeric = await adapter.fetchDetail('https://www.olx.pl/d/oferta/token-only-ID1bVYyE.html');
+  assert.equal(nonNumeric.availability.status, 'unknown');
+
+  const failing = createOlxJsonAdapter('OLX', async () => ({ status: 403, json: null }));
+  await assert.rejects(() => failing.fetchPublicSearch('https://www.olx.pl/oferty/q-iphone/'), /HTTP 403/);
+  assert.equal((await failing.fetchDetail('https://www.olx.pl/d/oferta/x-ID123.html', { listingId: '123' })).availability.status, 'unknown');
+});
+
+test('rejects OLX exact URLs that cannot be translated to the offers API', async () => {
+  const fixture = JSON.parse(readFileSync(resolve(import.meta.dirname, 'fixtures-olx-api.json'), 'utf8'));
+  const adapter = createOlxJsonAdapter('OLX', async () => ({ status: 200, json: fixture.search }));
+  await assert.rejects(() => adapter.fetchPublicSearch('https://www.olx.pl/elektronika/'), /offers API/);
+  await assert.rejects(() => adapter.fetchPublicSearch('https://allegrolokalnie.pl/oferty/q-iphone/'), /approved|offers API|domain/i);
 });
 
 test('parses Allegro Lokalnie offer type as shipping availability', () => {
