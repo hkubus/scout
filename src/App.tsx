@@ -16,6 +16,7 @@ import {
   PlugZap,
   Plus,
   RefreshCw,
+  ScrollText,
   Search,
   Settings2,
   SlidersHorizontal,
@@ -43,6 +44,7 @@ const navItems: Array<{ id: View; label: string; icon: typeof Grid2X2 }> = [
   { id: "listings", label: "Listings", icon: Tag },
   { id: "messages", label: "Messages", icon: MessageSquare },
   { id: "connectors", label: "Connectors", icon: PlugZap },
+  { id: "logs", label: "Logs", icon: ScrollText },
   { id: "settings", label: "Settings", icon: Settings2 },
 ];
 
@@ -50,12 +52,14 @@ const loadMessagesPage = () => import("./MessagesPage");
 const loadMarketResearchPage = () => import("./MarketResearchPage");
 const loadSettingsPage = () => import("./SettingsPage");
 const loadConnectorsPage = () => import("./ConnectorsPage");
+const loadLogsPage = () => import("./LogsPage");
 const loadSearchPage = () => import("./SearchPage");
 const loadListingsPage = () => import("./ListingsPage");
 const LazyMessagesPage = lazy(loadMessagesPage);
 const LazyMarketResearchPage = lazy(loadMarketResearchPage);
 const LazySettingsPage = lazy(loadSettingsPage);
 const LazyConnectorsPage = lazy(loadConnectorsPage);
+const LazyLogsPage = lazy(loadLogsPage);
 const LazySearchPage = lazy(loadSearchPage);
 const LazyListingsPage = lazy(loadListingsPage);
 const LazyListingDetailDrawer = lazy(() => import("./ListingDetailDrawer"));
@@ -74,6 +78,7 @@ const routeLoaders: Partial<Record<View, () => Promise<unknown>>> = {
   listings: loadListingsPage,
   messages: loadMessagesPage,
   connectors: loadConnectorsPage,
+  logs: loadLogsPage,
   settings: loadSettingsPage,
 };
 
@@ -142,6 +147,7 @@ function App() {
   const [showHistory, setShowHistory] = useState(false);
   const [marketRefreshKey, setMarketRefreshKey] = useState(0);
   const [messagesRefreshKey, setMessagesRefreshKey] = useState(0);
+  const [logsRefreshKey, setLogsRefreshKey] = useState(0);
   const [selectedWatchId, setSelectedWatchId] = useState<string | null>(
     null,
   );
@@ -205,6 +211,7 @@ function App() {
     source.addEventListener("ai-description-verification", refresh);
     source.addEventListener("market-watch", () => setMarketRefreshKey((value) => value + 1));
     source.addEventListener("seller-message", () => setMessagesRefreshKey((value) => value + 1));
+    source.addEventListener("log", () => setLogsRefreshKey((value) => value + 1));
     source.onerror = () => setConnection("offline");
     return () => {
       if (refreshTimer !== null) window.clearTimeout(refreshTimer);
@@ -534,6 +541,11 @@ function App() {
               onHistory={() => setShowHistory(true)}
               onToast={notify}
             />
+          </Suspense>
+        ) : null}
+        {view === "logs" ? (
+          <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading logs…</div>}>
+            <LazyLogsPage refreshKey={logsRefreshKey} onToast={notify} />
           </Suspense>
         ) : null}
         {view === "settings" ? (

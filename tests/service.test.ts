@@ -313,6 +313,71 @@ test('accepts Allegro account auth state while keeping unrelated session domains
   } finally { context.close(); }
 });
 
+test('bootstraps anonymous Vinted cookies once and re-bootstraps on a 401', async () => {
+  const context = fixture();
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  const cookieHeaders = new Headers();
+  cookieHeaders.append('set-cookie', 'access_token_web=jwt-token; Path=/; Domain=.vinted.pl; HttpOnly');
+  cookieHeaders.append('set-cookie', '__cf_bm=cf-cookie; Path=/; Domain=.vinted.pl');
+  let bootstraps = 0;
+  let apiCalls = 0;
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input);
+    requests.push({ url, init });
+    if (url === 'https://www.vinted.pl/') {
+      bootstraps += 1;
+      return new Response(null, { status: 200, headers: cookieHeaders });
+    }
+    if (url.startsWith('https://www.vinted.pl/api/v2/catalog/items')) {
+      apiCalls += 1;
+      if (apiCalls === 3) return new Response(JSON.stringify({ code: 100, message: 'invalid_authentication_token' }), { status: 401, headers: { 'content-type': 'application/json' } });
+      return new Response(JSON.stringify({ items: [], pagination: { current_page: 1, total_pages: 0, total_entries: 0, per_page: 20 }, code: 0 }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  }) as typeof fetch;
+  try {
+    const fetchVintedApi = (context.service as any).fetchVintedApi.bind(context.service) as (url: string) => Promise<{ status: number; json: unknown }>;
+    const apiUrl = 'https://www.vinted.pl/api/v2/catalog/items?search_text=lego&per_page=20';
+    assert.equal((await fetchVintedApi(apiUrl)).status, 200);
+    assert.equal(bootstraps, 1);
+    assert.equal(apiCalls, 1);
+    assert.equal(requests[0].url, 'https://www.vinted.pl/');
+    const cookie = (requests[1].init?.headers as Record<string, string>).cookie;
+    assert.match(cookie, /access_token_web=jwt-token/);
+    assert.match(cookie, /__cf_bm=cf-cookie/);
+    assert.equal((requests[1].init?.headers as Record<string, string>)['user-agent'], 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
+
+    assert.equal((await fetchVintedApi(apiUrl)).status, 200);
+    assert.equal(bootstraps, 1);
+    assert.equal(apiCalls, 2);
+
+    assert.equal((await fetchVintedApi(apiUrl)).status, 200);
+    assert.equal(bootstraps, 2);
+    assert.equal(apiCalls, 4);
+    assert.equal(requests[4].url, 'https://www.vinted.pl/');
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.close();
+  }
+});
+
+test('fails Vinted cookie bootstrap closed when the homepage is fenced', async () => {
+  const context = fixture();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input) => {
+    assert.equal(String(input), 'https://www.vinted.pl/');
+    return new Response('<html><body>Cloudflare challenge</body></html>', { status: 403 });
+  }) as typeof fetch;
+  try {
+    const fetchVintedApi = (context.service as any).fetchVintedApi.bind(context.service) as (url: string) => Promise<{ status: number; json: unknown }>;
+    await assert.rejects(() => fetchVintedApi('https://www.vinted.pl/api/v2/catalog/items?search_text=lego'), /anonymous access token/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.close();
+  }
+});
+
 test('deletes watches and prunes expired observations without seeded data', () => {
   const context = fixture();
   try {
@@ -982,14 +1047,20 @@ test('does not fetch listing details for shipping when manual search does not re
   const context = fixture();
   const fetchedUrls: string[] = [];
   try {
-    (context.service as any).fetchPublicPage = async (url: string) => {
+    (context.service as any).fetchVintedApi = async (url: string) => {
       fetchedUrls.push(url);
-      return `<script type="application/ld+json">${JSON.stringify({
-        '@type': 'Product', name: 'CPU', sku: 'cpu-vinted', url: 'https://www.vinted.pl/items/123', offers: { price: '150' },
-      })}</script>`;
+      return { status: 200, json: { items: [
+        { id: 123, title: 'CPU', price: { amount: '150', currency_code: 'PLN' }, url: 'https://www.vinted.pl/items/123-cpu', status: 'Bardzo dobry' },
+      ], pagination: { current_page: 1, total_pages: 1, total_entries: 1, per_page: 20 }, code: 0 } };
+    };
+    (context.service as any).fetchPublicPage = async (url: string) => {
+      throw new Error(`unexpected public page fetch: ${url}`);
     };
     const result = await context.service.manualSearch({ query: 'cpu', sources: ['Vinted'], minPrice: null, maxPrice: null, terms: '', excluded: '', shippingOnly: false, condition: 'Any', location: '' });
+    assert.equal(result.sources[0].status, 'ok');
     assert.equal(fetchedUrls.length, 1);
+    assert.match(fetchedUrls[0], /api\/v2\/catalog\/items/);
+    assert.equal(result.listings[0].id, 'Vinted:123');
     assert.equal(result.sources[0].pendingShipping, 0);
   } finally { context.close(); }
 });
@@ -1130,4 +1201,30 @@ test('reports database and scheduler readiness separately from the lightweight h
     assert.equal(after.scheduler.healthy, true);
     assert.equal(after.migrations.count, 11);
   } finally { context.close(); }
+});
+
+test('records watch scan paths in the in-memory log buffer and emits them over SSE', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'scout-service-'));
+  const db = openDatabase(join(directory, 'scout.sqlite'));
+  const emitted: Array<{ event: string; payload: unknown }> = [];
+  const service = new ScoutService(db, (event, payload) => { emitted.push({ event, payload }); });
+  try {
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO watches (id, name, query, sources_json, exact_urls_json, enabled, next_scan_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('log-watch', 'Log watch', 'cpu', '["OLX"]', '["https://www.olx.pl/elektronika/"]', 1, now, now, now);
+    assert.equal(service.queueScan('log-watch').queued, true);
+    const deadline = Date.now() + 2_000;
+    while (!service.logs().length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    const logs = service.logs();
+    assert.ok(logs.length, 'expected the failed scan to be logged');
+    assert.equal(logs[0].level, 'error');
+    assert.equal(logs[0].scope, 'watch');
+    assert.match(logs[0].message, /Log watch · OLX: failed via unstarted path — OLX search URL could not be translated to the offers API/);
+    assert.match(logs[0].at, /^\d{4}-\d{2}-\d{2}T/);
+    assert.ok(logs[0].id >= (logs.at(-1) as { id: number }).id, 'expected newest-first ordering');
+    assert.ok(emitted.some((entry) => entry.event === 'log'), 'expected the log entry to be emitted');
+  } finally {
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

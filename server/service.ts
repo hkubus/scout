@@ -2,14 +2,14 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:
 import { existsSync } from 'node:fs';
 import { chromium, type Browser, type BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, validateNtfyConfig, type NtfyConfig } from './notifications';
-import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createOlxJsonAdapter, createPublicAdapter, exponentialBackoff, parseListingDescription, parseShippingAvailability, validateSearchUrl, type ConnectorAdapter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult } from './marketplaces';
+import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, parseListingDescription, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, draftNegotiationMessageWithDeepSeek, legacyListingNormalizationInputHash, legacyListingRelevanceInputHash, listingDescriptionVerificationInputHash, listingNormalizationInputHash, listingRelevanceInputHash, normalizeListingWithDeepSeek, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseStoredListingNormalization, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type NegotiationListingContext } from './ai';
 import { OlxMessagingError, sendOlxMessageOnPage } from './olx-messaging';
 import { AllegroMessagingError, sendAllegroMessageOnPage } from './allegro-messaging';
 import { offerCeiling, recommendNegotiationPrice, type NegotiationRecommendation } from './negotiation';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, median, scoreDeal } from './scoring';
-import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, ManualSearchResponse, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
+import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -84,10 +84,13 @@ const NIGHT_START_HOUR = 22;
 const NIGHT_END_HOUR = 8;
 const MAX_RESEARCH_DETAIL_CHECKS = 100;
 /**
- * The OLX offers API rejects Scout's plain identifier UA; a modern Chrome UA
- * plus `Accept: application/json` is the verified anonymous access contract.
+ * The anonymous marketplace APIs (OLX offers, Vinted catalog, Lokalnie
+ * additional-data) reject Scout's plain identifier UA; a modern Chrome UA plus
+ * `Accept: application/json` is the verified anonymous access contract.
  */
-const OLX_API_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const MARKETPLACE_API_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+/** Scan-path log entries kept in memory for the Logs tab; pure diagnostics, never persisted. */
+const LOG_BUFFER_LIMIT = 500;
 
 export class ServiceError extends Error {
   status: number;
@@ -284,6 +287,8 @@ export class ScoutService {
   private readonly schedulerOwner = `scheduler-${process.pid}-${randomBytes(8).toString('hex')}`;
   private activeManualSearches = 0;
   private readonly messagingInFlight = new Set<string>();
+  private logSequence = 0;
+  private readonly logBuffer: LogEntry[] = [];
 
   constructor(db: Database, emit: (event: string, payload: unknown) => void, dependencies: ScoutServiceDependencies = {}) {
     this.db = db;
@@ -320,6 +325,19 @@ export class ScoutService {
   private failScan(scanId: number, error: unknown) {
     const message = (error instanceof Error ? error.message : String(error || 'Scan failed')).slice(0, 500);
     this.db.prepare("UPDATE scans SET status = 'failed', completed_at = ?, error = ? WHERE id = ?").run(nowIso(), message, scanId);
+  }
+
+  private log(level: LogEntry['level'], scope: LogEntry['scope'], message: string) {
+    const entry: LogEntry = { id: ++this.logSequence, at: nowIso(), level, scope, message };
+    this.logBuffer.push(entry);
+    if (this.logBuffer.length > LOG_BUFFER_LIMIT) this.logBuffer.splice(0, this.logBuffer.length - LOG_BUFFER_LIMIT);
+    if (level === 'error') console.error(`[${scope}] ${message}`);
+    else console.info(`[${scope}] ${message}`);
+    this.emit('log', entry);
+  }
+
+  logs(): LogEntry[] {
+    return [...this.logBuffer].reverse();
   }
 
   schedulerTick() {
@@ -1438,8 +1456,8 @@ export class ScoutService {
    * fresh offers are always on the first page; one OLX page carries 50 organic
    * offers plus promoted ads.
    */
-  private async fetchSearchPages(source: Marketplace, query: string, filters: Parameters<typeof buildMarketplaceSearchUrl>[2]) {
-    const adapter = this.createConnectorAdapter(source);
+  private async fetchSearchPages(source: Marketplace, query: string, filters: Parameters<typeof buildMarketplaceSearchUrl>[2], onPath?: ConnectorPathReporter) {
+    const adapter = this.createConnectorAdapter(source, onPath);
     const first = await adapter.fetchPublicSearch(this.marketplaceSearchRequestUrl(source, query, filters));
     return [...new Map(first.map((listing) => [`${listing.marketplace}:${listing.listingId}`, listing])).values()];
   }
@@ -1686,6 +1704,8 @@ export class ScoutService {
     let latestBackoffUntil: string | null = null;
     try {
       await Promise.all(sources.map(async (source) => {
+        const paths: string[] = [];
+        const onPath: ConnectorPathReporter = (path) => { if (!paths.includes(path)) paths.push(path); };
         const started = nowIso();
         const latest = this.db.prepare('SELECT backoff_until FROM connector_runs WHERE source = ? ORDER BY started_at DESC LIMIT 1').get(source) as { backoff_until?: string } | undefined;
         const backoffUntil = latest?.backoff_until && Date.parse(latest.backoff_until) > Date.now() ? latest.backoff_until : null;
@@ -1694,11 +1714,13 @@ export class ScoutService {
         const scanId = this.createScan(String(row.id), 'research', source, started);
         if (backoffUntil) {
           this.db.prepare("UPDATE scans SET status = 'skipped', completed_at = ?, error = ? WHERE id = ?").run(started, `Connector backoff active until ${backoffUntil}`, scanId);
+          this.log('info', 'research', `${row.name} · ${source}: skipped (connector backoff until ${backoffUntil})`);
           return;
         }
         try {
-          const adapter = this.createConnectorAdapter(source);
-          const fetched = await this.fetchSearchPages(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' });
+          const adapter = this.createConnectorAdapter(source, onPath);
+          const fetched = await this.fetchSearchPages(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' }, onPath);
+          this.log('info', 'research', `${row.name} · ${source}: query-search → ${paths.join(' → ') || 'no fetch'} · fetched=${fetched.length}`);
           const filters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, location: row.location, shippingOnly: false };
           const comparable = filterListings(fetched, row.query, row.included_terms ?? '', row.excluded_terms ?? '', filters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
@@ -1755,7 +1777,9 @@ export class ScoutService {
           this.finishRun(runId, 'ok', `${filtered.length} research listings saved${deferredMissing ? ` · ${deferredMissing} detail checks deferred` : ''}`);
         } catch (error) {
           this.failScan(scanId, error);
-          this.finishRun(runId, 'error', error instanceof Error ? error.message : 'Research connector failed');
+          const message = error instanceof Error ? error.message : 'Research connector failed';
+          this.log('error', 'research', `${row.name} · ${source}: failed via ${paths.join(' → ') || 'unstarted path'} — ${message}`);
+          this.finishRun(runId, 'error', message);
         }
       }));
       const finished = nowIso();
@@ -2088,6 +2112,8 @@ export class ScoutService {
     let latestBackoffUntil: string | null = null;
     try {
       await Promise.all(sources.map(async (source) => {
+        const paths: string[] = [];
+        const onPath: ConnectorPathReporter = (path) => { if (!paths.includes(path)) paths.push(path); };
         const latest = this.db.prepare('SELECT backoff_until FROM connector_runs WHERE source = ? ORDER BY started_at DESC LIMIT 1').get(source) as { backoff_until?: string } | undefined;
         const started = nowIso();
         const backoffUntil = latest?.backoff_until && Date.parse(latest.backoff_until) > Date.now() ? latest.backoff_until : null;
@@ -2096,6 +2122,7 @@ export class ScoutService {
         const scanId = this.createScan(String(row.id), 'watch', source, started);
         if (backoffUntil) {
           this.db.prepare("UPDATE scans SET status = 'skipped', completed_at = ?, error = ? WHERE id = ?").run(started, `Connector backoff active until ${backoffUntil}`, scanId);
+          this.log('info', 'watch', `${row.name} · ${source}: skipped (connector backoff until ${backoffUntil})`);
           return;
         }
         try {
@@ -2103,10 +2130,11 @@ export class ScoutService {
           const urls = matchingExact.length
             ? matchingExact
             : [this.marketplaceSearchRequestUrl(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' })];
-          const adapter = this.createConnectorAdapter(source);
+          const adapter = this.createConnectorAdapter(source, onPath);
           const fetched = matchingExact.length
             ? (await Promise.all(urls.map((url) => adapter.fetchPublicSearch(url)))).flat()
-            : await this.fetchSearchPages(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' });
+            : await this.fetchSearchPages(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' }, onPath);
+          this.log('info', 'watch', `${row.name} · ${source}: ${matchingExact.length ? `exact-urls (${matchingExact.length})` : 'query-search'} → ${paths.join(' → ') || 'no fetch'} · fetched=${fetched.length}`);
           const deterministicFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, location: row.location, shippingOnly: false };
           const comparable = filterListings(fetched, row.query, row.included_terms, row.excluded_terms, deterministicFilters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
@@ -2147,6 +2175,7 @@ export class ScoutService {
           const recent = this.db.prepare('SELECT status FROM connector_runs WHERE source = ? AND id != ? ORDER BY started_at DESC LIMIT 8').all(source, runId) as Array<{ status: string }>;
           const consecutiveFailures = recent.findIndex((run) => run.status !== 'error');
           const failureCount = consecutiveFailures === -1 ? recent.length : consecutiveFailures;
+          this.log('error', 'watch', `${row.name} · ${source}: failed via ${paths.join(' → ') || 'unstarted path'} — ${message}`);
           this.finishRun(runId, 'error', message, new Date(Date.now() + exponentialBackoff(failureCount)).toISOString());
         }
       }));
@@ -2162,14 +2191,27 @@ export class ScoutService {
   }
 
   /**
-   * OLX runs on its verified anonymous JSON offers API, so its connector needs
-   * no HTML rendering or Chromium at all; Allegro Lokalnie and Vinted keep the
-   * public-page adapter (with its browser fallback) unchanged.
+   * Every marketplace runs on a dedicated anonymous path: OLX on its verified
+   * offers API, Vinted on its cookie-bootstrapped catalog API (falling back to
+   * the public-page adapter, which owns the Chromium render), and Allegro
+   * Lokalnie on plain-HTTP SSR pages enriched through its anonymous batch API.
+   * Chromium is only reachable through those explicit fallbacks.
    */
-  private createConnectorAdapter(source: Marketplace): ConnectorAdapter {
-    return source === 'OLX'
-      ? createOlxJsonAdapter(source, (url) => this.fetchOlxApi(url))
-      : createPublicAdapter(source, (url) => this.fetchPublicPage(url, source));
+  private createConnectorAdapter(source: Marketplace, onPath?: ConnectorPathReporter): ConnectorAdapter {
+    if (source === 'OLX') return createOlxJsonAdapter(source, (url) => this.fetchOlxApi(url), onPath);
+    if (source === 'Vinted') {
+      return createVintedJsonAdapter(
+        source,
+        (url) => this.fetchVintedApi(url),
+        (url) => this.fetchVintedItemPage(url),
+        createPublicAdapter(source, (url) => this.fetchPublicPage(url, source), onPath),
+        onPath,
+      );
+    }
+    if (source === 'Allegro Lokalnie') {
+      return createAllegroLokalnieAdapter(source, (url) => this.fetchPublicPage(url, source), (url, body) => this.fetchAllegroLokalnieApi(url, body), onPath);
+    }
+    return createPublicAdapter(source, (url) => this.fetchPublicPage(url, source), onPath);
   }
 
   /** Watches pass their original query and filters straight into the OLX API instead of round-tripping an HTML URL slug. */
@@ -2180,7 +2222,7 @@ export class ScoutService {
   private async fetchOlxApi(url: string): Promise<OlxApiFetchResult> {
     const validation = validateSearchUrl(url, 'OLX');
     if (!validation.valid) throw new Error(validation.reason);
-    const headers = { 'user-agent': OLX_API_USER_AGENT, accept: 'application/json' };
+    const headers = { 'user-agent': MARKETPLACE_API_USER_AGENT, accept: 'application/json' };
     let response = await fetch(validation.url, { redirect: 'manual', headers, signal: AbortSignal.timeout(12_000) });
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
@@ -2190,6 +2232,115 @@ export class ScoutService {
       if (!redirectValidation.valid) throw new Error('Marketplace redirected off the approved domain');
       response = await fetch(redirectValidation.url, { redirect: 'manual', headers, signal: AbortSignal.timeout(12_000) });
     }
+    let json: unknown = null;
+    try { json = await response.json(); } catch { /* non-JSON bodies (e.g. challenge pages) surface through the status */ }
+    return { status: response.status, json };
+  }
+
+  private vintedCookieJar: { header: string } | null = null;
+  private vintedCookieBootstrap: Promise<string> | null = null;
+
+  /**
+   * Vinted's anonymous catalog API requires the `access_token_web` cookie that
+   * the homepage hands out to any visitor; no login is involved. The jar lives
+   * in memory per process (the token lasts 7 days), is shared across
+   * concurrent scans through the memoized bootstrap, and is re-bootstrapped
+   * once on 401 per the community-verified refresh pattern. A missing or
+   * fenced bootstrap throws so the adapter falls back to the rendered page.
+   */
+  private async fetchVintedApi(url: string): Promise<VintedApiFetchResult> {
+    const validation = validateSearchUrl(url, 'Vinted');
+    if (!validation.valid) throw new Error(validation.reason);
+    let response = await this.fetchVintedWithCookies(validation.url);
+    if (response.status === 401) {
+      this.vintedCookieJar = null;
+      response = await this.fetchVintedWithCookies(validation.url);
+    }
+    let json: unknown = null;
+    try { json = await response.json(); } catch { /* non-JSON bodies (challenge pages) surface through the status */ }
+    return { status: response.status, json };
+  }
+
+  private async fetchVintedWithCookies(url: string) {
+    const cookie = await this.ensureVintedCookies();
+    return fetch(url, {
+      redirect: 'manual',
+      headers: { 'user-agent': MARKETPLACE_API_USER_AGENT, accept: 'application/json', ...(cookie ? { cookie } : {}) },
+      signal: AbortSignal.timeout(12_000),
+    });
+  }
+
+  private async ensureVintedCookies(): Promise<string> {
+    if (this.vintedCookieJar) return this.vintedCookieJar.header;
+    if (!this.vintedCookieBootstrap) {
+      this.vintedCookieBootstrap = this.bootstrapVintedCookies().finally(() => { this.vintedCookieBootstrap = null; });
+    }
+    return this.vintedCookieBootstrap;
+  }
+
+  private async bootstrapVintedCookies(): Promise<string> {
+    const validation = validateSearchUrl('https://www.vinted.pl/', 'Vinted');
+    if (!validation.valid) throw new Error(validation.reason);
+    const headers = { 'user-agent': MARKETPLACE_API_USER_AGENT, accept: 'text/html,application/xhtml+xml', 'accept-language': 'pl-PL,pl;q=0.9' };
+    const jar = new Map<string, string>();
+    let url = validation.url;
+    let response = await fetch(url, { redirect: 'manual', headers, signal: AbortSignal.timeout(12_000) });
+    for (let hop = 0; hop < 3; hop += 1) {
+      for (const cookie of response.headers.getSetCookie()) {
+        const pair = cookie.split(';')[0];
+        const separator = pair.indexOf('=');
+        if (separator > 0) jar.set(pair.slice(0, separator).trim(), pair.slice(separator + 1).trim());
+      }
+      if (response.status < 300 || response.status >= 400) break;
+      const location = response.headers.get('location');
+      if (!location) throw new Error(`Unexpected redirect (${response.status})`);
+      const redirected = new URL(location, url).toString();
+      const redirectValidation = validateSearchUrl(redirected, 'Vinted');
+      if (!redirectValidation.valid) throw new Error('Marketplace redirected off the approved domain');
+      url = redirectValidation.url;
+      response = await fetch(url, { redirect: 'manual', headers, signal: AbortSignal.timeout(12_000) });
+    }
+    if (!jar.has('access_token_web')) {
+      throw new Error(`Vinted did not issue an anonymous access token (HTTP ${response.status})`);
+    }
+    this.vintedCookieJar = { header: [...jar].map(([name, value]) => `${name}=${value}`).join('; ') };
+    return this.vintedCookieJar.header;
+  }
+
+  /**
+   * Public Vinted item/catalog pages over plain HTTP with the status
+   * preserved: 404s must reach the availability classifier as terminal while
+   * 403/429 fall back to the Chromium render. The item JSON routes stay
+   * untouched — they are closed to anonymous clients.
+   */
+  private async fetchVintedItemPage(url: string): Promise<VintedPageFetchResult> {
+    const validation = validateSearchUrl(url, 'Vinted');
+    if (!validation.valid) throw new Error(validation.reason);
+    const headers = { 'user-agent': MARKETPLACE_API_USER_AGENT, accept: 'text/html,application/xhtml+xml', 'accept-language': 'pl-PL,pl;q=0.9' };
+    let finalUrl = validation.url;
+    let response = await fetch(finalUrl, { redirect: 'manual', headers, signal: AbortSignal.timeout(12_000) });
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      if (!location) throw new Error(`Unexpected redirect (${response.status})`);
+      const redirected = new URL(location, finalUrl).toString();
+      const redirectValidation = validateSearchUrl(redirected, 'Vinted');
+      if (!redirectValidation.valid) throw new Error('Marketplace redirected off the approved domain');
+      finalUrl = redirectValidation.url;
+      response = await fetch(finalUrl, { redirect: 'manual', headers, signal: AbortSignal.timeout(12_000) });
+    }
+    if (response.status === 403 || response.status === 429) {
+      return { status: 200, body: await this.renderPublicPage(finalUrl, 'Vinted') };
+    }
+    return { status: response.status, body: response.ok ? await response.text() : '' };
+  }
+
+  /** Anonymous Lokalnie JSON surface (batch condition enrichment); no cookies, no CSRF. */
+  private async fetchAllegroLokalnieApi(url: string, body: string | null): Promise<AllegroApiFetchResult> {
+    const validation = validateSearchUrl(url, 'Allegro Lokalnie');
+    if (!validation.valid) throw new Error(validation.reason);
+    const headers: Record<string, string> = { 'user-agent': MARKETPLACE_API_USER_AGENT, accept: 'application/json' };
+    if (body) headers['content-type'] = 'application/json';
+    const response = await fetch(validation.url, { method: body ? 'POST' : 'GET', redirect: 'manual', headers, body: body ?? undefined, signal: AbortSignal.timeout(12_000) });
     let json: unknown = null;
     try { json = await response.json(); } catch { /* non-JSON bodies (e.g. challenge pages) surface through the status */ }
     return { status: response.status, json };

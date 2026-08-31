@@ -303,6 +303,25 @@ export function parseAllegroCards(html: string) {
   return listings;
 }
 
+/** Offer slugs are the last path segment of Lokalnie's canonical `/oferta/` URLs. */
+function allegroSlugFromUrl(url: string) {
+  try {
+    const pathname = new URL(url).pathname;
+    return pathname.startsWith('/oferta/') ? pathname.split('/').filter(Boolean).at(-1) ?? null : null;
+  } catch { return null; }
+}
+
+const ALLEGRO_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Map schema.org itemCondition markers onto the Polish labels Scout stores. */
+function structuredConditionLabel(value: unknown) {
+  if (typeof value !== 'string') return undefined;
+  if (/NewCondition/i.test(value)) return 'Nowe';
+  if (/UsedCondition/i.test(value)) return 'Używane';
+  if (/DamagedCondition/i.test(value)) return 'Uszkodzone';
+  return value;
+}
+
 /** Parse Vinted's server-rendered public product overlays and accessible labels. */
 export function parseVintedCards(html: string) {
   const anchors = [...html.matchAll(/<a[^>]*data-testid=["']product-item-id-(\d+)--overlay-link["'][^>]*>/gi)];
@@ -466,14 +485,42 @@ export function parseStructuredListings(html: string, marketplace: Marketplace) 
         if (!url || !title || price === undefined || !listingId) continue;
         try {
           const description = [item.description, offer?.description].filter((value): value is string => typeof value === 'string').join(' ');
-          listings.push(normalizeListing({ marketplace, listingId: String(listingId), title: String(title), price, url: String(url), imageUrl: structuredImage(item.image), condition: typeof offer?.itemCondition === 'string' ? offer.itemCondition : undefined, location: typeof item.address?.addressLocality === 'string' ? item.address.addressLocality : undefined, priceNegotiable: parsePriceNegotiability(description) }));
+          const condition = structuredConditionLabel(offer?.itemCondition) ?? structuredConditionLabel(item.itemCondition);
+          listings.push(normalizeListing({ marketplace, listingId: String(listingId), title: String(title), price, url: String(url), imageUrl: structuredImage(item.image), condition, location: typeof item.address?.addressLocality === 'string' ? item.address.addressLocality : undefined, priceNegotiable: parsePriceNegotiability(description) }));
         } catch { /* invalid/off-domain structured data is ignored */ }
       }
     } catch { /* malformed JSON-LD is common in blocked pages */ }
   }
   const unique = new Map<string, NormalizedListing>();
   const cardListings = marketplace === 'OLX' ? parseOlxCards(html) : marketplace === 'Allegro Lokalnie' ? parseAllegroCards(html) : parseVintedCards(html);
-  for (const listing of cardListings) listings.push(listing);
+  if (marketplace === 'Allegro Lokalnie') {
+    // The Lokalnie SSR search page embeds a schema.org ItemList (the stable
+    // surface) keyed by offer slug, while cards remain the source for the
+    // offer uuid plus the shipping/negotiability/location fields JSON-LD
+    // omits. Merge per slug so one offer never appears twice under different
+    // ids.
+    const structuredBySlug = new Map<string, NormalizedListing>();
+    for (const listing of listings) {
+      const slug = allegroSlugFromUrl(listing.url);
+      if (slug && !structuredBySlug.has(slug)) structuredBySlug.set(slug, listing);
+    }
+    for (const card of cardListings) {
+      const slug = allegroSlugFromUrl(card.url);
+      const structured = slug ? structuredBySlug.get(slug) : undefined;
+      if (!structured) {
+        listings.push(card);
+        continue;
+      }
+      if (ALLEGRO_UUID_PATTERN.test(card.listingId)) structured.listingId = card.listingId;
+      structured.shippingAvailable = structured.shippingAvailable ?? card.shippingAvailable;
+      structured.priceNegotiable = structured.priceNegotiable ?? card.priceNegotiable;
+      structured.location = structured.location ?? card.location;
+      structured.condition = structured.condition ?? card.condition;
+      structured.imageUrl = structured.imageUrl ?? card.imageUrl;
+    }
+  } else {
+    for (const listing of cardListings) listings.push(listing);
+  }
   for (const listing of listings) {
     const key = dedupeKey(listing);
     const previous = unique.get(key);
@@ -502,17 +549,24 @@ export interface ConnectorAdapter {
 }
 
 /**
+ * Observes which transport path a connector actually takes (JSON API, SSR page,
+ * Chromium-backed fallback) so scans can log the route each watch runs on.
+ */
+export type ConnectorPathReporter = (path: string) => void;
+
+/**
  * The first release keeps the browser connector behind a small adapter boundary.
  * Deployments can provide a Chromium-backed fetcher without changing normalization,
  * scoring, storage, or notification code.
  */
-export function createPublicAdapter(marketplace: Marketplace, fetcher: (url: string) => Promise<string>): ConnectorAdapter {
+export function createPublicAdapter(marketplace: Marketplace, fetcher: (url: string) => Promise<string>, onPath?: ConnectorPathReporter): ConnectorAdapter {
   return {
     marketplace,
     async fetchPublicSearch(url) {
       const validation = validateSearchUrl(url, marketplace);
       if (!validation.valid) throw new Error(validation.reason);
       const html = await fetcher(validation.url);
+      onPath?.('public-page');
       return parseSearchPage(html, marketplace);
     },
     async fetchDetail(url) {
@@ -520,6 +574,7 @@ export function createPublicAdapter(marketplace: Marketplace, fetcher: (url: str
       if (!validation.valid) return { availability: availabilityUnknown(validation.reason) };
       try {
         const html = await fetcher(validation.url);
+        onPath?.('public-detail-page');
         const listings = parseStructuredListings(html, marketplace);
         const availability = parseListingAvailability(html, marketplace);
         return { availability, listing: listings[0] };
@@ -684,7 +739,7 @@ function olxListingIdFromUrl(url: string) {
  * numeric shape degrade to `unknown` rather than risking a false 404 terminal
  * classification.
  */
-export function createOlxJsonAdapter(marketplace: Marketplace, fetcher: (url: string) => Promise<OlxApiFetchResult>): ConnectorAdapter {
+export function createOlxJsonAdapter(marketplace: Marketplace, fetcher: (url: string) => Promise<OlxApiFetchResult>, onPath?: ConnectorPathReporter): ConnectorAdapter {
   return {
     marketplace,
     async fetchPublicSearch(url) {
@@ -694,6 +749,7 @@ export function createOlxJsonAdapter(marketplace: Marketplace, fetcher: (url: st
       if (!validation.valid) throw new Error(validation.reason);
       const { status, json } = await fetcher(validation.url);
       if (status < 200 || status >= 300) throw new Error(`OLX offers API returned HTTP ${status}`);
+      onPath?.('olx-offers-api');
       return parseOlxOffersApi(json);
     },
     async fetchDetail(url, context) {
@@ -709,6 +765,7 @@ export function createOlxJsonAdapter(marketplace: Marketplace, fetcher: (url: st
         const message = error instanceof Error ? error.message : 'OLX detail verification failed';
         return { availability: availabilityUnknown(message) };
       }
+      onPath?.('olx-offer-detail-api');
       const availability = parseOlxListingAvailabilityApi(response.json, response.status);
       let listing: NormalizedListing | undefined;
       if (availability.status === 'live' && isRecord(response.json) && isRecord(response.json.data)) {
@@ -718,6 +775,319 @@ export function createOlxJsonAdapter(marketplace: Marketplace, fetcher: (url: st
     },
     async verifyAvailability(url, context) {
       return (await this.fetchDetail(url, context)).availability;
+    },
+  };
+}
+
+/**
+ * Allegro Lokalnie connector.
+ *
+ * Search and liveness stay on plain-HTTP SSR pages: the anonymous JSON surface
+ * has no phrase-search endpoint, and `GET /api/offers/{uuid}` is a summary
+ * cache that never signals removal (offers archived years ago still return
+ * 200). The anonymous JSON is used where it is strictly better —
+ * `POST /api/additionaldata/offers` batch-enriches search cards with the
+ * condition enum the card markup omits. Risks and edge cases:
+ * - The batch caps at 60 offer ids per request (the site's own batch size);
+ *   invalid ids are silently dropped, the response order is arbitrary, and
+ *   items are keyed by slug (`item_id`), not uuid, so correlation runs through
+ *   each listing's offer URL.
+ * - Enrichment is opportunistic: any API failure keeps the un-enriched search
+ *   results instead of failing the scan.
+ * - The JSON surface currently bypasses the bot fence that challenges the HTML
+ *   pages; treat it as fragile and do not hammer it.
+ */
+export interface AllegroApiFetchResult {
+  status: number;
+  json: unknown;
+}
+
+const ALLEGRO_ADDITIONAL_DATA_URL = 'https://allegrolokalnie.pl/api/additionaldata/offers';
+/** The site itself batches 60 offer ids per additional-data request. */
+const ALLEGRO_ADDITIONAL_DATA_BATCH = 60;
+
+const ALLEGRO_CONDITION_LABELS: Record<string, string> = {
+  brand_new: 'Nowe',
+  very_good: 'Bardzo dobry',
+  visibly_used: 'Używane',
+};
+
+/** Parse the anonymous additional-data batch; items correlate by slug, never by uuid. */
+export function parseAllegroBatchEnrichmentApi(json: unknown): Map<string, string> {
+  const bySlug = new Map<string, string>();
+  if (!Array.isArray(json)) return bySlug;
+  for (const entry of json) {
+    if (!isRecord(entry)) continue;
+    const slug = typeof entry.item_id === 'string' ? entry.item_id : undefined;
+    const variant = typeof entry.item_variant === 'string' ? entry.item_variant.trim().toLowerCase() : undefined;
+    const label = variant ? ALLEGRO_CONDITION_LABELS[variant] : undefined;
+    if (slug && label) bySlug.set(slug, label);
+  }
+  return bySlug;
+}
+
+/**
+ * Best-effort condition enrichment: cards omit the condition, so offer uuids
+ * (from `data-card-analytics-click`) are batch-posted and matched back through
+ * each listing's offer-URL slug. JSON-LD-only listings without a card twin
+ * carry no uuid and stay un-enriched. Never fails the search; the return value
+ * reports what happened for path logging.
+ */
+async function enrichAllegroSearchConditions(
+  listings: MarketplaceSearchResult,
+  apiFetcher: (url: string, body: string | null) => Promise<AllegroApiFetchResult>,
+): Promise<'enriched' | 'skipped' | 'failed'> {
+  try {
+    const uuidBySlug = new Map<string, string>();
+    for (const listing of listings) {
+      if (listing.condition) continue;
+      const slug = allegroSlugFromUrl(listing.url);
+      if (!slug || uuidBySlug.has(slug)) continue;
+      if (ALLEGRO_UUID_PATTERN.test(listing.listingId)) uuidBySlug.set(slug, listing.listingId);
+    }
+    if (!uuidBySlug.size) return 'skipped';
+    const offerIds = [...new Set(uuidBySlug.values())].slice(0, ALLEGRO_ADDITIONAL_DATA_BATCH);
+    const { status, json } = await apiFetcher(ALLEGRO_ADDITIONAL_DATA_URL, JSON.stringify({ offer_ids: offerIds }));
+    if (status < 200 || status >= 300) return 'failed';
+    const conditionsBySlug = parseAllegroBatchEnrichmentApi(json);
+    if (!conditionsBySlug.size) return 'failed';
+    for (const listing of listings) {
+      if (listing.condition) continue;
+      const slug = allegroSlugFromUrl(listing.url);
+      const label = slug ? conditionsBySlug.get(slug) : undefined;
+      if (label) listing.condition = label;
+    }
+    return 'enriched';
+  } catch { /* enrichment is opportunistic; keep the raw search results */ return 'failed'; }
+}
+
+export function createAllegroLokalnieAdapter(
+  marketplace: Marketplace,
+  pageFetcher: (url: string) => Promise<string>,
+  apiFetcher: (url: string, body: string | null) => Promise<AllegroApiFetchResult>,
+  onPath?: ConnectorPathReporter,
+): ConnectorAdapter {
+  const base = createPublicAdapter(marketplace, pageFetcher, onPath);
+  return {
+    marketplace,
+    async fetchPublicSearch(url) {
+      const validation = validateSearchUrl(url, marketplace);
+      if (!validation.valid) throw new Error(validation.reason);
+      const html = await pageFetcher(validation.url);
+      const result = parseSearchPage(html, marketplace);
+      onPath?.('allegro-ssr-page');
+      if (await enrichAllegroSearchConditions(result, apiFetcher) === 'enriched') onPath?.('allegro-condition-batch');
+      return result;
+    },
+    async fetchDetail(url, context) {
+      return base.fetchDetail(url, context);
+    },
+    async verifyAvailability(url, context) {
+      return base.verifyAvailability(url, context);
+    },
+  };
+}
+
+/**
+ * Vinted JSON catalog connector.
+ *
+ * Anonymous JSON search works after a one-request cookie bootstrap
+ * (`GET https://www.vinted.pl/` → `access_token_web`), which the injected api
+ * fetcher owns: it must re-bootstrap and retry once on 401. The item JSON
+ * routes are closed to anonymous clients, so detail and availability run on
+ * the public item page over plain HTTP. Risks and edge cases:
+ * - The API is per-ccTLD: bootstrap and calls must target `www.vinted.pl`.
+ * - `sort=` is silently ignored; only `order=newest_first` is honored.
+ * - Search items carry no `priceNegotiable`, `location`, `shippingAvailable`,
+ *   or `created_at_ts`; prices arrive as buyer-view amounts in the domain
+ *   currency.
+ * - Datacenter IPs can be Cloudflare-fenced on the first bootstrap. JSON
+ *   failures fall back to the public-page adapter whose fetcher owns the
+ *   Chromium render path; bot fences are never bypassed.
+ */
+export interface VintedApiFetchResult {
+  status: number;
+  json: unknown;
+}
+
+export interface VintedPageFetchResult {
+  status: number;
+  body: string;
+}
+
+const VINTED_CATALOG_API_URL = 'https://www.vinted.pl/api/v2/catalog/items';
+/** The verified anonymous page size; larger values are undocumented. */
+const VINTED_API_PAGE_LIMIT = 20;
+
+/** Map Scout's cross-marketplace filters onto the verified Vinted catalog API params. */
+export function buildVintedSearchApiUrl(query: string, filters: MarketplaceSearchFilters = {}) {
+  const url = new URL(VINTED_CATALOG_API_URL);
+  const trimmed = query.trim();
+  if (trimmed) url.searchParams.set('search_text', trimmed);
+  setPriceParams(url, filters, 'price_from', 'price_to');
+  for (const statusId of vintedConditionIds(filters.condition)) url.searchParams.append('status_ids[]', statusId);
+  // `sort=` is silently ignored by the API; `order=` is the real parameter.
+  if (filters.sort === 'newest') url.searchParams.set('order', 'newest_first');
+  setMarketplacePage(url, filters.page);
+  url.searchParams.set('per_page', String(VINTED_API_PAGE_LIMIT));
+  return url.toString();
+}
+
+/** Translate a Vinted HTML catalog URL (e.g. a pasted exact URL) into a catalog API URL. */
+function vintedSearchApiUrlFromCatalogUrl(url: string) {
+  let parsed: URL;
+  try { parsed = new URL(url); } catch { return null; }
+  if (!isApprovedMarketplaceHost('Vinted', parsed.hostname)) return null;
+  const pathname = parsed.pathname.replace(/\/+$/, '');
+  if (pathname === '/api/v2/catalog/items') return parsed.toString();
+  if (!pathname.startsWith('/catalog')) return null;
+  const api = new URL(VINTED_CATALOG_API_URL);
+  const searchText = parsed.searchParams.get('search_text');
+  if (searchText?.trim()) api.searchParams.set('search_text', searchText.trim());
+  const from = parsed.searchParams.get('price_from');
+  const to = parsed.searchParams.get('price_to');
+  if (from) api.searchParams.set('price_from', from);
+  if (to) api.searchParams.set('price_to', to);
+  for (const statusId of [...parsed.searchParams.getAll('status_ids[]'), ...parsed.searchParams.getAll('status_id')]) {
+    if (statusId) api.searchParams.append('status_ids[]', statusId);
+  }
+  if (parsed.searchParams.get('order') === 'newest_first') api.searchParams.set('order', 'newest_first');
+  const page = Number(parsed.searchParams.get('page'));
+  if (Number.isInteger(page) && page > 1 && page <= 10) api.searchParams.set('page', String(page));
+  api.searchParams.set('per_page', String(VINTED_API_PAGE_LIMIT));
+  return api.toString();
+}
+
+function parseVintedCatalogItem(item: unknown): NormalizedListing | null {
+  if (!isRecord(item)) return null;
+  const listingId = item.id === undefined || item.id === null ? '' : String(item.id).trim();
+  const title = typeof item.title === 'string' ? item.title : undefined;
+  const priceRecord = isRecord(item.price) ? item.price : undefined;
+  const currency = typeof priceRecord?.currency_code === 'string' ? priceRecord.currency_code.trim().toUpperCase() : '';
+  // `NormalizedListing` is PLN-only; rows shown in another catalog currency are skipped.
+  if (currency && currency !== 'PLN') return null;
+  const price = parsePolishPrice(priceRecord?.amount);
+  const path = typeof item.path === 'string' && item.path ? item.path : undefined;
+  const url = typeof item.url === 'string' && item.url ? item.url : path ? new URL(path, 'https://www.vinted.pl').toString() : undefined;
+  if (!listingId || !title || price === null || !url) return null;
+  const photo = isRecord(item.photo) ? item.photo : undefined;
+  const imageUrl = typeof photo?.url === 'string' ? photo.url : undefined;
+  const condition = typeof item.status === 'string' && item.status.trim() ? item.status.trim() : undefined;
+  return normalizeListing({ marketplace: 'Vinted', listingId, title, price, url, imageUrl, condition, shippingAvailable: null, priceNegotiable: null });
+}
+
+/**
+ * Parse a Vinted catalog API search response. The `items` array must be
+ * present: error payloads without it fail closed instead of masquerading as
+ * empty pages.
+ */
+export function parseVintedCatalogApi(json: unknown): MarketplaceSearchResult {
+  const payload = isRecord(json) ? json : undefined;
+  const items = payload && Array.isArray(payload.items) ? payload.items : undefined;
+  if (!items) throw new Error('Vinted catalog API response did not contain an items array');
+  const listings: NormalizedListing[] = [];
+  for (const item of items) {
+    try {
+      const listing = parseVintedCatalogItem(item);
+      if (listing) listings.push(listing);
+    } catch { /* malformed or off-domain items are ignored, matching the HTML parser */ }
+  }
+  const pagination = payload && isRecord(payload.pagination) ? payload.pagination : undefined;
+  const totalEntries = pagination && Number.isFinite(Number(pagination.total_entries)) ? Number(pagination.total_entries) : null;
+  const empty = items.length === 0 || totalEntries === 0;
+  return withSearchStatus(listings, empty ? 'empty' : 'results', empty);
+}
+
+function vintedStructuredAvailability(html: string): ListingAvailability | null {
+  const scripts = html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
+  for (const match of scripts) {
+    try {
+      for (const item of flattenStructured(JSON.parse(match[1].trim()))) {
+        const offers = Array.isArray(item.offers) ? item.offers[0] : item.offers;
+        const availability = offers && typeof offers.availability === 'string' ? offers.availability : undefined;
+        if (!availability) continue;
+        if (/InStock/i.test(availability)) return { status: 'live' };
+        if (/SoldOut/i.test(availability)) return { status: 'terminal', reason: 'The marketplace explicitly marks the listing as sold out' };
+      }
+    } catch { /* malformed JSON-LD is common on partially rendered pages */ }
+  }
+  return null;
+}
+
+/**
+ * Classify a Vinted public item page. The JSON item routes are closed to
+ * anonymous clients, so availability comes from the HTTP status plus the
+ * page's schema.org `Product` LD-JSON (`availability: InStock`); a "sold"
+ * state is only trusted when the marketplace states it structurally.
+ */
+export function parseVintedItemPageAvailability(html: string, httpStatus?: number): ListingAvailability {
+  if (httpStatus === 404 || httpStatus === 410) return { status: 'terminal', reason: `Marketplace returned HTTP ${httpStatus}` };
+  if (httpStatus !== undefined && (httpStatus === 401 || httpStatus === 403 || httpStatus === 408 || httpStatus === 429 || httpStatus >= 500)) {
+    return availabilityUnknown(`Marketplace returned HTTP ${httpStatus}`);
+  }
+  if (!html || html.length < 80) return availabilityUnknown('Item page returned no usable markup');
+  if (isBlockedMarkup(html)) return availabilityUnknown('Marketplace returned a block or challenge page');
+  const structured = vintedStructuredAvailability(html);
+  if (structured) return structured;
+  return parseListingAvailability(html, 'Vinted');
+}
+
+export function createVintedJsonAdapter(
+  marketplace: Marketplace,
+  apiFetcher: (url: string) => Promise<VintedApiFetchResult>,
+  pageFetcher: (url: string) => Promise<VintedPageFetchResult>,
+  fallback?: ConnectorAdapter,
+  onPath?: ConnectorPathReporter,
+): ConnectorAdapter {
+  return {
+    marketplace,
+    async fetchPublicSearch(url) {
+      const validation = validateSearchUrl(url, marketplace);
+      if (!validation.valid) throw new Error(validation.reason);
+      const apiUrl = vintedSearchApiUrlFromCatalogUrl(validation.url);
+      if (apiUrl) {
+        const apiValidation = validateSearchUrl(apiUrl, marketplace);
+        if (apiValidation.valid) {
+          try {
+            const { status, json } = await apiFetcher(apiValidation.url);
+            if (status < 200 || status >= 300) throw new Error(`Vinted catalog API returned HTTP ${status}`);
+            onPath?.('vinted-catalog-api');
+            return parseVintedCatalogApi(json);
+          } catch (error) {
+            // JSON failures (expired bootstrap, Cloudflare fence, schema
+            // drift) fail closed to the public-page adapter, whose fetcher
+            // owns the Chromium render fallback.
+            if (!fallback) throw error;
+            onPath?.('vinted-catalog-api-fallback');
+            return fallback.fetchPublicSearch(url);
+          }
+        }
+      }
+      const page = await pageFetcher(validation.url);
+      onPath?.('vinted-catalog-page');
+      return parseSearchPage(page.body, marketplace);
+    },
+    async fetchDetail(url) {
+      const validation = validateSearchUrl(url, marketplace);
+      if (!validation.valid) return { availability: availabilityUnknown(validation.reason) };
+      let page: VintedPageFetchResult;
+      try {
+        page = await pageFetcher(validation.url);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Vinted detail verification failed';
+        if (/\b(?:404|410)\b/.test(message)) return { availability: { status: 'terminal', reason: message.slice(0, 240) } };
+        return { availability: availabilityUnknown(message) };
+      }
+      onPath?.('vinted-item-page');
+      const availability = parseVintedItemPageAvailability(page.body, page.status);
+      let listing: NormalizedListing | undefined;
+      if (availability.status === 'live') {
+        try { listing = parseStructuredListings(page.body, marketplace)[0]; } catch { listing = undefined; }
+      }
+      return { availability, listing };
+    },
+    async verifyAvailability(url) {
+      return (await this.fetchDetail(url)).availability;
     },
   };
 }

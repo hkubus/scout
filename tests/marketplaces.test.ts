@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createOlxJsonAdapter, dedupeKey, normalizeListing, parseAllegroCards, parseListingAvailability, parseListingDescription, parseOlxListingAvailabilityApi, parseOlxOffersApi, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, validateSearchUrl } from '../server/marketplaces';
+import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, buildVintedSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createVintedJsonAdapter, dedupeKey, normalizeListing, parseAllegroBatchEnrichmentApi, parseAllegroCards, parseListingAvailability, parseListingDescription, parseOlxListingAvailabilityApi, parseOlxOffersApi, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, parseVintedCatalogApi, parseVintedItemPageAvailability, validateSearchUrl, type ConnectorAdapter } from '../server/marketplaces';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { median, pruneBefore, scoreDeal } from '../server/scoring';
@@ -183,13 +183,15 @@ test('classifies OLX API availability from HTTP status and payload shape', () =>
 test('runs OLX searches and detail checks through the offers API adapter', async () => {
   const fixture = JSON.parse(readFileSync(resolve(import.meta.dirname, 'fixtures-olx-api.json'), 'utf8'));
   const requests: string[] = [];
+  const paths: string[] = [];
   const adapter = createOlxJsonAdapter('OLX', async (url) => {
     requests.push(url);
     if (url.endsWith('/api/v1/offers/1092728340/')) return { status: 200, json: { data: fixture.search.data[0] } };
     if (url.endsWith('/api/v1/offers/99999999999/')) return { status: 404, json: fixture.notFound };
     return { status: 200, json: fixture.search };
-  });
+  }, (path) => paths.push(path));
   const search = await adapter.fetchPublicSearch('https://www.olx.pl/oferty/q-iphone/?search[filter_float_price:from]=500&search[order]=created_at:desc&page=2');
+  assert.deepEqual(paths, ['olx-offers-api']);
   const requested = new URL(requests[0]);
   assert.equal(requested.pathname, '/api/v1/offers/');
   assert.equal(requested.searchParams.get('query'), 'iphone');
@@ -208,6 +210,7 @@ test('runs OLX searches and detail checks through the offers API adapter', async
 
   const removed = await adapter.fetchDetail('https://www.olx.pl/d/oferta/gone-ID99999999999.html', { listingId: '99999999999' });
   assert.deepEqual(removed.availability, { status: 'terminal', reason: 'Ad not found.' });
+  assert.deepEqual(paths, ['olx-offers-api', 'olx-offer-detail-api', 'olx-offer-detail-api']);
 
   const nonNumeric = await adapter.fetchDetail('https://www.olx.pl/d/oferta/token-only-ID1bVYyE.html');
   assert.equal(nonNumeric.availability.status, 'unknown');
@@ -222,6 +225,213 @@ test('rejects OLX exact URLs that cannot be translated to the offers API', async
   const adapter = createOlxJsonAdapter('OLX', async () => ({ status: 200, json: fixture.search }));
   await assert.rejects(() => adapter.fetchPublicSearch('https://www.olx.pl/elektronika/'), /offers API/);
   await assert.rejects(() => adapter.fetchPublicSearch('https://allegrolokalnie.pl/oferty/q-iphone/'), /approved|offers API|domain/i);
+});
+
+test('builds Vinted catalog API URLs from Scout query filters', () => {
+  const url = new URL(buildVintedSearchApiUrl('lego technic', { minPrice: 20, maxPrice: 150, condition: 'New', sort: 'newest', page: 3 }));
+  assert.equal(url.origin + url.pathname, 'https://www.vinted.pl/api/v2/catalog/items');
+  assert.equal(url.searchParams.get('search_text'), 'lego technic');
+  assert.equal(url.searchParams.get('price_from'), '20');
+  assert.equal(url.searchParams.get('price_to'), '150');
+  assert.deepEqual(url.searchParams.getAll('status_ids[]'), ['6', '1']);
+  assert.equal(url.searchParams.get('order'), 'newest_first');
+  assert.equal(url.searchParams.get('page'), '3');
+  assert.equal(url.searchParams.get('per_page'), '20');
+  const unfiltered = new URL(buildVintedSearchApiUrl('lego'));
+  assert.equal(unfiltered.searchParams.has('order'), false);
+  assert.equal(unfiltered.searchParams.has('page'), false);
+  assert.equal(unfiltered.searchParams.get('per_page'), '20');
+});
+
+test('maps Vinted catalog API payloads onto normalized listings', () => {
+  const fixture = JSON.parse(readFileSync(resolve(import.meta.dirname, 'fixtures-vinted-api.json'), 'utf8'));
+  const listings = parseVintedCatalogApi(fixture.search);
+  assert.equal(listings.pageStatus, 'results');
+  assert.equal(listings.empty, false);
+  assert.equal(listings.length, 1);
+  const [listing] = listings;
+  assert.equal(listing.marketplace, 'Vinted');
+  assert.equal(listing.listingId, '40203315928');
+  assert.equal(listing.title, 'Lego Technic Porsche 911 RSR');
+  assert.equal(listing.price, 149);
+  assert.equal(listing.currency, 'PLN');
+  assert.equal(listing.condition, 'Bardzo dobry');
+  assert.equal(listing.priceNegotiable, null);
+  assert.equal(listing.shippingAvailable, null);
+  assert.equal(listing.url, 'https://www.vinted.pl/items/40203315928-lego-technic-porsche-911-rsr');
+  assert.equal(listing.imageUrl, 'https://images1.vinted.net/t/03_0266a_9f08b2cb1_800x800.jpeg?s=s1');
+  assert.ok(listing.observedAt);
+  const empty = parseVintedCatalogApi(fixture.empty);
+  assert.equal(empty.pageStatus, 'empty');
+  assert.equal(empty.empty, true);
+  assert.equal(empty.length, 0);
+  assert.throws(() => parseVintedCatalogApi({ code: 100, message: 'invalid_authentication_token' }), /items array/);
+});
+
+test('translates Vinted catalog pages to the API and falls back to public pages', async () => {
+  const fixture = JSON.parse(readFileSync(resolve(import.meta.dirname, 'fixtures-vinted-api.json'), 'utf8'));
+  const requested: string[] = [];
+  const paths: string[] = [];
+  let apiFailures = 0;
+  let fallbackSearches = 0;
+  const fallback: ConnectorAdapter = {
+    marketplace: 'Vinted',
+    fetchPublicSearch: async () => {
+      fallbackSearches += 1;
+      return parseSearchPage('<html><body><div data-testid="no-results">Brak wyników</div></body></html>', 'Vinted');
+    },
+    fetchDetail: async () => ({ availability: { status: 'unknown', reason: 'unused' } }),
+    verifyAvailability: async () => ({ status: 'unknown', reason: 'unused' }),
+  };
+  const adapter = createVintedJsonAdapter(
+    'Vinted',
+    async (url) => {
+      requested.push(url);
+      if (apiFailures++ === 0) throw new Error('Vinted did not issue an anonymous access token (HTTP 403)');
+      const searchText = new URL(url).searchParams.get('search_text');
+      return { status: 200, json: searchText === 'zzzzqkzzzx' ? fixture.empty : fixture.search };
+    },
+    async () => ({ status: 200, body: '' }),
+    fallback,
+    (path) => paths.push(path),
+  );
+  const catalogUrl = buildMarketplaceSearchUrl('Vinted', 'lego', { minPrice: 20, maxPrice: 150, condition: 'New', sort: 'newest', page: 2 });
+
+  const fenced = await adapter.fetchPublicSearch(catalogUrl);
+  assert.equal(fallbackSearches, 1);
+  assert.equal(fenced.empty, true);
+  assert.deepEqual(paths, ['vinted-catalog-api-fallback']);
+
+  const search = await adapter.fetchPublicSearch(catalogUrl);
+  assert.equal(fallbackSearches, 1);
+  assert.equal(search.length, 1);
+  assert.equal(requested.length, 2);
+  assert.deepEqual(paths, ['vinted-catalog-api-fallback', 'vinted-catalog-api']);
+  const api = new URL(requested[1]);
+  assert.equal(api.origin + api.pathname, 'https://www.vinted.pl/api/v2/catalog/items');
+  assert.equal(api.searchParams.get('search_text'), 'lego');
+  assert.equal(api.searchParams.get('price_from'), '20');
+  assert.equal(api.searchParams.get('price_to'), '150');
+  assert.deepEqual(api.searchParams.getAll('status_ids[]'), ['6', '1']);
+  assert.equal(api.searchParams.get('order'), 'newest_first');
+  assert.equal(api.searchParams.get('page'), '2');
+  assert.equal(api.searchParams.get('per_page'), '20');
+
+  const empty = await adapter.fetchPublicSearch(buildMarketplaceSearchUrl('Vinted', 'zzzzqkzzzx', {}));
+  assert.equal(empty.empty, true);
+  assert.equal(fallbackSearches, 1);
+  await assert.rejects(() => adapter.fetchPublicSearch('https://vinted.pl.evil.example/catalog?search_text=lego'), /approved/i);
+});
+
+test('classifies Vinted item pages as live, terminal, or unknown without JSON routes', async () => {
+  const itemHtml = `<html><head><script type="application/ld+json">${JSON.stringify({
+    '@type': 'Product', name: 'Lego Technic Porsche', image: ['https://images1.vinted.net/t/item.jpeg'],
+    brand: { name: 'LEGO' }, offers: { price: 149, priceCurrency: 'PLN', availability: 'InStock', itemCondition: 'UsedCondition', url: 'https://www.vinted.pl/items/40203315928-lego-technic-porsche' },
+  })}</script></head><body></body></html>`;
+  const soldHtml = itemHtml.replace('InStock', 'SoldOut');
+  const pages: Record<string, { status: number; body: string }> = {
+    'https://www.vinted.pl/items/40203315928': { status: 200, body: itemHtml },
+    'https://www.vinted.pl/items/40203315929': { status: 200, body: soldHtml },
+    'https://www.vinted.pl/items/40203315930': { status: 404, body: '' },
+    'https://www.vinted.pl/items/40203315931': { status: 403, body: '' },
+    'https://www.vinted.pl/items/40203315932': { status: 200, body: '<html><head><title>Just a moment...</title></head><body>cf-chl-platform challenge</body></html>' },
+  };
+  const paths: string[] = [];
+  const adapter = createVintedJsonAdapter(
+    'Vinted',
+    async () => { throw new Error('item JSON routes are closed'); },
+    async (url) => {
+      const page = pages[url];
+      if (!page) throw new Error(`Unexpected page request: ${url}`);
+      return page;
+    },
+    undefined,
+    (path) => paths.push(path),
+  );
+
+  const live = await adapter.fetchDetail('https://www.vinted.pl/items/40203315928');
+  assert.deepEqual(live.availability, { status: 'live' });
+  assert.equal(live.listing?.price, 149);
+  assert.equal(live.listing?.condition, 'Używane');
+  assert.equal(live.listing?.listingId, '40203315928-lego-technic-porsche');
+  assert.deepEqual(paths, ['vinted-item-page']);
+
+  const sold = await adapter.fetchDetail('https://www.vinted.pl/items/40203315929');
+  assert.equal(sold.availability.status, 'terminal');
+  assert.equal(sold.listing, undefined);
+
+  const removed = await adapter.fetchDetail('https://www.vinted.pl/items/40203315930');
+  assert.deepEqual(removed.availability, { status: 'terminal', reason: 'Marketplace returned HTTP 404' });
+  assert.equal((await adapter.fetchDetail('https://www.vinted.pl/items/40203315931')).availability.status, 'unknown');
+  assert.equal((await adapter.fetchDetail('https://www.vinted.pl/items/40203315932')).availability.status, 'unknown');
+  assert.equal(parseVintedItemPageAvailability(itemHtml).status, 'live');
+  assert.equal(parseVintedItemPageAvailability('', 503).status, 'unknown');
+});
+
+test('enriches Allegro Lokalnie search conditions through the anonymous batch API', async () => {
+  const cardHtml = `<article class="mlc-itembox__container" data-card-analytics-click="7e6a8b9c-1d2e-4f3a-9b8c-7d6e5f4a3b2c">
+      <a href="/oferta/lego-technic-porsche" itemprop="url"><h3 itemprop="itemOffered">Lego Technic Porsche</h3></a>
+      <span class="mlc-itembox__offer-type mlc-itembox__offer-type--buy_now">Kup teraz</span>
+      <span class="ml-offer-price__dollars">149</span>
+    </article>`;
+  const requests: Array<{ url: string; body: string | null }> = [];
+  const paths: string[] = [];
+  const adapter = createAllegroLokalnieAdapter('Allegro Lokalnie', async () => cardHtml, async (url, body) => {
+    requests.push({ url, body });
+    return { status: 200, json: [{ item_id: 'lego-technic-porsche', item_variant: 'brand_new', item_name: 'Lego Technic Porsche', item_price: '149.00' }] };
+  }, (path) => paths.push(path));
+  const search = await adapter.fetchPublicSearch('https://allegrolokalnie.pl/oferty/q/lego?zrodlo=lokalnie');
+  assert.equal(search.length, 1);
+  assert.equal(search[0].condition, 'Nowe');
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, 'https://allegrolokalnie.pl/api/additionaldata/offers');
+  assert.deepEqual(JSON.parse(requests[0].body ?? '{}'), { offer_ids: ['7e6a8b9c-1d2e-4f3a-9b8c-7d6e5f4a3b2c'] });
+  assert.deepEqual(paths, ['allegro-ssr-page', 'allegro-condition-batch']);
+});
+
+test('keeps Allegro Lokalnie search results when batch enrichment fails', async () => {
+  const cardHtml = `<article class="mlc-itembox__container" data-card-analytics-click="7e6a8b9c-1d2e-4f3a-9b8c-7d6e5f4a3b2c">
+      <a href="/oferta/lego-technic-porsche" itemprop="url"><h3 itemprop="itemOffered">Lego Technic Porsche</h3></a>
+      <span class="mlc-itembox__offer-type mlc-itembox__offer-type--buy_now">Kup teraz</span>
+      <span class="ml-offer-price__dollars">149</span>
+    </article>`;
+  const failingPaths: string[] = [];
+  const failing = createAllegroLokalnieAdapter('Allegro Lokalnie', async () => cardHtml, async () => ({ status: 503, json: null }), (path) => failingPaths.push(path));
+  const search = await failing.fetchPublicSearch('https://allegrolokalnie.pl/oferty/q/lego?zrodlo=lokalnie');
+  assert.equal(search.length, 1);
+  assert.equal(search[0].condition, undefined);
+  assert.deepEqual(failingPaths, ['allegro-ssr-page']);
+  const malformed = createAllegroLokalnieAdapter('Allegro Lokalnie', async () => cardHtml, async () => ({ status: 200, json: 'not-an-array' }));
+  assert.equal((await malformed.fetchPublicSearch('https://allegrolokalnie.pl/oferty/q/lego')).length, 1);
+  assert.deepEqual([...parseAllegroBatchEnrichmentApi([
+    { item_id: 'a-slug', item_variant: 'visibly_used' },
+    { item_id: 'b-slug', item_variant: 'Very_Good' },
+    { item_id: 'c-slug', item_variant: 'unknown_variant' },
+    'junk',
+  ])], [['a-slug', 'Używane'], ['b-slug', 'Bardzo dobry']]);
+});
+
+test('merges Allegro JSON-LD search items with card uuids and shipping signals', () => {
+  const jsonLd = `<script type="application/ld+json">${JSON.stringify({
+    '@type': 'ItemList', itemListElement: [{ position: 1, item: {
+      name: 'Lego Technic Porsche', image: { url: 'https://a.allegroimg.com/original/lego.jpg' },
+      url: 'https://allegrolokalnie.pl/oferta/lego-technic-porsche',
+      offers: { price: '149', priceCurrency: 'PLN' }, itemCondition: 'https://schema.org/NewCondition',
+    } }],
+  })}</script>`;
+  const card = `<article class="mlc-itembox__container" data-card-analytics-click="7e6a8b9c-1d2e-4f3a-9b8c-7d6e5f4a3b2c">
+      <a href="/oferta/lego-technic-porsche" itemprop="url"><h3 itemprop="itemOffered">Lego Technic Porsche</h3></a>
+      <span class="mlc-itembox__offer-type mlc-itembox__offer-type--buy_now">Kup teraz</span>
+      <span class="price-negotiability">Cena do negocjacji</span>
+      <span class="ml-offer-price__dollars">149</span>
+    </article>`;
+  const listings = parseStructuredListings(`${jsonLd}${card}`, 'Allegro Lokalnie');
+  assert.equal(listings.length, 1);
+  assert.equal(listings[0].listingId, '7e6a8b9c-1d2e-4f3a-9b8c-7d6e5f4a3b2c');
+  assert.equal(listings[0].condition, 'Nowe');
+  assert.equal(listings[0].shippingAvailable, true);
+  assert.equal(listings[0].priceNegotiable, true);
+  assert.equal(listings[0].imageUrl, 'https://a.allegroimg.com/original/lego.jpg');
 });
 
 test('parses Allegro Lokalnie offer type as shipping availability', () => {

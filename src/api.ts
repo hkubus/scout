@@ -1,4 +1,4 @@
-import type { ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, ManualSearchResponse, MarketResearchData, MarketWatch, MarketWatchInput, Marketplace, NegotiationDraft, NegotiationRecommendation, NegotiationResult, NotificationPriority, NotificationRecord, SearchFilters, SellerMessage, SettingsData, Watch, WatchAnalytics } from './types';
+import type { ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketResearchData, MarketWatch, MarketWatchInput, Marketplace, NegotiationDraft, NegotiationRecommendation, NegotiationResult, NotificationPriority, NotificationRecord, SearchFilters, SellerMessage, SettingsData, Watch, WatchAnalytics } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -107,6 +107,7 @@ export const api = {
   testNtfy: () => request<{ delivered: boolean }>('/api/settings/ntfy/test', { method: 'POST' }),
   notifications: (options: { page?: number; pageSize?: number } = {}) => request<{ notifications: NotificationRecord[]; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/notifications?page=${options.page ?? 1}&pageSize=${options.pageSize ?? 100}`),
   connectorRuns: (options: { page?: number; pageSize?: number } = {}) => request<{ runs: ConnectorRun[]; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/connector-runs?page=${options.page ?? 1}&pageSize=${options.pageSize ?? 100}`),
+  logs: () => request<{ logs: LogEntry[] }>('/api/logs'),
   exportData: () => request<Record<string, unknown>>('/api/export'),
   backup: () => request<{ backup: string; message: string }>('/api/backup', { method: 'POST' }),
 };

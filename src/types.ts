@@ -1,5 +1,5 @@
 export type Theme = 'light' | 'dark' | 'system';
-export type View = 'overview' | 'search' | 'watches' | 'market-research' | 'listings' | 'messages' | 'connectors' | 'settings';
+export type View = 'overview' | 'search' | 'watches' | 'market-research' | 'listings' | 'messages' | 'connectors' | 'logs' | 'settings';
 export type Marketplace = 'OLX' | 'Allegro Lokalnie' | 'Vinted';
 export type DealLabel = 'Exceptional' | 'Very strong' | 'Strong' | 'Watch';
 export type NotificationPriority = 'strong' | 'very-strong' | 'exceptional';
@@ -330,6 +330,14 @@ export interface ConnectorRun {
   startedAt: string;
   finishedAt: string | null;
   duration: string;
+}
+
+export interface LogEntry {
+  id: number;
+  at: string;
+  level: 'info' | 'error';
+  scope: 'watch' | 'research';
+  message: string;
 }
 
 export interface NotificationRecord {

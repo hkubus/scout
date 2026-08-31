@@ -1,0 +1,37 @@
+{
+  "search": {
+    "items": [
+      {
+        "id": 40203315928,
+        "title": "Lego Technic Porsche 911 RSR",
+        "price": { "amount": "149.00", "currency_code": "PLN", "service_fee": { "amount": "8.15", "currency_code": "PLN" }, "total_item_price": "157.15" },
+        "url": "https://www.vinted.pl/items/40203315928-lego-technic-porsche-911-rsr",
+        "path": "/items/40203315928-lego-technic-porsche-911-rsr",
+        "photo": { "url": "https://images1.vinted.net/t/03_0266a_9f08b2cb1_800x800.jpeg?s=s1" },
+        "status": "Bardzo dobry",
+        "brand_title": "LEGO",
+        "size_title": "Uniwersalny",
+        "user": { "id": 1, "login": "seller", "business": false },
+        "favourite_count": 12,
+        "view_count": 340,
+        "promoted": false
+      },
+      {
+        "id": 40203315929,
+        "title": "EUR catalog item",
+        "price": { "amount": "20.00", "currency_code": "EUR" },
+        "url": "https://www.vinted.pl/items/40203315929-eur-catalog-item",
+        "status": "Bardzo dobry"
+      },
+      { "id": 40203315930 }
+    ],
+    "pagination": { "current_page": 1, "total_pages": 4, "total_entries": 72, "per_page": 20 },
+    "search_tracking_params": {},
+    "code": 0
+  },
+  "empty": {
+    "items": [],
+    "pagination": { "current_page": 1, "total_pages": 0, "total_entries": 0, "per_page": 20 },
+    "code": 0
+  }
+}
