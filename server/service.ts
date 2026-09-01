@@ -1587,10 +1587,13 @@ export class ScoutService {
       JOIN market_watches mw ON mw.id = ml.market_watch_id
       WHERE ml.status = 'ended' AND ml.last_price_pln > 0 AND ${versionFilter}`).all() as Array<{ market_watch_id: string; last_price_pln: number }>;
     const endedPricesByWatch = new Map<string, number[]>();
+    const aggregatePrices: number[] = [];
     for (const item of endedPriceRows) {
+      const price = Number(item.last_price_pln);
       const prices = endedPricesByWatch.get(item.market_watch_id) ?? [];
-      prices.push(Number(item.last_price_pln));
+      prices.push(price);
       endedPricesByWatch.set(item.market_watch_id, prices);
+      if (!options.watchId || options.watchId === item.market_watch_id) aggregatePrices.push(price);
     }
     const watches = watchRows.map((row): MarketWatch => {
       const version = versionsByWatch.get(row.id)!;
@@ -1603,13 +1606,9 @@ export class ScoutService {
         estimatedMedianPrice: endedPrices.length ? median(endedPrices) : null,
       };
     });
-    const applicable = [
-      `SELECT ml.last_price_pln FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ml.status = 'ended' AND ml.last_price_pln > 0 AND ${versionFilter}`,
-      ...(options.watchId ? ['AND ml.market_watch_id = ?'] : []),
-    ].join(' ');
-    const aggregateParams = options.watchId ? [options.watchId] : [];
-    const aggregatePrices = (this.stmt(applicable).all(...aggregateParams) as Array<{ last_price_pln: number }>).map((item) => Number(item.last_price_pln));
-    const aggregateCounts = this.stmt(`SELECT SUM(CASE WHEN ml.status = 'active' THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN ml.status = 'ended' THEN 1 ELSE 0 END) AS ended FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ml.status IN ('active', 'ended') AND ${versionFilter}${options.watchId ? ' AND ml.market_watch_id = ?' : ''}`).get(...aggregateParams) as { active?: number; ended?: number };
+    // The aggregate reuses the per-watch fetch above — the same ended rows,
+    // optionally scoped to the requested watch — instead of loading them twice.
+    const aggregateCounts = this.stmt(`SELECT SUM(CASE WHEN ml.status = 'active' THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN ml.status = 'ended' THEN 1 ELSE 0 END) AS ended FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ml.status IN ('active', 'ended') AND ${versionFilter}${options.watchId ? ' AND ml.market_watch_id = ?' : ''}`).get(...(options.watchId ? [options.watchId] : [])) as { active?: number; ended?: number };
 
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(400, Math.floor(options.pageSize ?? 100)));
