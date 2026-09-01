@@ -107,15 +107,11 @@ test('uses the recent-listing index for feed pagination order', () => {
 test('uses one indexed scan for connector health aggregation', () => {
   const context = fixture();
   try {
-    const plan = context.db.prepare(`EXPLAIN QUERY PLAN SELECT * FROM (
-      SELECT connector_runs.*,
-        COUNT(*) OVER (PARTITION BY source) AS source_count,
-        MAX(CASE WHEN status = 'ok' THEN finished_at END) OVER (PARTITION BY source) AS last_success,
-        ROW_NUMBER() OVER (PARTITION BY source ORDER BY started_at DESC, id DESC) AS source_rank
-      FROM connector_runs
-    ) WHERE source_rank = 1`).all() as Array<{ detail: string }>;
-    assert.ok(plan.some((row) => row.detail.includes('connector_runs_source_latest')));
-    assert.equal(plan.some((row) => row.detail.includes('USE TEMP B-TREE')), false);
+    const latestPlan = context.db.prepare('EXPLAIN QUERY PLAN SELECT * FROM connector_runs WHERE source = ? ORDER BY started_at DESC, id DESC LIMIT 1').all('OLX') as Array<{ detail: string }>;
+    assert.ok(latestPlan.some((row) => row.detail.includes('connector_runs_source_latest')));
+    const countPlan = context.db.prepare('EXPLAIN QUERY PLAN SELECT source, COUNT(*) AS count FROM connector_runs GROUP BY source').all() as Array<{ detail: string }>;
+    assert.equal(countPlan.some((row) => row.detail.includes('USE TEMP B-TREE')), false);
+    assert.equal(countPlan.some((row) => row.detail.includes('connector_runs_source_latest')), true);
   } finally { context.close(); }
 });
 

@@ -1976,14 +1976,20 @@ export class ScoutService {
   getConnectors(): Connector[] {
     const webhookConfigured = Boolean(this.getSetting('discord_webhook'));
     const ntfyConfigured = Boolean(this.ntfyConfig());
-    const healthRows = this.db.prepare(`SELECT * FROM (
-      SELECT connector_runs.*,
-        COUNT(*) OVER (PARTITION BY source) AS source_count,
-        MAX(CASE WHEN status = 'ok' THEN finished_at END) OVER (PARTITION BY source) AS last_success,
-        ROW_NUMBER() OVER (PARTITION BY source ORDER BY started_at DESC, id DESC) AS source_rank
-      FROM connector_runs
-    ) WHERE source_rank = 1`).all() as Array<Record<string, any>>;
-    const healthBySource = new Map(healthRows.map((row) => [String(row.source), row]));
+    // Latest row per source comes from one indexed lookup per connector and
+    // the run count from a grouped count (the source-leading index keeps it
+    // b-tree free). The previous window-function query materialized every
+    // connector_runs row — three full scans on every dashboard refresh and
+    // readiness probe.
+    const countBySource = new Map((this.db.prepare('SELECT source, COUNT(*) AS count FROM connector_runs GROUP BY source').all() as Array<{ source: string; count: number }>)
+      .map((row) => [String(row.source), Number(row.count)]));
+    const latestRun = this.db.prepare('SELECT * FROM connector_runs WHERE source = ? ORDER BY started_at DESC, id DESC LIMIT 1');
+    const latestSuccess = this.db.prepare("SELECT finished_at FROM connector_runs WHERE source = ? AND status = 'ok' AND finished_at IS NOT NULL ORDER BY started_at DESC, id DESC LIMIT 1");
+    const healthBySource = new Map<string, Record<string, any>>();
+    for (const definition of connectorDefinitions) {
+      const row = latestRun.get(definition.name) as Record<string, any> | undefined;
+      if (row) healthBySource.set(definition.name, { ...row, source_count: countBySource.get(definition.name) ?? 0, last_success: (latestSuccess.get(definition.name) as { finished_at?: string } | undefined)?.finished_at ?? null });
+    }
     return connectorDefinitions.map((definition) => {
       if (definition.name === 'Discord' && !webhookConfigured) return { ...definition, status: 'Idle', detail: 'Webhook not configured', lastSuccess: 'Never', requests: 0, latency: '—' };
       if (definition.name === 'ntfy' && !ntfyConfigured) return { ...definition, status: 'Idle', detail: 'ntfy not configured', lastSuccess: 'Never', requests: 0, latency: '—' };
