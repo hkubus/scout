@@ -2736,6 +2736,9 @@ export class ScoutService {
    * they are computed once per scan. The baseline uses a window function over
    * the (watch_id, listing_id, observed_at, id) index — one linear pass —
    * instead of a newest-first anti-join that degrades on recurring listings.
+   * INDEXED BY pins that covering index: without it the planner sometimes
+   * picked observations_watch_time and re-sorted the watch's full history
+   * (temp b-tree) on every scan.
    */
   private watchBaseline(row: WatchRow): { prices: number[]; firstObservedAt: string | null } {
     const baselineFilters = `
@@ -2753,11 +2756,11 @@ export class ScoutService {
     ] as unknown[];
     const prices = (this.stmt(`SELECT price_pln FROM (
         SELECT o.price_pln, o.observed_at, o.id, ROW_NUMBER() OVER (PARTITION BY o.listing_id ORDER BY o.observed_at DESC, o.id DESC) AS rank
-        FROM observations o ${baselineFilters}
+        FROM observations o INDEXED BY observations_watch_listing ${baselineFilters}
       ) WHERE rank <= 1 ORDER BY observed_at DESC, id DESC LIMIT 400`).all(...baselineParams) as Array<{ price_pln: number }>)
       .map((item) => Number(item.price_pln))
       .filter((price) => Number.isFinite(price) && price > 0);
-    const first = this.stmt(`SELECT MIN(o.observed_at) AS first FROM observations o ${baselineFilters}`).get(...baselineParams) as { first: string | null };
+    const first = this.stmt(`SELECT MIN(o.observed_at) AS first FROM observations o INDEXED BY observations_watch_listing ${baselineFilters}`).get(...baselineParams) as { first: string | null };
     return { prices, firstObservedAt: first?.first ?? null };
   }
 
