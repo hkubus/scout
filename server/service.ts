@@ -899,14 +899,27 @@ export class ScoutService {
   }
 
   private setMarketplaceSessionError(marketplace: Marketplace, message: string | null) {
+    this.marketplaceSessionCache.delete(marketplace);
     this.stmt('UPDATE marketplace_sessions SET last_error = ?, updated_at = ? WHERE marketplace = ?').run(message ? message.slice(0, 500) : null, nowIso(), marketplace);
   }
+
+  // Page fetches, shipping checks, and AI verifications read the session many
+  // times per scan; the AES-GCM decrypt + parse runs once per stored value
+  // instead of once per read. Keyed on the ciphertext so a re-imported
+  // session (new ciphertext) is re-read, and invalidated wherever the row is
+  // written or removed.
+  private marketplaceSessionCache = new Map<Marketplace, { ciphertext: string; state: MarketplaceStorageState }>();
 
   private readMarketplaceSession(marketplace: Marketplace): MarketplaceStorageState | null {
     const row = this.marketplaceSessionRow(marketplace);
     if (!row) return null;
+    const ciphertext = String(row.storage_state_encrypted);
+    const cached = this.marketplaceSessionCache.get(marketplace);
+    if (cached && cached.ciphertext === ciphertext) return cached.state;
     try {
-      return parseMarketplaceStorageState(decryptSecret(String(row.storage_state_encrypted)), marketplace);
+      const state = parseMarketplaceStorageState(decryptSecret(ciphertext), marketplace);
+      this.marketplaceSessionCache.set(marketplace, { ciphertext, state });
+      return state;
     } catch {
       this.setMarketplaceSessionError(marketplace, 'Stored session could not be read; import it again');
       throw new Error(`${marketplace} authenticated session could not be read; import it again`);
@@ -948,12 +961,14 @@ export class ScoutService {
       VALUES (?, ?, ?, ?, ?, NULL, NULL)
       ON CONFLICT(marketplace) DO UPDATE SET label = excluded.label, storage_state_encrypted = excluded.storage_state_encrypted, updated_at = excluded.updated_at, last_used_at = NULL, last_error = NULL`)
       .run(marketplace, safeLabel, encryptSecret(JSON.stringify(state)), timestamp, timestamp);
+    this.marketplaceSessionCache.delete(marketplace);
     return this.settings();
   }
 
   deleteMarketplaceSession(marketplace: Marketplace) {
     const result = this.stmt('DELETE FROM marketplace_sessions WHERE marketplace = ?').run(marketplace);
     if (!result.changes) throw new ServiceError('Marketplace session not found', 404);
+    this.marketplaceSessionCache.delete(marketplace);
     return this.settings();
   }
 
