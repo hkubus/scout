@@ -781,13 +781,6 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .decision-chip--watch { color: var(--blue); background: var(--blue-soft); }
 .decision-chip--pass { color: var(--orange); background: rgba(241, 90, 53, .1); }
 .decision-chip--reference { color: var(--teal); background: rgba(21, 155, 150, .12); }
-.decision-chip--duplicate { color: var(--blue-deep); background: var(--blue-soft); }
-.duplicate-list { display: grid; gap: 8px; }
-.duplicate-row { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-muted); color: inherit; text-decoration: none; font-size: 12px; }
-.duplicate-row i { width: 9px; height: 9px; border-radius: 50%; flex: none; }
-.duplicate-row span { flex: 1; }
-.duplicate-row strong { font-weight: 700; }
-.duplicate-row em { color: var(--muted); font-style: normal; }
 .snapshot-price-history { margin-top: 12px; display: grid; gap: 8px; }
 .snapshot-price-history > strong { font-size: 12px; }
 .listing-drawer-backdrop { position: fixed; inset: 0; z-index: 60; display: flex; justify-content: flex-end; background: rgba(12, 17, 26, .48); backdrop-filter: blur(3px); }

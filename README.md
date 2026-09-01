@@ -81,12 +81,6 @@ A deal watch can point at a research watch (`referenceMarketWatchId`). While the
 
 Separately opt-in in Settings, `Cap offers with a reference series band` uses the reference series' probable-sale band in negotiation math: the ceiling becomes the minimum of the buyer's total-cost ceiling and the band's p75. Because the cap can only *lower* the buyer's ceiling, it also applies to bounded automatic negotiation when enabled — it never widens the room below the asking price.
 
-### Cross-source duplicate detection
-
-Scout detects the same physical item cross-posted across OLX, Allegro Lokalnie, and Vinted. Once a day the scheduler materializes duplicate pairs for listings observed within the last 14 days, matching on title tokens (lowercased, diacritics stripped, marketplace boilerplate removed), price proximity with a hard cut beyond ±25%, condition equality, and an image CDN identity boost. Only pairs at or above the 0.75 similarity threshold are stored. Detected duplicates appear as a badge on listing rows (count plus the cheapest alternative) and as a "Cross-posted listings" section in the listing drawer with external links, so the cheapest copy can be compared before contacting a seller. Pairs age out with the 14-day window; similarity is heuristic and the badge is advisory, never a purchasing decision.
-
-Changing a research query, term, source, condition, location, shipping rule, or price range starts a new immutable comparable series. The old series is retained as previous history and excluded from current metrics. Main watches can be archived to stop future scans while retaining observations and analytics; permanent deletion is a separate, warned action.
-
 ## Preserved listing copies
 
 Research listings are preserved for market research: when a listing first appears in a research watch, Scout fetches its detail page once (bounded per scan, with a small retry budget on later scans), stores the description, and downloads the gallery images into the Scout database so the listing stays viewable after it is sold or removed. Captures are deduplicated by listing state, capped at 12 images of up to 4 MB each, and served only from Scout's own image endpoint. Use the eye action on a Saved listings row to view the preserved copy, or the save action to capture or refresh a copy on demand — including for listings that already ended. Copies live and die with their research listing row, so the daily 180-day retention cleanup also prunes them; deleting a research watch deletes its copies.

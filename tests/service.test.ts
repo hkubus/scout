@@ -964,7 +964,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_listing_duplicates']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1293,46 +1293,6 @@ test('seeds fresh listings from a reference series band for display only', async
   } finally { context.close(); }
 });
 
-test('materializes cross-source duplicate pairs and ages them out of the window', () => {
-  const context = fixture();
-  try {
-    const fresh = new Date().toISOString();
-    const stale = new Date(Date.now() - 20 * 24 * 60 * 60_000).toISOString();
-    seedWatch(context.db, 'dup-watch');
-    const insert = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, condition, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
-    insert.run('OLX', 'dup-olx', 'Rower górski Kross 29', 1500, 'https://www.olx.pl/d/oferta/dup-olx', 'Used', fresh, fresh);
-    insert.run('Vinted', 'dup-vinted', 'Rower gorski Kross 29', 1450, 'https://www.vinted.pl/items/dup-vinted', 'Used', fresh, fresh);
-    insert.run('Allegro Lokalnie', 'dup-stale', 'Rower górski Kross 29', 1500, 'https://allegrolokalnie.pl/oferta/dup-stale', 'Used', stale, stale);
-    const olxId = (context.db.prepare("SELECT id FROM listings WHERE listing_id = 'dup-olx'").get() as { id: number }).id;
-    const vintedId = (context.db.prepare("SELECT id FROM listings WHERE listing_id = 'dup-vinted'").get() as { id: number }).id;
-    const associate = context.db.prepare('INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)');
-    associate.run('dup-watch', olxId, fresh, fresh);
-    associate.run('dup-watch', vintedId, fresh, fresh);
-
-    (context.service as any).refreshDuplicatePairs();
-    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM listing_duplicate_pairs').get() as { count: number }).count, 1);
-    const pair = context.db.prepare('SELECT listing_id_a, listing_id_b, similarity FROM listing_duplicate_pairs').get() as { listing_id_a: number; listing_id_b: number; similarity: number };
-    assert.equal(pair.listing_id_a, Math.min(olxId, vintedId));
-    assert.equal(pair.listing_id_b, Math.max(olxId, vintedId));
-    assert.ok(pair.similarity >= 0.75);
-
-    const detail = context.service.listingDetail('OLX:dup-olx');
-    assert.equal(detail.duplicates?.length, 1);
-    assert.equal(detail.duplicates?.[0].marketplace, 'Vinted');
-    assert.equal(detail.duplicates?.[0].price, 1450);
-    const feed = context.service.getListings();
-    const badged = feed.find((item) => item.listingId === 'dup-olx');
-    assert.equal(badged?.duplicateCount, 1);
-    assert.equal(badged?.duplicateCheapest?.marketplace, 'Vinted');
-
-    // Aging out: when the partner leaves the 14-day window, the pair disappears.
-    context.db.prepare("DELETE FROM settings WHERE key = 'last_duplicate_refresh'").run();
-    context.db.prepare('UPDATE listings SET last_seen_at = ? WHERE listing_id = ?').run(stale, 'dup-vinted');
-    (context.service as any).refreshDuplicatePairs();
-    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM listing_duplicate_pairs').get() as { count: number }).count, 0);
-  } finally { context.close(); }
-});
-
 test('reports database and scheduler readiness separately from the lightweight health check', () => {
   const context = fixture();
   try {
@@ -1343,7 +1303,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 16);
+    assert.equal(after.migrations.count, 15);
   } finally { context.close(); }
 });
 

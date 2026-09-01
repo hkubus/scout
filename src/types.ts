@@ -48,15 +48,6 @@ export interface ListingDetailSnapshot {
   verificationStatus?: ListingDescriptionVerificationStatus | null;
 }
 
-/** Another listing (often on a different marketplace) detected as the same physical item. */
-export interface ListingDuplicate {
-  marketplace: Marketplace;
-  price: number;
-  url: string;
-  image: string | null;
-  observedAt: string;
-}
-
 export interface Listing {
   id: string;
   /** Global marketplace identity, safe for external links and triage actions. */
@@ -87,8 +78,6 @@ export interface Listing {
   listingId?: string;
   decision?: ListingDecision | null;
   note?: string;
-  duplicateCount?: number;
-  duplicateCheapest?: { marketplace: Marketplace; price: number; url: string; image: string | null } | null;
   aiNormalization?: ListingNormalization | null;
   aiNormalizationAt?: string | null;
   aiNormalizationError?: string | null;
@@ -116,7 +105,6 @@ export interface ListingDetail {
   descriptionSnapshot?: ListingDetailSnapshot | null;
   firstSeenAt: string;
   lastSeenAt: string;
-  duplicates?: ListingDuplicate[];
 }
 
 export type SellerMessageStatus = 'sent' | 'failed';
