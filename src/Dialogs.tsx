@@ -47,6 +47,7 @@ export function WatchDialog({
   const [minPrice, setMinPrice] = useState(initialWatch?.minPrice === null || initialWatch?.minPrice === undefined ? preset?.minPrice === null || preset?.minPrice === undefined ? "" : String(preset.minPrice) : String(initialWatch.minPrice));
   const [maxPrice, setMaxPrice] = useState(initialWatch?.maxPrice === null || initialWatch?.maxPrice === undefined ? preset?.maxPrice === null || preset?.maxPrice === undefined ? "" : String(preset.maxPrice) : String(initialWatch.maxPrice));
   const [shippingOnly, setShippingOnly] = useState(initialWatch?.shippingOnly ?? preset?.shippingOnly ?? false);
+  const [typoVariants, setTypoVariants] = useState(initialWatch?.typoVariants ?? false);
   const [aiRelevance, setAiRelevance] = useState(initialWatch?.aiRelevance ?? true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -101,6 +102,7 @@ export function WatchDialog({
           .filter(Boolean),
         sensitivity: Number(sensitivity),
         shippingOnly,
+        typoVariants,
         aiRelevance,
         minPrice: numericMin,
         maxPrice: numericMax,
@@ -262,6 +264,10 @@ export function WatchDialog({
           <label className="check-option check-option--modal">
             <input type="checkbox" checked={shippingOnly} onChange={(event) => setShippingOnly(event.target.checked)} />
             <span><strong>Require shipping</strong><small>Only learn from and alert on listings with confirmed shipping</small></span>
+          </label>
+          <label className="check-option check-option--modal">
+            <input type="checkbox" checked={typoVariants} onChange={(event) => setTypoVariants(event.target.checked)} />
+            <span><strong>Scan typo variants</strong><small>Catch misspelled listings — up to 2 extra searches per scan</small></span>
           </label>
           <label className="check-option check-option--modal">
             <input type="checkbox" checked={aiRelevance} onChange={(event) => setAiRelevance(event.target.checked)} />

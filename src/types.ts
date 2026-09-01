@@ -172,6 +172,7 @@ export interface Watch {
   exactUrls: string[];
   sensitivity: number;
   shippingOnly: boolean;
+  typoVariants: boolean;
   aiRelevance: boolean;
   minPrice: number | null;
   maxPrice: number | null;
@@ -254,6 +255,7 @@ export interface MarketWatch {
   minPrice: number | null;
   maxPrice: number | null;
   shippingOnly: boolean;
+  typoVariants: boolean;
   enabled: boolean;
   nextScan: string;
   lastScan: string;
@@ -264,7 +266,7 @@ export interface MarketWatch {
   activeVersionId?: string | null;
 }
 
-export type MarketWatchInput = Pick<MarketWatch, 'name' | 'query' | 'terms' | 'excluded' | 'location' | 'condition' | 'sources' | 'intervalHours' | 'minPrice' | 'maxPrice' | 'shippingOnly'>;
+export type MarketWatchInput = Pick<MarketWatch, 'name' | 'query' | 'terms' | 'excluded' | 'location' | 'condition' | 'sources' | 'intervalHours' | 'minPrice' | 'maxPrice' | 'shippingOnly' | 'typoVariants'>;
 
 export interface MarketTrackedListing {
   id: number;

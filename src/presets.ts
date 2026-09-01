@@ -96,5 +96,6 @@ export function marketWatchInputFromListing(listing: MarketTrackedListing): Mark
     minPrice: band.minPrice,
     maxPrice: band.maxPrice,
     shippingOnly: false,
+    typoVariants: false,
   };
 }

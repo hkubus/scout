@@ -369,7 +369,7 @@ function App() {
   const updateWatch = async (watch: Watch) =>
     withBusyWatch(watch, async () => {
       try {
-        await api.updateWatch(watch.id, { name: watch.name, query: watch.query, terms: watch.terms, excluded: watch.excluded, sources: watch.sources, location: watch.location, condition: watch.condition, interval: watch.interval, exactUrls: watch.exactUrls, sensitivity: watch.sensitivity, shippingOnly: watch.shippingOnly, aiRelevance: watch.aiRelevance, minPrice: watch.minPrice, maxPrice: watch.maxPrice, enabled: watch.enabled });
+        await api.updateWatch(watch.id, { name: watch.name, query: watch.query, terms: watch.terms, excluded: watch.excluded, sources: watch.sources, location: watch.location, condition: watch.condition, interval: watch.interval, exactUrls: watch.exactUrls, sensitivity: watch.sensitivity, shippingOnly: watch.shippingOnly, typoVariants: watch.typoVariants, aiRelevance: watch.aiRelevance, minPrice: watch.minPrice, maxPrice: watch.maxPrice, enabled: watch.enabled });
         await refreshData(false);
         setEditingFullWatch(null);
         setAllWatches(null);

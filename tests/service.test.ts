@@ -909,7 +909,7 @@ test('keeps market research separate and reports ended-listing price estimates',
     context.db.prepare('INSERT INTO market_price_observations (market_listing_id, price_pln, observed_at) VALUES (?, ?, ?)').run(listing.id, 2000, now);
     const research = context.service.marketResearch();
     assert.deepEqual(research.watches[0], {
-      id: 'market-watch', name: 'GPU market', query: 'rtx 4070', terms: '12gb', excluded: 'parts', location: 'Warszawa', condition: 'New', sources: ['OLX', 'Vinted'], intervalHours: 24, minPrice: 1000, maxPrice: 2500, shippingOnly: true, enabled: true, nextScan: 'due now', lastScan: 'just now', totalListings: 3, activeListings: 1, endedListings: 2, estimatedMedianPrice: 2200,
+      id: 'market-watch', name: 'GPU market', query: 'rtx 4070', terms: '12gb', excluded: 'parts', location: 'Warszawa', condition: 'New', sources: ['OLX', 'Vinted'], intervalHours: 24, minPrice: 1000, maxPrice: 2500, shippingOnly: true, typoVariants: false, enabled: true, nextScan: 'due now', lastScan: 'just now', totalListings: 3, activeListings: 1, endedListings: 2, estimatedMedianPrice: 2200,
     });
     assert.equal(research.watches[0].totalListings, 3);
     assert.equal(research.watches[0].activeListings, 1);
@@ -933,7 +933,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1081,7 +1081,7 @@ test('records failed scans and does not persist partial normal-watch data', asyn
 test('verifies missing research listings before ending them and leaves transient failures as unknown', async () => {
   const context = fixture();
   try {
-    context.service.createMarketWatch({ id: 'availability-watch', name: 'Availability', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false });
+    context.service.createMarketWatch({ id: 'availability-watch', name: 'Availability', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
     const now = new Date().toISOString();
     const insert = context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans, availability_status, last_verified_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, 'live', ?)`);
@@ -1123,7 +1123,7 @@ test('verifies missing research listings before ending them and leaves transient
 test('creates immutable research series and computes aggregates across the full result set', () => {
   const context = fixture();
   try {
-    context.service.createMarketWatch({ id: 'version-watch', name: 'Versioned', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false });
+    context.service.createMarketWatch({ id: 'version-watch', name: 'Versioned', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
     const now = new Date().toISOString();
     context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0)`).run('version-watch', 'version-watch:v1', 'OLX', 'old-series', 'Old CPU', 'https://www.olx.pl/d/oferta/old-series', 100, 100, 100, now, now);
@@ -1136,7 +1136,7 @@ test('creates immutable research series and computes aggregates across the full 
     assert.equal(context.service.marketResearch().watches.find((watch) => watch.id === 'version-watch')?.totalListings, 0);
     assert.equal(context.service.marketResearch({ status: 'superseded' }).listings[0].status, 'superseded');
 
-    context.service.createMarketWatch({ id: 'median-watch', name: 'Median', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false });
+    context.service.createMarketWatch({ id: 'median-watch', name: 'Median', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
     const insert = context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ended', 3)`);
     for (let price = 1; price <= 401; price += 1) insert.run('median-watch', 'median-watch:v1', 'OLX', `median-${price}`, 'CPU', `https://www.olx.pl/d/oferta/median-${price}`, price, price, price, now, now);
@@ -1144,6 +1144,31 @@ test('creates immutable research series and computes aggregates across the full 
     assert.equal(research.aggregates?.overallMedianPrice, 201);
     assert.deepEqual(research.pagination, { page: 2, pageSize: 100, total: 401, hasNext: true });
     assert.equal(research.listings.length, 100);
+  } finally { context.close(); }
+});
+
+test('toggling typo variants on a research watch starts a new immutable series', () => {
+  const context = fixture();
+  try {
+    context.service.createMarketWatch({ id: 'typo-watch', name: 'Typo watch', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
+    const now = new Date().toISOString();
+    context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0)`).run('typo-watch', 'typo-watch:v1', 'OLX', 'typo-series-listing', 'CPU', 'https://www.olx.pl/d/oferta/typo-series-listing', 100, 100, 100, now, now);
+
+    context.service.updateMarketWatch('typo-watch', { typoVariants: true });
+    const versions = context.db.prepare('SELECT id, typo_variants, closed_at FROM market_watch_versions WHERE market_watch_id = ? ORDER BY created_at').all('typo-watch') as Array<{ id: string; typo_variants: number; closed_at: string | null }>;
+    assert.equal(versions.length, 2);
+    assert.equal(versions[0].typo_variants, 0);
+    assert.equal(versions[1].typo_variants, 1);
+    assert.ok(versions[0].closed_at);
+    assert.equal((context.db.prepare("SELECT status FROM market_listings WHERE listing_id = 'typo-series-listing'").get() as { status: string }).status, 'superseded');
+    const watch = context.service.marketResearch().watches.find((item) => item.id === 'typo-watch')!;
+    assert.equal(watch.typoVariants, true);
+    assert.equal(watch.totalListings, 0);
+
+    // Pausing or renaming must not churn the series.
+    context.service.updateMarketWatch('typo-watch', { enabled: false });
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM market_watch_versions WHERE market_watch_id = ?').get('typo-watch') as { count: number }).count, 2);
   } finally { context.close(); }
 });
 
@@ -1199,7 +1224,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 13);
+    assert.equal(after.migrations.count, 14);
   } finally { context.close(); }
 });
 

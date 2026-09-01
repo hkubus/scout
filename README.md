@@ -50,9 +50,15 @@ Settings supports Discord webhooks and ntfy topics. Each channel has its own min
 
 Daily deal digests can be enabled for Discord, ntfy, or both at a configurable server-local time. On digest-enabled channels, Strong and Very strong deals are bundled into one ranked daily summary while Exceptional deals remain immediate. Empty digests are suppressed, unchanged listings are not repeated, and meaningful price drops or priority increases can appear in a later digest. Digest creation and per-channel delivery are durable and use the same capped retry behavior as immediate alerts.
 
+## Watch prefill from listings
+
+Any listing drawer offers a `Save as watch` action that opens the deal-watch dialog pre-filled from the listing's stored data: the search phrase comes from the stored AI canonical title (or the cleaned listing title, with price tokens, sale stopwords, and city names removed), brand/model become included terms, the source is preselected, the price range spans ±25% around the asking price, and the shipping requirement follows the listing. Research listings offer the same from their row actions and the preserved-copy dialog. Prefill never triggers an AI request, and every field stays editable before saving.
+
 ## Market research availability and history
 
 Research snapshots are separate from deal-watch scoring. A valid empty search page is recorded as an empty snapshot; blocked, unsupported, timed-out, or ambiguous markup fails that source snapshot. A listing that disappears from search is verified at its detail URL with low concurrency. Only explicit terminal responses advance the three-check threshold; live detail pages reset the missing count, while unknown checks leave it unchanged. The UI says “no longer available” and retains the last asking price without claiming a confirmed sale.
+
+Watches and research watches can optionally scan typo variants to catch mispriced listings whose titles misspell the product. Each scan runs at most two extra one-page searches with deterministic misspellings of the query (adjacent transpositions, vowel deletions, doubled-letter removal; Polish diacritics are preserved). The variant set rotates across scans so every variant is eventually covered without ever exceeding the one-page-per-search budget. Toggling the option on a research watch changes its criteria and therefore starts a new comparable series.
 
 Changing a research query, term, source, condition, location, shipping rule, or price range starts a new immutable comparable series. The old series is retained as previous history and excluded from current metrics. Main watches can be archived to stop future scans while retaining observations and analytics; permanent deletion is a separate, warned action.
 
