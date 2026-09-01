@@ -98,6 +98,12 @@ test('extracts a listing description from detail-page structured data and descri
   assert.equal(parseListingDescription('<html><body><h1>Steam Deck</h1></body></html>', 'OLX'), null);
 });
 
+test('prefers the Lokalnie offer description over the templated meta boilerplate', () => {
+  const boilerplate = 'Kup teraz: Nike Air Max Plus 3 za 800,00 zł i odbierz w mieście Warszawa. Szybko i bezpiecznie w najlepszym miejscu dla lokalnych Allegrowiczów.';
+  const html = `<html><head><meta name="description" content="${boilerplate}"></head><body><div class="ml-text-truncate__content"><div class="mlc-no-hydrate"><div class="ml-text-medium mlc-offer__description"><p class="desc-p">Sprzedaję oryginalne Nike Air Max Plus 3.</p></div></div></div></body></html>`;
+  assert.equal(parseListingDescription(html, 'Allegro Lokalnie'), 'Sprzedaję oryginalne Nike Air Max Plus 3.');
+});
+
 test('normalizes object-shaped JSON-LD images before storage', () => {
   const html = `<script type="application/ld+json">${JSON.stringify({
     '@type': 'Product', name: 'Intel i5', sku: 'i5-8400', url: 'https://allegrolokalnie.pl/oferta/i5-8400',

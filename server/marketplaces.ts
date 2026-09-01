@@ -413,13 +413,25 @@ function normalizeDescriptionCandidate(value: unknown) {
   return normalized || null;
 }
 
+/**
+ * Lokalnie's meta/og description is auto-generated boilerplate ("Kup teraz: X
+ * za Y zł i odbierz w mieście Z. Szybko i bezpiecznie…") — identical template
+ * on every offer. The seller's real text lives in `div.mlc-offer__description`,
+ * so templated candidates are dropped for that marketplace.
+ */
+const ALLEGRO_DESCRIPTION_BOILERPLATE = /szybko i bezpiecznie w najlepszym miejscu dla lokalnych allegrowicz|kup teraz .* za .+ (?:zł|pln)/i;
+
+function isDescriptionBoilerplate(text: string, marketplace: Marketplace) {
+  return marketplace === 'Allegro Lokalnie' && ALLEGRO_DESCRIPTION_BOILERPLATE.test(text);
+}
+
 /** Extract only listing-description fields from a marketplace detail page. */
 export function parseListingDescription(html: string, marketplace: Marketplace): string | null {
   if (!html) return null;
   const candidates: string[] = [];
   const add = (value: unknown) => {
     const normalized = normalizeDescriptionCandidate(value);
-    if (normalized && !candidates.includes(normalized)) candidates.push(normalized);
+    if (normalized && !isDescriptionBoilerplate(normalized, marketplace) && !candidates.includes(normalized)) candidates.push(normalized);
   };
 
   const scripts = html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
