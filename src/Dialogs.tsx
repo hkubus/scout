@@ -13,19 +13,8 @@ import {
 } from "lucide-react";
 import { api } from "./api";
 import { marketplaceColors } from "./data";
-import type { Marketplace, NotificationRecord, Watch } from "./types";
-
-type WatchPreset = {
-  query: string;
-  terms: string;
-  excluded: string;
-  sources: Marketplace[];
-  location: string;
-  condition: string;
-  minPrice: number | null;
-  maxPrice: number | null;
-  shippingOnly: boolean;
-};
+import type { WatchPreset } from "./presets";
+import type { Marketplace, MarketWatch, NotificationRecord, Watch } from "./types";
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
@@ -58,7 +47,10 @@ export function WatchDialog({
   const [minPrice, setMinPrice] = useState(initialWatch?.minPrice === null || initialWatch?.minPrice === undefined ? preset?.minPrice === null || preset?.minPrice === undefined ? "" : String(preset.minPrice) : String(initialWatch.minPrice));
   const [maxPrice, setMaxPrice] = useState(initialWatch?.maxPrice === null || initialWatch?.maxPrice === undefined ? preset?.maxPrice === null || preset?.maxPrice === undefined ? "" : String(preset.maxPrice) : String(initialWatch.maxPrice));
   const [shippingOnly, setShippingOnly] = useState(initialWatch?.shippingOnly ?? preset?.shippingOnly ?? false);
+  const [typoVariants, setTypoVariants] = useState(initialWatch?.typoVariants ?? false);
   const [aiRelevance, setAiRelevance] = useState(initialWatch?.aiRelevance ?? true);
+  const [referenceOptions, setReferenceOptions] = useState<MarketWatch[]>([]);
+  const [referenceMarketWatchId, setReferenceMarketWatchId] = useState(initialWatch?.referenceMarketWatchId ?? "");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const numericInterval = Number(interval);
@@ -84,6 +76,13 @@ export function WatchDialog({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose, submitting]);
+  useEffect(() => {
+    let active = true;
+    api.marketResearch({ pageSize: 1 }).then((result) => {
+      if (active) setReferenceOptions(result.watches);
+    }).catch(() => { /* the fallback-baseline select stays empty; core dialog works without it */ });
+    return () => { active = false; };
+  }, []);
   const submit = async () => {
     if (!canSubmit) return;
     setSubmitting(true);
@@ -112,7 +111,9 @@ export function WatchDialog({
           .filter(Boolean),
         sensitivity: Number(sensitivity),
         shippingOnly,
+        typoVariants,
         aiRelevance,
+        referenceMarketWatchId: referenceMarketWatchId.trim() ? referenceMarketWatchId.trim() : null,
         minPrice: numericMin,
         maxPrice: numericMax,
       });
@@ -275,9 +276,28 @@ export function WatchDialog({
             <span><strong>Require shipping</strong><small>Only learn from and alert on listings with confirmed shipping</small></span>
           </label>
           <label className="check-option check-option--modal">
+            <input type="checkbox" checked={typoVariants} onChange={(event) => setTypoVariants(event.target.checked)} />
+            <span><strong>Scan typo variants</strong><small>Catch misspelled listings — up to 2 extra searches per scan</small></span>
+          </label>
+          <label className="check-option check-option--modal">
             <input type="checkbox" checked={aiRelevance} onChange={(event) => setAiRelevance(event.target.checked)} />
             <span><strong>Use AI relevance filtering</strong><small>Exclude accessories, replacement parts, services, and unrelated listings when OpenRouter is configured</small></span>
           </label>
+          <label className="field-label">
+            Fallback baseline <span>optional · research series</span>
+            <select value={referenceMarketWatchId} onChange={(event) => setReferenceMarketWatchId(event.target.value)}>
+              <option value="">None — learn from own history</option>
+              {referenceOptions.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}
+            </select>
+          </label>
+          {referenceMarketWatchId ? (
+            <div className="modal-note">
+              <Info size={16} />
+              <span>
+                While this watch is still learning, listings display a “series baseline” typical from the reference research series' probable-sale band. It improves ranking and display only — no alerts fire earlier.
+              </span>
+            </div>
+          ) : null}
           <label className="field-label">
             Exact search URLs <span>optional · one per line</span>
             <textarea

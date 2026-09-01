@@ -13,6 +13,8 @@ export interface NegotiationRecommendationInput {
   shippingCost?: number;
   otherCosts?: number;
   openingDiscountPercent?: number;
+  /** Probable-sale band from a reference research series; `high` can only tighten the buyer's ceiling. */
+  fairPriceBand?: { low: number; high: number };
 }
 
 export interface NegotiationRecommendation {
@@ -83,7 +85,11 @@ export function recommendNegotiationPrice(input: NegotiationRecommendationInput)
   const askingPrice = money(input.askingPrice);
   const knownCosts = money(shippingCost + otherCosts);
   const affordablePrice = money(input.maxTotalCost - knownCosts);
-  const ceilingPrice = money(Math.min(askingPrice, affordablePrice));
+  const bandHigh = input.fairPriceBand && Number.isFinite(input.fairPriceBand.high) && input.fairPriceBand.high > 0
+    ? input.fairPriceBand.high
+    : null;
+  const ceilingPrice = money(Math.min(askingPrice, affordablePrice, bandHigh ?? Number.POSITIVE_INFINITY));
+  const bandCapped = bandHigh !== null && ceilingPrice < Math.min(askingPrice, affordablePrice);
   const status = input.priceNegotiable === true
     ? 'ready'
     : input.priceNegotiable === false
@@ -119,12 +125,15 @@ export function recommendNegotiationPrice(input: NegotiationRecommendationInput)
   ].map(money).filter((offer, index, values) => offer > result.openingOffer! && offer <= ceilingPrice && values.indexOf(offer) === index);
   result.counterOffers = counterOffers;
   const priceRationale = `The opening offer is ${result.openingDiscountPercent.toFixed(1)}% below the current asking price and stays below your ${ceilingPrice.toLocaleString('pl-PL')} zł ceiling.`;
+  const bandRationale = bandCapped
+    ? ' The ceiling also respects the probable-sale band of your reference research series (an estimate, not a confirmed sale price).'
+    : '';
   const reviewRationale = input.priceNegotiable === null
     ? 'Negotiability is not specified, so review this suggested price manually before contacting the seller.'
     : input.priceNegotiable === false
       ? 'The seller marked the price as fixed, so treat this as a reference price and do not send a negotiation message automatically.'
       : '';
-  result.rationale = [reviewRationale, priceRationale].filter(Boolean).join(' ');
+  result.rationale = [reviewRationale, priceRationale + bandRationale].filter(Boolean).join(' ');
   return result;
 }
 

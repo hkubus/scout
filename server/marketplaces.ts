@@ -479,7 +479,7 @@ function concreteImageUrl(raw: string) {
 }
 
 /** A stable identity for a photo regardless of resize variant or signature query. */
-function imageIdentityKey(raw: string) {
+export function imageIdentityKey(raw: string) {
   return raw
     .split('?')[0]
     .replace(/;s=\d+x\d+/gi, '')

@@ -56,3 +56,27 @@ test('accepts a bounded opening discount policy for automatic negotiation', () =
   assert.equal(openingDiscountForNegotiation(20), 0.2);
   assert.throws(() => openingDiscountForNegotiation(0), /between 1% and 50%/);
 });
+
+test('a reference band can only tighten the ceiling, never loosen it', () => {
+  // Band high below asking: ceiling is capped at the band, math recomputes from the smaller room.
+  const capped = recommendNegotiationPrice({ askingPrice: 2000, priceNegotiable: true, maxTotalCost: 3000, fairPriceBand: { low: 1200, high: 1500 } });
+  assert.equal(capped.ceilingPrice, 1500);
+  assert.equal(capped.openingOffer, 1500);
+  assert.ok(capped.openingOffer! <= capped.ceilingPrice!);
+  assert.ok(capped.openingOffer! < capped.askingPrice);
+  assert.match(capped.rationale, /probable-sale band/);
+
+  // Band above asking: behaviour is identical to no band at all.
+  const uncapped = recommendNegotiationPrice({ askingPrice: 2000, priceNegotiable: true, maxTotalCost: 3000, fairPriceBand: { low: 1800, high: 2600 } });
+  const plain = recommendNegotiationPrice({ askingPrice: 2000, priceNegotiable: true, maxTotalCost: 3000 });
+  assert.equal(uncapped.ceilingPrice, plain.ceilingPrice);
+  assert.equal(uncapped.openingOffer, plain.openingOffer);
+  assert.doesNotMatch(plain.rationale, /probable-sale band/);
+  assert.doesNotMatch(uncapped.rationale, /probable-sale band/);
+
+  // A very thin band still yields a positive, below-asking offer inside the ceiling.
+  const thin = recommendNegotiationPrice({ askingPrice: 2000, priceNegotiable: true, maxTotalCost: 3000, fairPriceBand: { low: 10, high: 12 } });
+  assert.equal(thin.status, 'ready');
+  assert.equal(thin.openingOffer, 10);
+  assert.equal(thin.ceilingPrice, 12);
+});

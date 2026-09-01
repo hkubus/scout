@@ -1,4 +1,4 @@
-import type { ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, Marketplace, NegotiationDraft, NegotiationRecommendation, NegotiationResult, NotificationPriority, NotificationRecord, SearchFilters, SellerMessage, SettingsData, Watch, WatchAnalytics } from './types';
+import type { ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, NegotiationDraft, NegotiationRecommendation, NegotiationResult, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SettingsData, Watch, WatchAnalytics } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -77,7 +77,7 @@ export const api = {
   watches: (includeArchived = false) => request<{ watches: Watch[] }>(`/api/watches?includeArchived=${includeArchived ? 'true' : 'false'}`),
   watchAnalytics: (id: string, days = 30) => request<WatchAnalytics>(`/api/watches/${encodeURIComponent(id)}/analytics?days=${days}`),
   createWatch: (watch: Watch) => request<{ watch: Watch }>('/api/watches', json('POST', watch)),
-  updateWatch: (id: string, patch: Partial<Pick<Watch, 'name' | 'query' | 'terms' | 'excluded' | 'sources' | 'location' | 'condition' | 'interval' | 'exactUrls' | 'sensitivity' | 'shippingOnly' | 'aiRelevance' | 'minPrice' | 'maxPrice' | 'enabled'>> & { archived?: boolean }) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
+  updateWatch: (id: string, patch: Partial<Pick<Watch, 'name' | 'query' | 'terms' | 'excluded' | 'sources' | 'location' | 'condition' | 'interval' | 'exactUrls' | 'sensitivity' | 'shippingOnly' | 'aiRelevance' | 'typoVariants' | 'referenceMarketWatchId' | 'minPrice' | 'maxPrice' | 'enabled'>> & { archived?: boolean }) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
   search: (filters: SearchFilters) => request<ManualSearchResponse>('/api/search', json('POST', filters), 60_000),
   marketResearch: (options: { page?: number; pageSize?: number; watchId?: string; status?: 'active' | 'ended' | 'superseded' } = {}) => {
     const params = new URLSearchParams();
@@ -89,10 +89,12 @@ export const api = {
     return request<MarketResearchData>(`/api/market-watches${suffix}`);
   },
   createMarketWatch: (watch: MarketWatchInput) => request<{ watch: MarketWatch }>('/api/market-watches', json('POST', watch)),
-  updateMarketWatch: (id: string, patch: Partial<Pick<MarketWatch, 'name' | 'query' | 'enabled' | 'intervalHours' | 'terms' | 'excluded' | 'location' | 'condition' | 'sources' | 'minPrice' | 'maxPrice' | 'shippingOnly'>>) => request<{ ok: true }>(`/api/market-watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
+  updateMarketWatch: (id: string, patch: Partial<Pick<MarketWatch, 'name' | 'query' | 'enabled' | 'intervalHours' | 'terms' | 'excluded' | 'location' | 'condition' | 'sources' | 'minPrice' | 'maxPrice' | 'shippingOnly' | 'typoVariants'>>) => request<{ ok: true }>(`/api/market-watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
   deleteMarketWatch: (id: string) => request<{ ok: true }>(`/api/market-watches/${encodeURIComponent(id)}`, json('DELETE')),
   scanMarketWatch: (id: string) => request<{ queued: boolean; message: string }>(`/api/market-watches/${encodeURIComponent(id)}/scan`, { method: 'POST' }),
+  marketWatchTrend: (id: string, days = 90) => request<MarketWatchTrend>(`/api/market-watches/${encodeURIComponent(id)}/trend?days=${days}`),
   marketListingSnapshot: (id: number) => request<{ snapshot: MarketListingSnapshot | null }>(`/api/market-listings/${id}/snapshot`),
+  marketListingHistory: (id: number) => request<{ points: PriceHistoryPoint[] }>(`/api/market-listings/${id}/history`),
   captureMarketListingSnapshot: (id: number) => request<{ snapshot: MarketListingSnapshot | null }>(`/api/market-listings/${id}/snapshot`, { method: 'POST' }, 60_000),
   marketSnapshotImageUrl: (imageId: number) => `/api/market-snapshot-images/${imageId}`,
   deleteWatch: (id: string) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('DELETE')),
@@ -106,7 +108,7 @@ export const api = {
   updateListingAction: (key: string, action: { decision: ListingDecision | null; note: string }) => request<{ action: ListingAction }>('/api/listing-actions', json('PATCH', { key, ...action })),
   scan: (watchId?: string) => request<{ queued: boolean; message: string }>('/api/scans', json('POST', watchId ? { watchId } : {})),
   settings: () => request<SettingsData>('/api/settings'),
-  saveSettings: (settings: { interval: number; nightInterval?: number; webhook?: string; clearWebhook?: boolean; discordMinimumPriority?: NotificationPriority; dailyDigest?: { enabled?: boolean; time?: string; discord?: boolean; ntfy?: boolean }; clearNtfy?: boolean; ntfy?: { serverUrl?: string; topic?: string; token?: string; minimumPriority?: NotificationPriority }; ai?: { apiKey?: string; clearApiKey?: boolean; model?: string }; autoNegotiation?: { enabled?: boolean; maxTotalCost?: number | null; shippingCost?: number; otherCosts?: number; minimumDiscountPercent?: number; openingDiscountPercent?: number; dailyLimit?: number } }) => request<SettingsData>('/api/settings', json('PATCH', settings)),
+  saveSettings: (settings: { interval: number; nightInterval?: number; webhook?: string; clearWebhook?: boolean; discordMinimumPriority?: NotificationPriority; dailyDigest?: { enabled?: boolean; time?: string; discord?: boolean; ntfy?: boolean }; clearNtfy?: boolean; ntfy?: { serverUrl?: string; topic?: string; token?: string; minimumPriority?: NotificationPriority }; ai?: { apiKey?: string; clearApiKey?: boolean; model?: string }; negotiationUseBand?: boolean; autoNegotiation?: { enabled?: boolean; maxTotalCost?: number | null; shippingCost?: number; otherCosts?: number; minimumDiscountPercent?: number; openingDiscountPercent?: number; dailyLimit?: number } }) => request<SettingsData>('/api/settings', json('PATCH', settings)),
   saveMarketplaceSession: (marketplace: Marketplace, label: string, storageState: unknown) => request<SettingsData>(`/api/marketplace-sessions/${encodeURIComponent(marketplace)}`, json('PUT', { label, storageState })),
   deleteMarketplaceSession: (marketplace: Marketplace) => request<SettingsData>(`/api/marketplace-sessions/${encodeURIComponent(marketplace)}`, json('DELETE')),
   testWebhook: () => request<{ delivered: boolean }>('/api/settings/webhook/test', { method: 'POST' }),

@@ -579,6 +579,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .analytics-axis-label { fill: var(--muted); font-size: 10px; }
 .analytics-band { fill: var(--blue-soft); }
 .analytics-line { fill: none; stroke: var(--blue); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+.analytics-reference-line { stroke: var(--orange, #f15a35); stroke-width: 2; stroke-dasharray: 7 5; stroke-linecap: round; }
 .analytics-point { fill: var(--surface); stroke: var(--blue); stroke-width: 2; }
 .analytics-chart-labels { display: flex; justify-content: space-between; gap: 10px; padding: 0 2px; color: var(--muted); font-size: 10px; }
 .analytics-chart-empty, .analytics-inline-empty, .analytics-loading { min-height: 180px; display: grid; place-items: center; color: var(--muted); font-size: 12px; text-align: center; }
@@ -779,6 +780,9 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .decision-chip--buy { color: var(--green); background: rgba(58, 171, 97, .12); }
 .decision-chip--watch { color: var(--blue); background: var(--blue-soft); }
 .decision-chip--pass { color: var(--orange); background: rgba(241, 90, 53, .1); }
+.decision-chip--reference { color: var(--teal); background: rgba(21, 155, 150, .12); }
+.snapshot-price-history { margin-top: 12px; display: grid; gap: 8px; }
+.snapshot-price-history > strong { font-size: 12px; }
 .listing-drawer-backdrop { position: fixed; inset: 0; z-index: 60; display: flex; justify-content: flex-end; background: rgba(12, 17, 26, .48); backdrop-filter: blur(3px); }
 .listing-drawer { width: min(530px, 100vw); height: 100%; overflow: auto; background: var(--surface); box-shadow: -18px 0 58px rgba(8, 20, 42, .2); animation: drawer-in .22s ease-out; }
 @keyframes drawer-in { from { transform: translateX(18px); opacity: .5; } to { transform: translateX(0); opacity: 1; } }

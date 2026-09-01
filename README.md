@@ -50,11 +50,36 @@ Settings supports Discord webhooks and ntfy topics. Each channel has its own min
 
 Daily deal digests can be enabled for Discord, ntfy, or both at a configurable server-local time. On digest-enabled channels, Strong and Very strong deals are bundled into one ranked daily summary while Exceptional deals remain immediate. Empty digests are suppressed, unchanged listings are not repeated, and meaningful price drops or priority increases can appear in a later digest. Digest creation and per-channel delivery are durable and use the same capped retry behavior as immediate alerts.
 
+## Watch prefill from listings
+
+Any listing drawer offers a `Save as watch` action that opens the deal-watch dialog pre-filled from the listing's stored data: the search phrase comes from the stored AI canonical title (or the cleaned listing title, with price tokens, sale stopwords, and city names removed), brand/model become included terms, the source is preselected, the price range spans ±25% around the asking price, and the shipping requirement follows the listing. Research listings offer the same from their row actions and the preserved-copy dialog. Prefill never triggers an AI request, and every field stays editable before saving.
+
 ## Market research availability and history
 
 Research snapshots are separate from deal-watch scoring. A valid empty search page is recorded as an empty snapshot; blocked, unsupported, timed-out, or ambiguous markup fails that source snapshot. A listing that disappears from search is verified at its detail URL with low concurrency. Only explicit terminal responses advance the three-check threshold; live detail pages reset the missing count, while unknown checks leave it unchanged. The UI says “no longer available” and retains the last asking price without claiming a confirmed sale.
 
-Changing a research query, term, source, condition, location, shipping rule, or price range starts a new immutable comparable series. The old series is retained as previous history and excluded from current metrics. Main watches can be archived to stop future scans while retaining observations and analytics; permanent deletion is a separate, warned action.
+Watches and research watches can optionally scan typo variants to catch mispriced listings whose titles misspell the product. Each scan runs at most two extra one-page searches with deterministic misspellings of the query (adjacent transpositions, vowel deletions, doubled-letter removal; Polish diacritics are preserved). The variant set rotates across scans so every variant is eventually covered without ever exceeding the one-page-per-search budget. Toggling the option on a research watch changes its criteria and therefore starts a new comparable series.
+
+### Probable-sale price bands
+
+For every research series Scout computes a p25–median–p75 band of **probable sales** from ended listings. The methodology is deliberately conservative:
+
+- A probable sale is a listing verified as no longer available (three terminal detail checks); its last asking price is used as a probable-sale estimate, **not** a confirmed sale price.
+- Superseded rows (research criteria changed) never count. Rows without a verified ended reason are excluded.
+- An asking price last seen more than 30 days before the listing disappeared is stale and is excluded — it describes an earlier market, not the exit price.
+- Bands cover a rolling 90-day window and open up (report `learning` with the eligible count) below 4 eligible samples. Percentiles use linear interpolation.
+
+The older raw `estimatedMedianPrice` field remains in the API payload for one release; the UI shows the probable-sale band instead.
+
+### Research trend charts
+
+Each research watch card offers a price-trend dialog (`GET /api/market-watches/:id/trend?days=30|90|180`). Trend points bucket the current series' price observations into days — one latest observation per listing per day — and draw the median asking price with a shaded p25–p75 band, plus the probable-sale median as a dashed reference line. Preserved-copy dialogs also show the listing's own asking-price sparkline from its stored observations. Open trend dialogs refresh automatically after research scans via the existing `market-watch` event.
+
+### Reference series as a fallback baseline (opt-in)
+
+A deal watch can point at a research watch (`referenceMarketWatchId`). While the watch's own baseline is below 30 comparable samples and the reference series has at least 4 eligible probable sales, new listings display a **series baseline**: the reference band's median stands in for the learned typical price, clearly chipped as "series baseline" in the table and drawer. This improves ranking and display only — the alert readiness gate (30 samples and 6 hours) is unchanged, so no alerts fire earlier than they would without a reference series. Once the watch's own history reaches the sample floor, own history always wins and new rows are marked `own-history`.
+
+Separately opt-in in Settings, `Cap offers with a reference series band` uses the reference series' probable-sale band in negotiation math: the ceiling becomes the minimum of the buyer's total-cost ceiling and the band's p75. Because the cap can only *lower* the buyer's ceiling, it also applies to bounded automatic negotiation when enabled — it never widens the room below the asking price.
 
 ## Preserved listing copies
 

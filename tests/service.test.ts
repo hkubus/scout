@@ -908,9 +908,13 @@ test('keeps market research separate and reports ended-listing price estimates',
     const listing = context.db.prepare("SELECT id FROM market_listings WHERE listing_id = 'ended-1'").get() as { id: number };
     context.db.prepare('INSERT INTO market_price_observations (market_listing_id, price_pln, observed_at) VALUES (?, ?, ?)').run(listing.id, 2000, now);
     const research = context.service.marketResearch();
-    assert.deepEqual(research.watches[0], {
-      id: 'market-watch', name: 'GPU market', query: 'rtx 4070', terms: '12gb', excluded: 'parts', location: 'Warszawa', condition: 'New', sources: ['OLX', 'Vinted'], intervalHours: 24, minPrice: 1000, maxPrice: 2500, shippingOnly: true, enabled: true, nextScan: 'due now', lastScan: 'just now', totalListings: 3, activeListings: 1, endedListings: 2, estimatedMedianPrice: 2200,
+    const { saleBand, ...marketWatch } = research.watches[0];
+    assert.deepEqual(marketWatch, {
+      id: 'market-watch', name: 'GPU market', query: 'rtx 4070', terms: '12gb', excluded: 'parts', location: 'Warszawa', condition: 'New', sources: ['OLX', 'Vinted'], intervalHours: 24, minPrice: 1000, maxPrice: 2500, shippingOnly: true, typoVariants: false, enabled: true, nextScan: 'due now', lastScan: 'just now', totalListings: 3, activeListings: 1, endedListings: 2, estimatedMedianPrice: 2200,
     });
+    // Both ended rows lack a verified ended reason, so the band stays open.
+    assert.deepEqual({ ...saleBand, computedAt: null }, { p25: null, median: null, p75: null, sampleCount: 2, eligibleCount: 0, excludedStale: 0, windowDays: 90, computedAt: null });
+    assert.ok(saleBand!.computedAt);
     assert.equal(research.watches[0].totalListings, 3);
     assert.equal(research.watches[0].activeListings, 1);
     assert.equal(research.watches[0].endedListings, 2);
@@ -919,6 +923,33 @@ test('keeps market research separate and reports ended-listing price estimates',
     context.service.deleteMarketWatch('market-watch');
     assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM market_listings').get() as { count: number }).count, 0);
     assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM market_price_observations').get() as { count: number }).count, 0);
+  } finally { context.close(); }
+});
+
+test('computes probable-sale bands from eligible ended research listings', () => {
+  const context = fixture();
+  try {
+    context.service.createMarketWatch({ id: 'band-watch', name: 'Band', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
+    const now = Date.now();
+    const daysAgoIso = (days: number) => new Date(now - days * 24 * 60 * 60_000).toISOString();
+    const insert = context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans, ended_at, ended_reason)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ended', 3, ?, ?)`);
+    [100, 200, 300, 400, 500].forEach((price, index) => insert.run('band-watch', 'band-watch:v1', 'OLX', `band-${index}`, `CPU ${index}`, `https://www.olx.pl/d/oferta/band-${index}`, price, price, price, daysAgoIso(2), daysAgoIso(1), daysAgoIso(1), 'Ad not found.'));
+    // Last seen far before disappearance: a stale asking price, not a probable sale.
+    insert.run('band-watch', 'band-watch:v1', 'OLX', 'band-stale', 'CPU stale', 'https://www.olx.pl/d/oferta/band-stale', 900, 900, 900, daysAgoIso(45), daysAgoIso(40), daysAgoIso(1), 'Ad not found.');
+    // Criteria-change rows are never probable sales.
+    insert.run('band-watch', 'band-watch:v1', 'OLX', 'band-criteria', 'CPU criteria', 'https://www.olx.pl/d/oferta/band-criteria', 950, 950, 950, daysAgoIso(2), daysAgoIso(1), daysAgoIso(1), 'Research criteria changed');
+
+    const research = context.service.marketResearch();
+    const band = research.watches.find((watch) => watch.id === 'band-watch')!.saleBand!;
+    assert.equal(band.sampleCount, 7);
+    assert.equal(band.eligibleCount, 5);
+    assert.equal(band.excludedStale, 1);
+    assert.equal(band.windowDays, 90);
+    assert.deepEqual({ p25: band.p25, median: band.median, p75: band.p75 }, { p25: 200, median: 300, p75: 400 });
+    assert.equal(research.aggregates?.saleBand?.eligibleCount, 5);
+    // The raw aggregate median keeps its old semantics: every ended asking price counts.
+    assert.equal(research.aggregates?.overallMedianPrice, 400);
   } finally { context.close(); }
 });
 
@@ -933,7 +964,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_drop_observation_link_trigger']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1081,7 +1112,7 @@ test('records failed scans and does not persist partial normal-watch data', asyn
 test('verifies missing research listings before ending them and leaves transient failures as unknown', async () => {
   const context = fixture();
   try {
-    context.service.createMarketWatch({ id: 'availability-watch', name: 'Availability', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false });
+    context.service.createMarketWatch({ id: 'availability-watch', name: 'Availability', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
     const now = new Date().toISOString();
     const insert = context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans, availability_status, last_verified_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, 'live', ?)`);
@@ -1123,7 +1154,7 @@ test('verifies missing research listings before ending them and leaves transient
 test('creates immutable research series and computes aggregates across the full result set', () => {
   const context = fixture();
   try {
-    context.service.createMarketWatch({ id: 'version-watch', name: 'Versioned', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false });
+    context.service.createMarketWatch({ id: 'version-watch', name: 'Versioned', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
     const now = new Date().toISOString();
     context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0)`).run('version-watch', 'version-watch:v1', 'OLX', 'old-series', 'Old CPU', 'https://www.olx.pl/d/oferta/old-series', 100, 100, 100, now, now);
@@ -1136,7 +1167,7 @@ test('creates immutable research series and computes aggregates across the full 
     assert.equal(context.service.marketResearch().watches.find((watch) => watch.id === 'version-watch')?.totalListings, 0);
     assert.equal(context.service.marketResearch({ status: 'superseded' }).listings[0].status, 'superseded');
 
-    context.service.createMarketWatch({ id: 'median-watch', name: 'Median', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false });
+    context.service.createMarketWatch({ id: 'median-watch', name: 'Median', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
     const insert = context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ended', 3)`);
     for (let price = 1; price <= 401; price += 1) insert.run('median-watch', 'median-watch:v1', 'OLX', `median-${price}`, 'CPU', `https://www.olx.pl/d/oferta/median-${price}`, price, price, price, now, now);
@@ -1144,6 +1175,31 @@ test('creates immutable research series and computes aggregates across the full 
     assert.equal(research.aggregates?.overallMedianPrice, 201);
     assert.deepEqual(research.pagination, { page: 2, pageSize: 100, total: 401, hasNext: true });
     assert.equal(research.listings.length, 100);
+  } finally { context.close(); }
+});
+
+test('toggling typo variants on a research watch starts a new immutable series', () => {
+  const context = fixture();
+  try {
+    context.service.createMarketWatch({ id: 'typo-watch', name: 'Typo watch', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
+    const now = new Date().toISOString();
+    context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0)`).run('typo-watch', 'typo-watch:v1', 'OLX', 'typo-series-listing', 'CPU', 'https://www.olx.pl/d/oferta/typo-series-listing', 100, 100, 100, now, now);
+
+    context.service.updateMarketWatch('typo-watch', { typoVariants: true });
+    const versions = context.db.prepare('SELECT id, typo_variants, closed_at FROM market_watch_versions WHERE market_watch_id = ? ORDER BY created_at').all('typo-watch') as Array<{ id: string; typo_variants: number; closed_at: string | null }>;
+    assert.equal(versions.length, 2);
+    assert.equal(versions[0].typo_variants, 0);
+    assert.equal(versions[1].typo_variants, 1);
+    assert.ok(versions[0].closed_at);
+    assert.equal((context.db.prepare("SELECT status FROM market_listings WHERE listing_id = 'typo-series-listing'").get() as { status: string }).status, 'superseded');
+    const watch = context.service.marketResearch().watches.find((item) => item.id === 'typo-watch')!;
+    assert.equal(watch.typoVariants, true);
+    assert.equal(watch.totalListings, 0);
+
+    // Pausing or renaming must not churn the series.
+    context.service.updateMarketWatch('typo-watch', { enabled: false });
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM market_watch_versions WHERE market_watch_id = ?').get('typo-watch') as { count: number }).count, 2);
   } finally { context.close(); }
 });
 
@@ -1189,6 +1245,54 @@ test('retries failed notifications without duplicating alerts and keeps state pe
   }
 });
 
+test('seeds fresh listings from a reference series band for display only', async () => {
+  const context = fixture();
+  try {
+    context.service.createMarketWatch({ id: 'ref-series', name: 'Reference series', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
+    const now = Date.now();
+    const daysAgoIso = (days: number) => new Date(now - days * 24 * 60 * 60_000).toISOString();
+    const insertEnded = context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans, ended_at, ended_reason)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ended', 3, ?, ?)`);
+    [100, 200, 300, 400, 500].forEach((price, index) => insertEnded.run('ref-series', 'ref-series:v1', 'OLX', `ref-${index}`, `CPU ${index}`, `https://www.olx.pl/d/oferta/ref-${index}`, price, price, price, daysAgoIso(2), daysAgoIso(1), daysAgoIso(1), 'Ad not found.'));
+
+    seedWatch(context.db, 'ref-watch');
+    context.db.prepare('UPDATE watches SET reference_market_watch_id = ? WHERE id = ?').run('ref-series', 'ref-watch');
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'ref-listing', url: 'https://www.olx.pl/d/oferta/ref-listing', title: 'CPU deal', created_time: new Date(now).toISOString(), params: [{ key: 'price', value: { value: 240, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 1 } } });
+    const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('ref-watch');
+    await (context.service as any).runWatch(row);
+
+    const association = context.db.prepare('SELECT typical_pln, typical_source, deal_label FROM watch_listings WHERE watch_id = ?').get('ref-watch') as { typical_pln: number; typical_source: string; deal_label: string };
+    assert.deepEqual({ ...association, typical_pln: 300 }, { typical_pln: 300, typical_source: 'reference-band', deal_label: 'Very strong' });
+    const feed = context.service.getListings();
+    assert.equal(feed[0].typical, 300);
+    assert.equal(feed[0].typicalSource, 'reference-band');
+    // The readiness gate stays closed: no alerts fired while learning.
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM notification_deliveries').get() as { count: number }).count, 0);
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM notifications').get() as { count: number }).count, 0);
+
+    // Once the watch has 30+ own samples, own history wins and the band is ignored.
+    seedWatch(context.db, 'own-history-watch', { query: 'cpu' });
+    context.db.prepare('UPDATE watches SET reference_market_watch_id = ? WHERE id = ?').run('ref-series', 'own-history-watch');
+    const firstObserved = daysAgoIso(0.4); // ~9.6h: satisfies the 6h readiness window
+    const insertListing = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+    const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    for (let index = 0; index < 30; index += 1) {
+      insertListing.run('OLX', `own-baseline-${index}`, `Baseline CPU ${index}`, 1000, `https://www.olx.pl/d/oferta/own-baseline-${index}`, firstObserved, firstObserved);
+      const listingId = (context.db.prepare('SELECT id FROM listings WHERE listing_id = ?').get(`own-baseline-${index}`) as { id: number }).id;
+      insertObservation.run(listingId, 'own-history-watch', 1000, firstObserved);
+    }
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'own-listing', url: 'https://www.olx.pl/d/oferta/own-listing', title: 'Own CPU', created_time: new Date(now).toISOString(), params: [{ key: 'price', value: { value: 900, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 1 } } });
+    const ownRow = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('own-history-watch');
+    await (context.service as any).runWatch(ownRow);
+    const ownAssociation = context.db.prepare("SELECT typical_pln, typical_source FROM watch_listings WHERE watch_id = 'own-history-watch' AND typical_source IS NOT NULL").get() as { typical_pln: number; typical_source: string } | undefined;
+    assert.deepEqual({ ...ownAssociation, typical_pln: 1000 }, { typical_pln: 1000, typical_source: 'own-history' });
+  } finally { context.close(); }
+});
+
 test('reports database and scheduler readiness separately from the lightweight health check', () => {
   const context = fixture();
   try {
@@ -1199,7 +1303,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 14);
+    assert.equal(after.migrations.count, 16);
   } finally { context.close(); }
 });
 

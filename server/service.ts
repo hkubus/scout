@@ -10,7 +10,10 @@ import { AllegroMessagingError, sendAllegroMessageOnPage } from './allegro-messa
 import { offerCeiling, recommendNegotiationPrice, type NegotiationRecommendation } from './negotiation';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, median, scoreDeal } from './scoring';
-import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
+import { pickVariantBatch, typoVariants } from './typos';
+import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
+import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
+import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -97,6 +100,10 @@ const MATCH_VISIBILITY_MS = 12 * 60 * 60_000;
 const NIGHT_START_HOUR = 22;
 const NIGHT_END_HOUR = 8;
 const MAX_RESEARCH_DETAIL_CHECKS = 100;
+/** Extra per-source searches a typo-variant scan may fetch (each still one page). */
+const TYPO_VARIANTS_PER_SCAN = 2;
+/** Rolling window of ended listings that feed probable-sale bands. */
+const SALE_BAND_WINDOW_DAYS = 90;
 /** Bounded per-scan capture of preserved listing copies (description + downloaded images). */
 const SNAPSHOT_CAPTURES_PER_SCAN = 8;
 const SNAPSHOT_MAX_IMAGES = 12;
@@ -352,6 +359,16 @@ export class ScoutService {
   private createScan(watchId: string, watchKind: 'watch' | 'research', marketplace: Marketplace, startedAt = nowIso()) {
     const result = this.stmt('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run(watchId, watchKind, marketplace, 'running', startedAt);
     return Number(result.lastInsertRowid);
+  }
+
+  /**
+   * Stable ordinal for rotating typo-variant batches: the number of scan
+   * attempts recorded for this watch (including the running one). Deterministic
+   * per attempt, needs no extra state, and never depends on wall-clock time.
+   */
+  private scanOrdinal(watchId: string, watchKind: 'watch' | 'research') {
+    const row = this.stmt('SELECT COUNT(*) AS count FROM scans WHERE watch_id = ? AND watch_kind = ?').get(watchId, watchKind) as { count?: number };
+    return Number(row?.count ?? 0);
   }
 
   private completeScan(scanId: number, message?: string) {
@@ -1004,7 +1021,9 @@ export class ScoutService {
       exactUrls: parseJson<string[]>(row.exact_urls_json, []),
       sensitivity: Number(row.sensitivity ?? 1),
       shippingOnly: Boolean(row.shipping_only),
+      typoVariants: Boolean(row.typo_variants),
       aiRelevance: row.ai_relevance === undefined ? true : Boolean(row.ai_relevance),
+      referenceMarketWatchId: row.reference_market_watch_id ?? null,
       minPrice: row.min_price_pln === null ? null : Number(row.min_price_pln),
       maxPrice: row.max_price_pln === null ? null : Number(row.max_price_pln),
       archivedAt: row.archived_at ?? null,
@@ -1012,8 +1031,12 @@ export class ScoutService {
   }
 
   private listingFromRow(row: Record<string, any>, baselineReady: boolean): Listing {
+    const typicalSource = row.typical_source === 'reference-band' || row.typical_source === 'own-history' ? row.typical_source : null;
     const associationTypical = row.watch_typical_pln ?? row.typical_pln;
-    const typical = baselineReady && associationTypical !== null && associationTypical !== undefined ? Number(associationTypical) : null;
+    // A band-seeded typical is display-only, so it shows even while the watch
+    // is still learning its own baseline.
+    const showTypical = baselineReady || typicalSource === 'reference-band';
+    const typical = showTypical && associationTypical !== null && associationTypical !== undefined ? Number(associationTypical) : null;
     const price = Number(row.price_pln);
     const belowTypical = typical && typical > 0 ? -Math.max(0, ((typical - price) / typical) * 100) : null;
     const discount = belowTypical === null ? 0 : Math.abs(belowTypical);
@@ -1038,6 +1061,7 @@ export class ScoutService {
       marketplace: row.marketplace,
       price,
       typical,
+      typicalSource,
       belowTypical,
       observed: relativeTime(row.watch_last_seen_at ?? row.last_seen_at),
       observedAt: row.watch_last_seen_at ?? row.last_seen_at,
@@ -1201,7 +1225,7 @@ export class ScoutService {
     const total = Number((this.stmt(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(500, Math.floor(options.pageSize ?? 200)));
-    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note
+    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note
       FROM listings l
       JOIN watch_listings wl ON wl.listing_id = l.id
       JOIN watches w ON w.id = wl.watch_id
@@ -1219,7 +1243,7 @@ export class ScoutService {
 
   listingDetail(key: string, watchId?: string | null): ListingDetail {
     const { marketplace, listingId } = parseListingKey(key);
-    const row = this.stmt(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, a.decision AS listing_decision, a.note AS listing_note, a.updated_at AS action_updated_at
+    const row = this.stmt(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, a.decision AS listing_decision, a.note AS listing_note, a.updated_at AS action_updated_at
       FROM listings l
       LEFT JOIN watch_listings wl ON wl.listing_id = l.id AND (? IS NULL OR wl.watch_id = ?)
       LEFT JOIN watches w ON w.id = wl.watch_id
@@ -1404,6 +1428,7 @@ export class ScoutService {
     const { marketplace } = parseListingKey(key);
     if (marketplace !== 'OLX' && marketplace !== 'Allegro Lokalnie') throw new ServiceError('AI seller negotiation is currently available for OLX and Allegro Lokalnie only.', 409);
     const detail = this.listingDetail(key);
+    const fairPriceBand = this.negotiationFairPriceBand(detail.listing.watchId);
     try {
       return recommendNegotiationPrice({
         askingPrice: detail.listing.price,
@@ -1412,6 +1437,7 @@ export class ScoutService {
         shippingCost,
         otherCosts,
         openingDiscountPercent,
+        ...(fairPriceBand ? { fairPriceBand } : {}),
       });
     } catch (error) {
       throw new ServiceError(error instanceof Error ? error.message : 'Could not calculate a negotiation price.', 400);
@@ -1632,7 +1658,7 @@ export class ScoutService {
       ? this.stmt('SELECT * FROM market_watch_versions WHERE id = ?').get(row.active_version_id) as WatchRow | undefined
       : undefined;
     return version ?? {
-      id: `${row.id}:legacy`, market_watch_id: row.id, query: row.query, included_terms: row.included_terms ?? '', excluded_terms: row.excluded_terms ?? '', location: row.location ?? 'Polska', condition: row.condition ?? 'Any', sources_json: row.sources_json, min_price_pln: row.min_price_pln, max_price_pln: row.max_price_pln, shipping_only: row.shipping_only,
+      id: `${row.id}:legacy`, market_watch_id: row.id, query: row.query, included_terms: row.included_terms ?? '', excluded_terms: row.excluded_terms ?? '', location: row.location ?? 'Polska', condition: row.condition ?? 'Any', sources_json: row.sources_json, min_price_pln: row.min_price_pln, max_price_pln: row.max_price_pln, shipping_only: row.shipping_only, typo_variants: row.typo_variants,
     };
   }
 
@@ -1641,7 +1667,7 @@ export class ScoutService {
     const versionId = `${row.id}:v1`;
     const now = nowIso();
     this.transaction(() => {
-      this.stmt('INSERT OR IGNORE INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, row.id, row.query, row.included_terms ?? '', row.excluded_terms ?? '', row.location ?? 'Polska', row.condition ?? 'Any', row.sources_json, row.min_price_pln, row.max_price_pln, row.shipping_only ? 1 : 0, now);
+      this.stmt('INSERT OR IGNORE INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, row.id, row.query, row.included_terms ?? '', row.excluded_terms ?? '', row.location ?? 'Polska', row.condition ?? 'Any', row.sources_json, row.min_price_pln, row.max_price_pln, row.shipping_only ? 1 : 0, row.typo_variants ? 1 : 0, now);
       this.stmt("UPDATE market_listings SET version_id = ? WHERE market_watch_id = ? AND version_id IS NULL AND status <> 'superseded'").run(versionId, row.id);
       this.stmt('UPDATE market_price_observations SET version_id = ? WHERE market_listing_id IN (SELECT id FROM market_listings WHERE market_watch_id = ?) AND version_id IS NULL').run(versionId, row.id);
       this.stmt('UPDATE market_watches SET active_version_id = ? WHERE id = ? AND active_version_id IS NULL').run(versionId, row.id);
@@ -1658,7 +1684,7 @@ export class ScoutService {
       : [];
     const versionsById = new Map(versionRows.map((version) => [version.id, version]));
     const versionsByWatch = new Map(watchRows.map((row) => [row.id, versionsById.get(row.active_version_id ?? '') ?? {
-      id: `${row.id}:legacy`, market_watch_id: row.id, query: row.query, included_terms: row.included_terms ?? '', excluded_terms: row.excluded_terms ?? '', location: row.location ?? 'Polska', condition: row.condition ?? 'Any', sources_json: row.sources_json, min_price_pln: row.min_price_pln, max_price_pln: row.max_price_pln, shipping_only: row.shipping_only,
+      id: `${row.id}:legacy`, market_watch_id: row.id, query: row.query, included_terms: row.included_terms ?? '', excluded_terms: row.excluded_terms ?? '', location: row.location ?? 'Polska', condition: row.condition ?? 'Any', sources_json: row.sources_json, min_price_pln: row.min_price_pln, max_price_pln: row.max_price_pln, shipping_only: row.shipping_only, typo_variants: row.typo_variants,
     }]));
     const versionFilter = '(ml.version_id = mw.active_version_id OR (mw.active_version_id IS NULL AND ml.version_id IS NULL))';
     const watchStats = this.stmt(`SELECT ml.market_watch_id,
@@ -1683,15 +1709,27 @@ export class ScoutService {
       endedPricesByWatch.set(item.market_watch_id, prices);
       if (!options.watchId || options.watchId === item.market_watch_id) aggregatePrices.push(price);
     }
+    const bandComputedAt = nowIso();
+    const endedSampleRows = this.endedSaleBandRows(null);
+    const bandSamplesByWatch = new Map<string, MarketBandSample[]>();
+    const allBandSamples: MarketBandSample[] = [];
+    for (const item of endedSampleRows) {
+      const sample: MarketBandSample = { price: Number(item.last_price_pln), lastSeenAt: String(item.last_seen_at), endedAt: String(item.ended_at), endedReason: item.ended_reason };
+      const samples = bandSamplesByWatch.get(item.market_watch_id) ?? [];
+      samples.push(sample);
+      bandSamplesByWatch.set(item.market_watch_id, samples);
+      allBandSamples.push(sample);
+    }
     const watches = watchRows.map((row): MarketWatch => {
       const version = versionsByWatch.get(row.id)!;
       const counts = statsByWatch.get(row.id) ?? { total: 0, active: null, ended: null };
       const endedPrices = endedPricesByWatch.get(row.id) ?? [];
       return {
         id: row.id, name: row.name, query: version.query, terms: version.included_terms ?? '', excluded: version.excluded_terms ?? '', location: version.location ?? 'Polska', condition: version.condition ?? 'Any', sources: parseJson<Marketplace[]>(version.sources_json, []),
-        intervalHours: Number(row.interval_hours), minPrice: version.min_price_pln === null || version.min_price_pln === undefined ? null : Number(version.min_price_pln), maxPrice: version.max_price_pln === null || version.max_price_pln === undefined ? null : Number(version.max_price_pln), shippingOnly: Boolean(version.shipping_only), enabled: Boolean(row.enabled), nextScan: Boolean(row.enabled) ? relativeTimeFuture(row.next_scan_at) : 'Paused',
+        intervalHours: Number(row.interval_hours), minPrice: version.min_price_pln === null || version.min_price_pln === undefined ? null : Number(version.min_price_pln), maxPrice: version.max_price_pln === null || version.max_price_pln === undefined ? null : Number(version.max_price_pln), shippingOnly: Boolean(version.shipping_only), typoVariants: Boolean(version.typo_variants), enabled: Boolean(row.enabled), nextScan: Boolean(row.enabled) ? relativeTimeFuture(row.next_scan_at) : 'Paused',
         lastScan: relativeTime(row.last_scan_at), totalListings: Number(counts.total ?? 0), activeListings: Number(counts.active ?? 0), endedListings: Number(counts.ended ?? 0),
         estimatedMedianPrice: endedPrices.length ? median(endedPrices) : null,
+        saleBand: computeSaleBand(bandSamplesByWatch.get(row.id) ?? [], SALE_BAND_WINDOW_DAYS, bandComputedAt),
       };
     });
     // The aggregate reuses the per-watch fetch above — the same ended rows,
@@ -1725,9 +1763,81 @@ export class ScoutService {
     return {
       watches,
       listings,
-      aggregates: { overallMedianPrice: aggregatePrices.length ? median(aggregatePrices) : null, endedCount: Number(aggregateCounts?.ended ?? 0), activeCount: Number(aggregateCounts?.active ?? 0) },
+      aggregates: { overallMedianPrice: aggregatePrices.length ? median(aggregatePrices) : null, endedCount: Number(aggregateCounts?.ended ?? 0), activeCount: Number(aggregateCounts?.active ?? 0), saleBand: computeSaleBand(options.watchId ? bandSamplesByWatch.get(options.watchId) ?? [] : allBandSamples, SALE_BAND_WINDOW_DAYS, bandComputedAt) },
       pagination: { page, pageSize, total, hasNext: page * pageSize < total },
     };
+  }
+
+  /** Ended research listings (active series only) that may feed probable-sale bands. */
+  private endedSaleBandRows(watchId: string | null) {
+    const versionFilter = '(ml.version_id = mw.active_version_id OR (mw.active_version_id IS NULL AND ml.version_id IS NULL))';
+    return this.stmt(`SELECT ml.market_watch_id, ml.last_price_pln, ml.last_seen_at, ml.ended_at, ml.ended_reason
+      FROM market_listings ml
+      JOIN market_watches mw ON mw.id = ml.market_watch_id
+      WHERE ml.status = 'ended' AND ml.last_price_pln > 0 AND ml.ended_at IS NOT NULL AND ${versionFilter}${watchId ? ' AND ml.market_watch_id = ?' : ''}`)
+      .all(...(watchId ? [watchId] : [])) as Array<{ market_watch_id: string; last_price_pln: number; last_seen_at: string; ended_at: string; ended_reason: string | null }>;
+  }
+
+  private toBandSample(row: { last_price_pln: number; last_seen_at: string; ended_at: string; ended_reason: string | null }): MarketBandSample {
+    return { price: Number(row.last_price_pln), lastSeenAt: String(row.last_seen_at), endedAt: String(row.ended_at), endedReason: row.ended_reason };
+  }
+
+  /** Probable-sale median of a reference research series, or null while the band is too thin. */
+  private referenceBandMedian(marketWatchId: string): number | null {
+    const samples = this.endedSaleBandRows(marketWatchId).map((item) => this.toBandSample(item));
+    const band = computeSaleBand(samples, SALE_BAND_WINDOW_DAYS, nowIso());
+    return band.eligibleCount >= MIN_BAND_SAMPLES && band.median !== null ? band.median : null;
+  }
+
+  /** Fair-price band for negotiation when the watch's reference series is opted in. */
+  private negotiationFairPriceBand(watchId: string | null | undefined): { low: number; high: number } | null {
+    if (!watchId || this.getSetting('negotiation_use_band') !== '1') return null;
+    const row = this.stmt('SELECT reference_market_watch_id FROM watches WHERE id = ?').get(watchId) as { reference_market_watch_id?: string | null } | undefined;
+    if (!row?.reference_market_watch_id) return null;
+    const band = computeSaleBand(this.endedSaleBandRows(String(row.reference_market_watch_id)).map((item) => this.toBandSample(item)), SALE_BAND_WINDOW_DAYS, nowIso());
+    if (band.eligibleCount < MIN_BAND_SAMPLES || band.p25 === null || band.p75 === null) return null;
+    return { low: band.p25, high: band.p75 };
+  }
+
+  /**
+   * Daily active-market trend for one research series, with the current
+   * probable-sale band median as a reference line.
+   */
+  marketWatchTrend(id: string, rangeDays = 90): MarketWatchTrend {
+    const row = this.stmt('SELECT id, name FROM market_watches WHERE id = ?').get(id) as WatchRow | undefined;
+    if (!row) throw new ServiceError('Market watch not found', 404);
+    const days = Math.max(7, Math.min(180, Math.floor(rangeDays)));
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60_000).toISOString();
+    const rawRows = this.stmt(`SELECT mpo.market_listing_id, mpo.price_pln, mpo.observed_at
+      FROM market_price_observations mpo
+      JOIN market_listings ml ON ml.id = mpo.market_listing_id
+      WHERE ml.market_watch_id = ?
+        AND mpo.observed_at >= ?
+        AND (ml.version_id = ? OR (? IS NULL AND ml.version_id IS NULL))
+      ORDER BY mpo.observed_at ASC`).all(id, cutoff, row.active_version_id ?? null, row.active_version_id ?? null) as Array<{ market_listing_id: number; price_pln: number; observed_at: string }>;
+    const observations: MarketTrendObservation[] = rawRows.map((item) => ({
+      marketListingId: Number(item.market_listing_id),
+      price: Number(item.price_pln),
+      observedAt: String(item.observed_at),
+    }));
+    const points = bucketDailyObservations(observations, days, nowIso());
+    const band = computeSaleBand(this.endedSaleBandRows(id).map((item) => this.toBandSample(item)), SALE_BAND_WINDOW_DAYS, nowIso());
+    return {
+      marketWatchId: id,
+      watchName: String(row.name),
+      rangeDays: days,
+      firstObservedAt: observations[0]?.observedAt ?? null,
+      lastObservedAt: observations[observations.length - 1]?.observedAt ?? null,
+      totalObservations: observations.length,
+      probableSaleMedian: band.median,
+      points,
+    };
+  }
+
+  /** Asking-price history of one preserved research listing (oldest first). */
+  marketListingHistory(marketListingId: number): PriceHistoryPoint[] {
+    const rows = this.stmt('SELECT price_pln, observed_at FROM market_price_observations WHERE market_listing_id = ? ORDER BY observed_at ASC, id ASC LIMIT 120').all(marketListingId) as Array<{ price_pln: number; observed_at: string }>;
+    return rows.map((point) => ({ price: Number(point.price_pln), observedAt: point.observed_at }));
   }
 
   queueMarketScan(id: string) {
@@ -1750,12 +1860,13 @@ export class ScoutService {
     minPrice: number | null;
     maxPrice: number | null;
     shippingOnly: boolean;
+    typoVariants: boolean;
   }) {
     const now = nowIso();
     const versionId = `${input.id}:v1`;
     this.transaction(() => {
-      this.stmt('INSERT INTO market_watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, interval_hours, min_price_pln, max_price_pln, shipping_only, enabled, active_version_id, next_scan_at, last_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?)').run(input.id, input.name, input.query, input.terms, input.excluded, input.location, input.condition, JSON.stringify(input.sources), input.intervalHours, input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, versionId, now, now, now);
-      this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, input.id, input.query, input.terms, input.excluded, input.location, input.condition, JSON.stringify(input.sources), input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, now);
+      this.stmt('INSERT INTO market_watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, interval_hours, min_price_pln, max_price_pln, shipping_only, typo_variants, enabled, active_version_id, next_scan_at, last_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?)').run(input.id, input.name, input.query, input.terms, input.excluded, input.location, input.condition, JSON.stringify(input.sources), input.intervalHours, input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, input.typoVariants ? 1 : 0, versionId, now, now, now);
+      this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, input.id, input.query, input.terms, input.excluded, input.location, input.condition, JSON.stringify(input.sources), input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, input.typoVariants ? 1 : 0, now);
     });
     return this.marketResearch().watches.find((watch) => watch.id === input.id)!;
   }
@@ -1773,11 +1884,12 @@ export class ScoutService {
     minPrice?: number | null;
     maxPrice?: number | null;
     shippingOnly?: boolean;
+    typoVariants?: boolean;
   }) {
     const row = this.stmt('SELECT * FROM market_watches WHERE id = ?').get(id) as WatchRow | undefined;
     if (!row) throw new ServiceError('Market watch not found', 404);
     const currentVersion = this.marketWatchVersion(row);
-    const criteriaChanged = patch.query !== undefined || patch.terms !== undefined || patch.excluded !== undefined || patch.location !== undefined || patch.condition !== undefined || patch.sources !== undefined || patch.minPrice !== undefined || patch.maxPrice !== undefined || patch.shippingOnly !== undefined;
+    const criteriaChanged = patch.query !== undefined || patch.terms !== undefined || patch.excluded !== undefined || patch.location !== undefined || patch.condition !== undefined || patch.sources !== undefined || patch.minPrice !== undefined || patch.maxPrice !== undefined || patch.shippingOnly !== undefined || patch.typoVariants !== undefined;
     const now = nowIso();
     this.transaction(() => {
       const directFields: string[] = [];
@@ -1797,15 +1909,16 @@ export class ScoutService {
           minPrice: patch.minPrice === undefined ? (currentVersion.min_price_pln === null || currentVersion.min_price_pln === undefined ? null : Number(currentVersion.min_price_pln)) : patch.minPrice,
           maxPrice: patch.maxPrice === undefined ? (currentVersion.max_price_pln === null || currentVersion.max_price_pln === undefined ? null : Number(currentVersion.max_price_pln)) : patch.maxPrice,
           shippingOnly: patch.shippingOnly === undefined ? Boolean(currentVersion.shipping_only) : patch.shippingOnly,
+          typoVariants: patch.typoVariants === undefined ? Boolean(currentVersion.typo_variants) : patch.typoVariants,
         };
-        const changed = next.query !== currentVersion.query || next.terms !== (currentVersion.included_terms ?? '') || next.excluded !== (currentVersion.excluded_terms ?? '') || next.location !== (currentVersion.location ?? 'Polska') || next.condition !== (currentVersion.condition ?? 'Any') || JSON.stringify(next.sources) !== String(currentVersion.sources_json) || next.minPrice !== (currentVersion.min_price_pln ?? null) || next.maxPrice !== (currentVersion.max_price_pln ?? null) || next.shippingOnly !== Boolean(currentVersion.shipping_only);
+        const changed = next.query !== currentVersion.query || next.terms !== (currentVersion.included_terms ?? '') || next.excluded !== (currentVersion.excluded_terms ?? '') || next.location !== (currentVersion.location ?? 'Polska') || next.condition !== (currentVersion.condition ?? 'Any') || JSON.stringify(next.sources) !== String(currentVersion.sources_json) || next.minPrice !== (currentVersion.min_price_pln ?? null) || next.maxPrice !== (currentVersion.max_price_pln ?? null) || next.shippingOnly !== Boolean(currentVersion.shipping_only) || next.typoVariants !== Boolean(currentVersion.typo_variants);
         if (changed) {
           const versionId = `${id}:v${Date.now()}-${randomBytes(3).toString('hex')}`;
           if (row.active_version_id) this.stmt('UPDATE market_watch_versions SET closed_at = ? WHERE id = ? AND closed_at IS NULL').run(now, row.active_version_id);
-          this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, id, next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, now);
+          this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, id, next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, next.typoVariants ? 1 : 0, now);
           this.stmt("UPDATE market_listings SET status = 'superseded', ended_at = COALESCE(ended_at, ?), ended_reason = COALESCE(ended_reason, 'Research criteria changed') WHERE market_watch_id = ? AND (version_id = ? OR version_id IS NULL) AND status <> 'superseded'").run(now, id, row.active_version_id ?? currentVersion.id);
-          directFields.push('query = ?', 'included_terms = ?', 'excluded_terms = ?', 'location = ?', 'condition = ?', 'sources_json = ?', 'min_price_pln = ?', 'max_price_pln = ?', 'shipping_only = ?', 'active_version_id = ?', 'next_scan_at = ?');
-          directValues.push(next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, versionId, now);
+          directFields.push('query = ?', 'included_terms = ?', 'excluded_terms = ?', 'location = ?', 'condition = ?', 'sources_json = ?', 'min_price_pln = ?', 'max_price_pln = ?', 'shipping_only = ?', 'typo_variants = ?', 'active_version_id = ?', 'next_scan_at = ?');
+          directValues.push(next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, next.typoVariants ? 1 : 0, versionId, now);
         }
       }
       if (!directFields.length) throw new ServiceError('No supported fields', 400);
@@ -1845,8 +1958,20 @@ export class ScoutService {
         }
         try {
           const adapter = this.createConnectorAdapter(source, onPath);
-          const fetched = await this.fetchSearchPages(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' }, onPath);
-          this.log('info', 'research', `${row.name} · ${source}: query-search → ${paths.join(' → ') || 'no fetch'} · fetched=${fetched.length}`);
+          const searchFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' as const };
+          const mainListings = await this.fetchSearchPages(source, row.query, searchFilters, onPath);
+          // Typo variants come from the immutable criteria version, like every
+          // other research criterion, and append one page per variant query.
+          const variantQueries = version.typo_variants
+            ? pickVariantBatch(typoVariants(String(version.query ?? row.query)), this.scanOrdinal(String(row.id), 'research'), TYPO_VARIANTS_PER_SCAN)
+            : [];
+          const variantFetches: string[] = [];
+          for (const variantQuery of variantQueries) {
+            variantFetches.push(`"${variantQuery}"`);
+            mainListings.push(...await this.fetchSearchPages(source, variantQuery, searchFilters, onPath));
+          }
+          const fetched = [...new Map(mainListings.map((listing) => [`${listing.marketplace}:${listing.listingId}`, listing])).values()];
+          this.log('info', 'research', `${row.name} · ${source}: query-search${variantFetches.length ? ` + typo-variants (${variantFetches.join(', ')})` : ''} → ${paths.join(' → ') || 'no fetch'} · fetched=${fetched.length}`);
           const filters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, location: row.location, shippingOnly: false };
           const comparable = filterListings(fetched, row.query, row.included_terms ?? '', row.excluded_terms ?? '', filters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
@@ -2186,6 +2311,7 @@ export class ScoutService {
         };
       })(),
       autoNegotiation: this.autoNegotiationSettings(),
+      negotiationUseBand: this.getSetting('negotiation_use_band') === '1',
       publicExposureWarning: this.publicExposureWarning,
       marketplaceSessions: this.marketplaceSessions(),
     };
@@ -2201,6 +2327,7 @@ export class ScoutService {
     clearNtfy?: boolean;
     ntfy?: { serverUrl?: string; topic?: string; token?: string; minimumPriority?: NotificationPriority };
     ai?: { apiKey?: string; clearApiKey?: boolean; model?: string };
+    negotiationUseBand?: boolean;
     autoNegotiation?: {
       enabled?: boolean;
       maxTotalCost?: number | null;
@@ -2259,6 +2386,7 @@ export class ScoutService {
       if (!model || model.length > 200 || /\s/.test(model)) throw new ServiceError('OpenRouter model must be a non-empty model slug without spaces');
       this.setSetting('deepseek_model', model);
     }
+    if (input.negotiationUseBand !== undefined) this.setSetting('negotiation_use_band', input.negotiationUseBand ? '1' : '0');
     if (input.autoNegotiation !== undefined) {
       const current = this.autoNegotiationConfig();
       const next = {
@@ -2399,6 +2527,8 @@ export class ScoutService {
     this.running.add(row.id);
     const sources = parseJson<Marketplace[]>(row.sources_json, []);
     const exactUrls = parseJson<string[]>(row.exact_urls_json, []);
+    // Reference-series fallback is computed once per scan, like the baseline.
+    const referenceMedian = row.reference_market_watch_id ? this.referenceBandMedian(String(row.reference_market_watch_id)) : null;
     let latestBackoffUntil: string | null = null;
     try {
       await Promise.all(sources.map(async (source) => {
@@ -2417,14 +2547,26 @@ export class ScoutService {
         }
         try {
           const matchingExact = exactUrls.filter((url) => validateSearchUrl(url, source).valid);
+          const searchFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' as const };
           const urls = matchingExact.length
             ? matchingExact
-            : [this.marketplaceSearchRequestUrl(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' })];
+            : [this.marketplaceSearchRequestUrl(source, row.query, searchFilters)];
           const adapter = this.createConnectorAdapter(source, onPath);
-          const fetched = matchingExact.length
+          const mainListings = matchingExact.length
             ? (await Promise.all(urls.map((url) => adapter.fetchPublicSearch(url)))).flat()
-            : await this.fetchSearchPages(source, row.query, { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' }, onPath);
-          this.log('info', 'watch', `${row.name} · ${source}: ${matchingExact.length ? `exact-urls (${matchingExact.length})` : 'query-search'} → ${paths.join(' → ') || 'no fetch'} · fetched=${fetched.length}`);
+            : await this.fetchSearchPages(source, row.query, searchFilters, onPath);
+          // Typo variants append at most one page per variant query after the
+          // main page; exact-URL watches pin their own searches instead.
+          const variantQueries = matchingExact.length || !row.typo_variants
+            ? []
+            : pickVariantBatch(typoVariants(String(row.query)), this.scanOrdinal(String(row.id), 'watch'), TYPO_VARIANTS_PER_SCAN);
+          const variantFetches: string[] = [];
+          for (const variantQuery of variantQueries) {
+            variantFetches.push(`"${variantQuery}"`);
+            mainListings.push(...await this.fetchSearchPages(source, variantQuery, searchFilters, onPath));
+          }
+          const fetched = [...new Map(mainListings.map((listing) => [`${listing.marketplace}:${listing.listingId}`, listing])).values()];
+          this.log('info', 'watch', `${row.name} · ${source}: ${matchingExact.length ? `exact-urls (${matchingExact.length})` : 'query-search'}${variantFetches.length ? ` + typo-variants (${variantFetches.join(', ')})` : ''} → ${paths.join(' → ') || 'no fetch'} · fetched=${fetched.length}`);
           const deterministicFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, location: row.location, shippingOnly: false };
           const comparable = filterListings(fetched, row.query, row.included_terms, row.excluded_terms, deterministicFilters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
@@ -2441,7 +2583,7 @@ export class ScoutService {
             const baseline = this.watchBaseline(row);
             const pendingCandidates: DealNotificationCandidate[] = [];
             for (const listing of relevance.listings) {
-              const candidate = this.storeListing(row, listing, scanId, baseline);
+              const candidate = this.storeListing(row, listing, scanId, baseline, referenceMedian);
               if (candidate) pendingCandidates.push(candidate);
             }
             const pending = row.shipping_only ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
@@ -2860,7 +3002,7 @@ export class ScoutService {
     return { prices, firstObservedAt: first?.first ?? null };
   }
 
-  private storeListing(row: WatchRow, listing: NormalizedListing, scanId: number, baseline: { prices: number[]; firstObservedAt: string | null }): DealNotificationCandidate | null {
+  private storeListing(row: WatchRow, listing: NormalizedListing, scanId: number, baseline: { prices: number[]; firstObservedAt: string | null }, referenceMedian: number | null = null): DealNotificationCandidate | null {
     const existingPrices = baseline.prices;
     const observedAt = nowIso();
     // RETURNING removes the follow-up SELECT for the row id on both the
@@ -2876,14 +3018,18 @@ export class ScoutService {
       ON CONFLICT(watch_id, listing_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
       RETURNING id`).get(row.id, stored.id, observedAt, observedAt) as { id: number };
     const observedHours = baseline.firstObservedAt ? Math.max(0, (Date.now() - Date.parse(baseline.firstObservedAt)) / 3_600_000) : 0;
-    const score = scoreDeal(existingPrices, listing.price, { observedHours, sensitivity: Number(row.sensitivity ?? 1) });
+    // The reference-band fallback seeds ranking/display only: while the watch's
+    // own history is below the sample floor, its median stands in for the
+    // typical. Once own samples reach the floor, own history always wins.
+    const useReference = referenceMedian !== null && existingPrices.length < BASELINE_MIN_SAMPLES;
+    const score = scoreDeal(existingPrices, listing.price, { observedHours, sensitivity: Number(row.sensitivity ?? 1), ...(useReference ? { typicalOverride: referenceMedian } : {}) });
     const observation = this.stmt('INSERT INTO observations (listing_id, watch_id, watch_listing_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?, ?)').run(stored.id, row.id, association.id, scanId, listing.price, observedAt);
     const observationId = Number(observation.lastInsertRowid);
     if (score.isReady && score.typical !== null) {
       const discountPercent = score.discountPercent ?? 0;
       const dealStrength = discountPercent >= 30 ? 5 : discountPercent >= 20 ? 4 : discountPercent >= 12 ? 3 : discountPercent > 0 ? 2 : 1;
       const dealLabel: DealLabel = dealStrength >= 5 ? 'Exceptional' : dealStrength === 4 ? 'Very strong' : dealStrength === 3 ? 'Strong' : 'Watch';
-      this.stmt('UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, last_seen_at = ? WHERE id = ?').run(score.typical, dealStrength, dealLabel, observedAt, association.id);
+      this.stmt("UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, typical_source = 'own-history', last_seen_at = ? WHERE id = ?").run(score.typical, dealStrength, dealLabel, observedAt, association.id);
       this.stmt('UPDATE observations SET baseline_pln = ?, discount_percent = ?, deal_strength = ?, deal_label = ? WHERE id = ?').run(score.typical, discountPercent, dealStrength, dealLabel, observationId);
       if (score.qualifies) return {
         watchId: String(row.id),
@@ -2893,6 +3039,13 @@ export class ScoutService {
         confidence: score.confidence,
         requiresDescriptionVerification: dealStrength >= 4,
       };
+    } else if (useReference && score.typical !== null) {
+      // Band-seeded display values; the readiness gate is untouched, so no
+      // alerts fire earlier than they would without a reference series.
+      const discountPercent = score.discountPercent ?? 0;
+      const dealStrength = discountPercent >= 30 ? 5 : discountPercent >= 20 ? 4 : discountPercent >= 12 ? 3 : discountPercent > 0 ? 2 : 1;
+      const dealLabel: DealLabel = dealStrength >= 5 ? 'Exceptional' : dealStrength === 4 ? 'Very strong' : dealStrength === 3 ? 'Strong' : 'Watch';
+      this.stmt("UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, typical_source = 'reference-band', last_seen_at = ? WHERE id = ?").run(score.typical, dealStrength, dealLabel, observedAt, association.id);
     } else {
       this.stmt('UPDATE observations SET baseline_pln = NULL, discount_percent = NULL WHERE id = ?').run(observationId);
     }

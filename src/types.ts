@@ -61,6 +61,8 @@ export interface Listing {
   marketplace: Marketplace;
   price: number;
   typical: number | null;
+  /** Where the displayed typical comes from: the watch's own history or a reference research series band. */
+  typicalSource?: 'own-history' | 'reference-band' | null;
   belowTypical: number | null;
   observed: string;
   observedAt: string;
@@ -172,7 +174,9 @@ export interface Watch {
   exactUrls: string[];
   sensitivity: number;
   shippingOnly: boolean;
+  typoVariants: boolean;
   aiRelevance: boolean;
+  referenceMarketWatchId: string | null;
   minPrice: number | null;
   maxPrice: number | null;
   archivedAt?: string | null;
@@ -241,6 +245,18 @@ export interface ManualSearchResponse {
   sources: SearchSourceStatus[];
 }
 
+/** Probable-sale estimate band — never a confirmed/completed-sale price. */
+export interface SaleBand {
+  p25: number | null;
+  median: number | null;
+  p75: number | null;
+  sampleCount: number;
+  eligibleCount: number;
+  excludedStale: number;
+  windowDays: number;
+  computedAt: string;
+}
+
 export interface MarketWatch {
   id: string;
   name: string;
@@ -254,6 +270,7 @@ export interface MarketWatch {
   minPrice: number | null;
   maxPrice: number | null;
   shippingOnly: boolean;
+  typoVariants: boolean;
   enabled: boolean;
   nextScan: string;
   lastScan: string;
@@ -261,10 +278,11 @@ export interface MarketWatch {
   activeListings: number;
   endedListings: number;
   estimatedMedianPrice: number | null;
+  saleBand: SaleBand | null;
   activeVersionId?: string | null;
 }
 
-export type MarketWatchInput = Pick<MarketWatch, 'name' | 'query' | 'terms' | 'excluded' | 'location' | 'condition' | 'sources' | 'intervalHours' | 'minPrice' | 'maxPrice' | 'shippingOnly'>;
+export type MarketWatchInput = Pick<MarketWatch, 'name' | 'query' | 'terms' | 'excluded' | 'location' | 'condition' | 'sources' | 'intervalHours' | 'minPrice' | 'maxPrice' | 'shippingOnly' | 'typoVariants'>;
 
 export interface MarketTrackedListing {
   id: number;
@@ -310,6 +328,25 @@ export interface MarketListingSnapshot {
   images: MarketListingSnapshotImage[];
 }
 
+export interface MarketWatchTrendPoint {
+  date: string;
+  medianPrice: number | null;
+  lowerPrice: number | null;
+  upperPrice: number | null;
+  listingCount: number;
+}
+
+export interface MarketWatchTrend {
+  marketWatchId: string;
+  watchName: string;
+  rangeDays: number;
+  firstObservedAt: string | null;
+  lastObservedAt: string | null;
+  totalObservations: number;
+  probableSaleMedian: number | null;
+  points: MarketWatchTrendPoint[];
+}
+
 export interface MarketResearchData {
   watches: MarketWatch[];
   listings: MarketTrackedListing[];
@@ -317,6 +354,7 @@ export interface MarketResearchData {
     overallMedianPrice: number | null;
     endedCount: number;
     activeCount: number;
+    saleBand?: SaleBand | null;
   };
   pagination?: {
     page: number;
@@ -379,6 +417,8 @@ export interface SettingsData {
   ntfy: NtfySettings;
   ai: AiSettings;
   autoNegotiation: AutoNegotiationSettings;
+  /** Cap negotiation ceilings with the reference series' probable-sale band (opt-in). */
+  negotiationUseBand: boolean;
   publicExposureWarning: boolean;
   marketplaceSessions: MarketplaceSession[];
 }
