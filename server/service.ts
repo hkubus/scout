@@ -318,18 +318,35 @@ export class ScoutService {
     }
   }
 
+  // node:sqlite has no internal statement cache and every prepare() re-parses
+  // the SQL, so hot loops (storeListing, relevance filtering, shipping
+  // enrichment) memoize their statements here. The map is keyed by the full
+  // SQL string, so dynamically assembled queries (page predicates) stay
+  // distinct per shape and no user text ever lands in a key — filters travel
+  // through bind parameters.
+  private statements = new Map<string, any>();
+
+  private stmt(sql: string) {
+    let statement = this.statements.get(sql);
+    if (!statement) {
+      statement = this.db.prepare(sql);
+      this.statements.set(sql, statement);
+    }
+    return statement;
+  }
+
   private createScan(watchId: string, watchKind: 'watch' | 'research', marketplace: Marketplace, startedAt = nowIso()) {
-    const result = this.db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run(watchId, watchKind, marketplace, 'running', startedAt);
+    const result = this.stmt('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run(watchId, watchKind, marketplace, 'running', startedAt);
     return Number(result.lastInsertRowid);
   }
 
   private completeScan(scanId: number, message?: string) {
-    this.db.prepare("UPDATE scans SET status = 'completed', completed_at = ?, error = ? WHERE id = ?").run(nowIso(), message ?? null, scanId);
+    this.stmt("UPDATE scans SET status = 'completed', completed_at = ?, error = ? WHERE id = ?").run(nowIso(), message ?? null, scanId);
   }
 
   private failScan(scanId: number, error: unknown) {
     const message = (error instanceof Error ? error.message : String(error || 'Scan failed')).slice(0, 500);
-    this.db.prepare("UPDATE scans SET status = 'failed', completed_at = ?, error = ? WHERE id = ?").run(nowIso(), message, scanId);
+    this.stmt("UPDATE scans SET status = 'failed', completed_at = ?, error = ? WHERE id = ?").run(nowIso(), message, scanId);
   }
 
   private log(level: LogEntry['level'], scope: LogEntry['scope'], message: string) {
@@ -355,9 +372,9 @@ export class ScoutService {
     const now = nowIso();
     const expiresAt = new Date(Date.now() + 45_000).toISOString();
     try {
-      const update = this.db.prepare('UPDATE scheduler_leases SET owner_id = ?, expires_at = ? WHERE id = 1 AND (owner_id = ? OR expires_at <= ?)').run(this.schedulerOwner, expiresAt, this.schedulerOwner, now);
+      const update = this.stmt('UPDATE scheduler_leases SET owner_id = ?, expires_at = ? WHERE id = 1 AND (owner_id = ? OR expires_at <= ?)').run(this.schedulerOwner, expiresAt, this.schedulerOwner, now);
       if (Number(update.changes) > 0) return true;
-      const insert = this.db.prepare('INSERT OR IGNORE INTO scheduler_leases (id, owner_id, expires_at) VALUES (1, ?, ?)').run(this.schedulerOwner, expiresAt);
+      const insert = this.stmt('INSERT OR IGNORE INTO scheduler_leases (id, owner_id, expires_at) VALUES (1, ?, ?)').run(this.schedulerOwner, expiresAt);
       return Number(insert.changes) > 0;
     } catch {
       return false;
@@ -368,7 +385,7 @@ export class ScoutService {
     let database = false;
     let databaseError: string | null = null;
     try {
-      const result = this.db.prepare('SELECT 1 AS ok').get() as { ok?: number } | undefined;
+      const result = this.stmt('SELECT 1 AS ok').get() as { ok?: number } | undefined;
       database = result?.ok === 1;
     } catch (error) {
       databaseError = error instanceof Error ? error.message : 'Database probe failed';
@@ -379,8 +396,8 @@ export class ScoutService {
     let degradedConnectors: Array<Connector['name']> = [];
     try {
       if (database) {
-        staleScans = Number((this.db.prepare("SELECT COUNT(*) AS count FROM scans WHERE status = 'running' OR status = 'interrupted'").get() as { count?: number } | undefined)?.count ?? 0);
-        migration = this.db.prepare('SELECT COUNT(*) AS count, MAX(id) AS latest FROM migrations').get() as { count?: number; latest?: string | null };
+        staleScans = Number((this.stmt("SELECT COUNT(*) AS count FROM scans WHERE status = 'running' OR status = 'interrupted'").get() as { count?: number } | undefined)?.count ?? 0);
+        migration = this.stmt('SELECT COUNT(*) AS count, MAX(id) AS latest FROM migrations').get() as { count?: number; latest?: string | null };
         degradedConnectors = this.getConnectors().filter((connector) => connector.status === 'Degraded').map((connector) => connector.name);
       }
     } catch (error) {
@@ -404,12 +421,12 @@ export class ScoutService {
   }
 
   private getSetting(key: string) {
-    const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value?: string } | undefined;
+    const row = this.stmt('SELECT value FROM settings WHERE key = ?').get(key) as { value?: string } | undefined;
     return row?.value ?? null;
   }
 
   private setSetting(key: string, value: string) {
-    this.db.prepare('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run(key, value, nowIso());
+    this.stmt('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run(key, value, nowIso());
   }
 
   private autoNegotiationConfig(): AutoNegotiationConfig {
@@ -463,7 +480,7 @@ export class ScoutService {
 
   private autoNegotiationSettings(): AutoNegotiationSettings {
     const config = this.autoNegotiationConfig();
-    const counts = this.db.prepare(`SELECT COUNT(*) AS attempted, SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent
+    const counts = this.stmt(`SELECT COUNT(*) AS attempted, SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent
       FROM automatic_negotiations WHERE created_at >= ?`).get(this.currentDayStart()) as { attempted?: number; sent?: number } | undefined;
     return {
       ...config,
@@ -519,7 +536,7 @@ export class ScoutService {
     reason: string;
     error?: string | null;
   }) {
-    this.db.prepare(`INSERT INTO listing_relevance (watch_id, marketplace, listing_id, input_hash, model, relevant, reason, error, checked_at, relevance_status)
+    this.stmt(`INSERT INTO listing_relevance (watch_id, marketplace, listing_id, input_hash, model, relevant, reason, error, checked_at, relevance_status)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(watch_id, marketplace, listing_id) DO UPDATE SET input_hash = excluded.input_hash, model = excluded.model, relevant = excluded.relevant, reason = excluded.reason, error = excluded.error, checked_at = excluded.checked_at, relevance_status = excluded.relevance_status`).run(
       input.watchId,
@@ -566,7 +583,7 @@ export class ScoutService {
         const inputHash = listingRelevanceInputHash(context);
         const legacyInputHash = legacyListingRelevanceInputHash(context);
         if (watchId) {
-          const cached = this.db.prepare('SELECT input_hash, model, relevant, reason, error, relevance_status FROM listing_relevance WHERE watch_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, listing.marketplace, listing.listingId) as { input_hash?: string; model?: string; relevant?: number; reason?: string; error?: string | null; relevance_status?: string } | undefined;
+          const cached = this.stmt('SELECT input_hash, model, relevant, reason, error, relevance_status FROM listing_relevance WHERE watch_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, listing.marketplace, listing.listingId) as { input_hash?: string; model?: string; relevant?: number; reason?: string; error?: string | null; relevance_status?: string } | undefined;
           const cachedStatus: 'relevant' | 'irrelevant' | 'unknown' = cached?.relevance_status === 'irrelevant' || cached?.relevance_status === 'unknown' || cached?.relevance_status === 'relevant'
             ? cached.relevance_status
             : cached?.error ? 'unknown' : cached?.relevant === 0 ? 'irrelevant' : 'relevant';
@@ -576,7 +593,7 @@ export class ScoutService {
           }
         }
 
-        const reusable = this.db.prepare(`SELECT relevant, reason, relevance_status FROM listing_relevance
+        const reusable = this.stmt(`SELECT relevant, reason, relevance_status FROM listing_relevance
           WHERE input_hash = ? AND model = ? AND relevance_status IN ('relevant', 'irrelevant') AND error IS NULL
           ORDER BY checked_at DESC LIMIT 1`).get(inputHash, config.model) as { relevant?: number; reason?: string; relevance_status?: string } | undefined;
         if (reusable) {
@@ -629,7 +646,7 @@ export class ScoutService {
     error?: string | null;
   }) {
     if (input.status === 'pending') {
-      this.db.prepare(`UPDATE listings SET
+      this.stmt(`UPDATE listings SET
         ai_description_verification_model = COALESCE(?, ai_description_verification_model),
         ai_description_verification_at = ?,
         ai_description_verification_status = ?
@@ -642,7 +659,7 @@ export class ScoutService {
       );
       return;
     }
-    this.db.prepare(`UPDATE listings SET
+    this.stmt(`UPDATE listings SET
       ai_description_verification_json = ?,
       ai_description_verification_input_hash = ?,
       ai_description_verification_model = ?,
@@ -662,7 +679,7 @@ export class ScoutService {
   }
 
   private captureListingDetailSnapshot(candidate: DealNotificationCandidate, description: string | null) {
-    const stored = this.db.prepare('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get(candidate.listing.marketplace, candidate.listing.listingId) as { id?: number } | undefined;
+    const stored = this.stmt('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get(candidate.listing.marketplace, candidate.listing.listingId) as { id?: number } | undefined;
     if (!stored?.id) return null;
     const stateHash = createHash('sha256').update(JSON.stringify({
       title: candidate.listing.title,
@@ -673,7 +690,7 @@ export class ScoutService {
       description,
     })).digest('hex');
     const capturedAt = nowIso();
-    this.db.prepare(`INSERT INTO listing_detail_snapshots (
+    this.stmt(`INSERT INTO listing_detail_snapshots (
       listing_id, marketplace, external_listing_id, title, price_pln, url,
       condition, location, description, state_hash, verification_status, captured_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
@@ -690,13 +707,13 @@ export class ScoutService {
       stateHash,
       capturedAt,
     );
-    const snapshot = this.db.prepare('SELECT id FROM listing_detail_snapshots WHERE listing_id = ? AND state_hash = ?').get(stored.id, stateHash) as { id?: number } | undefined;
+    const snapshot = this.stmt('SELECT id FROM listing_detail_snapshots WHERE listing_id = ? AND state_hash = ?').get(stored.id, stateHash) as { id?: number } | undefined;
     return snapshot?.id ? { id: Number(snapshot.id), stateHash } : null;
   }
 
   private updateListingDetailSnapshot(snapshotId: number | null, status: ListingDescriptionVerificationStatus, inputHash: string | null) {
     if (!snapshotId) return;
-    this.db.prepare('UPDATE listing_detail_snapshots SET verification_status = ?, verification_input_hash = ? WHERE id = ?').run(status, inputHash, snapshotId);
+    this.stmt('UPDATE listing_detail_snapshots SET verification_status = ?, verification_input_hash = ? WHERE id = ?').run(status, inputHash, snapshotId);
   }
 
   private async verifyHighPriorityDealOnce(candidate: DealNotificationCandidate): Promise<boolean> {
@@ -731,7 +748,7 @@ export class ScoutService {
     };
     const inputHash = listingDescriptionVerificationInputHash(context);
     const snapshot = this.captureListingDetailSnapshot(candidate, description);
-    const row = this.db.prepare(`SELECT ai_description_verification_json, ai_description_verification_input_hash,
+    const row = this.stmt(`SELECT ai_description_verification_json, ai_description_verification_input_hash,
       ai_description_verification_model, ai_description_verification_at, ai_description_verification_error,
       ai_description_verification_status
       FROM listings WHERE marketplace = ? AND listing_id = ?`).get(marketplace, listingId) as Record<string, any> | undefined;
@@ -764,7 +781,7 @@ export class ScoutService {
       return false;
     }
 
-    const reusable = this.db.prepare(`SELECT ai_description_verification_json
+    const reusable = this.stmt(`SELECT ai_description_verification_json
       FROM listings
       WHERE ai_description_verification_input_hash = ?
         AND ai_description_verification_model = ?
@@ -821,11 +838,11 @@ export class ScoutService {
   }
 
   private marketplaceSessionRow(marketplace: Marketplace) {
-    return this.db.prepare('SELECT * FROM marketplace_sessions WHERE marketplace = ?').get(marketplace) as Record<string, any> | undefined;
+    return this.stmt('SELECT * FROM marketplace_sessions WHERE marketplace = ?').get(marketplace) as Record<string, any> | undefined;
   }
 
   private setMarketplaceSessionError(marketplace: Marketplace, message: string | null) {
-    this.db.prepare('UPDATE marketplace_sessions SET last_error = ?, updated_at = ? WHERE marketplace = ?').run(message ? message.slice(0, 500) : null, nowIso(), marketplace);
+    this.stmt('UPDATE marketplace_sessions SET last_error = ?, updated_at = ? WHERE marketplace = ?').run(message ? message.slice(0, 500) : null, nowIso(), marketplace);
   }
 
   private readMarketplaceSession(marketplace: Marketplace): MarketplaceStorageState | null {
@@ -840,7 +857,7 @@ export class ScoutService {
   }
 
   private touchMarketplaceSession(marketplace: Marketplace) {
-    this.db.prepare('UPDATE marketplace_sessions SET last_used_at = ?, last_error = NULL, updated_at = ? WHERE marketplace = ?').run(nowIso(), nowIso(), marketplace);
+    this.stmt('UPDATE marketplace_sessions SET last_used_at = ?, last_error = NULL, updated_at = ? WHERE marketplace = ?').run(nowIso(), nowIso(), marketplace);
   }
 
   marketplaceSessions() {
@@ -870,7 +887,7 @@ export class ScoutService {
     }
     const timestamp = nowIso();
     const safeLabel = (label ?? '').trim().slice(0, 80);
-    this.db.prepare(`INSERT INTO marketplace_sessions (marketplace, label, storage_state_encrypted, created_at, updated_at, last_used_at, last_error)
+    this.stmt(`INSERT INTO marketplace_sessions (marketplace, label, storage_state_encrypted, created_at, updated_at, last_used_at, last_error)
       VALUES (?, ?, ?, ?, ?, NULL, NULL)
       ON CONFLICT(marketplace) DO UPDATE SET label = excluded.label, storage_state_encrypted = excluded.storage_state_encrypted, updated_at = excluded.updated_at, last_used_at = NULL, last_error = NULL`)
       .run(marketplace, safeLabel, encryptSecret(JSON.stringify(state)), timestamp, timestamp);
@@ -878,7 +895,7 @@ export class ScoutService {
   }
 
   deleteMarketplaceSession(marketplace: Marketplace) {
-    const result = this.db.prepare('DELETE FROM marketplace_sessions WHERE marketplace = ?').run(marketplace);
+    const result = this.stmt('DELETE FROM marketplace_sessions WHERE marketplace = ?').run(marketplace);
     if (!result.changes) throw new ServiceError('Marketplace session not found', 404);
     return this.settings();
   }
@@ -980,9 +997,9 @@ export class ScoutService {
   }
 
   private watches(includeArchived: boolean) {
-    const rows = this.db.prepare(`SELECT * FROM watches ${includeArchived ? '' : 'WHERE archived_at IS NULL '}ORDER BY created_at DESC`).all() as WatchRow[];
+    const rows = this.stmt(`SELECT * FROM watches ${includeArchived ? '' : 'WHERE archived_at IS NULL '}ORDER BY created_at DESC`).all() as WatchRow[];
     if (!rows.length) return [];
-    const statsRows = this.db.prepare(`SELECT o.watch_id, COUNT(DISTINCT o.listing_id) AS samples, MIN(o.observed_at) AS first_observed
+    const statsRows = this.stmt(`SELECT o.watch_id, COUNT(DISTINCT o.listing_id) AS samples, MIN(o.observed_at) AS first_observed
       FROM observations o
       JOIN listings l ON l.id = o.listing_id
       JOIN watches w ON w.id = o.watch_id
@@ -1005,11 +1022,11 @@ export class ScoutService {
   }
 
   watchAnalytics(id: string, rangeDays = 30): WatchAnalytics {
-    const row = this.db.prepare('SELECT id, name, shipping_only, min_price_pln, max_price_pln FROM watches WHERE id = ?').get(id) as WatchRow | undefined;
+    const row = this.stmt('SELECT id, name, shipping_only, min_price_pln, max_price_pln FROM watches WHERE id = ?').get(id) as WatchRow | undefined;
     if (!row) throw new ServiceError('Watch not found', 404);
     const days = Math.max(7, Math.min(180, Math.floor(rangeDays)));
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60_000).toISOString();
-    const rawRows = this.db.prepare(`SELECT o.listing_id, l.marketplace, o.price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, o.observed_at
+    const rawRows = this.stmt(`SELECT o.listing_id, l.marketplace, o.price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, o.observed_at
       FROM observations o
       JOIN listings l ON l.id = o.listing_id
       WHERE o.watch_id = ?
@@ -1093,10 +1110,10 @@ export class ScoutService {
     const query = options.q?.trim().toLowerCase() ?? '';
     if (query) { predicates.push("lower(COALESCE(l.title, '') || ' ' || COALESCE(l.subtitle, '')) LIKE ?"); params.push(`%${query}%`); }
     const where = predicates.join(' AND ');
-    const total = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
+    const total = Number((this.stmt(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(500, Math.floor(options.pageSize ?? 200)));
-    const rows = this.db.prepare(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note
+    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note
       FROM listings l
       JOIN watch_listings wl ON wl.listing_id = l.id
       JOIN watches w ON w.id = wl.watch_id
@@ -1114,7 +1131,7 @@ export class ScoutService {
 
   listingDetail(key: string, watchId?: string | null): ListingDetail {
     const { marketplace, listingId } = parseListingKey(key);
-    const row = this.db.prepare(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, a.decision AS listing_decision, a.note AS listing_note, a.updated_at AS action_updated_at
+    const row = this.stmt(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, a.decision AS listing_decision, a.note AS listing_note, a.updated_at AS action_updated_at
       FROM listings l
       LEFT JOIN watch_listings wl ON wl.listing_id = l.id AND (? IS NULL OR wl.watch_id = ?)
       LEFT JOIN watches w ON w.id = wl.watch_id
@@ -1124,8 +1141,8 @@ export class ScoutService {
     if (!row) throw new ServiceError('Listing detail is not available yet', 404);
     const watches = new Map(this.allWatches().map((watch) => [watch.id, watch]));
     const listing = this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100);
-    const history = (this.db.prepare('SELECT price_pln, observed_at FROM observations WHERE listing_id = ? AND (? IS NULL OR watch_id = ?) ORDER BY observed_at DESC, id DESC LIMIT 120').all(row.id, row.watch_id ?? watchId ?? null, row.watch_id ?? watchId ?? null) as Array<{ price_pln: number; observed_at: string }>).reverse().map((point): PriceHistoryPoint => ({ price: Number(point.price_pln), observedAt: point.observed_at }));
-    const snapshotRow = this.db.prepare(`SELECT title, price_pln, condition, location, url, description, captured_at, verification_status
+    const history = (this.stmt('SELECT price_pln, observed_at FROM observations WHERE listing_id = ? AND (? IS NULL OR watch_id = ?) ORDER BY observed_at DESC, id DESC LIMIT 120').all(row.id, row.watch_id ?? watchId ?? null, row.watch_id ?? watchId ?? null) as Array<{ price_pln: number; observed_at: string }>).reverse().map((point): PriceHistoryPoint => ({ price: Number(point.price_pln), observedAt: point.observed_at }));
+    const snapshotRow = this.stmt(`SELECT title, price_pln, condition, location, url, description, captured_at, verification_status
       FROM listing_detail_snapshots WHERE listing_id = ? ORDER BY captured_at DESC, id DESC LIMIT 1`).get(row.id) as Record<string, any> | undefined;
     const snapshotStatus = snapshotRow?.verification_status === 'pass'
       || snapshotRow?.verification_status === 'reject'
@@ -1158,7 +1175,7 @@ export class ScoutService {
   private async normalizeStoredListing(marketplace: Marketplace, listingId: string, force = false) {
     const config = this.deepSeekConfig();
     if (!config.apiKey) throw new ServiceError('OpenRouter is not configured. Add an API key in Settings or set SCOUT_OPENROUTER_API_KEY.', 409);
-    const row = this.db.prepare('SELECT marketplace, listing_id, title, condition, location, ai_normalization_json, ai_normalization_input_hash, ai_normalization_model, ai_normalization_at, ai_normalization_error FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as Record<string, any> | undefined;
+    const row = this.stmt('SELECT marketplace, listing_id, title, condition, location, ai_normalization_json, ai_normalization_input_hash, ai_normalization_model, ai_normalization_at, ai_normalization_error FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as Record<string, any> | undefined;
     if (!row) throw new ServiceError('Listing detail is not available yet', 404);
 
     const source = {
@@ -1173,20 +1190,20 @@ export class ScoutService {
     const sameInput = row.ai_normalization_input_hash === inputHash && row.ai_normalization_model === config.model;
     if (!force && sameInput && cached) return cached;
     if (!force && row.ai_normalization_input_hash === legacyInputHash && row.ai_normalization_model === config.model && cached) {
-      this.db.prepare('UPDATE listings SET ai_normalization_input_hash = ? WHERE marketplace = ? AND listing_id = ?').run(inputHash, marketplace, listingId);
+      this.stmt('UPDATE listings SET ai_normalization_input_hash = ? WHERE marketplace = ? AND listing_id = ?').run(inputHash, marketplace, listingId);
       return cached;
     }
     if (!force && sameInput && row.ai_normalization_error && row.ai_normalization_at && Date.now() - Date.parse(row.ai_normalization_at) < 6 * 60 * 60_000) {
       throw new ServiceError(String(row.ai_normalization_error), 502);
     }
     if (!force) {
-      const reusable = this.db.prepare(`SELECT ai_normalization_json FROM listings
+      const reusable = this.stmt(`SELECT ai_normalization_json FROM listings
         WHERE ai_normalization_input_hash = ? AND ai_normalization_model = ? AND ai_normalization_json IS NOT NULL
         ORDER BY ai_normalization_at DESC LIMIT 1`).get(inputHash, config.model) as { ai_normalization_json?: string } | undefined;
       const shared = parseStoredListingNormalization(reusable?.ai_normalization_json);
       if (shared) {
         const normalizedAt = nowIso();
-        this.db.prepare('UPDATE listings SET ai_normalization_json = ?, ai_normalization_input_hash = ?, ai_normalization_model = ?, ai_normalization_at = ?, ai_normalization_error = NULL WHERE marketplace = ? AND listing_id = ?').run(JSON.stringify(shared), inputHash, config.model, normalizedAt, marketplace, listingId);
+        this.stmt('UPDATE listings SET ai_normalization_json = ?, ai_normalization_input_hash = ?, ai_normalization_model = ?, ai_normalization_at = ?, ai_normalization_error = NULL WHERE marketplace = ? AND listing_id = ?').run(JSON.stringify(shared), inputHash, config.model, normalizedAt, marketplace, listingId);
         this.emit('ai-normalization', { key: `${marketplace}:${listingId}`, status: 'ready' });
         return shared;
       }
@@ -1195,13 +1212,13 @@ export class ScoutService {
     try {
       const normalization = await normalizeListingWithDeepSeek(source, { apiKey: config.apiKey, model: config.model });
       const normalizedAt = nowIso();
-      this.db.prepare('UPDATE listings SET ai_normalization_json = ?, ai_normalization_input_hash = ?, ai_normalization_model = ?, ai_normalization_at = ?, ai_normalization_error = NULL WHERE marketplace = ? AND listing_id = ?').run(JSON.stringify(normalization), inputHash, config.model, normalizedAt, marketplace, listingId);
+      this.stmt('UPDATE listings SET ai_normalization_json = ?, ai_normalization_input_hash = ?, ai_normalization_model = ?, ai_normalization_at = ?, ai_normalization_error = NULL WHERE marketplace = ? AND listing_id = ?').run(JSON.stringify(normalization), inputHash, config.model, normalizedAt, marketplace, listingId);
       this.emit('ai-normalization', { key: `${marketplace}:${listingId}`, status: 'ready' });
       return normalization;
     } catch (error) {
       const message = (error instanceof ServiceError ? error.message : error instanceof Error ? error.message : 'Listing normalization failed').slice(0, 500);
       const attemptedAt = nowIso();
-      this.db.prepare('UPDATE listings SET ai_normalization_json = NULL, ai_normalization_input_hash = ?, ai_normalization_model = ?, ai_normalization_at = ?, ai_normalization_error = ? WHERE marketplace = ? AND listing_id = ?').run(inputHash, config.model, attemptedAt, message, marketplace, listingId);
+      this.stmt('UPDATE listings SET ai_normalization_json = NULL, ai_normalization_input_hash = ?, ai_normalization_model = ?, ai_normalization_at = ?, ai_normalization_error = ? WHERE marketplace = ? AND listing_id = ?').run(inputHash, config.model, attemptedAt, message, marketplace, listingId);
       this.emit('ai-normalization', { key: `${marketplace}:${listingId}`, status: 'error' });
       if (error instanceof ServiceError) throw error;
       throw new ServiceError(message, error instanceof DeepSeekError ? 502 : 500);
@@ -1216,7 +1233,7 @@ export class ScoutService {
 
   listingAction(key: string): ListingAction {
     const { marketplace, listingId } = parseListingKey(key);
-    const row = this.db.prepare('SELECT decision, note, updated_at FROM listing_actions WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as { decision?: unknown; note?: string; updated_at?: string } | undefined;
+    const row = this.stmt('SELECT decision, note, updated_at FROM listing_actions WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as { decision?: unknown; note?: string; updated_at?: string } | undefined;
     return { decision: parseListingDecision(row?.decision), note: row?.note ?? '', updatedAt: row?.updated_at ?? null };
   }
 
@@ -1225,9 +1242,9 @@ export class ScoutService {
     const safeNote = note.trim().slice(0, 2000);
     const timestamp = nowIso();
     if (decision === null && !safeNote) {
-      this.db.prepare('DELETE FROM listing_actions WHERE marketplace = ? AND listing_id = ?').run(marketplace, listingId);
+      this.stmt('DELETE FROM listing_actions WHERE marketplace = ? AND listing_id = ?').run(marketplace, listingId);
     } else {
-      this.db.prepare(`INSERT INTO listing_actions (marketplace, listing_id, decision, note, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(marketplace, listing_id) DO UPDATE SET decision = excluded.decision, note = excluded.note, updated_at = excluded.updated_at`).run(marketplace, listingId, decision, safeNote, timestamp);
+      this.stmt(`INSERT INTO listing_actions (marketplace, listing_id, decision, note, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(marketplace, listing_id) DO UPDATE SET decision = excluded.decision, note = excluded.note, updated_at = excluded.updated_at`).run(marketplace, listingId, decision, safeNote, timestamp);
     }
     this.emit('listing-action', { key, decision });
     return { decision, note: safeNote, updatedAt: safeNote || decision ? timestamp : null };
@@ -1258,8 +1275,8 @@ export class ScoutService {
   messagesPage(options: { page?: number; pageSize?: number } = {}) {
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(200, Math.floor(options.pageSize ?? 100)));
-    const total = Number((this.db.prepare('SELECT COUNT(*) AS count FROM seller_messages').get() as { count?: number }).count ?? 0);
-    const rows = this.db.prepare('SELECT * FROM seller_messages ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?').all(pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
+    const total = Number((this.stmt('SELECT COUNT(*) AS count FROM seller_messages').get() as { count?: number }).count ?? 0);
+    const rows = this.stmt('SELECT * FROM seller_messages ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?').all(pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
     return { messages: rows.map((row) => this.sellerMessageFromRow(row)), pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
   }
 
@@ -1277,7 +1294,7 @@ export class ScoutService {
     createdAt: string;
     sentAt?: string | null;
   }) {
-    const result = this.db.prepare(`INSERT INTO seller_messages (marketplace, listing_id, listing_title, listing_url, message, offer_price_pln, model, source, status, error, created_at, sent_at)
+    const result = this.stmt(`INSERT INTO seller_messages (marketplace, listing_id, listing_title, listing_url, message, offer_price_pln, model, source, status, error, created_at, sent_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       input.marketplace,
       input.listingId,
@@ -1292,7 +1309,7 @@ export class ScoutService {
       input.createdAt,
       input.sentAt ?? null,
     );
-    return this.sellerMessageFromRow(this.db.prepare('SELECT * FROM seller_messages WHERE id = ?').get(Number(result.lastInsertRowid)) as Record<string, any>);
+    return this.sellerMessageFromRow(this.stmt('SELECT * FROM seller_messages WHERE id = ?').get(Number(result.lastInsertRowid)) as Record<string, any>);
   }
 
   recommendNegotiationPriceByKey(key: string, maxTotalCost: number | null = null, shippingCost = 0, otherCosts = 0, openingDiscountPercent?: number): NegotiationRecommendation {
@@ -1316,7 +1333,7 @@ export class ScoutService {
   private prepareNegotiation(key: string, offerPrice: number | null, budget: { maxTotalCost: number; shippingCost?: number; otherCosts?: number } | undefined, source: SellerMessageSource) {
     const { marketplace, listingId } = parseListingKey(key);
     if (marketplace !== 'OLX' && marketplace !== 'Allegro Lokalnie') throw new ServiceError('AI seller negotiation is currently available for OLX and Allegro Lokalnie only.', 409);
-    const row = this.db.prepare('SELECT marketplace, listing_id, title, price_pln, url, condition, location, price_negotiable FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as Record<string, any> | undefined;
+    const row = this.stmt('SELECT marketplace, listing_id, title, price_pln, url, condition, location, price_negotiable FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as Record<string, any> | undefined;
     if (!row) throw new ServiceError('Listing detail is not available yet', 404);
 
     const config = this.deepSeekConfig();
@@ -1410,17 +1427,17 @@ export class ScoutService {
     if (config.maxTotalCost === null || recommendation.openingOffer === null) return false;
     const now = nowIso();
     return this.transaction(() => {
-      const existing = this.db.prepare('SELECT status, attempt_count, updated_at FROM automatic_negotiations WHERE marketplace = ? AND listing_id = ?').get(candidate.listing.marketplace, candidate.listing.listingId) as { status?: string; attempt_count?: number; updated_at?: string } | undefined;
+      const existing = this.stmt('SELECT status, attempt_count, updated_at FROM automatic_negotiations WHERE marketplace = ? AND listing_id = ?').get(candidate.listing.marketplace, candidate.listing.listingId) as { status?: string; attempt_count?: number; updated_at?: string } | undefined;
       if (existing?.status === 'sent') return false;
       if (existing?.status === 'processing' && existing.updated_at && Date.parse(existing.updated_at) > Date.now() - 15 * 60_000) return false;
       if (existing && Number(existing.attempt_count ?? 0) >= 5) return false;
-      const attemptedToday = this.db.prepare('SELECT COUNT(*) AS count FROM automatic_negotiations WHERE created_at >= ?').get(this.currentDayStart()) as { count?: number } | undefined;
+      const attemptedToday = this.stmt('SELECT COUNT(*) AS count FROM automatic_negotiations WHERE created_at >= ?').get(this.currentDayStart()) as { count?: number } | undefined;
       if (Number(attemptedToday?.count ?? 0) >= config.dailyLimit) return false;
       if (existing) {
-        this.db.prepare(`UPDATE automatic_negotiations SET watch_id = ?, status = 'processing', asking_price_pln = ?, offer_price_pln = ?, max_total_cost_pln = ?, known_costs_pln = ?, discount_percent = ?, attempt_count = attempt_count + 1, error = NULL, updated_at = ?
+        this.stmt(`UPDATE automatic_negotiations SET watch_id = ?, status = 'processing', asking_price_pln = ?, offer_price_pln = ?, max_total_cost_pln = ?, known_costs_pln = ?, discount_percent = ?, attempt_count = attempt_count + 1, error = NULL, updated_at = ?
           WHERE marketplace = ? AND listing_id = ?`).run(candidate.watchId, recommendation.askingPrice, recommendation.openingOffer, config.maxTotalCost, recommendation.knownCosts, candidate.discountPercent, now, candidate.listing.marketplace, candidate.listing.listingId);
       } else {
-        this.db.prepare(`INSERT INTO automatic_negotiations (marketplace, listing_id, watch_id, status, asking_price_pln, offer_price_pln, max_total_cost_pln, known_costs_pln, discount_percent, attempt_count, created_at, updated_at)
+        this.stmt(`INSERT INTO automatic_negotiations (marketplace, listing_id, watch_id, status, asking_price_pln, offer_price_pln, max_total_cost_pln, known_costs_pln, discount_percent, attempt_count, created_at, updated_at)
           VALUES (?, ?, ?, 'processing', ?, ?, ?, ?, ?, 1, ?, ?)`).run(candidate.listing.marketplace, candidate.listing.listingId, candidate.watchId, recommendation.askingPrice, recommendation.openingOffer, config.maxTotalCost, recommendation.knownCosts, candidate.discountPercent, now, now);
       }
       return true;
@@ -1430,7 +1447,7 @@ export class ScoutService {
   private finishAutomaticNegotiation(key: string, status: 'sent' | 'failed', messageId: number | null, error?: unknown) {
     const { marketplace, listingId } = parseListingKey(key);
     const safeError = error === undefined || error === null ? null : (error instanceof Error ? error.message : String(error)).slice(0, 500);
-    this.db.prepare('UPDATE automatic_negotiations SET status = ?, message_id = ?, error = ?, updated_at = ? WHERE marketplace = ? AND listing_id = ?').run(status, messageId, safeError, nowIso(), marketplace, listingId);
+    this.stmt('UPDATE automatic_negotiations SET status = ?, message_id = ?, error = ?, updated_at = ? WHERE marketplace = ? AND listing_id = ?').run(status, messageId, safeError, nowIso(), marketplace, listingId);
   }
 
   private async automaticallyNegotiate(candidate: DealNotificationCandidate) {
@@ -1524,7 +1541,7 @@ export class ScoutService {
 
   private marketWatchVersion(row: WatchRow) {
     const version = row.active_version_id
-      ? this.db.prepare('SELECT * FROM market_watch_versions WHERE id = ?').get(row.active_version_id) as WatchRow | undefined
+      ? this.stmt('SELECT * FROM market_watch_versions WHERE id = ?').get(row.active_version_id) as WatchRow | undefined
       : undefined;
     return version ?? {
       id: `${row.id}:legacy`, market_watch_id: row.id, query: row.query, included_terms: row.included_terms ?? '', excluded_terms: row.excluded_terms ?? '', location: row.location ?? 'Polska', condition: row.condition ?? 'Any', sources_json: row.sources_json, min_price_pln: row.min_price_pln, max_price_pln: row.max_price_pln, shipping_only: row.shipping_only,
@@ -1536,27 +1553,27 @@ export class ScoutService {
     const versionId = `${row.id}:v1`;
     const now = nowIso();
     this.transaction(() => {
-      this.db.prepare('INSERT OR IGNORE INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, row.id, row.query, row.included_terms ?? '', row.excluded_terms ?? '', row.location ?? 'Polska', row.condition ?? 'Any', row.sources_json, row.min_price_pln, row.max_price_pln, row.shipping_only ? 1 : 0, now);
-      this.db.prepare("UPDATE market_listings SET version_id = ? WHERE market_watch_id = ? AND version_id IS NULL AND status <> 'superseded'").run(versionId, row.id);
-      this.db.prepare('UPDATE market_price_observations SET version_id = ? WHERE market_listing_id IN (SELECT id FROM market_listings WHERE market_watch_id = ?) AND version_id IS NULL').run(versionId, row.id);
-      this.db.prepare('UPDATE market_watches SET active_version_id = ? WHERE id = ? AND active_version_id IS NULL').run(versionId, row.id);
+      this.stmt('INSERT OR IGNORE INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, row.id, row.query, row.included_terms ?? '', row.excluded_terms ?? '', row.location ?? 'Polska', row.condition ?? 'Any', row.sources_json, row.min_price_pln, row.max_price_pln, row.shipping_only ? 1 : 0, now);
+      this.stmt("UPDATE market_listings SET version_id = ? WHERE market_watch_id = ? AND version_id IS NULL AND status <> 'superseded'").run(versionId, row.id);
+      this.stmt('UPDATE market_price_observations SET version_id = ? WHERE market_listing_id IN (SELECT id FROM market_listings WHERE market_watch_id = ?) AND version_id IS NULL').run(versionId, row.id);
+      this.stmt('UPDATE market_watches SET active_version_id = ? WHERE id = ? AND active_version_id IS NULL').run(versionId, row.id);
     });
-    const refreshed = this.db.prepare('SELECT * FROM market_watches WHERE id = ?').get(row.id) as WatchRow;
+    const refreshed = this.stmt('SELECT * FROM market_watches WHERE id = ?').get(row.id) as WatchRow;
     return this.marketWatchVersion(refreshed);
   }
 
   marketResearch(options: { page?: number; pageSize?: number; watchId?: string; status?: 'active' | 'ended' | 'superseded' } = {}): MarketResearchData {
-    const watchRows = this.db.prepare('SELECT * FROM market_watches ORDER BY created_at DESC').all() as WatchRow[];
+    const watchRows = this.stmt('SELECT * FROM market_watches ORDER BY created_at DESC').all() as WatchRow[];
     const activeVersionIds = watchRows.flatMap((row) => row.active_version_id ? [row.active_version_id] : []);
     const versionRows = activeVersionIds.length
-      ? this.db.prepare(`SELECT * FROM market_watch_versions WHERE id IN (${activeVersionIds.map(() => '?').join(',')})`).all(...activeVersionIds) as WatchRow[]
+      ? this.stmt(`SELECT * FROM market_watch_versions WHERE id IN (${activeVersionIds.map(() => '?').join(',')})`).all(...activeVersionIds) as WatchRow[]
       : [];
     const versionsById = new Map(versionRows.map((version) => [version.id, version]));
     const versionsByWatch = new Map(watchRows.map((row) => [row.id, versionsById.get(row.active_version_id ?? '') ?? {
       id: `${row.id}:legacy`, market_watch_id: row.id, query: row.query, included_terms: row.included_terms ?? '', excluded_terms: row.excluded_terms ?? '', location: row.location ?? 'Polska', condition: row.condition ?? 'Any', sources_json: row.sources_json, min_price_pln: row.min_price_pln, max_price_pln: row.max_price_pln, shipping_only: row.shipping_only,
     }]));
     const versionFilter = '(ml.version_id = mw.active_version_id OR (mw.active_version_id IS NULL AND ml.version_id IS NULL))';
-    const watchStats = this.db.prepare(`SELECT ml.market_watch_id,
+    const watchStats = this.stmt(`SELECT ml.market_watch_id,
         COUNT(*) AS total,
         SUM(CASE WHEN ml.status = 'active' THEN 1 ELSE 0 END) AS active,
         SUM(CASE WHEN ml.status = 'ended' THEN 1 ELSE 0 END) AS ended
@@ -1565,7 +1582,7 @@ export class ScoutService {
       WHERE ml.status IN ('active', 'ended') AND ${versionFilter}
       GROUP BY ml.market_watch_id`).all() as Array<{ market_watch_id: string; total: number; active: number | null; ended: number | null }>;
     const statsByWatch = new Map(watchStats.map((stats) => [stats.market_watch_id, stats]));
-    const endedPriceRows = this.db.prepare(`SELECT ml.market_watch_id, ml.last_price_pln
+    const endedPriceRows = this.stmt(`SELECT ml.market_watch_id, ml.last_price_pln
       FROM market_listings ml
       JOIN market_watches mw ON mw.id = ml.market_watch_id
       WHERE ml.status = 'ended' AND ml.last_price_pln > 0 AND ${versionFilter}`).all() as Array<{ market_watch_id: string; last_price_pln: number }>;
@@ -1591,8 +1608,8 @@ export class ScoutService {
       ...(options.watchId ? ['AND ml.market_watch_id = ?'] : []),
     ].join(' ');
     const aggregateParams = options.watchId ? [options.watchId] : [];
-    const aggregatePrices = (this.db.prepare(applicable).all(...aggregateParams) as Array<{ last_price_pln: number }>).map((item) => Number(item.last_price_pln));
-    const aggregateCounts = this.db.prepare(`SELECT SUM(CASE WHEN ml.status = 'active' THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN ml.status = 'ended' THEN 1 ELSE 0 END) AS ended FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ml.status IN ('active', 'ended') AND ${versionFilter}${options.watchId ? ' AND ml.market_watch_id = ?' : ''}`).get(...aggregateParams) as { active?: number; ended?: number };
+    const aggregatePrices = (this.stmt(applicable).all(...aggregateParams) as Array<{ last_price_pln: number }>).map((item) => Number(item.last_price_pln));
+    const aggregateCounts = this.stmt(`SELECT SUM(CASE WHEN ml.status = 'active' THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN ml.status = 'ended' THEN 1 ELSE 0 END) AS ended FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ml.status IN ('active', 'ended') AND ${versionFilter}${options.watchId ? ' AND ml.market_watch_id = ?' : ''}`).get(...aggregateParams) as { active?: number; ended?: number };
 
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(400, Math.floor(options.pageSize ?? 100)));
@@ -1604,8 +1621,8 @@ export class ScoutService {
     } else if (options.status) {
       predicates.push('ml.status = ?'); params.push(options.status);
     }
-    const total = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ${predicates.join(' AND ')}`).get(...params) as { count?: number }).count ?? 0);
-    const rows = this.db.prepare(`SELECT ml.*, mw.name AS watch_name,
+    const total = Number((this.stmt(`SELECT COUNT(*) AS count FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ${predicates.join(' AND ')}`).get(...params) as { count?: number }).count ?? 0);
+    const rows = this.stmt(`SELECT ml.*, mw.name AS watch_name,
       (SELECT COUNT(*) FROM market_price_observations mpo WHERE mpo.market_listing_id = ml.id AND (mpo.version_id = ml.version_id OR (ml.version_id IS NULL AND mpo.version_id IS NULL))) AS observations
       FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id
       WHERE ${predicates.join(' AND ')}
@@ -1627,7 +1644,7 @@ export class ScoutService {
   }
 
   queueMarketScan(id: string) {
-    const row = this.db.prepare('SELECT * FROM market_watches WHERE id = ? AND enabled = 1').get(id) as WatchRow | undefined;
+    const row = this.stmt('SELECT * FROM market_watches WHERE id = ? AND enabled = 1').get(id) as WatchRow | undefined;
     if (!row) throw new ServiceError('Enabled market watch not found', 404);
     void this.runMarketWatch(row);
     return { queued: true, message: `Queued ${row.name}` };
@@ -1650,8 +1667,8 @@ export class ScoutService {
     const now = nowIso();
     const versionId = `${input.id}:v1`;
     this.transaction(() => {
-      this.db.prepare('INSERT INTO market_watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, interval_hours, min_price_pln, max_price_pln, shipping_only, enabled, active_version_id, next_scan_at, last_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?)').run(input.id, input.name, input.query, input.terms, input.excluded, input.location, input.condition, JSON.stringify(input.sources), input.intervalHours, input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, versionId, now, now, now);
-      this.db.prepare('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, input.id, input.query, input.terms, input.excluded, input.location, input.condition, JSON.stringify(input.sources), input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, now);
+      this.stmt('INSERT INTO market_watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, interval_hours, min_price_pln, max_price_pln, shipping_only, enabled, active_version_id, next_scan_at, last_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?)').run(input.id, input.name, input.query, input.terms, input.excluded, input.location, input.condition, JSON.stringify(input.sources), input.intervalHours, input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, versionId, now, now, now);
+      this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, input.id, input.query, input.terms, input.excluded, input.location, input.condition, JSON.stringify(input.sources), input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, now);
     });
     return this.marketResearch().watches.find((watch) => watch.id === input.id)!;
   }
@@ -1670,7 +1687,7 @@ export class ScoutService {
     maxPrice?: number | null;
     shippingOnly?: boolean;
   }) {
-    const row = this.db.prepare('SELECT * FROM market_watches WHERE id = ?').get(id) as WatchRow | undefined;
+    const row = this.stmt('SELECT * FROM market_watches WHERE id = ?').get(id) as WatchRow | undefined;
     if (!row) throw new ServiceError('Market watch not found', 404);
     const currentVersion = this.marketWatchVersion(row);
     const criteriaChanged = patch.query !== undefined || patch.terms !== undefined || patch.excluded !== undefined || patch.location !== undefined || patch.condition !== undefined || patch.sources !== undefined || patch.minPrice !== undefined || patch.maxPrice !== undefined || patch.shippingOnly !== undefined;
@@ -1697,23 +1714,23 @@ export class ScoutService {
         const changed = next.query !== currentVersion.query || next.terms !== (currentVersion.included_terms ?? '') || next.excluded !== (currentVersion.excluded_terms ?? '') || next.location !== (currentVersion.location ?? 'Polska') || next.condition !== (currentVersion.condition ?? 'Any') || JSON.stringify(next.sources) !== String(currentVersion.sources_json) || next.minPrice !== (currentVersion.min_price_pln ?? null) || next.maxPrice !== (currentVersion.max_price_pln ?? null) || next.shippingOnly !== Boolean(currentVersion.shipping_only);
         if (changed) {
           const versionId = `${id}:v${Date.now()}-${randomBytes(3).toString('hex')}`;
-          if (row.active_version_id) this.db.prepare('UPDATE market_watch_versions SET closed_at = ? WHERE id = ? AND closed_at IS NULL').run(now, row.active_version_id);
-          this.db.prepare('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, id, next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, now);
-          this.db.prepare("UPDATE market_listings SET status = 'superseded', ended_at = COALESCE(ended_at, ?), ended_reason = COALESCE(ended_reason, 'Research criteria changed') WHERE market_watch_id = ? AND (version_id = ? OR version_id IS NULL) AND status <> 'superseded'").run(now, id, row.active_version_id ?? currentVersion.id);
+          if (row.active_version_id) this.stmt('UPDATE market_watch_versions SET closed_at = ? WHERE id = ? AND closed_at IS NULL').run(now, row.active_version_id);
+          this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, id, next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, now);
+          this.stmt("UPDATE market_listings SET status = 'superseded', ended_at = COALESCE(ended_at, ?), ended_reason = COALESCE(ended_reason, 'Research criteria changed') WHERE market_watch_id = ? AND (version_id = ? OR version_id IS NULL) AND status <> 'superseded'").run(now, id, row.active_version_id ?? currentVersion.id);
           directFields.push('query = ?', 'included_terms = ?', 'excluded_terms = ?', 'location = ?', 'condition = ?', 'sources_json = ?', 'min_price_pln = ?', 'max_price_pln = ?', 'shipping_only = ?', 'active_version_id = ?', 'next_scan_at = ?');
           directValues.push(next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, versionId, now);
         }
       }
       if (!directFields.length) throw new ServiceError('No supported fields', 400);
       directValues.push(now, id);
-      this.db.prepare(`UPDATE market_watches SET ${directFields.join(', ')}, updated_at = ? WHERE id = ?`).run(...(directValues as any[]));
+      this.stmt(`UPDATE market_watches SET ${directFields.join(', ')}, updated_at = ? WHERE id = ?`).run(...(directValues as any[]));
     });
     this.emit('market-watch', { refresh: true, id });
     return { ok: true } as const;
   }
 
   deleteMarketWatch(id: string) {
-    const result = this.db.prepare('DELETE FROM market_watches WHERE id = ?').run(id);
+    const result = this.stmt('DELETE FROM market_watches WHERE id = ?').run(id);
     if (!result.changes) throw new ServiceError('Market watch not found', 404);
   }
 
@@ -1729,13 +1746,13 @@ export class ScoutService {
         const paths: string[] = [];
         const onPath: ConnectorPathReporter = (path) => { if (!paths.includes(path)) paths.push(path); };
         const started = nowIso();
-        const latest = this.db.prepare('SELECT backoff_until FROM connector_runs WHERE source = ? ORDER BY started_at DESC LIMIT 1').get(source) as { backoff_until?: string } | undefined;
+        const latest = this.stmt('SELECT backoff_until FROM connector_runs WHERE source = ? ORDER BY started_at DESC LIMIT 1').get(source) as { backoff_until?: string } | undefined;
         const backoffUntil = latest?.backoff_until && Date.parse(latest.backoff_until) > Date.now() ? latest.backoff_until : null;
         if (backoffUntil && (!latestBackoffUntil || Date.parse(backoffUntil) > Date.parse(latestBackoffUntil))) latestBackoffUntil = backoffUntil;
         const runId = this.recordRun(source, backoffUntil ? 'skipped' : 'running', backoffUntil ? `Skipped research for ${row.name}; connector backoff is active` : `Researching ${row.name}`, started, backoffUntil ? started : null);
         const scanId = this.createScan(String(row.id), 'research', source, started);
         if (backoffUntil) {
-          this.db.prepare("UPDATE scans SET status = 'skipped', completed_at = ?, error = ? WHERE id = ?").run(started, `Connector backoff active until ${backoffUntil}`, scanId);
+          this.stmt("UPDATE scans SET status = 'skipped', completed_at = ?, error = ? WHERE id = ?").run(started, `Connector backoff active until ${backoffUntil}`, scanId);
           this.log('info', 'research', `${row.name} · ${source}: skipped (connector backoff until ${backoffUntil})`);
           return;
         }
@@ -1749,7 +1766,7 @@ export class ScoutService {
           const filtered = filterListings(comparable, row.query, row.included_terms ?? '', row.excluded_terms ?? '', { ...filters, shippingOnly: Boolean(row.shipping_only) });
           const observedAt = nowIso();
           const seen = new Set(filtered.map((listing) => listing.listingId));
-          const active = this.db.prepare("SELECT id, listing_id, url, missing_scans FROM market_listings WHERE market_watch_id = ? AND version_id = ? AND marketplace = ? AND status = 'active'").all(row.id, version.id, source) as Array<{ id: number; listing_id: string; url: string; missing_scans: number }>;
+          const active = this.stmt("SELECT id, listing_id, url, missing_scans FROM market_listings WHERE market_watch_id = ? AND version_id = ? AND marketplace = ? AND status = 'active'").all(row.id, version.id, source) as Array<{ id: number; listing_id: string; url: string; missing_scans: number }>;
           const missing = active.filter((listing) => !seen.has(listing.listing_id));
           const deferredMissing = Math.max(0, missing.length - MAX_RESEARCH_DETAIL_CHECKS);
           const verifiedMissing: Array<{ listing: typeof missing[number]; availability: ListingAvailability; refreshed?: NormalizedListing }> = [];
@@ -1766,9 +1783,9 @@ export class ScoutService {
           }
           let discarded = false;
           this.transaction(() => {
-            const current = this.db.prepare('SELECT active_version_id FROM market_watches WHERE id = ?').get(row.id) as { active_version_id?: string | null } | undefined;
+            const current = this.stmt('SELECT active_version_id FROM market_watches WHERE id = ?').get(row.id) as { active_version_id?: string | null } | undefined;
             if (!current || current.active_version_id !== version.id) {
-              this.db.prepare("UPDATE scans SET status = 'superseded', completed_at = ?, error = ? WHERE id = ?").run(nowIso(), 'Research criteria changed while this scan was running', scanId);
+              this.stmt("UPDATE scans SET status = 'superseded', completed_at = ?, error = ? WHERE id = ?").run(nowIso(), 'Research criteria changed while this scan was running', scanId);
               discarded = true;
               return;
             }
@@ -1778,22 +1795,22 @@ export class ScoutService {
               if (stored.created) newListingIds.push(stored.id);
             }
             if (newListingIds.length) {
-              this.db.prepare(`UPDATE market_listings SET snapshot_status = 'pending'
+              this.stmt(`UPDATE market_listings SET snapshot_status = 'pending'
                 WHERE id IN (${newListingIds.map(() => '?').join(',')}) AND snapshot_status IS NULL`).run(...newListingIds);
             }
             for (const { listing, availability, refreshed } of verifiedMissing) {
               if (availability.status === 'live') {
                 if (refreshed) {
-                  this.db.prepare("UPDATE market_listings SET title = ?, url = ?, image_url = COALESCE(?, image_url), last_price_pln = ?, lowest_price_pln = MIN(lowest_price_pln, ?), missing_scans = 0, status = 'active', availability_status = 'live', ended_reason = NULL, last_verified_at = ?, ended_at = NULL WHERE id = ?").run(refreshed.title, refreshed.url, refreshed.imageUrl ?? null, refreshed.price, refreshed.price, observedAt, listing.id);
-                  this.db.prepare('INSERT INTO market_price_observations (market_listing_id, version_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?)').run(listing.id, version.id, scanId, refreshed.price, observedAt);
+                  this.stmt("UPDATE market_listings SET title = ?, url = ?, image_url = COALESCE(?, image_url), last_price_pln = ?, lowest_price_pln = MIN(lowest_price_pln, ?), missing_scans = 0, status = 'active', availability_status = 'live', ended_reason = NULL, last_verified_at = ?, ended_at = NULL WHERE id = ?").run(refreshed.title, refreshed.url, refreshed.imageUrl ?? null, refreshed.price, refreshed.price, observedAt, listing.id);
+                  this.stmt('INSERT INTO market_price_observations (market_listing_id, version_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?)').run(listing.id, version.id, scanId, refreshed.price, observedAt);
                 } else {
-                  this.db.prepare("UPDATE market_listings SET missing_scans = 0, status = 'active', availability_status = 'live', ended_reason = NULL, last_verified_at = ?, ended_at = NULL WHERE id = ?").run(observedAt, listing.id);
+                  this.stmt("UPDATE market_listings SET missing_scans = 0, status = 'active', availability_status = 'live', ended_reason = NULL, last_verified_at = ?, ended_at = NULL WHERE id = ?").run(observedAt, listing.id);
                 }
               } else if (availability.status === 'terminal') {
                 const next = marketStatusAfterMiss(Number(listing.missing_scans));
-                this.db.prepare("UPDATE market_listings SET missing_scans = ?, status = ?, ended_at = CASE WHEN ? = 'ended' THEN COALESCE(ended_at, ?) ELSE ended_at END, availability_status = 'terminal', ended_reason = ?, last_verified_at = ? WHERE id = ?").run(next.missingScans, next.status, next.status, observedAt, availability.reason, observedAt, listing.id);
+                this.stmt("UPDATE market_listings SET missing_scans = ?, status = ?, ended_at = CASE WHEN ? = 'ended' THEN COALESCE(ended_at, ?) ELSE ended_at END, availability_status = 'terminal', ended_reason = ?, last_verified_at = ? WHERE id = ?").run(next.missingScans, next.status, next.status, observedAt, availability.reason, observedAt, listing.id);
               } else {
-                this.db.prepare("UPDATE market_listings SET availability_status = 'unknown', last_verified_at = ? WHERE id = ?").run(observedAt, listing.id);
+                this.stmt("UPDATE market_listings SET availability_status = 'unknown', last_verified_at = ? WHERE id = ?").run(observedAt, listing.id);
               }
             }
             this.completeScan(scanId, `${filtered.length} research listings saved${deferredMissing ? ` · ${deferredMissing} detail checks deferred` : ''}`);
@@ -1814,18 +1831,18 @@ export class ScoutService {
       const finished = nowIso();
       const scheduled = new Date(Date.now() + Math.max(6, Number(row.interval_hours)) * 3_600_000).toISOString();
       const next = latestBackoffUntil && Date.parse(latestBackoffUntil) > Date.parse(scheduled) ? latestBackoffUntil : scheduled;
-      this.db.prepare('UPDATE market_watches SET next_scan_at = ?, last_scan_at = ?, updated_at = ? WHERE id = ? AND active_version_id = ?').run(next, finished, finished, row.id, version.id);
+      this.stmt('UPDATE market_watches SET next_scan_at = ?, last_scan_at = ?, updated_at = ? WHERE id = ? AND active_version_id = ?').run(next, finished, finished, row.id, version.id);
       this.emit('market-watch', { refresh: true, id: row.id });
     } finally { this.running.delete(runningKey); }
   }
 
   private storeMarketListing(watchId: string, versionId: string, listing: NormalizedListing, observedAt: string, scanId: number): { id: number; created: boolean } {
-    const existing = this.db.prepare('SELECT id FROM market_listings WHERE market_watch_id = ? AND version_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, versionId, listing.marketplace, listing.listingId) as { id: number } | undefined;
-    this.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, image_url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans, availability_status, ended_reason, last_verified_at)
+    const existing = this.stmt('SELECT id FROM market_listings WHERE market_watch_id = ? AND version_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, versionId, listing.marketplace, listing.listingId) as { id: number } | undefined;
+    this.stmt(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, image_url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans, availability_status, ended_reason, last_verified_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, 'live', NULL, ?)
       ON CONFLICT(market_watch_id, version_id, marketplace, listing_id) DO UPDATE SET title = excluded.title, url = excluded.url, image_url = COALESCE(excluded.image_url, market_listings.image_url), last_price_pln = excluded.last_price_pln, lowest_price_pln = MIN(market_listings.lowest_price_pln, excluded.last_price_pln), last_seen_at = excluded.last_seen_at, status = 'active', missing_scans = 0, ended_at = NULL, availability_status = 'live', ended_reason = NULL, last_verified_at = excluded.last_verified_at`).run(watchId, versionId, listing.marketplace, listing.listingId, listing.title, listing.url, listing.imageUrl ?? null, listing.price, listing.price, listing.price, observedAt, observedAt, observedAt);
-    const stored = this.db.prepare('SELECT id FROM market_listings WHERE market_watch_id = ? AND version_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, versionId, listing.marketplace, listing.listingId) as { id: number };
-    this.db.prepare('INSERT INTO market_price_observations (market_listing_id, version_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?)').run(stored.id, versionId, scanId, listing.price, observedAt);
+    const stored = this.stmt('SELECT id FROM market_listings WHERE market_watch_id = ? AND version_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, versionId, listing.marketplace, listing.listingId) as { id: number };
+    this.stmt('INSERT INTO market_price_observations (market_listing_id, version_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?)').run(stored.id, versionId, scanId, listing.price, observedAt);
     return { id: Number(stored.id), created: !existing };
   }
 
@@ -1836,7 +1853,7 @@ export class ScoutService {
    */
   private async capturePendingMarketSnapshots(watchId: string, marketplace: Marketplace) {
     try {
-      const due = this.db.prepare(`SELECT * FROM market_listings
+      const due = this.stmt(`SELECT * FROM market_listings
         WHERE market_watch_id = ? AND marketplace = ? AND status IN ('active', 'ended')
           AND snapshot_status IN ('pending', 'failed') AND snapshot_attempts < ?
         ORDER BY COALESCE(ended_at, first_seen_at) ASC, id ASC
@@ -1887,7 +1904,7 @@ export class ScoutService {
       const capturedAt = nowIso();
       let snapshotId: number;
       this.transaction(() => {
-        this.db.prepare(`INSERT INTO market_listing_snapshots (
+        this.stmt(`INSERT INTO market_listing_snapshots (
             market_listing_id, marketplace, external_listing_id, title, price_pln, url,
             condition, location, description, state_hash, image_count, source, captured_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1896,15 +1913,15 @@ export class ScoutService {
           String(listing.url), listing.condition ?? null, listing.location ?? null, description, stateHash,
           images.length, source, capturedAt,
         );
-        const stored = this.db.prepare('SELECT id FROM market_listing_snapshots WHERE market_listing_id = ? AND state_hash = ?').get(Number(listing.id), stateHash) as { id: number };
+        const stored = this.stmt('SELECT id FROM market_listing_snapshots WHERE market_listing_id = ? AND state_hash = ?').get(Number(listing.id), stateHash) as { id: number };
         snapshotId = Number(stored.id);
-        const existingImages = this.db.prepare('SELECT COUNT(*) AS count FROM market_listing_snapshot_images WHERE snapshot_id = ?').get(snapshotId) as { count?: number };
+        const existingImages = this.stmt('SELECT COUNT(*) AS count FROM market_listing_snapshot_images WHERE snapshot_id = ?').get(snapshotId) as { count?: number };
         if (!Number(existingImages.count ?? 0)) {
-          const insertImage = this.db.prepare('INSERT INTO market_listing_snapshot_images (snapshot_id, position, source_url, mime_type, byte_size, data) VALUES (?, ?, ?, ?, ?, ?)');
+          const insertImage = this.stmt('INSERT INTO market_listing_snapshot_images (snapshot_id, position, source_url, mime_type, byte_size, data) VALUES (?, ?, ?, ?, ?, ?)');
           images.forEach((image, index) => insertImage.run(snapshotId, index, image.sourceUrl, image.mime, image.data.byteLength, image.data));
         }
       });
-      this.db.prepare("UPDATE market_listings SET snapshot_status = 'saved', snapshot_at = ? WHERE id = ?").run(capturedAt, Number(listing.id));
+      this.stmt("UPDATE market_listings SET snapshot_status = 'saved', snapshot_at = ? WHERE id = ?").run(capturedAt, Number(listing.id));
       return { ok: true, message: `preserved listing copy (description ${description ? 'saved' : 'unavailable'}, ${images.length} image${images.length === 1 ? '' : 's'})`, snapshotId: snapshotId! };
     } catch (error) {
       const message = (error instanceof Error ? error.message : 'Listing preservation failed').slice(0, 240);
@@ -1914,7 +1931,7 @@ export class ScoutService {
   }
 
   private markSnapshotFailure(listingId: number, attemptsToAdd: number) {
-    this.db.prepare("UPDATE market_listings SET snapshot_status = 'failed', snapshot_attempts = snapshot_attempts + ? WHERE id = ?").run(attemptsToAdd, listingId);
+    this.stmt("UPDATE market_listings SET snapshot_status = 'failed', snapshot_attempts = snapshot_attempts + ? WHERE id = ?").run(attemptsToAdd, listingId);
   }
 
   private async fetchSnapshotImage(url: string, referer: string): Promise<{ mime: string; data: Buffer } | null> {
@@ -1937,12 +1954,12 @@ export class ScoutService {
 
   /** The most recent preserved copy of a research listing, with image metadata (bytes come from the image endpoint). */
   marketListingSnapshot(marketListingId: number): MarketListingSnapshot | null {
-    const listing = this.db.prepare('SELECT id FROM market_listings WHERE id = ?').get(marketListingId) as { id?: number } | undefined;
+    const listing = this.stmt('SELECT id FROM market_listings WHERE id = ?').get(marketListingId) as { id?: number } | undefined;
     if (!listing?.id) throw new ServiceError('Research listing not found', 404);
-    const snapshot = this.db.prepare(`SELECT * FROM market_listing_snapshots WHERE market_listing_id = ?
+    const snapshot = this.stmt(`SELECT * FROM market_listing_snapshots WHERE market_listing_id = ?
       ORDER BY captured_at DESC, id DESC LIMIT 1`).get(marketListingId) as Record<string, any> | undefined;
     if (!snapshot) return null;
-    const images = this.db.prepare('SELECT id, position, byte_size FROM market_listing_snapshot_images WHERE snapshot_id = ? ORDER BY position, id').all(Number(snapshot.id)) as Array<Record<string, any>>;
+    const images = this.stmt('SELECT id, position, byte_size FROM market_listing_snapshot_images WHERE snapshot_id = ? ORDER BY position, id').all(Number(snapshot.id)) as Array<Record<string, any>>;
     return {
       id: Number(snapshot.id),
       marketplace: snapshot.marketplace as Marketplace,
@@ -1959,14 +1976,14 @@ export class ScoutService {
   }
 
   marketSnapshotImage(imageId: number): { mime: string; data: Buffer } | null {
-    const row = this.db.prepare('SELECT mime_type, data FROM market_listing_snapshot_images WHERE id = ?').get(imageId) as { mime_type?: string; data?: Uint8Array } | undefined;
+    const row = this.stmt('SELECT mime_type, data FROM market_listing_snapshot_images WHERE id = ?').get(imageId) as { mime_type?: string; data?: Uint8Array } | undefined;
     if (!row?.data) return null;
     return { mime: row.mime_type ?? 'image/jpeg', data: Buffer.from(row.data) };
   }
 
   /** Manual on-demand preservation, also usable for listings that already ended. */
   async captureMarketListingSnapshotNow(marketListingId: number): Promise<MarketListingSnapshot | null> {
-    const listing = this.db.prepare('SELECT * FROM market_listings WHERE id = ?').get(marketListingId) as Record<string, any> | undefined;
+    const listing = this.stmt('SELECT * FROM market_listings WHERE id = ?').get(marketListingId) as Record<string, any> | undefined;
     if (!listing) throw new ServiceError('Research listing not found', 404);
     const outcome = await this.captureMarketListingSnapshot(listing, 'manual');
     if (!outcome.ok) throw new ServiceError(outcome.message, 502);
@@ -1981,10 +1998,10 @@ export class ScoutService {
     // b-tree free). The previous window-function query materialized every
     // connector_runs row — three full scans on every dashboard refresh and
     // readiness probe.
-    const countBySource = new Map((this.db.prepare('SELECT source, COUNT(*) AS count FROM connector_runs GROUP BY source').all() as Array<{ source: string; count: number }>)
+    const countBySource = new Map((this.stmt('SELECT source, COUNT(*) AS count FROM connector_runs GROUP BY source').all() as Array<{ source: string; count: number }>)
       .map((row) => [String(row.source), Number(row.count)]));
-    const latestRun = this.db.prepare('SELECT * FROM connector_runs WHERE source = ? ORDER BY started_at DESC, id DESC LIMIT 1');
-    const latestSuccess = this.db.prepare("SELECT finished_at FROM connector_runs WHERE source = ? AND status = 'ok' AND finished_at IS NOT NULL ORDER BY started_at DESC, id DESC LIMIT 1");
+    const latestRun = this.stmt('SELECT * FROM connector_runs WHERE source = ? ORDER BY started_at DESC, id DESC LIMIT 1');
+    const latestSuccess = this.stmt("SELECT finished_at FROM connector_runs WHERE source = ? AND status = 'ok' AND finished_at IS NOT NULL ORDER BY started_at DESC, id DESC LIMIT 1");
     const healthBySource = new Map<string, Record<string, any>>();
     for (const definition of connectorDefinitions) {
       const row = latestRun.get(definition.name) as Record<string, any> | undefined;
@@ -2028,7 +2045,7 @@ export class ScoutService {
   }
 
   exportData() {
-    const rows = (table: string) => this.db.prepare(`SELECT * FROM ${table}`).all() as Array<Record<string, unknown>>;
+    const rows = (table: string) => this.stmt(`SELECT * FROM ${table}`).all() as Array<Record<string, unknown>>;
     const settings = rows('settings').map((row) => {
       const key = String(row.key);
       return { key, configured: Boolean(row.value), value: /(?:webhook|ntfy_config|api_key)/i.test(key) ? null : row.value };
@@ -2111,7 +2128,7 @@ export class ScoutService {
       if (!Number.isInteger(input.nightInterval) || input.nightInterval < 5 || input.nightInterval > 1440) throw new ServiceError('Night polling interval must be between 5 and 1440 minutes');
       this.setSetting('night_interval', String(input.nightInterval));
     }
-    if (input.clearWebhook) this.db.prepare("DELETE FROM settings WHERE key = 'discord_webhook'").run();
+    if (input.clearWebhook) this.stmt("DELETE FROM settings WHERE key = 'discord_webhook'").run();
     if (input.webhook?.trim()) this.setSetting('discord_webhook', encryptSecret(validateDiscordWebhook(input.webhook.trim())));
     if (input.discordMinimumPriority !== undefined) this.setSetting('discord_minimum_priority', parseNotificationPriority(input.discordMinimumPriority, 'strong'));
     if (input.dailyDigest !== undefined) {
@@ -2126,7 +2143,7 @@ export class ScoutService {
       if (next.enabled && !next.discord && !next.ntfy) throw new ServiceError('Select Discord, ntfy, or both for daily digests.');
       this.setSetting('daily_digest_config', JSON.stringify(next));
     }
-    if (input.clearNtfy) this.db.prepare("DELETE FROM settings WHERE key = 'ntfy_config'").run();
+    if (input.clearNtfy) this.stmt("DELETE FROM settings WHERE key = 'ntfy_config'").run();
     if (input.ntfy !== undefined) {
       const current = this.ntfyConfig();
       try {
@@ -2141,9 +2158,9 @@ export class ScoutService {
         throw new ServiceError(error instanceof Error ? error.message : 'Invalid ntfy configuration');
       }
     }
-    if (input.ai?.clearApiKey) this.db.prepare("DELETE FROM settings WHERE key IN ('openrouter_api_key', 'deepseek_api_key')").run();
+    if (input.ai?.clearApiKey) this.stmt("DELETE FROM settings WHERE key IN ('openrouter_api_key', 'deepseek_api_key')").run();
     if (input.ai?.apiKey?.trim()) {
-      this.db.prepare("DELETE FROM settings WHERE key = 'deepseek_api_key'").run();
+      this.stmt("DELETE FROM settings WHERE key = 'deepseek_api_key'").run();
       this.setSetting('openrouter_api_key', encryptSecret(input.ai.apiKey.trim()));
     }
     if (input.ai?.model !== undefined) {
@@ -2180,8 +2197,8 @@ export class ScoutService {
   notificationsPage(options: { page?: number; pageSize?: number } = {}) {
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(200, Math.floor(options.pageSize ?? 100)));
-    const total = Number((this.db.prepare('SELECT COUNT(*) AS count FROM notifications').get() as { count?: number }).count ?? 0);
-    const rows = this.db.prepare('SELECT * FROM notifications ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?').all(pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
+    const total = Number((this.stmt('SELECT COUNT(*) AS count FROM notifications').get() as { count?: number }).count ?? 0);
+    const rows = this.stmt('SELECT * FROM notifications ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?').all(pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
     return { notifications: rows.map((row) => {
       const payload = parseJson<Record<string, any>>(row.payload_json, {});
       const embed = payload.embeds?.[0];
@@ -2198,21 +2215,21 @@ export class ScoutService {
   connectorRunsPage(options: { page?: number; pageSize?: number } = {}) {
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(200, Math.floor(options.pageSize ?? 100)));
-    const total = Number((this.db.prepare('SELECT COUNT(*) AS count FROM connector_runs').get() as { count?: number }).count ?? 0);
-    const rows = this.db.prepare('SELECT * FROM connector_runs ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?').all(pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
+    const total = Number((this.stmt('SELECT COUNT(*) AS count FROM connector_runs').get() as { count?: number }).count ?? 0);
+    const rows = this.stmt('SELECT * FROM connector_runs ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?').all(pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
     return { runs: rows.map((row) => ({ id: Number(row.id), source: row.source, status: row.status, message: row.message, startedAt: row.started_at, finishedAt: row.finished_at, duration: duration(row.started_at, row.finished_at) })), pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
   }
 
   deleteWatch(id: string) {
-    const result = this.db.prepare('DELETE FROM watches WHERE id = ?').run(id);
+    const result = this.stmt('DELETE FROM watches WHERE id = ?').run(id);
     if (!result.changes) throw new ServiceError('Watch not found', 404);
   }
 
   archiveWatch(id: string, archived: boolean) {
     const now = nowIso();
     const result = archived
-      ? this.db.prepare('UPDATE watches SET archived_at = ?, enabled = 0, updated_at = ? WHERE id = ?').run(now, now, id)
-      : this.db.prepare('UPDATE watches SET archived_at = NULL, enabled = 1, updated_at = ? WHERE id = ?').run(now, id);
+      ? this.stmt('UPDATE watches SET archived_at = ?, enabled = 0, updated_at = ? WHERE id = ?').run(now, now, id)
+      : this.stmt('UPDATE watches SET archived_at = NULL, enabled = 1, updated_at = ? WHERE id = ?').run(now, id);
     if (!result.changes) throw new ServiceError('Watch not found', 404);
     this.emit('watch', { id, archived });
   }
@@ -2227,13 +2244,13 @@ export class ScoutService {
     try {
       const response = await fetch(webhook, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(12_000) });
       if (!response.ok) throw new Error(`Discord returned ${response.status}`);
-      this.db.prepare('INSERT INTO notifications (listing_key, payload_json, status, sent_at, created_at) VALUES (?, ?, ?, ?, ?)').run(key, JSON.stringify({ ...payload, test: true }), 'delivered', sentAt, sentAt);
+      this.stmt('INSERT INTO notifications (listing_key, payload_json, status, sent_at, created_at) VALUES (?, ?, ?, ?, ?)').run(key, JSON.stringify({ ...payload, test: true }), 'delivered', sentAt, sentAt);
       this.recordRun('Discord', 'ok', 'Test webhook delivered', sentAt, nowIso());
       this.emit('notification', { refresh: true });
       return { delivered: true };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Discord delivery failed';
-      this.db.prepare('INSERT INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(key, JSON.stringify({ ...payload, test: true }), 'failed', sentAt);
+      this.stmt('INSERT INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(key, JSON.stringify({ ...payload, test: true }), 'failed', sentAt);
       this.recordRun('Discord', 'error', message, sentAt, nowIso());
       throw new ServiceError(message, 502);
     }
@@ -2254,13 +2271,13 @@ export class ScoutService {
     const key = `test-ntfy-${Date.now()}`;
     try {
       await publishNtfy(config, payload);
-      this.db.prepare('INSERT INTO notifications (listing_key, payload_json, status, sent_at, created_at) VALUES (?, ?, ?, ?, ?)').run(key, JSON.stringify({ ...payload, test: true, channel: 'ntfy' }), 'delivered', sentAt, sentAt);
+      this.stmt('INSERT INTO notifications (listing_key, payload_json, status, sent_at, created_at) VALUES (?, ?, ?, ?, ?)').run(key, JSON.stringify({ ...payload, test: true, channel: 'ntfy' }), 'delivered', sentAt, sentAt);
       this.recordRun('ntfy', 'ok', 'Test ntfy notification delivered', sentAt, nowIso());
       this.emit('notification', { refresh: true });
       return { delivered: true };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'ntfy delivery failed';
-      this.db.prepare('INSERT INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(key, JSON.stringify({ ...payload, test: true, channel: 'ntfy' }), 'failed', sentAt);
+      this.stmt('INSERT INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(key, JSON.stringify({ ...payload, test: true, channel: 'ntfy' }), 'failed', sentAt);
       this.recordRun('ntfy', 'error', message, sentAt, nowIso());
       throw new ServiceError(message, 502);
     }
@@ -2268,8 +2285,8 @@ export class ScoutService {
 
   queueScan(watchId?: string) {
     const rows = watchId
-      ? this.db.prepare('SELECT * FROM watches WHERE id = ? AND enabled = 1').all(watchId) as WatchRow[]
-      : this.db.prepare('SELECT * FROM watches WHERE enabled = 1').all() as WatchRow[];
+      ? this.stmt('SELECT * FROM watches WHERE id = ? AND enabled = 1').all(watchId) as WatchRow[]
+      : this.stmt('SELECT * FROM watches WHERE enabled = 1').all() as WatchRow[];
     if (!rows.length) throw new ServiceError(watchId ? 'Enabled watch not found' : 'There are no enabled watches to scan', 404);
     for (const row of rows) void this.runWatch(row);
     return { queued: true, message: `Queued ${rows.length} ${rows.length === 1 ? 'watch' : 'watches'}` };
@@ -2279,9 +2296,9 @@ export class ScoutService {
     this.pruneRetention();
     void this.processNotificationRetries();
     void this.processDailyDigest();
-    const rows = this.db.prepare('SELECT * FROM watches WHERE enabled = 1 AND next_scan_at <= ?').all(nowIso()) as WatchRow[];
+    const rows = this.stmt('SELECT * FROM watches WHERE enabled = 1 AND next_scan_at <= ?').all(nowIso()) as WatchRow[];
     for (const row of rows) void this.runWatch(row);
-    const marketRows = this.db.prepare('SELECT * FROM market_watches WHERE enabled = 1 AND next_scan_at <= ?').all(nowIso()) as WatchRow[];
+    const marketRows = this.stmt('SELECT * FROM market_watches WHERE enabled = 1 AND next_scan_at <= ?').all(nowIso()) as WatchRow[];
     for (const row of marketRows) void this.runMarketWatch(row);
   }
 
@@ -2295,14 +2312,14 @@ export class ScoutService {
       await Promise.all(sources.map(async (source) => {
         const paths: string[] = [];
         const onPath: ConnectorPathReporter = (path) => { if (!paths.includes(path)) paths.push(path); };
-        const latest = this.db.prepare('SELECT backoff_until FROM connector_runs WHERE source = ? ORDER BY started_at DESC LIMIT 1').get(source) as { backoff_until?: string } | undefined;
+        const latest = this.stmt('SELECT backoff_until FROM connector_runs WHERE source = ? ORDER BY started_at DESC LIMIT 1').get(source) as { backoff_until?: string } | undefined;
         const started = nowIso();
         const backoffUntil = latest?.backoff_until && Date.parse(latest.backoff_until) > Date.now() ? latest.backoff_until : null;
         if (backoffUntil && (!latestBackoffUntil || Date.parse(backoffUntil) > Date.parse(latestBackoffUntil))) latestBackoffUntil = backoffUntil;
         const runId = this.recordRun(source, backoffUntil ? 'skipped' : 'running', backoffUntil ? `Skipped ${row.name}; connector backoff is active` : `Scanning ${row.name}`, started, backoffUntil ? started : null);
         const scanId = this.createScan(String(row.id), 'watch', source, started);
         if (backoffUntil) {
-          this.db.prepare("UPDATE scans SET status = 'skipped', completed_at = ?, error = ? WHERE id = ?").run(started, `Connector backoff active until ${backoffUntil}`, scanId);
+          this.stmt("UPDATE scans SET status = 'skipped', completed_at = ?, error = ? WHERE id = ?").run(started, `Connector backoff active until ${backoffUntil}`, scanId);
           this.log('info', 'watch', `${row.name} · ${source}: skipped (connector backoff until ${backoffUntil})`);
           return;
         }
@@ -2357,7 +2374,7 @@ export class ScoutService {
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Connector failed';
           this.failScan(scanId, error);
-          const recent = this.db.prepare('SELECT status FROM connector_runs WHERE source = ? AND id != ? ORDER BY started_at DESC LIMIT 8').all(source, runId) as Array<{ status: string }>;
+          const recent = this.stmt('SELECT status FROM connector_runs WHERE source = ? AND id != ? ORDER BY started_at DESC LIMIT 8').all(source, runId) as Array<{ status: string }>;
           const consecutiveFailures = recent.findIndex((run) => run.status !== 'error');
           const failureCount = consecutiveFailures === -1 ? recent.length : consecutiveFailures;
           this.log('error', 'watch', `${row.name} · ${source}: failed via ${paths.join(' → ') || 'unstarted path'} — ${message}`);
@@ -2367,7 +2384,7 @@ export class ScoutService {
       const finished = nowIso();
       const scheduled = nextWatchScanAt(finished, Number(row.interval_minutes), Number(this.getSetting('night_interval') ?? DEFAULT_NIGHT_INTERVAL_MINUTES));
       const next = latestBackoffUntil && Date.parse(latestBackoffUntil) > Date.parse(scheduled) ? latestBackoffUntil : scheduled;
-      this.db.prepare('UPDATE watches SET next_scan_at = ?, updated_at = ? WHERE id = ?').run(next, finished, row.id);
+      this.stmt('UPDATE watches SET next_scan_at = ?, updated_at = ? WHERE id = ?').run(next, finished, row.id);
       this.setSetting('last_scan', JSON.stringify({ at: finished }));
       this.emit('scan', { refresh: true, watchId: row.id });
     } finally {
@@ -2647,25 +2664,25 @@ export class ScoutService {
     const lastPrune = this.getSetting('last_prune');
     if (lastPrune && Date.now() - Date.parse(lastPrune) < 24 * 60 * 60_000) return;
     const cutoff = new Date(Date.now() - 180 * 24 * 60 * 60_000).toISOString();
-    this.db.prepare('DELETE FROM observations WHERE observed_at < ?').run(cutoff);
-    this.db.prepare('DELETE FROM listing_detail_snapshots WHERE captured_at < ?').run(cutoff);
-    this.db.prepare('DELETE FROM market_price_observations WHERE observed_at < ?').run(cutoff);
-    this.db.prepare('DELETE FROM listing_relevance WHERE checked_at < ?').run(cutoff);
-    this.db.prepare('DELETE FROM connector_runs WHERE started_at < ?').run(cutoff);
-    this.db.prepare('DELETE FROM scans WHERE started_at < ?').run(cutoff);
-    this.db.prepare('DELETE FROM seller_messages WHERE created_at < ?').run(cutoff);
-    this.db.prepare('DELETE FROM automatic_negotiations WHERE created_at < ?').run(cutoff);
-    this.db.prepare('DELETE FROM notification_deliveries WHERE created_at < ?').run(cutoff);
-    this.db.prepare('DELETE FROM notifications WHERE created_at < ?').run(cutoff);
-    this.db.prepare('DELETE FROM daily_digest_candidates WHERE (digest_date IS NOT NULL AND digest_date < ?) OR (digest_date IS NULL AND observed_at < ?)').run(cutoff.slice(0, 10), cutoff);
-    this.db.prepare("DELETE FROM market_listings WHERE status IN ('ended', 'superseded') AND last_seen_at < ?").run(cutoff);
-    this.db.prepare("DELETE FROM market_watch_versions WHERE closed_at IS NOT NULL AND closed_at < ? AND id NOT IN (SELECT active_version_id FROM market_watches WHERE active_version_id IS NOT NULL)").run(cutoff);
-    this.db.prepare('DELETE FROM listings WHERE last_seen_at < ? AND NOT EXISTS (SELECT 1 FROM observations WHERE observations.listing_id = listings.id)').run(cutoff);
+    this.stmt('DELETE FROM observations WHERE observed_at < ?').run(cutoff);
+    this.stmt('DELETE FROM listing_detail_snapshots WHERE captured_at < ?').run(cutoff);
+    this.stmt('DELETE FROM market_price_observations WHERE observed_at < ?').run(cutoff);
+    this.stmt('DELETE FROM listing_relevance WHERE checked_at < ?').run(cutoff);
+    this.stmt('DELETE FROM connector_runs WHERE started_at < ?').run(cutoff);
+    this.stmt('DELETE FROM scans WHERE started_at < ?').run(cutoff);
+    this.stmt('DELETE FROM seller_messages WHERE created_at < ?').run(cutoff);
+    this.stmt('DELETE FROM automatic_negotiations WHERE created_at < ?').run(cutoff);
+    this.stmt('DELETE FROM notification_deliveries WHERE created_at < ?').run(cutoff);
+    this.stmt('DELETE FROM notifications WHERE created_at < ?').run(cutoff);
+    this.stmt('DELETE FROM daily_digest_candidates WHERE (digest_date IS NOT NULL AND digest_date < ?) OR (digest_date IS NULL AND observed_at < ?)').run(cutoff.slice(0, 10), cutoff);
+    this.stmt("DELETE FROM market_listings WHERE status IN ('ended', 'superseded') AND last_seen_at < ?").run(cutoff);
+    this.stmt("DELETE FROM market_watch_versions WHERE closed_at IS NOT NULL AND closed_at < ? AND id NOT IN (SELECT active_version_id FROM market_watches WHERE active_version_id IS NOT NULL)").run(cutoff);
+    this.stmt('DELETE FROM listings WHERE last_seen_at < ? AND NOT EXISTS (SELECT 1 FROM observations WHERE observations.listing_id = listings.id)').run(cutoff);
     this.setSetting('last_prune', nowIso());
   }
 
   private async enrichShipping(listings: NormalizedListing[], marketplace: Marketplace, options: { limit?: number } = {}) {
-    const lookup = this.db.prepare('SELECT shipping_available FROM listings WHERE marketplace = ? AND listing_id = ?');
+    const lookup = this.stmt('SELECT shipping_available FROM listings WHERE marketplace = ? AND listing_id = ?');
     for (const listing of listings) {
       if (listing.shippingAvailable !== null) continue;
       const cached = lookup.get(listing.marketplace, listing.listingId) as { shipping_available: number | null } | undefined;
@@ -2697,12 +2714,12 @@ export class ScoutService {
   private cacheShipping(listing: NormalizedListing) {
     if (listing.shippingAvailable === null) return;
     const checked = nowIso();
-    this.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(marketplace, listing_id) DO UPDATE SET shipping_available = excluded.shipping_available, price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), last_seen_at = excluded.last_seen_at`).run(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable ? 1 : 0, listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0, checked, checked);
+    this.stmt(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(marketplace, listing_id) DO UPDATE SET shipping_available = excluded.shipping_available, price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), last_seen_at = excluded.last_seen_at`).run(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable ? 1 : 0, listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0, checked, checked);
   }
 
   private storeManualListing(listing: NormalizedListing) {
     const observedAt = nowIso();
-    this.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, availability_status, last_verified_at, first_seen_at, last_seen_at)
+    this.stmt(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, availability_status, last_verified_at, first_seen_at, last_seen_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, ?)
       ON CONFLICT(marketplace, listing_id) DO UPDATE SET title = excluded.title, price_pln = excluded.price_pln, url = excluded.url, image_url = COALESCE(excluded.image_url, listings.image_url), condition = COALESCE(excluded.condition, listings.condition), location = COALESCE(excluded.location, listings.location), shipping_available = COALESCE(excluded.shipping_available, listings.shipping_available), price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), availability_status = 'live', last_verified_at = excluded.last_verified_at, last_seen_at = excluded.last_seen_at`).run(
       listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null,
@@ -2734,39 +2751,39 @@ export class ScoutService {
       row.shipping_only ? 1 : 0,
       row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln,
     ] as unknown[];
-    const prices = (this.db.prepare(`SELECT price_pln FROM (
+    const prices = (this.stmt(`SELECT price_pln FROM (
         SELECT o.price_pln, o.observed_at, o.id, ROW_NUMBER() OVER (PARTITION BY o.listing_id ORDER BY o.observed_at DESC, o.id DESC) AS rank
         FROM observations o ${baselineFilters}
       ) WHERE rank <= 1 ORDER BY observed_at DESC, id DESC LIMIT 400`).all(...baselineParams) as Array<{ price_pln: number }>)
       .map((item) => Number(item.price_pln))
       .filter((price) => Number.isFinite(price) && price > 0);
-    const first = this.db.prepare(`SELECT MIN(o.observed_at) AS first FROM observations o ${baselineFilters}`).get(...baselineParams) as { first: string | null };
+    const first = this.stmt(`SELECT MIN(o.observed_at) AS first FROM observations o ${baselineFilters}`).get(...baselineParams) as { first: string | null };
     return { prices, firstObservedAt: first?.first ?? null };
   }
 
   private storeListing(row: WatchRow, listing: NormalizedListing, scanId: number, baseline: { prices: number[]; firstObservedAt: string | null }): DealNotificationCandidate | null {
     const existingPrices = baseline.prices;
     const observedAt = nowIso();
-    this.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, availability_status, last_verified_at, first_seen_at, last_seen_at)
+    this.stmt(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, availability_status, last_verified_at, first_seen_at, last_seen_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, ?)
       ON CONFLICT(marketplace, listing_id) DO UPDATE SET title = excluded.title, price_pln = excluded.price_pln, url = excluded.url, image_url = COALESCE(excluded.image_url, listings.image_url), condition = COALESCE(excluded.condition, listings.condition), location = COALESCE(excluded.location, listings.location), shipping_available = COALESCE(excluded.shipping_available, listings.shipping_available), price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), availability_status = 'live', ended_reason = NULL, last_verified_at = excluded.last_verified_at, last_seen_at = excluded.last_seen_at`).run(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable === null ? null : listing.shippingAvailable ? 1 : 0, listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0, observedAt, observedAt, observedAt);
     const inputHash = listingNormalizationInputHash(listing);
-    this.db.prepare('UPDATE listings SET ai_normalization_json = NULL, ai_normalization_input_hash = NULL, ai_normalization_model = NULL, ai_normalization_at = NULL, ai_normalization_error = NULL WHERE marketplace = ? AND listing_id = ? AND ai_normalization_input_hash IS NOT NULL AND ai_normalization_input_hash <> ?').run(listing.marketplace, listing.listingId, inputHash);
-    const stored = this.db.prepare('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get(listing.marketplace, listing.listingId) as { id: number };
-    this.db.prepare(`INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at)
+    this.stmt('UPDATE listings SET ai_normalization_json = NULL, ai_normalization_input_hash = NULL, ai_normalization_model = NULL, ai_normalization_at = NULL, ai_normalization_error = NULL WHERE marketplace = ? AND listing_id = ? AND ai_normalization_input_hash IS NOT NULL AND ai_normalization_input_hash <> ?').run(listing.marketplace, listing.listingId, inputHash);
+    const stored = this.stmt('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get(listing.marketplace, listing.listingId) as { id: number };
+    this.stmt(`INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at)
       VALUES (?, ?, ?, ?)
       ON CONFLICT(watch_id, listing_id) DO UPDATE SET last_seen_at = excluded.last_seen_at`).run(row.id, stored.id, observedAt, observedAt);
-    const association = this.db.prepare('SELECT id FROM watch_listings WHERE watch_id = ? AND listing_id = ?').get(row.id, stored.id) as { id: number };
+    const association = this.stmt('SELECT id FROM watch_listings WHERE watch_id = ? AND listing_id = ?').get(row.id, stored.id) as { id: number };
     const observedHours = baseline.firstObservedAt ? Math.max(0, (Date.now() - Date.parse(baseline.firstObservedAt)) / 3_600_000) : 0;
     const score = scoreDeal(existingPrices, listing.price, { observedHours, sensitivity: Number(row.sensitivity ?? 1) });
-    const observation = this.db.prepare('INSERT INTO observations (listing_id, watch_id, watch_listing_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?, ?)').run(stored.id, row.id, association.id, scanId, listing.price, observedAt);
+    const observation = this.stmt('INSERT INTO observations (listing_id, watch_id, watch_listing_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?, ?)').run(stored.id, row.id, association.id, scanId, listing.price, observedAt);
     const observationId = Number(observation.lastInsertRowid);
     if (score.isReady && score.typical !== null) {
       const discountPercent = score.discountPercent ?? 0;
       const dealStrength = discountPercent >= 30 ? 5 : discountPercent >= 20 ? 4 : discountPercent >= 12 ? 3 : discountPercent > 0 ? 2 : 1;
       const dealLabel: DealLabel = dealStrength >= 5 ? 'Exceptional' : dealStrength === 4 ? 'Very strong' : dealStrength === 3 ? 'Strong' : 'Watch';
-      this.db.prepare('UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, last_seen_at = ? WHERE id = ?').run(score.typical, dealStrength, dealLabel, observedAt, association.id);
-      this.db.prepare('UPDATE observations SET baseline_pln = ?, discount_percent = ?, deal_strength = ?, deal_label = ? WHERE id = ?').run(score.typical, discountPercent, dealStrength, dealLabel, observationId);
+      this.stmt('UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, last_seen_at = ? WHERE id = ?').run(score.typical, dealStrength, dealLabel, observedAt, association.id);
+      this.stmt('UPDATE observations SET baseline_pln = ?, discount_percent = ?, deal_strength = ?, deal_label = ? WHERE id = ?').run(score.typical, discountPercent, dealStrength, dealLabel, observationId);
       if (score.qualifies) return {
         watchId: String(row.id),
         listing,
@@ -2776,18 +2793,18 @@ export class ScoutService {
         requiresDescriptionVerification: dealStrength >= 4,
       };
     } else {
-      this.db.prepare('UPDATE observations SET baseline_pln = NULL, discount_percent = NULL WHERE id = ?').run(observationId);
+      this.stmt('UPDATE observations SET baseline_pln = NULL, discount_percent = NULL WHERE id = ?').run(observationId);
     }
     return null;
   }
 
   private queueDailyDigestCandidate(watchId: string, listing: NormalizedListing, typical: number, discountPercent: number, confidence: number, priority: NotificationPriority) {
-    const latest = this.db.prepare(`SELECT sequence, price_pln AS last_alerted_price_pln, priority AS last_priority
+    const latest = this.stmt(`SELECT sequence, price_pln AS last_alerted_price_pln, priority AS last_priority
       FROM daily_digest_candidates WHERE watch_id = ? AND marketplace = ? AND listing_id = ?
       ORDER BY sequence DESC LIMIT 1`).get(watchId, listing.marketplace, listing.listingId) as { sequence?: number; last_alerted_price_pln?: number; last_priority?: NotificationPriority } | undefined;
     if (!this.shouldAlert(latest, listing.price, priority)) return false;
     const sequence = Number(latest?.sequence ?? 0) + 1;
-    this.db.prepare(`INSERT INTO daily_digest_candidates (
+    this.stmt(`INSERT INTO daily_digest_candidates (
       watch_id, marketplace, listing_id, sequence, title, url, image_url, price_pln,
       typical_pln, discount_percent, confidence, priority, observed_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
@@ -2848,8 +2865,8 @@ export class ScoutService {
       }
       const finished = nowIso();
       this.transaction(() => {
-        this.db.prepare("UPDATE notification_deliveries SET status = 'delivered', sent_at = ?, next_attempt_at = NULL, updated_at = ? WHERE listing_key = ? AND channel = ?").run(finished, finished, input.deliveryKey, input.channel);
-        this.db.prepare("UPDATE notifications SET status = 'delivered', sent_at = ? WHERE listing_key = ?").run(finished, input.eventKey);
+        this.stmt("UPDATE notification_deliveries SET status = 'delivered', sent_at = ?, next_attempt_at = NULL, updated_at = ? WHERE listing_key = ? AND channel = ?").run(finished, finished, input.deliveryKey, input.channel);
+        this.stmt("UPDATE notifications SET status = 'delivered', sent_at = ? WHERE listing_key = ?").run(finished, input.eventKey);
         this.setSetting('daily_digest_last_sent_at', finished);
       });
       this.recordRun(input.channel, 'ok', `${input.channel} daily digest delivered`, started, finished);
@@ -2858,8 +2875,8 @@ export class ScoutService {
     } catch (error) {
       const message = (error instanceof Error ? error.message : `${input.channel} digest delivery failed`).slice(0, 500);
       const nextAttempt = input.attemptCount < 5 ? new Date(Date.now() + exponentialBackoff(input.attemptCount - 1, 30_000, 6 * 60 * 60_000)).toISOString() : null;
-      this.db.prepare("UPDATE notification_deliveries SET status = 'failed', message = ?, next_attempt_at = ?, updated_at = ? WHERE listing_key = ? AND channel = ?").run(message, nextAttempt, nowIso(), input.deliveryKey, input.channel);
-      this.db.prepare("UPDATE notifications SET status = 'failed' WHERE listing_key = ?").run(input.eventKey);
+      this.stmt("UPDATE notification_deliveries SET status = 'failed', message = ?, next_attempt_at = ?, updated_at = ? WHERE listing_key = ? AND channel = ?").run(message, nextAttempt, nowIso(), input.deliveryKey, input.channel);
+      this.stmt("UPDATE notifications SET status = 'failed' WHERE listing_key = ?").run(input.eventKey);
       this.recordRun(input.channel, 'error', message, started, nowIso());
       return 'failed' as const;
     }
@@ -2879,7 +2896,7 @@ export class ScoutService {
     if (!channels.length) return;
     this.digestRunning = true;
     try {
-      const candidates = this.db.prepare(`SELECT c.*, w.name AS watch_name
+      const candidates = this.stmt(`SELECT c.*, w.name AS watch_name
         FROM daily_digest_candidates c JOIN watches w ON w.id = c.watch_id
         WHERE c.digest_date IS NULL ORDER BY c.discount_percent DESC, c.observed_at ASC, c.id ASC`).all() as DigestCandidateRow[];
       const planned: Array<{ channel: DigestChannel; eventKey: string; payload: Record<string, any> }> = [];
@@ -2891,7 +2908,7 @@ export class ScoutService {
           const eventKey = `digest:${local.date}:${channel.toLowerCase()}`;
           const payload = channel === 'Discord' ? this.digestDiscordPayload(local.date, eligible) : this.digestNtfyPayload(ntfy!, local.date, eligible);
           const stored = { ...payload, _scoutDigest: { channel, date: local.date, count: eligible.length } };
-          this.db.prepare('INSERT OR IGNORE INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(eventKey, JSON.stringify(stored), 'pending', nowIso());
+          this.stmt('INSERT OR IGNORE INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(eventKey, JSON.stringify(stored), 'pending', nowIso());
           planned.push({ channel, eventKey, payload: stored });
         }
         if (planned.length) {
@@ -2899,7 +2916,7 @@ export class ScoutService {
           for (const row of candidates) {
             if (channels.some((channel) => meetsMinimumPriority(row.priority, channel === 'Discord' ? this.discordMinimumPriority() : ntfy!.minimumPriority))) eligibleIds.add(Number(row.id));
           }
-          const update = this.db.prepare('UPDATE daily_digest_candidates SET digest_date = ? WHERE id = ?');
+          const update = this.stmt('UPDATE daily_digest_candidates SET digest_date = ? WHERE id = ?');
           for (const id of eligibleIds) update.run(local.date, id);
         }
         if (planned.length) this.setSetting('daily_digest_last_date', local.date);
@@ -2935,7 +2952,7 @@ export class ScoutService {
     const staleBefore = new Date(Date.now() - 15 * 60_000).toISOString();
     const maxAttempts = 5;
     return this.transaction(() => {
-      const existing = this.db.prepare('SELECT id, status, attempt_count, next_attempt_at, updated_at, created_at FROM notification_deliveries WHERE listing_key = ? AND channel = ?').get(listingKey, channel) as Record<string, any> | undefined;
+      const existing = this.stmt('SELECT id, status, attempt_count, next_attempt_at, updated_at, created_at FROM notification_deliveries WHERE listing_key = ? AND channel = ?').get(listingKey, channel) as Record<string, any> | undefined;
       if (existing) {
         const attempts = Number(existing.attempt_count ?? 0);
         const updatedAt = String(existing.updated_at ?? existing.created_at ?? '');
@@ -2943,21 +2960,21 @@ export class ScoutService {
         if (existing.status === 'failed' && existing.next_attempt_at && Date.parse(existing.next_attempt_at) > Date.now()) return null;
         if (existing.status === 'pending' && updatedAt && Date.parse(updatedAt) > Date.parse(staleBefore)) return null;
         const nextAttempt = attempts + 1;
-        this.db.prepare("UPDATE notification_deliveries SET status = 'pending', attempt_count = ?, next_attempt_at = NULL, updated_at = ? WHERE id = ?").run(nextAttempt, createdAt, existing.id);
+        this.stmt("UPDATE notification_deliveries SET status = 'pending', attempt_count = ?, next_attempt_at = NULL, updated_at = ? WHERE id = ?").run(nextAttempt, createdAt, existing.id);
         return { id: Number(existing.id), attemptCount: nextAttempt };
       }
-      const result = this.db.prepare("INSERT INTO notification_deliveries (listing_key, channel, status, attempt_count, next_attempt_at, updated_at, created_at) VALUES (?, ?, 'pending', 1, NULL, ?, ?)").run(listingKey, channel, createdAt, createdAt);
+      const result = this.stmt("INSERT INTO notification_deliveries (listing_key, channel, status, attempt_count, next_attempt_at, updated_at, created_at) VALUES (?, ?, 'pending', 1, NULL, ?, ?)").run(listingKey, channel, createdAt, createdAt);
       return { id: Number(result.lastInsertRowid), attemptCount: 1 };
     });
   }
 
   private latestDeliveryForAlert(watchId: string, listing: NormalizedListing, channel: 'Discord' | 'ntfy') {
     const prefix = `${watchId}|${listing.marketplace}|${listing.listingId}|alert:`;
-    return this.db.prepare("SELECT listing_key, status, attempt_count, next_attempt_at, updated_at, created_at FROM notification_deliveries WHERE channel = ? AND listing_key LIKE ? ORDER BY id DESC LIMIT 1").get(channel, `${prefix}%|channel:${channel}`) as Record<string, any> | undefined;
+    return this.stmt("SELECT listing_key, status, attempt_count, next_attempt_at, updated_at, created_at FROM notification_deliveries WHERE channel = ? AND listing_key LIKE ? ORDER BY id DESC LIMIT 1").get(channel, `${prefix}%|channel:${channel}`) as Record<string, any> | undefined;
   }
 
   private alertState(watchId: string, listing: NormalizedListing, channel: 'Discord' | 'ntfy') {
-    return this.db.prepare('SELECT last_alerted_price_pln, last_priority, alert_sequence FROM watch_listing_alert_state WHERE watch_id = ? AND marketplace = ? AND listing_id = ? AND channel = ?').get(watchId, listing.marketplace, listing.listingId, channel) as { last_alerted_price_pln?: number; last_priority?: NotificationPriority; alert_sequence?: number } | undefined;
+    return this.stmt('SELECT last_alerted_price_pln, last_priority, alert_sequence FROM watch_listing_alert_state WHERE watch_id = ? AND marketplace = ? AND listing_id = ? AND channel = ?').get(watchId, listing.marketplace, listing.listingId, channel) as { last_alerted_price_pln?: number; last_priority?: NotificationPriority; alert_sequence?: number } | undefined;
   }
 
   private shouldAlert(state: { last_alerted_price_pln?: number; last_priority?: NotificationPriority } | undefined, price: number, priority: NotificationPriority) {
@@ -2995,15 +3012,15 @@ export class ScoutService {
       }
       const finished = nowIso();
       this.transaction(() => {
-        this.db.prepare("UPDATE notification_deliveries SET status = 'delivered', sent_at = ?, next_attempt_at = NULL, updated_at = ? WHERE listing_key = ? AND channel = ?").run(finished, finished, input.deliveryKey, input.channel);
-        const canPersistWatchState = !input.legacy && input.watchId !== undefined && input.sequence !== undefined && Boolean(this.db.prepare('SELECT 1 FROM watches WHERE id = ?').get(input.watchId));
+        this.stmt("UPDATE notification_deliveries SET status = 'delivered', sent_at = ?, next_attempt_at = NULL, updated_at = ? WHERE listing_key = ? AND channel = ?").run(finished, finished, input.deliveryKey, input.channel);
+        const canPersistWatchState = !input.legacy && input.watchId !== undefined && input.sequence !== undefined && Boolean(this.stmt('SELECT 1 FROM watches WHERE id = ?').get(input.watchId));
         if (canPersistWatchState) {
-          this.db.prepare(`INSERT INTO watch_listing_alert_state (watch_id, marketplace, listing_id, channel, last_alerted_price_pln, last_priority, alert_sequence, updated_at)
+          this.stmt(`INSERT INTO watch_listing_alert_state (watch_id, marketplace, listing_id, channel, last_alerted_price_pln, last_priority, alert_sequence, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(watch_id, marketplace, listing_id, channel) DO UPDATE SET last_alerted_price_pln = excluded.last_alerted_price_pln, last_priority = excluded.last_priority, alert_sequence = excluded.alert_sequence, updated_at = excluded.updated_at`).run(input.watchId, input.listing.marketplace, input.listing.listingId, input.channel, input.listing.price, input.priority, input.sequence, finished);
-          this.db.prepare("UPDATE notifications SET status = 'delivered', sent_at = ? WHERE listing_key = ?").run(finished, input.eventKey);
+          this.stmt("UPDATE notifications SET status = 'delivered', sent_at = ? WHERE listing_key = ?").run(finished, input.eventKey);
         } else {
-          this.db.prepare("UPDATE notifications SET status = 'delivered', sent_at = ? WHERE listing_key = ?").run(finished, input.eventKey);
+          this.stmt("UPDATE notifications SET status = 'delivered', sent_at = ? WHERE listing_key = ?").run(finished, input.eventKey);
         }
       });
       this.recordRun(input.channel, 'ok', `${input.channel} notification delivered`, started, finished);
@@ -3012,8 +3029,8 @@ export class ScoutService {
     } catch (error) {
       const message = (error instanceof Error ? error.message : `${input.channel} delivery failed`).slice(0, 500);
       const nextAttempt = input.attemptCount < 5 ? new Date(Date.now() + exponentialBackoff(input.attemptCount - 1, 30_000, 6 * 60 * 60_000)).toISOString() : null;
-      this.db.prepare("UPDATE notification_deliveries SET status = 'failed', message = ?, next_attempt_at = ?, updated_at = ? WHERE listing_key = ? AND channel = ?").run(message, nextAttempt, nowIso(), input.deliveryKey, input.channel);
-      this.db.prepare("UPDATE notifications SET status = 'failed' WHERE listing_key = ? AND status <> 'delivered'").run(input.eventKey);
+      this.stmt("UPDATE notification_deliveries SET status = 'failed', message = ?, next_attempt_at = ?, updated_at = ? WHERE listing_key = ? AND channel = ?").run(message, nextAttempt, nowIso(), input.deliveryKey, input.channel);
+      this.stmt("UPDATE notifications SET status = 'failed' WHERE listing_key = ? AND status <> 'delivered'").run(input.eventKey);
       this.recordRun(input.channel, 'error', message, started, nowIso());
       return 'failed' as const;
     }
@@ -3071,7 +3088,7 @@ export class ScoutService {
         deliveryKey = this.notificationDeliveryKey(eventKey, channel);
       }
       const payload = { ...buildDiscordEmbed({ listing, typical, discountPercent, confidence }), _scout: { watchId, listing, typical, discountPercent, confidence, priority, sequence } };
-      this.db.prepare('INSERT OR IGNORE INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(eventKey, JSON.stringify(payload), 'pending', nowIso());
+      this.stmt('INSERT OR IGNORE INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(eventKey, JSON.stringify(payload), 'pending', nowIso());
       const claim = this.claimNotificationDelivery(deliveryKey, channel);
       if (claim) planned.push({ channel, eventKey, deliveryKey, sequence: legacy ? undefined : sequence, claim, legacy });
     }
@@ -3097,7 +3114,7 @@ export class ScoutService {
   private async processNotificationRetries() {
     const now = nowIso();
     const stale = new Date(Date.now() - 15 * 60_000).toISOString();
-    const rows = this.db.prepare(`SELECT nd.listing_key, nd.channel, nd.attempt_count, n.listing_key AS event_key, n.payload_json
+    const rows = this.stmt(`SELECT nd.listing_key, nd.channel, nd.attempt_count, n.listing_key AS event_key, n.payload_json
       FROM notification_deliveries nd
       JOIN notifications n ON n.listing_key = CASE WHEN instr(nd.listing_key, '|channel:') > 0 THEN substr(nd.listing_key, 1, instr(nd.listing_key, '|channel:') - 1) ELSE nd.listing_key END
       WHERE nd.attempt_count < 5 AND ((nd.status = 'failed' AND nd.next_attempt_at IS NOT NULL AND nd.next_attempt_at <= ?) OR (nd.status = 'pending' AND COALESCE(nd.updated_at, nd.created_at) <= ?))
@@ -3141,12 +3158,12 @@ export class ScoutService {
   }
 
   private recordRun(source: string, status: string, message: string, startedAt: string, finishedAt: string | null) {
-    const result = this.db.prepare('INSERT INTO connector_runs (source, status, message, started_at, finished_at) VALUES (?, ?, ?, ?, ?)').run(source, status, message, startedAt, finishedAt);
+    const result = this.stmt('INSERT INTO connector_runs (source, status, message, started_at, finished_at) VALUES (?, ?, ?, ?, ?)').run(source, status, message, startedAt, finishedAt);
     return Number(result.lastInsertRowid);
   }
 
   private finishRun(id: number, status: string, message: string, backoffUntil: string | null = null) {
-    this.db.prepare('UPDATE connector_runs SET status = ?, message = ?, finished_at = ?, backoff_until = ? WHERE id = ?').run(status, message, nowIso(), backoffUntil, id);
+    this.stmt('UPDATE connector_runs SET status = ?, message = ?, finished_at = ?, backoff_until = ? WHERE id = ?').run(status, message, nowIso(), backoffUntil, id);
   }
 }
 
