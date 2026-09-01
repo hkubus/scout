@@ -469,6 +469,77 @@ export function parseShippingAvailability(html: string, marketplace: Marketplace
   return null;
 }
 
+const MARKETPLACE_IMAGE_CDN_SUFFIXES = ['olxcdn.com', 'allegroimg.com', 'vinted.net'];
+
+/** Replace OLX CDN resize placeholders with a concrete gallery-size request. */
+function concreteImageUrl(raw: string) {
+  return raw
+    .replace(/\{width\}x\{height\}/gi, '1000x750')
+    .replace(/%7Bwidth%7Dx%7Bheight%7D/gi, '1000x750');
+}
+
+/** A stable identity for a photo regardless of resize variant or signature query. */
+function imageIdentityKey(raw: string) {
+  return raw
+    .split('?')[0]
+    .replace(/;s=\d+x\d+/gi, '')
+    .replace(/[-_.]\d+x\d+(?=\.[a-z]{3,4}$)/i, '')
+    .replace(/\/(\d+)x(\d+)\//, '/');
+}
+
+/**
+ * Collect gallery photo URLs from a marketplace detail page so listings can be
+ * preserved locally before (or shortly after) they leave the marketplace.
+ * JSON-LD and Open Graph markup are the stable surfaces; CDN-hosted <img> and
+ * srcset entries are a secondary source. Icon/logo-like assets are ignored.
+ */
+export function parseListingImageUrls(html: string, marketplace: Marketplace, limit = 40): string[] {
+  if (!html) return [];
+  const found: string[] = [];
+  const push = (value: unknown) => {
+    if (typeof value !== 'string') return;
+    const candidate = concreteImageUrl(value.trim());
+    if (!/^https:\/\//i.test(candidate)) return;
+    if (candidate.length > 1_000) return;
+    if (/favicon|sprite|logo|icon|avatar|placeholder|banner|emoji|flag/i.test(candidate)) return;
+    const identity = imageIdentityKey(candidate);
+    if (!identity || found.some((existing) => imageIdentityKey(existing) === identity)) return;
+    found.push(candidate);
+  };
+
+  const scripts = html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
+  for (const match of scripts) {
+    try {
+      const parsed = JSON.parse(match[1].trim());
+      for (const item of flattenStructured(parsed)) {
+        const image = item.image;
+        if (Array.isArray(image)) image.forEach(push);
+        else push(image);
+        push(item.thumbnailUrl);
+      }
+    } catch { /* malformed JSON-LD is common on partially rendered marketplace pages */ }
+  }
+
+  for (const match of html.matchAll(/<meta\b[^>]*>/gi)) {
+    const tag = match[0];
+    if (/(?:property)=["'](?:og:image(?::secure_url)?|twitter:image(?::src)?)["']|(?:name)=["']twitter:image["']/i.test(tag)) push(attribute(tag, 'content'));
+  }
+
+  void marketplace;
+  const cdnPattern = new RegExp(`https:[^"'\\s<>]+`, 'gi');
+  for (const match of html.matchAll(cdnPattern)) {
+    const candidate = match[0].replace(/[),.;]+$/, '');
+    try {
+      const parsed = new URL(candidate);
+      if (!MARKETPLACE_IMAGE_CDN_SUFFIXES.some((suffix) => parsed.hostname === suffix || parsed.hostname.endsWith(`.${suffix}`))) continue;
+      if (!/\.(?:jpe?g|png|webp)(?:$|[?;])/i.test(parsed.pathname + (parsed.search ?? '')) && !/\/image(;|$)/i.test(parsed.pathname)) continue;
+      push(concreteImageUrl(parsed.toString()));
+    } catch { /* not a usable URL */ }
+    if (found.length >= limit) break;
+  }
+  return found.slice(0, limit);
+}
+
 /** Parse the small, stable JSON-LD surface that marketplaces publish on public pages. */
 export function parseStructuredListings(html: string, marketplace: Marketplace) {
   const listings: NormalizedListing[] = [];

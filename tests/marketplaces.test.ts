@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, buildVintedSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createVintedJsonAdapter, dedupeKey, normalizeListing, parseAllegroBatchEnrichmentApi, parseAllegroCards, parseListingAvailability, parseListingDescription, parseOlxListingAvailabilityApi, parseOlxOffersApi, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, parseVintedCatalogApi, parseVintedItemPageAvailability, validateSearchUrl, type ConnectorAdapter } from '../server/marketplaces';
+import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, buildVintedSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createVintedJsonAdapter, dedupeKey, normalizeListing, parseAllegroBatchEnrichmentApi, parseAllegroCards, parseListingAvailability, parseListingDescription, parseListingImageUrls, parseOlxListingAvailabilityApi, parseOlxOffersApi, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, parseVintedCatalogApi, parseVintedItemPageAvailability, validateSearchUrl, type ConnectorAdapter } from '../server/marketplaces';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { median, pruneBefore, scoreDeal } from '../server/scoring';
@@ -105,6 +105,24 @@ test('normalizes object-shaped JSON-LD images before storage', () => {
   })}</script>`;
   const [listing] = parseStructuredListings(html, 'Allegro Lokalnie');
   assert.equal(listing.imageUrl, 'https://img.example/i5.jpg');
+});
+
+test('collects deduplicated gallery image URLs from detail pages', () => {
+  const html = [
+    `<script type="application/ld+json">${JSON.stringify({ '@type': 'Product', name: 'GPU', image: ['https://ireland.apollo.olxcdn.com/v1/files/abc-PL/image;s={width}x{height}', 'https://ireland.apollo.olxcdn.com/v1/files/abc-PL/image;s=320x240'] })}</script>`,
+    '<meta property="og:image" content="https://ireland.apollo.olxcdn.com/v1/files/def-PL/image;s=644x461">',
+    '<img src="https://ireland.apollo.olxcdn.com/v1/files/def-PL/image;s=320x240" alt="">',
+    '<img src="https://images1.vinted.net/t/03_0266a_9f08b2cb1_800x800.jpeg?s=sig" alt="">',
+    '<img src="https://ireland.apollo.olxcdn.com/favicon.ico" alt="">',
+    '<img src="http://ireland.apollo.olxcdn.com/v1/files/insecure-PL/image" alt="">',
+  ].join('');
+  const urls = parseListingImageUrls(html, 'OLX');
+  assert.deepEqual(urls, [
+    'https://ireland.apollo.olxcdn.com/v1/files/abc-PL/image;s=1000x750',
+    'https://ireland.apollo.olxcdn.com/v1/files/def-PL/image;s=644x461',
+    'https://images1.vinted.net/t/03_0266a_9f08b2cb1_800x800.jpeg?s=sig',
+  ]);
+  assert.deepEqual(parseListingImageUrls('', 'OLX'), []);
 });
 
 test('parses rendered OLX cards without relying on generated class names', () => {

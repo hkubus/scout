@@ -7,6 +7,7 @@ import {
   Clock3,
   Database,
   ExternalLink,
+  Eye,
   Info,
   LoaderCircle,
   Pause,
@@ -22,6 +23,7 @@ import { api } from "./api";
 import { marketplaceColors } from "./data";
 import type {
   Marketplace,
+  MarketListingSnapshot,
   MarketResearchData,
   MarketTrackedListing,
   MarketWatch,
@@ -120,6 +122,8 @@ export default function MarketResearchPage({
   const [status, setStatus] = useState<"All" | "active" | "ended" | "superseded">("All");
   const [page, setPage] = useState(1);
   const [busyIds, setBusyIds] = useState<Set<string>>(() => new Set());
+  const [rowBusy, setRowBusy] = useState<Set<number>>(() => new Set());
+  const [snapshotListing, setSnapshotListing] = useState<MarketTrackedListing | null>(null);
 
   const load = useCallback(async (showLoader = false) => {
     if (showLoader) setLoading(true);
@@ -184,6 +188,22 @@ export default function MarketResearchPage({
     await load(false);
     onToast(`${watch.name} deleted.`);
   });
+  const saveCopy = async (listing: MarketTrackedListing) => {
+    setRowBusy((current) => new Set(current).add(listing.id));
+    try {
+      await api.captureMarketListingSnapshot(listing.id);
+      onToast(`Saved a copy of “${listing.title}”.`, "success");
+      await load(false);
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+    } finally {
+      setRowBusy((current) => {
+        const next = new Set(current);
+        next.delete(listing.id);
+        return next;
+      });
+    }
+  };
 
   const visible = useMemo(
     () => data.listings.filter((listing) =>
@@ -226,11 +246,12 @@ export default function MarketResearchPage({
       {data.watches.length ? (
         <section className="research-history">
           <div className="section-heading-row"><h2>Saved listings</h2><div className="filters"><SelectControl value={selectedWatch} options={[{ value: "All", label: "All research watches" }, ...data.watches.map((watch) => ({ value: watch.id, label: watch.name }))]} onChange={(value) => { setSelectedWatch(value); setPage(1); }} /><SelectControl value={status} options={[{ value: "All", label: "All statuses" }, { value: "active", label: "Active" }, { value: "ended", label: "No longer available" }, { value: "superseded", label: "Previous series" }]} onChange={(value) => { setStatus(value as typeof status); setPage(1); }} /></div></div>
-          <MarketResearchTable listings={visible} />
+          <MarketResearchTable listings={visible} onViewSnapshot={setSnapshotListing} rowBusy={rowBusy} onSaveCopy={saveCopy} />
           {data.pagination && (data.pagination.page > 1 || data.pagination.hasNext) ? <div className="research-pagination"><button className="outline-button" disabled={page <= 1 || loading} onClick={() => setPage((current) => Math.max(1, current - 1))}>Previous</button><span>Page {data.pagination.page} · {data.pagination.total.toLocaleString("pl-PL")} listings</span><button className="outline-button" disabled={!data.pagination.hasNext || loading} onClick={() => setPage((current) => current + 1)}>Next</button></div> : null}
         </section>
       ) : null}
       {showDialog ? <MarketWatchDialog key={editingWatch?.id ?? "new"} initialWatch={editingWatch} onClose={closeDialog} onSubmit={editingWatch ? update : create} /> : null}
+      {snapshotListing ? <MarketListingSnapshotModal listing={snapshotListing} onClose={() => setSnapshotListing(null)} onToast={onToast} onSaved={() => void load(false)} /> : null}
     </>
   );
 }
@@ -246,7 +267,12 @@ function MarketWatchFilterSummary({ watch }: { watch: MarketWatch }) {
   return <div className="research-watch-filters">{tags.length ? tags.map((tag) => <span key={tag}>{tag}</span>) : <span>All prices · any condition</span>}</div>;
 }
 
-function MarketResearchTable({ listings }: { listings: MarketTrackedListing[] }) {
+function MarketResearchTable({ listings, onViewSnapshot, rowBusy, onSaveCopy }: {
+  listings: MarketTrackedListing[];
+  onViewSnapshot: (listing: MarketTrackedListing) => void;
+  rowBusy: Set<number>;
+  onSaveCopy: (listing: MarketTrackedListing) => Promise<void>;
+}) {
   if (!listings.length) return <div className="empty-state"><Database size={24} /><strong>No saved listings in this view</strong><span>The first successful snapshot will populate this history.</span></div>;
   return (
     <div className="research-table-wrap" role="table" aria-label="Market research listings">
@@ -254,15 +280,156 @@ function MarketResearchTable({ listings }: { listings: MarketTrackedListing[] })
       {listings.map((listing) => (
         <div className="research-table research-listing-row" role="row" key={listing.id}>
           <div className="research-listing" role="cell"><MarketThumbnail listing={listing} /><div><strong>{listing.title}</strong><span><i style={{ background: marketplaceColors[listing.marketplace] }} />{listing.marketplace} · {listing.watchName}</span></div></div>
-          <span className={`research-status research-status--${listing.status}`} role="cell"><i />{listing.status === "ended" ? "No longer available" : listing.status === "superseded" ? "Previous series" : listing.missingScans ? `Verifying (${listing.missingScans}/3)` : "Active"}</span>
+          <span className={`research-status research-status--${listing.status}`} role="cell"><i />{listing.status === "ended" ? "No longer available" : listing.status === "superseded" ? "Previous series" : listing.missingScans ? `Verifying (${listing.missingScans}/3)` : "Active"}{listing.snapshotStatus === "saved" ? <small>copy saved</small> : null}</span>
           <span data-label="First price" role="cell">{formatPln(listing.firstPrice)}</span>
           <strong data-label="Last price" role="cell">{formatPln(listing.lastPrice)}{listing.status === "ended" ? <small>last asking price · not a confirmed sale</small> : null}</strong>
           <span data-label="Change" role="cell" className={listing.priceChangePercent < 0 ? "price-down" : listing.priceChangePercent > 0 ? "price-up" : ""}>{listing.priceChangePercent === 0 ? "—" : `${listing.priceChangePercent > 0 ? "+" : ""}${listing.priceChangePercent.toFixed(1)}%`}</span>
           <span data-label="Observations" role="cell">{listing.observations}</span>
           <span data-label="Last seen / ended" role="cell">{new Date(listing.endedAt ?? listing.lastSeenAt).toLocaleDateString("pl-PL", { day: "2-digit", month: "short", year: "numeric" })}</span>
-          <a role="cell" href={listing.url} target="_blank" rel="noreferrer" className="external-link" aria-label={`Open ${listing.title}`}><ExternalLink size={17} /></a>
+          <span role="cell" className="research-row-actions">
+            <button
+              className="icon-button"
+              title={listing.snapshotStatus === "saved" ? "View the preserved listing copy" : "View or preserve a listing copy"}
+              aria-label={`View saved copy of ${listing.title}`}
+              onClick={() => onViewSnapshot(listing)}
+            >
+              <Eye size={17} />
+            </button>
+            <button
+              className="icon-button"
+              title="Save a fresh copy of this listing now"
+              aria-label={`Save a copy of ${listing.title}`}
+              disabled={rowBusy.has(listing.id)}
+              onClick={() => void onSaveCopy(listing)}
+            >
+              {rowBusy.has(listing.id) ? <LoaderCircle size={17} className="spin" /> : <Database size={17} />}
+            </button>
+            <a href={listing.url} target="_blank" rel="noreferrer" className="external-link" aria-label={`Open ${listing.title}`}><ExternalLink size={17} /></a>
+          </span>
         </div>
       ))}
+    </div>
+  );
+}
+
+function MarketListingSnapshotModal({ listing, onClose, onToast, onSaved }: {
+  listing: MarketTrackedListing;
+  onClose: () => void;
+  onToast: (message: string, type?: ToastType) => void;
+  onSaved: () => void;
+}) {
+  const [snapshot, setSnapshot] = useState<MarketListingSnapshot | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [lightbox, setLightbox] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.marketListingSnapshot(listing.id)
+      .then((result) => { if (!cancelled) setSnapshot(result.snapshot); })
+      .catch((error) => onToast(errorMessage(error), "error"))
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [listing.id, onToast]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !saving) {
+        if (lightbox) setLightbox(null);
+        else onClose();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [lightbox, onClose, saving]);
+
+  const saveCopy = async () => {
+    setSaving(true);
+    try {
+      const result = await api.captureMarketListingSnapshot(listing.id);
+      setSnapshot(result.snapshot);
+      onToast("Listing copy saved locally.", "success");
+      onSaved();
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !saving && onClose()}>
+      <section className="modal modal--snapshot" role="dialog" aria-modal="true" aria-labelledby="snapshot-title">
+        <div className="modal-header">
+          <div>
+            <span className="modal-kicker">Preserved listing copy</span>
+            <h2 id="snapshot-title">{listing.title}</h2>
+            <p>
+              {listing.marketplace} · {formatPln(listing.lastPrice)} ·{" "}
+              {listing.status === "ended" ? "no longer available — the copy below is what Scout preserved" : "a local copy that stays viewable if the listing is sold"}
+            </p>
+          </div>
+          <button className="icon-button" disabled={saving} onClick={onClose} aria-label="Close"><X size={20} /></button>
+        </div>
+        <div className="modal-body modal-body--snapshot">
+          {loading ? (
+            <div className="table-loading"><LoaderCircle size={20} className="spin" />Loading the preserved copy…</div>
+          ) : snapshot ? (
+            <>
+              <div className="snapshot-meta">
+                <span>Saved {new Date(snapshot.capturedAt).toLocaleString("pl-PL", { dateStyle: "medium", timeStyle: "short" })}</span>
+                {snapshot.condition ? <span>Condition: {snapshot.condition}</span> : null}
+                {snapshot.location ? <span>Location: {snapshot.location}</span> : null}
+                <span>{snapshot.images.length} image{snapshot.images.length === 1 ? "" : "s"} stored</span>
+              </div>
+              {snapshot.images.length ? (
+                <div className="snapshot-gallery">
+                  {snapshot.images.map((image) => (
+                    <button type="button" key={image.id} className="snapshot-thumb" onClick={() => setLightbox(api.marketSnapshotImageUrl(image.id))} aria-label={`Open image ${image.position + 1}`}>
+                      <img src={api.marketSnapshotImageUrl(image.id)} alt="" loading="lazy" />
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div className="snapshot-empty-gallery"><Tag size={20} /><span>No images were stored for this copy.</span></div>
+              )}
+              {snapshot.description ? (
+                <div className="snapshot-description">
+                  <strong>Description</strong>
+                  <p>{snapshot.description}</p>
+                </div>
+              ) : (
+                <div className="snapshot-description snapshot-description--empty"><strong>Description</strong><p>The detail page did not expose a description when this copy was saved.</p></div>
+              )}
+              <div className="modal-note"><Info size={16} /><span>Images and the description are stored in Scout's database, so they remain viewable even after the marketplace page is gone.</span></div>
+            </>
+          ) : (
+            <div className="snapshot-missing">
+              <Database size={26} />
+              <strong>No preserved copy yet</strong>
+              <span>Scout saves copies automatically for new research listings. Save one now to keep the description and images before the listing disappears.</span>
+              <button className="primary-button" disabled={saving} onClick={() => void saveCopy()}>
+                {saving ? <LoaderCircle size={17} className="spin" /> : <Database size={17} />}
+                {saving ? "Saving…" : "Save a copy now"}
+              </button>
+            </div>
+          )}
+        </div>
+        <div className="modal-footer">
+          <a className="outline-button" href={listing.url} target="_blank" rel="noreferrer">Open on {listing.marketplace}</a>
+          {snapshot ? (
+            <button className="primary-button" disabled={saving} onClick={() => void saveCopy()}>
+              {saving ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}
+              {saving ? "Saving…" : "Refresh saved copy"}
+            </button>
+          ) : null}
+        </div>
+      </section>
+      {lightbox ? (
+        <div className="lightbox-backdrop" role="presentation" onClick={() => setLightbox(null)}>
+          <img src={lightbox} alt="" />
+        </div>
+      ) : null}
     </div>
   );
 }

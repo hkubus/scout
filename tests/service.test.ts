@@ -933,7 +933,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1199,7 +1199,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 12);
+    assert.equal(after.migrations.count, 13);
   } finally { context.close(); }
 });
 
@@ -1226,5 +1226,97 @@ test('records watch scan paths in the in-memory log buffer and emits them over S
   } finally {
     db.close();
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('preserves research listings with description and images for post-sale review', async () => {
+  const context = fixture();
+  const originalFetch = globalThis.fetch;
+  const now = new Date().toISOString();
+  try {
+    context.db.prepare(`INSERT INTO market_watches (id, name, query, sources_json, interval_hours, enabled, next_scan_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('market-snap', 'Snap watch', 'gpu', '["OLX"]', 24, 1, now, now, now);
+    context.db.prepare(`INSERT INTO market_listings (market_watch_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans, availability_status, snapshot_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, 'live', 'pending')`).run('market-snap', 'OLX', 'offer-1', 'RTX 4070', 'https://www.olx.pl/d/oferta/rtx-4070-IDabc123.html', 2000, 2000, 2000, now, now);
+    const listingRow = context.db.prepare('SELECT id FROM market_listings WHERE listing_id = ?').get('offer-1') as { id: number };
+    assert.equal(context.service.marketListingSnapshot(listingRow.id), null);
+
+    const detailHtml = `<html><head><meta property="og:image" content="https://cdn.example/photo-1.jpg"></head><body>
+      <script type="application/ld+json">${JSON.stringify({ '@type': 'Product', name: 'RTX 4070', description: 'Karta bez uszkodzeń. W zestawie pudełko.', offers: { price: '2000' } })}</script>
+      </body></html>`;
+    const imageRequests: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://www.olx.pl/d/oferta/rtx-4070-IDabc123.html') return new Response(detailHtml, { status: 200, headers: { 'content-type': 'text/html' } });
+      if (url === 'https://cdn.example/photo-1.jpg') {
+        imageRequests.push(url);
+        return new Response(new Uint8Array([1, 2, 3, 4]), { status: 200, headers: { 'content-type': 'image/jpeg' } });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const snapshot = await context.service.captureMarketListingSnapshotNow(listingRow.id);
+    assert.ok(snapshot);
+    assert.equal(snapshot!.title, 'RTX 4070');
+    assert.equal(snapshot!.description, 'Karta bez uszkodzeń. W zestawie pudełko.');
+    assert.equal(snapshot!.price, 2000);
+    assert.equal(snapshot!.images.length, 1);
+    const image = context.service.marketSnapshotImage(snapshot!.images[0].id);
+    assert.ok(image);
+    assert.equal(image!.mime, 'image/jpeg');
+    assert.deepEqual([...image!.data], [1, 2, 3, 4]);
+
+    const stored = context.db.prepare('SELECT snapshot_status, snapshot_attempts FROM market_listings WHERE id = ?').get(listingRow.id) as { snapshot_status: string; snapshot_attempts: number };
+    assert.equal(stored.snapshot_status, 'saved');
+    assert.equal(stored.snapshot_attempts, 0);
+
+    // Re-capturing an unchanged listing deduplicates into one stored snapshot.
+    const imageRequestsBefore = imageRequests.length;
+    await context.service.captureMarketListingSnapshotNow(listingRow.id);
+    const snapshotCount = context.db.prepare('SELECT COUNT(*) AS count FROM market_listing_snapshots').get() as { count: number };
+    assert.equal(snapshotCount.count, 1);
+    const imageCount = context.db.prepare('SELECT COUNT(*) AS count FROM market_listing_snapshot_images').get() as { count: number };
+    assert.equal(imageCount.count, 1);
+    assert.equal(imageRequests.length, imageRequestsBefore + 1);
+
+    await assert.rejects(() => context.service.captureMarketListingSnapshotNow(99_999), (error: unknown) => error instanceof ServiceError && error.status === 404);
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.close();
+  }
+});
+
+test('records failed preservation attempts and stops retrying after the cap', async () => {
+  const context = fixture();
+  const originalFetch = globalThis.fetch;
+  const now = new Date().toISOString();
+  try {
+    context.db.prepare(`INSERT INTO market_watches (id, name, query, sources_json, interval_hours, enabled, next_scan_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('market-snap', 'Snap watch', 'gpu', '["OLX"]', 24, 1, now, now, now);
+    context.db.prepare(`INSERT INTO market_listings (market_watch_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans, availability_status, snapshot_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, 'live', 'pending')`).run('market-snap', 'OLX', 'offer-gone', 'Sold GPU', 'https://www.olx.pl/d/oferta/sold-gpu-IDgone123.html', 1500, 1500, 1500, now, now);
+    const listingRow = context.db.prepare('SELECT id FROM market_listings WHERE listing_id = ?').get('offer-gone') as { id: number };
+
+    globalThis.fetch = (async () => new Response('<html>page body</html>', { status: 404 })) as typeof fetch;
+    await assert.rejects(
+      () => context.service.captureMarketListingSnapshotNow(listingRow.id),
+      (error: unknown) => error instanceof ServiceError && error.status === 502 && /could not preserve listing/.test(error.message),
+    );
+
+    const stored = context.db.prepare('SELECT snapshot_status, snapshot_attempts FROM market_listings WHERE id = ?').get(listingRow.id) as { snapshot_status: string; snapshot_attempts: number };
+    assert.equal(stored.snapshot_status, 'failed');
+    assert.equal(stored.snapshot_attempts, 0, 'manual attempts do not consume the automatic retry budget');
+
+    // The automatic queue stops after the attempt cap is reached.
+    context.db.prepare('UPDATE market_listings SET snapshot_attempts = 3 WHERE id = ?').run(listingRow.id);
+    const queueRow = { ...listingRow, marketplace: 'OLX', title: 'Sold GPU', url: 'https://www.olx.pl/d/oferta/sold-gpu-IDgone123.html', last_price_pln: 1500, condition: null, location: null, listing_id: 'offer-gone', snapshot_status: 'pending', snapshot_attempts: 3 } as Record<string, any>;
+    const outcome = await (context.service as any).captureMarketListingSnapshot(queueRow, 'auto');
+    assert.equal(outcome.ok, false);
+    const attempts = context.db.prepare('SELECT snapshot_attempts FROM market_listings WHERE id = ?').get(listingRow.id) as { snapshot_attempts: number };
+    assert.equal(attempts.snapshot_attempts, 4);
+    assert.equal(context.service.marketListingSnapshot(listingRow.id), null);
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.close();
   }
 });

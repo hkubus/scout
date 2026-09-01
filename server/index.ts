@@ -51,7 +51,7 @@ app.addHook('onRequest', async (request, reply) => {
   const isEvents = url === '/events';
   if (!isApi && !isEvents) return;
 
-  const expensive = /\/search$|\/scan$|\/scans$|\/negotiate(?:\/draft)?$|\/recommendation$|\/normalize-listing$|\/settings\/(?:webhook|ntfy)\/test$|\/backup$/.test(url);
+  const expensive = /\/search$|\/scan$|\/scans$|\/negotiate(?:\/draft)?$|\/recommendation$|\/normalize-listing$|\/snapshot$|\/settings\/(?:webhook|ntfy)\/test$|\/backup$/.test(url);
   const limit = expensive ? 30 : 240;
   const bucket = rateLimiter.consume(`${request.ip}:${expensive ? 'expensive' : url}`, limit);
   reply.header('X-RateLimit-Limit', String(limit));
@@ -391,6 +391,29 @@ app.post('/api/market-watches/:id/scan', async (request, reply) => {
   const params = resourceIdParams.safeParse(request.params);
   if (!params.success) return reply.code(400).send({ error: 'A valid market watch id is required' });
   return reply.code(202).send(service.queueMarketScan(params.data.id));
+});
+
+app.get('/api/market-listings/:id/snapshot', async (request, reply) => {
+  const params = z.object({ id: z.coerce.number().int().min(1) }).safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid research listing id is required' });
+  return { snapshot: service.marketListingSnapshot(params.data.id) };
+});
+
+app.post('/api/market-listings/:id/snapshot', async (request, reply) => {
+  const params = z.object({ id: z.coerce.number().int().min(1) }).safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid research listing id is required' });
+  const snapshot = await service.captureMarketListingSnapshotNow(params.data.id);
+  emit('market-watch', { refresh: true });
+  return reply.code(201).send({ snapshot });
+});
+
+app.get('/api/market-snapshot-images/:imageId', async (request, reply) => {
+  const params = z.object({ imageId: z.coerce.number().int().min(1) }).safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid snapshot image id is required' });
+  const image = service.marketSnapshotImage(params.data.imageId);
+  if (!image) return reply.code(404).send({ error: 'Snapshot image not found' });
+  reply.header('cache-control', 'private, max-age=31536000, immutable');
+  return reply.type(image.mime).send(image.data);
 });
 
 app.delete('/api/market-watches/:id', async (request, reply) => {

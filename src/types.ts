@@ -287,6 +287,27 @@ export interface MarketTrackedListing {
   endedReason?: string | null;
   missingScans: number;
   observations: number;
+  snapshotStatus?: 'pending' | 'saved' | 'failed' | null;
+}
+
+export interface MarketListingSnapshotImage {
+  id: number;
+  position: number;
+  byteSize: number;
+}
+
+export interface MarketListingSnapshot {
+  id: number;
+  marketplace: Marketplace;
+  listingId: string;
+  title: string;
+  price: number;
+  condition: string | null;
+  location: string | null;
+  url: string;
+  description: string | null;
+  capturedAt: string;
+  images: MarketListingSnapshotImage[];
 }
 
 export interface MarketResearchData {

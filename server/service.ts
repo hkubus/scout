@@ -2,14 +2,14 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:
 import { existsSync } from 'node:fs';
 import { chromium, type Browser, type BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, validateNtfyConfig, type NtfyConfig } from './notifications';
-import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, parseListingDescription, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
+import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, draftNegotiationMessageWithDeepSeek, legacyListingNormalizationInputHash, legacyListingRelevanceInputHash, listingDescriptionVerificationInputHash, listingNormalizationInputHash, listingRelevanceInputHash, normalizeListingWithDeepSeek, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseStoredListingNormalization, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type NegotiationListingContext } from './ai';
 import { OlxMessagingError, sendOlxMessageOnPage } from './olx-messaging';
 import { AllegroMessagingError, sendAllegroMessageOnPage } from './allegro-messaging';
 import { offerCeiling, recommendNegotiationPrice, type NegotiationRecommendation } from './negotiation';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, median, scoreDeal } from './scoring';
-import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
+import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -83,6 +83,11 @@ const MATCH_VISIBILITY_MS = 12 * 60 * 60_000;
 const NIGHT_START_HOUR = 22;
 const NIGHT_END_HOUR = 8;
 const MAX_RESEARCH_DETAIL_CHECKS = 100;
+/** Bounded per-scan capture of preserved listing copies (description + downloaded images). */
+const SNAPSHOT_CAPTURES_PER_SCAN = 8;
+const SNAPSHOT_MAX_IMAGES = 12;
+const SNAPSHOT_MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+const SNAPSHOT_MAX_ATTEMPTS = 3;
 /**
  * The anonymous marketplace APIs (OLX offers, Vinted catalog, Lokalnie
  * additional-data) reject Scout's plain identifier UA; a modern Chrome UA plus
@@ -1597,6 +1602,7 @@ export class ScoutService {
       title: row.title, url: row.url, image: row.image_url ?? '', firstPrice: Number(row.first_price_pln), lastPrice: Number(row.last_price_pln), lowestPrice: Number(row.lowest_price_pln),
       priceChangePercent: Number(row.first_price_pln) > 0 ? ((Number(row.last_price_pln) - Number(row.first_price_pln)) / Number(row.first_price_pln)) * 100 : 0,
       firstSeenAt: row.first_seen_at, lastSeenAt: row.last_seen_at, endedAt: row.ended_at, status: row.status, availabilityStatus: row.availability_status ?? null, endedReason: row.ended_reason ?? null, missingScans: Number(row.missing_scans), observations: Number(row.observations),
+      snapshotStatus: row.snapshot_status ?? null,
     }));
     return {
       watches,
@@ -1752,8 +1758,14 @@ export class ScoutService {
               discarded = true;
               return;
             }
+            const newListingIds: number[] = [];
             for (const listing of filtered) {
-              this.storeMarketListing(row.id, version.id, listing, observedAt, scanId);
+              const stored = this.storeMarketListing(row.id, version.id, listing, observedAt, scanId);
+              if (stored.created) newListingIds.push(stored.id);
+            }
+            if (newListingIds.length) {
+              this.db.prepare(`UPDATE market_listings SET snapshot_status = 'pending'
+                WHERE id IN (${newListingIds.map(() => '?').join(',')}) AND snapshot_status IS NULL`).run(...newListingIds);
             }
             for (const { listing, availability, refreshed } of verifiedMissing) {
               if (availability.status === 'live') {
@@ -1777,6 +1789,7 @@ export class ScoutService {
             return;
           }
           this.finishRun(runId, 'ok', `${filtered.length} research listings saved${deferredMissing ? ` · ${deferredMissing} detail checks deferred` : ''}`);
+          await this.capturePendingMarketSnapshots(String(row.id), source);
         } catch (error) {
           this.failScan(scanId, error);
           const message = error instanceof Error ? error.message : 'Research connector failed';
@@ -1792,12 +1805,158 @@ export class ScoutService {
     } finally { this.running.delete(runningKey); }
   }
 
-  private storeMarketListing(watchId: string, versionId: string, listing: NormalizedListing, observedAt: string, scanId: number) {
+  private storeMarketListing(watchId: string, versionId: string, listing: NormalizedListing, observedAt: string, scanId: number): { id: number; created: boolean } {
+    const existing = this.db.prepare('SELECT id FROM market_listings WHERE market_watch_id = ? AND version_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, versionId, listing.marketplace, listing.listingId) as { id: number } | undefined;
     this.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, image_url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans, availability_status, ended_reason, last_verified_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, 'live', NULL, ?)
       ON CONFLICT(market_watch_id, version_id, marketplace, listing_id) DO UPDATE SET title = excluded.title, url = excluded.url, image_url = COALESCE(excluded.image_url, market_listings.image_url), last_price_pln = excluded.last_price_pln, lowest_price_pln = MIN(market_listings.lowest_price_pln, excluded.last_price_pln), last_seen_at = excluded.last_seen_at, status = 'active', missing_scans = 0, ended_at = NULL, availability_status = 'live', ended_reason = NULL, last_verified_at = excluded.last_verified_at`).run(watchId, versionId, listing.marketplace, listing.listingId, listing.title, listing.url, listing.imageUrl ?? null, listing.price, listing.price, listing.price, observedAt, observedAt, observedAt);
     const stored = this.db.prepare('SELECT id FROM market_listings WHERE market_watch_id = ? AND version_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, versionId, listing.marketplace, listing.listingId) as { id: number };
     this.db.prepare('INSERT INTO market_price_observations (market_listing_id, version_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?)').run(stored.id, versionId, scanId, listing.price, observedAt);
+    return { id: Number(stored.id), created: !existing };
+  }
+
+  /**
+   * Preserves research listings before their marketplace page disappears:
+   * the description plus downloaded gallery images are stored locally so the
+   * listing stays reviewable after it is sold or removed.
+   */
+  private async capturePendingMarketSnapshots(watchId: string, marketplace: Marketplace) {
+    try {
+      const due = this.db.prepare(`SELECT * FROM market_listings
+        WHERE market_watch_id = ? AND marketplace = ? AND status IN ('active', 'ended')
+          AND snapshot_status IN ('pending', 'failed') AND snapshot_attempts < ?
+        ORDER BY COALESCE(ended_at, first_seen_at) ASC, id ASC
+        LIMIT ?`).all(watchId, marketplace, SNAPSHOT_MAX_ATTEMPTS, SNAPSHOT_CAPTURES_PER_SCAN) as Array<Record<string, any>>;
+      for (let offset = 0; offset < due.length; offset += 2) {
+        await Promise.all(due.slice(offset, offset + 2).map(async (listing) => {
+          const outcome = await this.captureMarketListingSnapshot(listing, 'auto');
+          this.log(outcome.ok ? 'info' : 'error', 'research', `${marketplace} · ${listing.title}: ${outcome.message}`);
+        }));
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Snapshot capture queue failed';
+      this.log('error', 'research', `${marketplace}: snapshot capture failed — ${message.slice(0, 240)}`);
+    }
+  }
+
+  /** Never throws; callers rely on the outcome message for logging and UI feedback. */
+  private async captureMarketListingSnapshot(listing: Record<string, any>, source: 'auto' | 'manual'): Promise<{ ok: boolean; message: string; snapshotId?: number }> {
+    const marketplace = listing.marketplace as Marketplace;
+    try {
+      const html = await this.fetchPublicPage(String(listing.url), marketplace);
+      const description = parseListingDescription(html, marketplace);
+      const imageUrls = parseListingImageUrls(html, marketplace, SNAPSHOT_MAX_IMAGES * 4).slice(0, SNAPSHOT_MAX_IMAGES);
+      const images: Array<{ sourceUrl: string; mime: string; data: Buffer }> = [];
+      for (let offset = 0; offset < imageUrls.length && images.length < SNAPSHOT_MAX_IMAGES; offset += 3) {
+        const batch = await Promise.all(imageUrls.slice(offset, offset + 3).map(async (url) => {
+          try {
+            const image = await this.fetchSnapshotImage(url, String(listing.url));
+            return image ? { sourceUrl: url, mime: image.mime, data: image.data } : null;
+          } catch { return null; }
+        }));
+        for (const item of batch) if (item && images.length < SNAPSHOT_MAX_IMAGES) images.push(item);
+      }
+      if (!description && !images.length) {
+        this.markSnapshotFailure(Number(listing.id), source === 'manual' ? 0 : 1);
+        return { ok: false, message: 'detail page exposed no usable description or images' };
+      }
+
+      const stateHash = createHash('sha256').update(JSON.stringify({
+        title: listing.title,
+        price: Number(listing.last_price_pln),
+        condition: listing.condition ?? null,
+        location: listing.location ?? null,
+        url: listing.url,
+        description,
+        images: images.map((image) => image.sourceUrl),
+      })).digest('hex');
+      const capturedAt = nowIso();
+      let snapshotId: number;
+      this.transaction(() => {
+        this.db.prepare(`INSERT INTO market_listing_snapshots (
+            market_listing_id, marketplace, external_listing_id, title, price_pln, url,
+            condition, location, description, state_hash, image_count, source, captured_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(market_listing_id, state_hash) DO NOTHING`).run(
+          Number(listing.id), marketplace, String(listing.listing_id), String(listing.title), Number(listing.last_price_pln),
+          String(listing.url), listing.condition ?? null, listing.location ?? null, description, stateHash,
+          images.length, source, capturedAt,
+        );
+        const stored = this.db.prepare('SELECT id FROM market_listing_snapshots WHERE market_listing_id = ? AND state_hash = ?').get(Number(listing.id), stateHash) as { id: number };
+        snapshotId = Number(stored.id);
+        const existingImages = this.db.prepare('SELECT COUNT(*) AS count FROM market_listing_snapshot_images WHERE snapshot_id = ?').get(snapshotId) as { count?: number };
+        if (!Number(existingImages.count ?? 0)) {
+          const insertImage = this.db.prepare('INSERT INTO market_listing_snapshot_images (snapshot_id, position, source_url, mime_type, byte_size, data) VALUES (?, ?, ?, ?, ?, ?)');
+          images.forEach((image, index) => insertImage.run(snapshotId, index, image.sourceUrl, image.mime, image.data.byteLength, image.data));
+        }
+      });
+      this.db.prepare("UPDATE market_listings SET snapshot_status = 'saved', snapshot_at = ? WHERE id = ?").run(capturedAt, Number(listing.id));
+      return { ok: true, message: `preserved listing copy (description ${description ? 'saved' : 'unavailable'}, ${images.length} image${images.length === 1 ? '' : 's'})`, snapshotId: snapshotId! };
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : 'Listing preservation failed').slice(0, 240);
+      this.markSnapshotFailure(Number(listing.id), source === 'manual' ? 0 : 1);
+      return { ok: false, message: `could not preserve listing — ${message}` };
+    }
+  }
+
+  private markSnapshotFailure(listingId: number, attemptsToAdd: number) {
+    this.db.prepare("UPDATE market_listings SET snapshot_status = 'failed', snapshot_attempts = snapshot_attempts + ? WHERE id = ?").run(attemptsToAdd, listingId);
+  }
+
+  private async fetchSnapshotImage(url: string, referer: string): Promise<{ mime: string; data: Buffer } | null> {
+    let parsed: URL;
+    try { parsed = new URL(url); } catch { return null; }
+    if (parsed.protocol !== 'https:') return null;
+    const response = await fetch(parsed.toString(), {
+      headers: { 'user-agent': MARKETPLACE_API_USER_AGENT, accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', referer },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) return null;
+    const declared = Number(response.headers.get('content-length') ?? 0);
+    if (declared > SNAPSHOT_MAX_IMAGE_BYTES) return null;
+    const contentType = (response.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
+    if (!contentType.startsWith('image/')) return null;
+    const data = Buffer.from(await response.arrayBuffer());
+    if (!data.byteLength || data.byteLength > SNAPSHOT_MAX_IMAGE_BYTES) return null;
+    return { mime: contentType, data };
+  }
+
+  /** The most recent preserved copy of a research listing, with image metadata (bytes come from the image endpoint). */
+  marketListingSnapshot(marketListingId: number): MarketListingSnapshot | null {
+    const listing = this.db.prepare('SELECT id FROM market_listings WHERE id = ?').get(marketListingId) as { id?: number } | undefined;
+    if (!listing?.id) throw new ServiceError('Research listing not found', 404);
+    const snapshot = this.db.prepare(`SELECT * FROM market_listing_snapshots WHERE market_listing_id = ?
+      ORDER BY captured_at DESC, id DESC LIMIT 1`).get(marketListingId) as Record<string, any> | undefined;
+    if (!snapshot) return null;
+    const images = this.db.prepare('SELECT id, position, byte_size FROM market_listing_snapshot_images WHERE snapshot_id = ? ORDER BY position, id').all(Number(snapshot.id)) as Array<Record<string, any>>;
+    return {
+      id: Number(snapshot.id),
+      marketplace: snapshot.marketplace as Marketplace,
+      listingId: String(snapshot.external_listing_id),
+      title: String(snapshot.title),
+      price: Number(snapshot.price_pln),
+      condition: snapshot.condition ?? null,
+      location: snapshot.location ?? null,
+      url: String(snapshot.url),
+      description: snapshot.description ?? null,
+      capturedAt: String(snapshot.captured_at),
+      images: images.map((image) => ({ id: Number(image.id), position: Number(image.position), byteSize: Number(image.byte_size) })),
+    };
+  }
+
+  marketSnapshotImage(imageId: number): { mime: string; data: Buffer } | null {
+    const row = this.db.prepare('SELECT mime_type, data FROM market_listing_snapshot_images WHERE id = ?').get(imageId) as { mime_type?: string; data?: Uint8Array } | undefined;
+    if (!row?.data) return null;
+    return { mime: row.mime_type ?? 'image/jpeg', data: Buffer.from(row.data) };
+  }
+
+  /** Manual on-demand preservation, also usable for listings that already ended. */
+  async captureMarketListingSnapshotNow(marketListingId: number): Promise<MarketListingSnapshot | null> {
+    const listing = this.db.prepare('SELECT * FROM market_listings WHERE id = ?').get(marketListingId) as Record<string, any> | undefined;
+    if (!listing) throw new ServiceError('Research listing not found', 404);
+    const outcome = await this.captureMarketListingSnapshot(listing, 'manual');
+    if (!outcome.ok) throw new ServiceError(outcome.message, 502);
+    return this.marketListingSnapshot(marketListingId);
   }
 
   getConnectors(): Connector[] {

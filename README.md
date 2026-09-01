@@ -56,6 +56,10 @@ Research snapshots are separate from deal-watch scoring. A valid empty search pa
 
 Changing a research query, term, source, condition, location, shipping rule, or price range starts a new immutable comparable series. The old series is retained as previous history and excluded from current metrics. Main watches can be archived to stop future scans while retaining observations and analytics; permanent deletion is a separate, warned action.
 
+## Preserved listing copies
+
+Research listings are preserved for market research: when a listing first appears in a research watch, Scout fetches its detail page once (bounded per scan, with a small retry budget on later scans), stores the description, and downloads the gallery images into the Scout database so the listing stays viewable after it is sold or removed. Captures are deduplicated by listing state, capped at 12 images of up to 4 MB each, and served only from Scout's own image endpoint. Use the eye action on a Saved listings row to view the preserved copy, or the save action to capture or refresh a copy on demand — including for listings that already ended. Copies live and die with their research listing row, so the daily 180-day retention cleanup also prunes them; deleting a research watch deletes its copies.
+
 ## Docker Compose
 
 Compose binds Scout to `0.0.0.0` inside the container and publishes port 3001 to the host. The browserless image is pinned and the image build uses `npm ci` from `package-lock.json`:

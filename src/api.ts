@@ -1,4 +1,4 @@
-import type { ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketResearchData, MarketWatch, MarketWatchInput, Marketplace, NegotiationDraft, NegotiationRecommendation, NegotiationResult, NotificationPriority, NotificationRecord, SearchFilters, SellerMessage, SettingsData, Watch, WatchAnalytics } from './types';
+import type { ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, Marketplace, NegotiationDraft, NegotiationRecommendation, NegotiationResult, NotificationPriority, NotificationRecord, SearchFilters, SellerMessage, SettingsData, Watch, WatchAnalytics } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -92,6 +92,9 @@ export const api = {
   updateMarketWatch: (id: string, patch: Partial<Pick<MarketWatch, 'name' | 'query' | 'enabled' | 'intervalHours' | 'terms' | 'excluded' | 'location' | 'condition' | 'sources' | 'minPrice' | 'maxPrice' | 'shippingOnly'>>) => request<{ ok: true }>(`/api/market-watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
   deleteMarketWatch: (id: string) => request<{ ok: true }>(`/api/market-watches/${encodeURIComponent(id)}`, json('DELETE')),
   scanMarketWatch: (id: string) => request<{ queued: boolean; message: string }>(`/api/market-watches/${encodeURIComponent(id)}/scan`, { method: 'POST' }),
+  marketListingSnapshot: (id: number) => request<{ snapshot: MarketListingSnapshot | null }>(`/api/market-listings/${id}/snapshot`),
+  captureMarketListingSnapshot: (id: number) => request<{ snapshot: MarketListingSnapshot | null }>(`/api/market-listings/${id}/snapshot`, { method: 'POST' }, 60_000),
+  marketSnapshotImageUrl: (imageId: number) => `/api/market-snapshot-images/${imageId}`,
   deleteWatch: (id: string) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('DELETE')),
   listingDetail: (key: string, watchId?: string | null) => request<ListingDetail>(`/api/listing-detail?key=${encodeURIComponent(key)}${watchId ? `&watchId=${encodeURIComponent(watchId)}` : ''}`),
   normalizeListing: (key: string, force = false) => request<ListingDetail>('/api/ai/normalize-listing', json('POST', { key, force })),
