@@ -18,11 +18,17 @@ export function median(values: number[]) {
   return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
-export function scoreDeal(prices: number[], price: number, options: { minSamples?: number; minHours?: number; observedHours?: number; sensitivity?: number } = {}): ScoreResult {
+export function scoreDeal(prices: number[], price: number, options: { minSamples?: number; minHours?: number; observedHours?: number; sensitivity?: number; typicalOverride?: number } = {}): ScoreResult {
   const minSamples = options.minSamples ?? BASELINE_MIN_SAMPLES;
   const minHours = options.minHours ?? BASELINE_MIN_HOURS;
   const usablePrices = prices.filter((value) => Number.isFinite(value) && value > 0);
-  const typical = median(usablePrices);
+  // A typicalOverride (e.g. a reference series' probable-sale median) seeds the
+  // typical for ranking/display while a watch's own baseline is still learning.
+  // Readiness (and therefore the qualifies gate) still requires own samples.
+  const override = options.typicalOverride !== undefined && Number.isFinite(options.typicalOverride) && options.typicalOverride > 0
+    ? options.typicalOverride
+    : null;
+  const typical = override ?? median(usablePrices);
   if (typical === null || price <= 0) return { typical, mad: null, deviation: null, discountPercent: null, confidence: 0, isReady: false, qualifies: false };
   const deviations = usablePrices.map((value) => Math.abs(value - typical));
   const mad = median(deviations) ?? 0;

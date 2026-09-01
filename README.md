@@ -75,6 +75,12 @@ The older raw `estimatedMedianPrice` field remains in the API payload for one re
 
 Each research watch card offers a price-trend dialog (`GET /api/market-watches/:id/trend?days=30|90|180`). Trend points bucket the current series' price observations into days — one latest observation per listing per day — and draw the median asking price with a shaded p25–p75 band, plus the probable-sale median as a dashed reference line. Preserved-copy dialogs also show the listing's own asking-price sparkline from its stored observations. Open trend dialogs refresh automatically after research scans via the existing `market-watch` event.
 
+### Reference series as a fallback baseline (opt-in)
+
+A deal watch can point at a research watch (`referenceMarketWatchId`). While the watch's own baseline is below 30 comparable samples and the reference series has at least 4 eligible probable sales, new listings display a **series baseline**: the reference band's median stands in for the learned typical price, clearly chipped as "series baseline" in the table and drawer. This improves ranking and display only — the alert readiness gate (30 samples and 6 hours) is unchanged, so no alerts fire earlier than they would without a reference series. Once the watch's own history reaches the sample floor, own history always wins and new rows are marked `own-history`.
+
+Separately opt-in in Settings, `Cap offers with a reference series band` uses the reference series' probable-sale band in negotiation math: the ceiling becomes the minimum of the buyer's total-cost ceiling and the band's p75. Because the cap can only *lower* the buyer's ceiling, it also applies to bounded automatic negotiation when enabled — it never widens the room below the asking price.
+
 Changing a research query, term, source, condition, location, shipping rule, or price range starts a new immutable comparable series. The old series is retained as previous history and excluded from current metrics. Main watches can be archived to stop future scans while retaining observations and analytics; permanent deletion is a separate, warned action.
 
 ## Preserved listing copies

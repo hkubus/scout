@@ -303,7 +303,7 @@ export default function ListingDetailDrawer({
             </div>
             <div className="drawer-hero-copy">
               <strong className="drawer-price">{formatPln(currentListing.price)}</strong>
-              <span>{currentListing.typical === null ? "Baseline is still learning" : `${Math.abs(currentListing.belowTypical ?? 0).toFixed(1)}% below typical`}</span>
+              <span>{currentListing.typical === null ? "Baseline is still learning" : `${Math.abs(currentListing.belowTypical ?? 0).toFixed(1)}% below typical`}{currentListing.typicalSource === "reference-band" ? " · series baseline" : ""}</span>
               <small>{currentListing.condition || "Condition not specified"}{currentListing.location ? ` · ${currentListing.location}` : ""}</small>
             </div>
           </div>

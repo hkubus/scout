@@ -10,7 +10,7 @@ import { AllegroMessagingError, sendAllegroMessageOnPage } from './allegro-messa
 import { offerCeiling, recommendNegotiationPrice, type NegotiationRecommendation } from './negotiation';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, median, scoreDeal } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
-import { computeSaleBand, type MarketBandSample } from './marketBand';
+import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
 
@@ -918,6 +918,7 @@ export class ScoutService {
       shippingOnly: Boolean(row.shipping_only),
       typoVariants: Boolean(row.typo_variants),
       aiRelevance: row.ai_relevance === undefined ? true : Boolean(row.ai_relevance),
+      referenceMarketWatchId: row.reference_market_watch_id ?? null,
       minPrice: row.min_price_pln === null ? null : Number(row.min_price_pln),
       maxPrice: row.max_price_pln === null ? null : Number(row.max_price_pln),
       archivedAt: row.archived_at ?? null,
@@ -925,8 +926,12 @@ export class ScoutService {
   }
 
   private listingFromRow(row: Record<string, any>, baselineReady: boolean): Listing {
+    const typicalSource = row.typical_source === 'reference-band' || row.typical_source === 'own-history' ? row.typical_source : null;
     const associationTypical = row.watch_typical_pln ?? row.typical_pln;
-    const typical = baselineReady && associationTypical !== null && associationTypical !== undefined ? Number(associationTypical) : null;
+    // A band-seeded typical is display-only, so it shows even while the watch
+    // is still learning its own baseline.
+    const showTypical = baselineReady || typicalSource === 'reference-band';
+    const typical = showTypical && associationTypical !== null && associationTypical !== undefined ? Number(associationTypical) : null;
     const price = Number(row.price_pln);
     const belowTypical = typical && typical > 0 ? -Math.max(0, ((typical - price) / typical) * 100) : null;
     const discount = belowTypical === null ? 0 : Math.abs(belowTypical);
@@ -951,6 +956,7 @@ export class ScoutService {
       marketplace: row.marketplace,
       price,
       typical,
+      typicalSource,
       belowTypical,
       observed: relativeTime(row.watch_last_seen_at ?? row.last_seen_at),
       observedAt: row.watch_last_seen_at ?? row.last_seen_at,
@@ -1104,7 +1110,7 @@ export class ScoutService {
     const total = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(500, Math.floor(options.pageSize ?? 200)));
-    const rows = this.db.prepare(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note
+    const rows = this.db.prepare(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note
       FROM listings l
       JOIN watch_listings wl ON wl.listing_id = l.id
       JOIN watches w ON w.id = wl.watch_id
@@ -1122,7 +1128,7 @@ export class ScoutService {
 
   listingDetail(key: string, watchId?: string | null): ListingDetail {
     const { marketplace, listingId } = parseListingKey(key);
-    const row = this.db.prepare(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, a.decision AS listing_decision, a.note AS listing_note, a.updated_at AS action_updated_at
+    const row = this.db.prepare(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, a.decision AS listing_decision, a.note AS listing_note, a.updated_at AS action_updated_at
       FROM listings l
       LEFT JOIN watch_listings wl ON wl.listing_id = l.id AND (? IS NULL OR wl.watch_id = ?)
       LEFT JOIN watches w ON w.id = wl.watch_id
@@ -1307,6 +1313,7 @@ export class ScoutService {
     const { marketplace } = parseListingKey(key);
     if (marketplace !== 'OLX' && marketplace !== 'Allegro Lokalnie') throw new ServiceError('AI seller negotiation is currently available for OLX and Allegro Lokalnie only.', 409);
     const detail = this.listingDetail(key);
+    const fairPriceBand = this.negotiationFairPriceBand(detail.listing.watchId);
     try {
       return recommendNegotiationPrice({
         askingPrice: detail.listing.price,
@@ -1315,6 +1322,7 @@ export class ScoutService {
         shippingCost,
         otherCosts,
         openingDiscountPercent,
+        ...(fairPriceBand ? { fairPriceBand } : {}),
       });
     } catch (error) {
       throw new ServiceError(error instanceof Error ? error.message : 'Could not calculate a negotiation price.', 400);
@@ -1654,6 +1662,23 @@ export class ScoutService {
 
   private toBandSample(row: { last_price_pln: number; last_seen_at: string; ended_at: string; ended_reason: string | null }): MarketBandSample {
     return { price: Number(row.last_price_pln), lastSeenAt: String(row.last_seen_at), endedAt: String(row.ended_at), endedReason: row.ended_reason };
+  }
+
+  /** Probable-sale median of a reference research series, or null while the band is too thin. */
+  private referenceBandMedian(marketWatchId: string): number | null {
+    const samples = this.endedSaleBandRows(marketWatchId).map((item) => this.toBandSample(item));
+    const band = computeSaleBand(samples, SALE_BAND_WINDOW_DAYS, nowIso());
+    return band.eligibleCount >= MIN_BAND_SAMPLES && band.median !== null ? band.median : null;
+  }
+
+  /** Fair-price band for negotiation when the watch's reference series is opted in. */
+  private negotiationFairPriceBand(watchId: string | null | undefined): { low: number; high: number } | null {
+    if (!watchId || this.getSetting('negotiation_use_band') !== '1') return null;
+    const row = this.db.prepare('SELECT reference_market_watch_id FROM watches WHERE id = ?').get(watchId) as { reference_market_watch_id?: string | null } | undefined;
+    if (!row?.reference_market_watch_id) return null;
+    const band = computeSaleBand(this.endedSaleBandRows(String(row.reference_market_watch_id)).map((item) => this.toBandSample(item)), SALE_BAND_WINDOW_DAYS, nowIso());
+    if (band.eligibleCount < MIN_BAND_SAMPLES || band.p25 === null || band.p75 === null) return null;
+    return { low: band.p25, high: band.p75 };
   }
 
   /**
@@ -2158,6 +2183,7 @@ export class ScoutService {
         source: this.deepSeekConfig().source,
       },
       autoNegotiation: this.autoNegotiationSettings(),
+      negotiationUseBand: this.getSetting('negotiation_use_band') === '1',
       publicExposureWarning: this.publicExposureWarning,
       marketplaceSessions: this.marketplaceSessions(),
     };
@@ -2173,6 +2199,7 @@ export class ScoutService {
     clearNtfy?: boolean;
     ntfy?: { serverUrl?: string; topic?: string; token?: string; minimumPriority?: NotificationPriority };
     ai?: { apiKey?: string; clearApiKey?: boolean; model?: string };
+    negotiationUseBand?: boolean;
     autoNegotiation?: {
       enabled?: boolean;
       maxTotalCost?: number | null;
@@ -2231,6 +2258,7 @@ export class ScoutService {
       if (!model || model.length > 200 || /\s/.test(model)) throw new ServiceError('OpenRouter model must be a non-empty model slug without spaces');
       this.setSetting('deepseek_model', model);
     }
+    if (input.negotiationUseBand !== undefined) this.setSetting('negotiation_use_band', input.negotiationUseBand ? '1' : '0');
     if (input.autoNegotiation !== undefined) {
       const current = this.autoNegotiationConfig();
       const next = {
@@ -2370,6 +2398,8 @@ export class ScoutService {
     this.running.add(row.id);
     const sources = parseJson<Marketplace[]>(row.sources_json, []);
     const exactUrls = parseJson<string[]>(row.exact_urls_json, []);
+    // Reference-series fallback is computed once per scan, like the baseline.
+    const referenceMedian = row.reference_market_watch_id ? this.referenceBandMedian(String(row.reference_market_watch_id)) : null;
     let latestBackoffUntil: string | null = null;
     try {
       await Promise.all(sources.map(async (source) => {
@@ -2424,7 +2454,7 @@ export class ScoutService {
             const baseline = this.watchBaseline(row);
             const pendingCandidates: DealNotificationCandidate[] = [];
             for (const listing of relevance.listings) {
-              const candidate = this.storeListing(row, listing, scanId, baseline);
+              const candidate = this.storeListing(row, listing, scanId, baseline, referenceMedian);
               if (candidate) pendingCandidates.push(candidate);
             }
             const pending = row.shipping_only ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
@@ -2828,7 +2858,7 @@ export class ScoutService {
     return { prices, firstObservedAt: first?.first ?? null };
   }
 
-  private storeListing(row: WatchRow, listing: NormalizedListing, scanId: number, baseline: { prices: number[]; firstObservedAt: string | null }): DealNotificationCandidate | null {
+  private storeListing(row: WatchRow, listing: NormalizedListing, scanId: number, baseline: { prices: number[]; firstObservedAt: string | null }, referenceMedian: number | null = null): DealNotificationCandidate | null {
     const existingPrices = baseline.prices;
     const observedAt = nowIso();
     this.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, availability_status, last_verified_at, first_seen_at, last_seen_at)
@@ -2842,14 +2872,18 @@ export class ScoutService {
       ON CONFLICT(watch_id, listing_id) DO UPDATE SET last_seen_at = excluded.last_seen_at`).run(row.id, stored.id, observedAt, observedAt);
     const association = this.db.prepare('SELECT id FROM watch_listings WHERE watch_id = ? AND listing_id = ?').get(row.id, stored.id) as { id: number };
     const observedHours = baseline.firstObservedAt ? Math.max(0, (Date.now() - Date.parse(baseline.firstObservedAt)) / 3_600_000) : 0;
-    const score = scoreDeal(existingPrices, listing.price, { observedHours, sensitivity: Number(row.sensitivity ?? 1) });
+    // The reference-band fallback seeds ranking/display only: while the watch's
+    // own history is below the sample floor, its median stands in for the
+    // typical. Once own samples reach the floor, own history always wins.
+    const useReference = referenceMedian !== null && existingPrices.length < BASELINE_MIN_SAMPLES;
+    const score = scoreDeal(existingPrices, listing.price, { observedHours, sensitivity: Number(row.sensitivity ?? 1), ...(useReference ? { typicalOverride: referenceMedian } : {}) });
     const observation = this.db.prepare('INSERT INTO observations (listing_id, watch_id, watch_listing_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?, ?)').run(stored.id, row.id, association.id, scanId, listing.price, observedAt);
     const observationId = Number(observation.lastInsertRowid);
     if (score.isReady && score.typical !== null) {
       const discountPercent = score.discountPercent ?? 0;
       const dealStrength = discountPercent >= 30 ? 5 : discountPercent >= 20 ? 4 : discountPercent >= 12 ? 3 : discountPercent > 0 ? 2 : 1;
       const dealLabel: DealLabel = dealStrength >= 5 ? 'Exceptional' : dealStrength === 4 ? 'Very strong' : dealStrength === 3 ? 'Strong' : 'Watch';
-      this.db.prepare('UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, last_seen_at = ? WHERE id = ?').run(score.typical, dealStrength, dealLabel, observedAt, association.id);
+      this.db.prepare("UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, typical_source = 'own-history', last_seen_at = ? WHERE id = ?").run(score.typical, dealStrength, dealLabel, observedAt, association.id);
       this.db.prepare('UPDATE observations SET baseline_pln = ?, discount_percent = ?, deal_strength = ?, deal_label = ? WHERE id = ?').run(score.typical, discountPercent, dealStrength, dealLabel, observationId);
       if (score.qualifies) return {
         watchId: String(row.id),
@@ -2859,6 +2893,13 @@ export class ScoutService {
         confidence: score.confidence,
         requiresDescriptionVerification: dealStrength >= 4,
       };
+    } else if (useReference && score.typical !== null) {
+      // Band-seeded display values; the readiness gate is untouched, so no
+      // alerts fire earlier than they would without a reference series.
+      const discountPercent = score.discountPercent ?? 0;
+      const dealStrength = discountPercent >= 30 ? 5 : discountPercent >= 20 ? 4 : discountPercent >= 12 ? 3 : discountPercent > 0 ? 2 : 1;
+      const dealLabel: DealLabel = dealStrength >= 5 ? 'Exceptional' : dealStrength === 4 ? 'Very strong' : dealStrength === 3 ? 'Strong' : 'Watch';
+      this.db.prepare("UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, typical_source = 'reference-band', last_seen_at = ? WHERE id = ?").run(score.typical, dealStrength, dealLabel, observedAt, association.id);
     } else {
       this.db.prepare('UPDATE observations SET baseline_pln = NULL, discount_percent = NULL WHERE id = ?').run(observationId);
     }

@@ -14,7 +14,7 @@ import {
 import { api } from "./api";
 import { marketplaceColors } from "./data";
 import type { WatchPreset } from "./presets";
-import type { Marketplace, NotificationRecord, Watch } from "./types";
+import type { Marketplace, MarketWatch, NotificationRecord, Watch } from "./types";
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
@@ -49,6 +49,8 @@ export function WatchDialog({
   const [shippingOnly, setShippingOnly] = useState(initialWatch?.shippingOnly ?? preset?.shippingOnly ?? false);
   const [typoVariants, setTypoVariants] = useState(initialWatch?.typoVariants ?? false);
   const [aiRelevance, setAiRelevance] = useState(initialWatch?.aiRelevance ?? true);
+  const [referenceOptions, setReferenceOptions] = useState<MarketWatch[]>([]);
+  const [referenceMarketWatchId, setReferenceMarketWatchId] = useState(initialWatch?.referenceMarketWatchId ?? "");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const numericInterval = Number(interval);
@@ -74,6 +76,13 @@ export function WatchDialog({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose, submitting]);
+  useEffect(() => {
+    let active = true;
+    api.marketResearch({ pageSize: 1 }).then((result) => {
+      if (active) setReferenceOptions(result.watches);
+    }).catch(() => { /* the fallback-baseline select stays empty; core dialog works without it */ });
+    return () => { active = false; };
+  }, []);
   const submit = async () => {
     if (!canSubmit) return;
     setSubmitting(true);
@@ -104,6 +113,7 @@ export function WatchDialog({
         shippingOnly,
         typoVariants,
         aiRelevance,
+        referenceMarketWatchId: referenceMarketWatchId.trim() ? referenceMarketWatchId.trim() : null,
         minPrice: numericMin,
         maxPrice: numericMax,
       });
@@ -273,6 +283,21 @@ export function WatchDialog({
             <input type="checkbox" checked={aiRelevance} onChange={(event) => setAiRelevance(event.target.checked)} />
             <span><strong>Use AI relevance filtering</strong><small>Exclude accessories, replacement parts, services, and unrelated listings when OpenRouter is configured</small></span>
           </label>
+          <label className="field-label">
+            Fallback baseline <span>optional · research series</span>
+            <select value={referenceMarketWatchId} onChange={(event) => setReferenceMarketWatchId(event.target.value)}>
+              <option value="">None — learn from own history</option>
+              {referenceOptions.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}
+            </select>
+          </label>
+          {referenceMarketWatchId ? (
+            <div className="modal-note">
+              <Info size={16} />
+              <span>
+                While this watch is still learning, listings display a “series baseline” typical from the reference research series' probable-sale band. It improves ranking and display only — no alerts fire earlier.
+              </span>
+            </div>
+          ) : null}
           <label className="field-label">
             Exact search URLs <span>optional · one per line</span>
             <textarea

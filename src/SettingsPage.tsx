@@ -59,6 +59,7 @@ export default function SettingsPage({
   const [autoNegotiationMinimumDiscount, setAutoNegotiationMinimumDiscount] = useState("18");
   const [autoNegotiationOpeningDiscount, setAutoNegotiationOpeningDiscount] = useState("12");
   const [autoNegotiationDailyLimit, setAutoNegotiationDailyLimit] = useState("3");
+  const [negotiationUseBand, setNegotiationUseBand] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testingNtfy, setTestingNtfy] = useState(false);
@@ -85,6 +86,7 @@ export default function SettingsPage({
       setNightInterval(String(result.nightInterval));
       setAiModel(result.ai?.model ?? "");
       setAutoNegotiationEnabled(result.autoNegotiation?.enabled ?? false);
+      setNegotiationUseBand(result.negotiationUseBand ?? false);
       setAutoNegotiationMaxTotal(result.autoNegotiation?.maxTotalCost === null || result.autoNegotiation?.maxTotalCost === undefined ? "" : String(result.autoNegotiation.maxTotalCost));
       setAutoNegotiationShipping(String(result.autoNegotiation?.shippingCost ?? 0));
       setAutoNegotiationOtherCosts(String(result.autoNegotiation?.otherCosts ?? 0));
@@ -181,6 +183,7 @@ export default function SettingsPage({
           model: aiModel.trim() || undefined,
           apiKey: aiApiKey.trim() || undefined,
         },
+        negotiationUseBand,
         autoNegotiation: {
           enabled: autoNegotiationEnabled,
           maxTotalCost: autoMaxTotal,
@@ -210,6 +213,7 @@ export default function SettingsPage({
       setDailyDigestDiscord(result.dailyDigest?.discord ?? true);
       setDailyDigestNtfy(result.dailyDigest?.ntfy ?? false);
       setAutoNegotiationEnabled(result.autoNegotiation?.enabled ?? false);
+      setNegotiationUseBand(result.negotiationUseBand ?? false);
       setAutoNegotiationMaxTotal(result.autoNegotiation?.maxTotalCost === null || result.autoNegotiation?.maxTotalCost === undefined ? "" : String(result.autoNegotiation.maxTotalCost));
       setAutoNegotiationShipping(String(result.autoNegotiation?.shippingCost ?? 0));
       setAutoNegotiationOtherCosts(String(result.autoNegotiation?.otherCosts ?? 0));
@@ -519,6 +523,13 @@ export default function SettingsPage({
             <span>
               <strong>Enable automatic seller messages</strong>
               <small>Opt in only after checking the budget, session, and message limit below.</small>
+            </span>
+          </label>
+          <label className="auto-negotiation-toggle">
+            <input type="checkbox" checked={negotiationUseBand} disabled={!settingsLoaded || saving} onChange={(event) => setNegotiationUseBand(event.target.checked)} />
+            <span>
+              <strong>Cap offers with a reference series band</strong>
+              <small>When a watch uses a research series as its fallback baseline, probable-sale band highs can only tighten the offer ceiling — including bounded automatic negotiation. It never loosens it.</small>
             </span>
           </label>
           <div className="field-row">

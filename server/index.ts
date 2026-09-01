@@ -232,6 +232,7 @@ const watchInput = z.object({
   shippingOnly: z.boolean().optional().default(false),
   typoVariants: z.boolean().optional().default(false),
   aiRelevance: z.boolean().optional().default(true),
+  referenceMarketWatchId: z.string().trim().max(160).nullable().optional().default(null),
   minPrice: z.number().nonnegative().nullable().optional().default(null),
   maxPrice: z.number().positive().nullable().optional().default(null),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
@@ -244,9 +245,12 @@ app.post('/api/watches', async (request, reply) => {
     const valid = validateSearchUrl(url);
     if (!valid.valid || !value.sources.includes(valid.marketplace)) return reply.code(400).send({ error: valid.valid ? 'Exact URL source is not selected' : valid.reason });
   }
+  if (value.referenceMarketWatchId && !db.prepare('SELECT 1 FROM market_watches WHERE id = ?').get(value.referenceMarketWatchId)) {
+    return reply.code(400).send({ error: 'Reference research watch not found' });
+  }
   const id = value.id ?? `watch-${randomUUID()}`;
   const now = nowIso();
-  db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, sensitivity, shipping_only, typo_variants, ai_relevance, min_price_pln, max_price_pln, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, value.minPrice, value.maxPrice, 1, now, now, now);
+  db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, sensitivity, shipping_only, typo_variants, ai_relevance, reference_market_watch_id, min_price_pln, max_price_pln, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, 1, now, now, now);
   emit('watch', { id, name: value.name });
   const created = service.getWatches().find((watch) => watch.id === id);
   return reply.code(201).send({ watch: created });
@@ -263,6 +267,7 @@ app.patch('/api/watches/:id', async (request, reply) => {
     enabled: z.boolean().optional(), interval: z.number().int().min(5).max(1440).optional(), shippingOnly: z.boolean().optional(),
     aiRelevance: z.boolean().optional(),
     typoVariants: z.boolean().optional(),
+    referenceMarketWatchId: z.string().trim().max(160).nullable().optional(),
     archived: z.boolean().optional(),
     minPrice: z.number().nonnegative().nullable().optional(), maxPrice: z.number().positive().nullable().optional(),
   }).strict().safeParse(request.body);
@@ -296,6 +301,13 @@ app.patch('/api/watches/:id', async (request, reply) => {
   if (typeof body.shippingOnly === 'boolean') { fields.push('shipping_only = ?'); values.push(body.shippingOnly ? 1 : 0); }
   if (typeof body.aiRelevance === 'boolean') { fields.push('ai_relevance = ?'); values.push(body.aiRelevance ? 1 : 0); }
   if (typeof body.typoVariants === 'boolean') { fields.push('typo_variants = ?'); values.push(body.typoVariants ? 1 : 0); }
+  if (body.referenceMarketWatchId !== undefined) {
+    if (body.referenceMarketWatchId && !db.prepare('SELECT 1 FROM market_watches WHERE id = ?').get(body.referenceMarketWatchId)) {
+      return reply.code(400).send({ error: 'Reference research watch not found' });
+    }
+    fields.push('reference_market_watch_id = ?');
+    values.push(body.referenceMarketWatchId);
+  }
   if (body.minPrice !== undefined) { fields.push('min_price_pln = ?'); values.push(body.minPrice); }
   if (body.maxPrice !== undefined) { fields.push('max_price_pln = ?'); values.push(body.maxPrice); }
   if (body.archived !== undefined) {
@@ -482,6 +494,7 @@ const settingsInput = z.object({
     clearApiKey: z.boolean().optional(),
     model: z.string().trim().max(200).optional(),
   }).strict().optional(),
+  negotiationUseBand: z.boolean().optional(),
   autoNegotiation: z.object({
     enabled: z.boolean().optional(),
     maxTotalCost: z.number().positive().nullable().optional(),

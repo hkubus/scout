@@ -61,6 +61,8 @@ export interface Listing {
   marketplace: Marketplace;
   price: number;
   typical: number | null;
+  /** Where the displayed typical comes from: the watch's own history or a reference research series band. */
+  typicalSource?: 'own-history' | 'reference-band' | null;
   belowTypical: number | null;
   observed: string;
   observedAt: string;
@@ -174,6 +176,7 @@ export interface Watch {
   shippingOnly: boolean;
   typoVariants: boolean;
   aiRelevance: boolean;
+  referenceMarketWatchId: string | null;
   minPrice: number | null;
   maxPrice: number | null;
   archivedAt?: string | null;
@@ -414,6 +417,8 @@ export interface SettingsData {
   ntfy: NtfySettings;
   ai: AiSettings;
   autoNegotiation: AutoNegotiationSettings;
+  /** Cap negotiation ceilings with the reference series' probable-sale band (opt-in). */
+  negotiationUseBand: boolean;
   publicExposureWarning: boolean;
   marketplaceSessions: MarketplaceSession[];
 }
