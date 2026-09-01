@@ -325,6 +325,25 @@ export interface MarketListingSnapshot {
   images: MarketListingSnapshotImage[];
 }
 
+export interface MarketWatchTrendPoint {
+  date: string;
+  medianPrice: number | null;
+  lowerPrice: number | null;
+  upperPrice: number | null;
+  listingCount: number;
+}
+
+export interface MarketWatchTrend {
+  marketWatchId: string;
+  watchName: string;
+  rangeDays: number;
+  firstObservedAt: string | null;
+  lastObservedAt: string | null;
+  totalObservations: number;
+  probableSaleMedian: number | null;
+  points: MarketWatchTrendPoint[];
+}
+
 export interface MarketResearchData {
   watches: MarketWatch[];
   listings: MarketTrackedListing[];

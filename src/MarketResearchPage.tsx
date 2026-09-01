@@ -22,7 +22,9 @@ import {
 } from "lucide-react";
 import { api } from "./api";
 import { marketplaceColors } from "./data";
+import { AnalyticsTrendChart, formatAnalyticsDate, formatAnalyticsPrice } from "./AnalyticsTrendChart";
 import { marketWatchInputFromListing } from "./presets";
+import { PriceSparkline } from "./PriceSparkline";
 import type {
   Marketplace,
   MarketListingSnapshot,
@@ -30,6 +32,8 @@ import type {
   MarketTrackedListing,
   MarketWatch,
   MarketWatchInput,
+  MarketWatchTrend,
+  PriceHistoryPoint,
   SaleBand,
 } from "./types";
 
@@ -145,6 +149,7 @@ export default function MarketResearchPage({
   const [snapshotListing, setSnapshotListing] = useState<MarketTrackedListing | null>(null);
   const [watchPreset, setWatchPreset] = useState<MarketWatchInput | null>(null);
   const [dialogNonce, setDialogNonce] = useState(0);
+  const [trendWatch, setTrendWatch] = useState<MarketWatch | null>(null);
 
   const load = useCallback(async (showLoader = false) => {
     if (showLoader) setLoading(true);
@@ -268,7 +273,7 @@ export default function MarketResearchPage({
               <div className="research-watch-sources">{watch.sources.map((source) => <span key={source}><i style={{ background: marketplaceColors[source] }} />{source}</span>)}</div>
               <MarketWatchFilterSummary watch={watch} />
               <div className="research-watch-metrics"><div><span>Tracked</span><strong>{watch.totalListings}</strong></div><div><span>Ended</span><strong>{watch.endedListings}</strong></div><SaleBandChip band={watch.saleBand} /></div>
-              <div className="research-watch-footer"><span><Clock3 size={14} />Every {watch.intervalHours}h · Last {watch.lastScan} · Next {watch.nextScan}</span><div><button className="icon-button" title="Edit research filters" aria-label={`Edit ${watch.name}`} disabled={busyIds.has(watch.id)} onClick={() => openEdit(watch)}><SlidersHorizontal size={16} /></button><button className="icon-button" title="Scan research watch now" aria-label={`Scan ${watch.name} now`} disabled={busyIds.has(watch.id) || !watch.enabled} onClick={() => void scan(watch)}>{busyIds.has(watch.id) ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}</button><button className={`toggle ${watch.enabled ? "toggle--on" : ""}`} aria-label={watch.enabled ? `Pause ${watch.name}` : `Resume ${watch.name}`} disabled={busyIds.has(watch.id)} onClick={() => void toggle(watch)}>{watch.enabled ? <Pause size={13} /> : <Play size={13} />}</button><button className="icon-button danger-icon" title="Delete research watch" aria-label={`Delete ${watch.name}`} disabled={busyIds.has(watch.id)} onClick={() => void remove(watch)}><Trash2 size={16} /></button></div></div>
+              <div className="research-watch-footer"><span><Clock3 size={14} />Every {watch.intervalHours}h · Last {watch.lastScan} · Next {watch.nextScan}</span><div><button className="icon-button" title="View price trend" aria-label={`View price trend for ${watch.name}`} onClick={() => setTrendWatch(watch)}><BarChart3 size={16} /></button><button className="icon-button" title="Edit research filters" aria-label={`Edit ${watch.name}`} disabled={busyIds.has(watch.id)} onClick={() => openEdit(watch)}><SlidersHorizontal size={16} /></button><button className="icon-button" title="Scan research watch now" aria-label={`Scan ${watch.name} now`} disabled={busyIds.has(watch.id) || !watch.enabled} onClick={() => void scan(watch)}>{busyIds.has(watch.id) ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}</button><button className={`toggle ${watch.enabled ? "toggle--on" : ""}`} aria-label={watch.enabled ? `Pause ${watch.name}` : `Resume ${watch.name}`} disabled={busyIds.has(watch.id)} onClick={() => void toggle(watch)}>{watch.enabled ? <Pause size={13} /> : <Play size={13} />}</button><button className="icon-button danger-icon" title="Delete research watch" aria-label={`Delete ${watch.name}`} disabled={busyIds.has(watch.id)} onClick={() => void remove(watch)}><Trash2 size={16} /></button></div></div>
             </article>
           ))}
         </div>
@@ -283,8 +288,81 @@ export default function MarketResearchPage({
         </section>
       ) : null}
       {showDialog ? <MarketWatchDialog key={editingWatch?.id ?? `new-${dialogNonce}`} initialWatch={editingWatch} preset={watchPreset} onClose={closeDialog} onSubmit={editingWatch ? update : create} /> : null}
+      {trendWatch ? <MarketWatchTrendDialog watch={trendWatch} refreshKey={refreshKey} onClose={() => setTrendWatch(null)} /> : null}
       {snapshotListing ? <MarketListingSnapshotModal listing={snapshotListing} onClose={() => setSnapshotListing(null)} onToast={onToast} onSaved={() => void load(false)} onWatch={openCreateFromListing} /> : null}
     </>
+  );
+}
+
+function MarketWatchTrendDialog({ watch, refreshKey, onClose }: {
+  watch: MarketWatch;
+  refreshKey: number;
+  onClose: () => void;
+}) {
+  const [days, setDays] = useState(90);
+  const [trend, setTrend] = useState<MarketWatchTrend | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    api.marketWatchTrend(watch.id, days).then((result) => {
+      if (!cancelled) setTrend(result);
+    }).catch((requestError) => {
+      if (!cancelled) setError(errorMessage(requestError));
+    }).finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [watch.id, days, refreshKey]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const lastPoint = trend?.points.length ? trend.points[trend.points.length - 1] : null;
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <section className="modal modal--analytics" role="dialog" aria-modal="true" aria-labelledby="market-trend-title">
+        <div className="modal-header">
+          <div>
+            <span className="modal-kicker">Market research</span>
+            <h2 id="market-trend-title">{watch.name}</h2>
+            <p>Daily asking-price movement for the current comparable series.</p>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="Close research trend"><X size={20} /></button>
+        </div>
+        <div className="modal-body analytics-body">
+          <div className="analytics-toolbar">
+            <span>{trend ? `${trend.totalObservations.toLocaleString("pl-PL")} observations · ${formatAnalyticsDate(trend.firstObservedAt)}–${formatAnalyticsDate(trend.lastObservedAt)}` : "Loading observation history…"}</span>
+            <div className="analytics-range-options" role="group" aria-label="Trend time range">
+              {[30, 90, 180].map((option) => <button key={option} className={days === option ? "analytics-range-option analytics-range-option--active" : "analytics-range-option"} onClick={() => setDays(option)}>{option}d</button>)}
+            </div>
+          </div>
+          {loading && !trend ? <div className="analytics-loading"><LoaderCircle size={20} className="spin" />Loading trend…</div> : null}
+          {error ? <div className="analytics-error" role="alert"><AlertTriangle size={16} />{error}</div> : null}
+          {trend && !error ? (
+            <>
+              <div className="analytics-stat-grid">
+                <div className="analytics-stat"><span>Active median</span><strong>{formatAnalyticsPrice(lastPoint?.medianPrice ?? null)}</strong><small>latest observed day</small></div>
+                <div className="analytics-stat"><span>Active band</span><strong>{lastPoint?.lowerPrice != null && lastPoint?.upperPrice != null ? `${lastPoint.lowerPrice.toLocaleString("pl-PL")}–${lastPoint.upperPrice.toLocaleString("pl-PL")} zł` : "—"}</strong><small>middle 50% of asking prices</small></div>
+                <div className="analytics-stat"><span>Probable-sale median</span><strong>{formatAnalyticsPrice(trend.probableSaleMedian)}</strong><small>reference line · estimated</small></div>
+                <div className="analytics-stat"><span>Listings last day</span><strong>{lastPoint?.listingCount ?? 0}</strong><small>unique listings observed</small></div>
+              </div>
+              <section className="analytics-section">
+                <div className="analytics-section-heading"><div><span className="drawer-section-kicker">Price trend</span><h3>Asking prices vs probable sales</h3></div><span>Middle 50% shaded</span></div>
+                <div className="analytics-chart-card"><AnalyticsTrendChart analytics={{ watchName: watch.name, points: trend.points }} referenceMedian={trend.probableSaleMedian} /></div>
+              </section>
+              <div className="analytics-note"><Info size={16} /><span>The solid line is the median asking price of the live market. The dashed line is the probable-sale median estimated from listings verified as no longer available — an estimate, not a confirmed sale price.</span></div>
+            </>
+          ) : null}
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -361,6 +439,7 @@ function MarketListingSnapshotModal({ listing, onClose, onToast, onSaved, onWatc
   onWatch: (listing: MarketTrackedListing) => void;
 }) {
   const [snapshot, setSnapshot] = useState<MarketListingSnapshot | null>(null);
+  const [history, setHistory] = useState<PriceHistoryPoint[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [lightbox, setLightbox] = useState<string | null>(null);
@@ -371,6 +450,9 @@ function MarketListingSnapshotModal({ listing, onClose, onToast, onSaved, onWatc
       .then((result) => { if (!cancelled) setSnapshot(result.snapshot); })
       .catch((error) => onToast(errorMessage(error), "error"))
       .finally(() => { if (!cancelled) setLoading(false); });
+    api.marketListingHistory(listing.id)
+      .then((result) => { if (!cancelled) setHistory(result.points); })
+      .catch(() => { /* price history is optional in this view */ });
     return () => { cancelled = true; };
   }, [listing.id, onToast]);
 
@@ -424,6 +506,19 @@ function MarketListingSnapshotModal({ listing, onClose, onToast, onSaved, onWatc
                 {snapshot.location ? <span>Location: {snapshot.location}</span> : null}
                 <span>{snapshot.images.length} image{snapshot.images.length === 1 ? "" : "s"} stored</span>
               </div>
+              {history && history.length ? (
+                <div className="snapshot-price-history">
+                  <strong>Price history</strong>
+                  <div className="price-chart-card">
+                    <PriceSparkline points={history} />
+                    <div className="price-chart-labels">
+                      <span>{formatPln(Math.min(...history.map((point) => point.price)))}</span>
+                      <strong>Latest {formatPln(history[history.length - 1].price)}</strong>
+                      <span>{formatPln(Math.max(...history.map((point) => point.price)))}</span>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
               {snapshot.images.length ? (
                 <div className="snapshot-gallery">
                   {snapshot.images.map((image) => (

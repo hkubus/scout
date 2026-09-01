@@ -398,6 +398,20 @@ app.post('/api/market-watches/:id/scan', async (request, reply) => {
   return reply.code(202).send(service.queueMarketScan(params.data.id));
 });
 
+app.get('/api/market-watches/:id/trend', async (request, reply) => {
+  const params = resourceIdParams.safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid market watch id is required' });
+  const parsed = z.object({ days: z.coerce.number().int().min(7).max(180).default(90) }).safeParse(request.query);
+  if (!parsed.success) return reply.code(400).send({ error: 'Trend range must be between 7 and 180 days' });
+  return service.marketWatchTrend(params.data.id, parsed.data.days);
+});
+
+app.get('/api/market-listings/:id/history', async (request, reply) => {
+  const params = z.object({ id: z.coerce.number().int().min(1) }).safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid research listing id is required' });
+  return { points: service.marketListingHistory(params.data.id) };
+});
+
 app.get('/api/market-listings/:id/snapshot', async (request, reply) => {
   const params = z.object({ id: z.coerce.number().int().min(1) }).safeParse(request.params);
   if (!params.success) return reply.code(400).send({ error: 'A valid research listing id is required' });

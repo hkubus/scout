@@ -11,7 +11,8 @@ import { offerCeiling, recommendNegotiationPrice, type NegotiationRecommendation
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, median, scoreDeal } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
 import { computeSaleBand, type MarketBandSample } from './marketBand';
-import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
+import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
+import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -1579,10 +1580,7 @@ export class ScoutService {
       endedPricesByWatch.set(item.market_watch_id, prices);
     }
     const bandComputedAt = nowIso();
-    const endedSampleRows = this.db.prepare(`SELECT ml.market_watch_id, ml.last_price_pln, ml.last_seen_at, ml.ended_at, ml.ended_reason
-      FROM market_listings ml
-      JOIN market_watches mw ON mw.id = ml.market_watch_id
-      WHERE ml.status = 'ended' AND ml.last_price_pln > 0 AND ml.ended_at IS NOT NULL AND ${versionFilter}`).all() as Array<{ market_watch_id: string; last_price_pln: number; last_seen_at: string; ended_at: string; ended_reason: string | null }>;
+    const endedSampleRows = this.endedSaleBandRows(null);
     const bandSamplesByWatch = new Map<string, MarketBandSample[]>();
     const allBandSamples: MarketBandSample[] = [];
     for (const item of endedSampleRows) {
@@ -1642,6 +1640,61 @@ export class ScoutService {
       aggregates: { overallMedianPrice: aggregatePrices.length ? median(aggregatePrices) : null, endedCount: Number(aggregateCounts?.ended ?? 0), activeCount: Number(aggregateCounts?.active ?? 0), saleBand: computeSaleBand(options.watchId ? bandSamplesByWatch.get(options.watchId) ?? [] : allBandSamples, SALE_BAND_WINDOW_DAYS, bandComputedAt) },
       pagination: { page, pageSize, total, hasNext: page * pageSize < total },
     };
+  }
+
+  /** Ended research listings (active series only) that may feed probable-sale bands. */
+  private endedSaleBandRows(watchId: string | null) {
+    const versionFilter = '(ml.version_id = mw.active_version_id OR (mw.active_version_id IS NULL AND ml.version_id IS NULL))';
+    return this.db.prepare(`SELECT ml.market_watch_id, ml.last_price_pln, ml.last_seen_at, ml.ended_at, ml.ended_reason
+      FROM market_listings ml
+      JOIN market_watches mw ON mw.id = ml.market_watch_id
+      WHERE ml.status = 'ended' AND ml.last_price_pln > 0 AND ml.ended_at IS NOT NULL AND ${versionFilter}${watchId ? ' AND ml.market_watch_id = ?' : ''}`)
+      .all(...(watchId ? [watchId] : [])) as Array<{ market_watch_id: string; last_price_pln: number; last_seen_at: string; ended_at: string; ended_reason: string | null }>;
+  }
+
+  private toBandSample(row: { last_price_pln: number; last_seen_at: string; ended_at: string; ended_reason: string | null }): MarketBandSample {
+    return { price: Number(row.last_price_pln), lastSeenAt: String(row.last_seen_at), endedAt: String(row.ended_at), endedReason: row.ended_reason };
+  }
+
+  /**
+   * Daily active-market trend for one research series, with the current
+   * probable-sale band median as a reference line.
+   */
+  marketWatchTrend(id: string, rangeDays = 90): MarketWatchTrend {
+    const row = this.db.prepare('SELECT id, name FROM market_watches WHERE id = ?').get(id) as WatchRow | undefined;
+    if (!row) throw new ServiceError('Market watch not found', 404);
+    const days = Math.max(7, Math.min(180, Math.floor(rangeDays)));
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60_000).toISOString();
+    const rawRows = this.db.prepare(`SELECT mpo.market_listing_id, mpo.price_pln, mpo.observed_at
+      FROM market_price_observations mpo
+      JOIN market_listings ml ON ml.id = mpo.market_listing_id
+      WHERE ml.market_watch_id = ?
+        AND mpo.observed_at >= ?
+        AND (ml.version_id = ? OR (? IS NULL AND ml.version_id IS NULL))
+      ORDER BY mpo.observed_at ASC`).all(id, cutoff, row.active_version_id ?? null, row.active_version_id ?? null) as Array<{ market_listing_id: number; price_pln: number; observed_at: string }>;
+    const observations: MarketTrendObservation[] = rawRows.map((item) => ({
+      marketListingId: Number(item.market_listing_id),
+      price: Number(item.price_pln),
+      observedAt: String(item.observed_at),
+    }));
+    const points = bucketDailyObservations(observations, days, nowIso());
+    const band = computeSaleBand(this.endedSaleBandRows(id).map((item) => this.toBandSample(item)), SALE_BAND_WINDOW_DAYS, nowIso());
+    return {
+      marketWatchId: id,
+      watchName: String(row.name),
+      rangeDays: days,
+      firstObservedAt: observations[0]?.observedAt ?? null,
+      lastObservedAt: observations[observations.length - 1]?.observedAt ?? null,
+      totalObservations: observations.length,
+      probableSaleMedian: band.median,
+      points,
+    };
+  }
+
+  /** Asking-price history of one preserved research listing (oldest first). */
+  marketListingHistory(marketListingId: number): PriceHistoryPoint[] {
+    const rows = this.db.prepare('SELECT price_pln, observed_at FROM market_price_observations WHERE market_listing_id = ? ORDER BY observed_at ASC, id ASC LIMIT 120').all(marketListingId) as Array<{ price_pln: number; observed_at: string }>;
+    return rows.map((point) => ({ price: Number(point.price_pln), observedAt: point.observed_at }));
   }
 
   queueMarketScan(id: string) {
