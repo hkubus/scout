@@ -31,6 +31,19 @@ type DealNotificationCandidate = {
   requiresDescriptionVerification: boolean;
 };
 
+/**
+ * Notification/verification configuration snapshotted once per scan: reading
+ * it per candidate re-decrypted the webhook, ntfy, and AI credentials for
+ * every deal. Built lazily so scans without candidates never decrypt.
+ */
+type ScanNotifyContext = {
+  encryptedDiscord: string | null;
+  ntfy: NtfyConfig | null;
+  digest: DailyDigestConfig;
+  discordMinimumPriority: NotificationPriority;
+  deepSeek: { apiKey: string | null; model: string; source: 'settings' | 'environment' | 'none' };
+};
+
 type AutoNegotiationConfig = Omit<AutoNegotiationSettings, 'sentToday' | 'attemptedToday'>;
 type DigestChannel = 'Discord' | 'ntfy';
 type DailyDigestConfig = Omit<DailyDigestSettings, 'lastSentAt'>;
@@ -716,10 +729,10 @@ export class ScoutService {
     this.stmt('UPDATE listing_detail_snapshots SET verification_status = ?, verification_input_hash = ? WHERE id = ?').run(status, inputHash, snapshotId);
   }
 
-  private async verifyHighPriorityDealOnce(candidate: DealNotificationCandidate): Promise<boolean> {
+  private async verifyHighPriorityDealOnce(candidate: DealNotificationCandidate, notifyContext?: ScanNotifyContext): Promise<boolean> {
     const marketplace = candidate.listing.marketplace;
     const listingId = candidate.listing.listingId;
-    const config = this.deepSeekConfig();
+    const config = notifyContext?.deepSeek ?? this.deepSeekConfig();
     if (!config.apiKey) {
       const snapshot = this.captureListingDetailSnapshot(candidate, null);
       this.updateListingDetailSnapshot(snapshot?.id ?? null, 'not-configured', null);
@@ -811,15 +824,59 @@ export class ScoutService {
     }
   }
 
-  private verifyHighPriorityDeal(candidate: DealNotificationCandidate) {
+  private verifyHighPriorityDeal(candidate: DealNotificationCandidate, notifyContext?: ScanNotifyContext) {
     const key = `${candidate.listing.marketplace}:${candidate.listing.listingId}`;
     const existing = this.descriptionVerificationInFlight.get(key);
     if (existing) return existing;
-    const verification = this.verifyHighPriorityDealOnce(candidate).finally(() => {
+    const verification = this.verifyHighPriorityDealOnce(candidate, notifyContext).finally(() => {
       if (this.descriptionVerificationInFlight.get(key) === verification) this.descriptionVerificationInFlight.delete(key);
     });
     this.descriptionVerificationInFlight.set(key, verification);
     return verification;
+  }
+
+  /** Read once per scan — see ScanNotifyContext. */
+  private scanNotifyContext(): ScanNotifyContext {
+    return {
+      encryptedDiscord: this.getSetting('discord_webhook'),
+      ntfy: this.ntfyConfig(),
+      digest: this.dailyDigestConfig(),
+      discordMinimumPriority: this.discordMinimumPriority(),
+      deepSeek: this.deepSeekConfig(),
+    };
+  }
+
+  /**
+   * Deal candidates run through a two-worker pool: verification and delivery
+   * spend their time on marketplace and OpenRouter round trips. Candidates
+   * for the same listing are grouped and each group is consumed sequentially
+   * — the alert-state and delivery-claim logic is per listing and must not
+   * race itself. Two workers also stay within the messagingInFlight cap of
+   * two concurrent seller messages.
+   */
+  private async processDealCandidates(candidates: DealNotificationCandidate[], buildContext: () => ScanNotifyContext) {
+    if (!candidates.length) return;
+    const groups = new Map<string, DealNotificationCandidate[]>();
+    for (const candidate of candidates) {
+      const key = `${candidate.listing.marketplace}:${candidate.listing.listingId}`;
+      const group = groups.get(key);
+      if (group) group.push(candidate);
+      else groups.set(key, [candidate]);
+    }
+    const context = buildContext();
+    const queue = [...groups.values()];
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < queue.length) {
+        const group = queue[cursor++];
+        for (const candidate of group) {
+          if (candidate.requiresDescriptionVerification && !await this.verifyHighPriorityDeal(candidate, context)) continue;
+          await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence, context);
+          await this.automaticallyNegotiate(candidate, context);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(2, queue.length) }, worker));
   }
 
   private discordMinimumPriority(): NotificationPriority {
@@ -1460,11 +1517,11 @@ export class ScoutService {
     this.stmt('UPDATE automatic_negotiations SET status = ?, message_id = ?, error = ?, updated_at = ? WHERE marketplace = ? AND listing_id = ?').run(status, messageId, safeError, nowIso(), marketplace, listingId);
   }
 
-  private async automaticallyNegotiate(candidate: DealNotificationCandidate) {
+  private async automaticallyNegotiate(candidate: DealNotificationCandidate, context?: ScanNotifyContext) {
     const config = this.autoNegotiationConfig();
     if (!config.enabled || (candidate.listing.marketplace !== 'OLX' && candidate.listing.marketplace !== 'Allegro Lokalnie') || config.maxTotalCost === null) return;
     if (candidate.discountPercent < config.minimumDiscountPercent || candidate.listing.priceNegotiable !== true) return;
-    if (!this.deepSeekConfig().apiKey) return;
+    if (!(context?.deepSeek ?? this.deepSeekConfig()).apiKey) return;
     try {
       if (!this.readMarketplaceSession(candidate.listing.marketplace)) return;
     } catch {
@@ -2373,11 +2430,7 @@ export class ScoutService {
             this.completeScan(scanId, row.shipping_only ? `${relevance.listings.length} shipping matches${pending ? ` · ${pending} pending checks` : ''}${relevanceNote}` : `${relevance.listings.length} listings normalized${relevanceNote}`);
             return pendingCandidates;
           });
-          for (const candidate of candidates) {
-            if (candidate.requiresDescriptionVerification && !await this.verifyHighPriorityDeal(candidate)) continue;
-            await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence);
-            await this.automaticallyNegotiate(candidate);
-          }
+          await this.processDealCandidates(candidates, () => this.scanNotifyContext());
           const pending = row.shipping_only ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
           const relevanceNote = relevance.notConfigured && (row.ai_relevance === undefined || Boolean(row.ai_relevance))
             ? ' · AI relevance inactive'
@@ -3064,6 +3117,7 @@ export class ScoutService {
     typicalOrDiscount: number,
     discountOrConfidence: number,
     maybeConfidence?: number,
+    context?: ScanNotifyContext,
   ) {
     const legacy = typeof watchIdOrListing !== 'string';
     const watchId = legacy ? '__legacy__' : watchIdOrListing;
@@ -3072,17 +3126,18 @@ export class ScoutService {
     const discountPercent = legacy ? typicalOrDiscount : discountOrConfidence;
     const confidence = legacy ? discountOrConfidence : maybeConfidence!;
     const priority = priorityFromDiscount(discountPercent);
-    const encryptedDiscord = this.getSetting('discord_webhook');
-    const ntfy = this.ntfyConfig();
-    const digest = this.dailyDigestConfig();
+    const encryptedDiscord = context?.encryptedDiscord ?? this.getSetting('discord_webhook');
+    const ntfy = context?.ntfy ?? this.ntfyConfig();
+    const digest = context?.digest ?? this.dailyDigestConfig();
+    const discordMinimum = context?.discordMinimumPriority ?? this.discordMinimumPriority();
     const digestSelected = (channel: DigestChannel) => digest.enabled && (channel === 'Discord' ? digest.discord : digest.ntfy);
     if (!legacy && priority !== 'exceptional') {
-      const qualifiesForDigest = (digestSelected('Discord') && Boolean(encryptedDiscord) && meetsMinimumPriority(priority, this.discordMinimumPriority()))
+      const qualifiesForDigest = (digestSelected('Discord') && Boolean(encryptedDiscord) && meetsMinimumPriority(priority, discordMinimum))
         || (digestSelected('ntfy') && Boolean(ntfy) && meetsMinimumPriority(priority, ntfy?.minimumPriority ?? 'exceptional'));
       if (qualifiesForDigest) this.queueDailyDigestCandidate(watchId, listing, typical, discountPercent, confidence, priority);
     }
     const channels: Array<'Discord' | 'ntfy'> = [];
-    if (encryptedDiscord && meetsMinimumPriority(priority, this.discordMinimumPriority()) && (priority === 'exceptional' || !digestSelected('Discord'))) channels.push('Discord');
+    if (encryptedDiscord && meetsMinimumPriority(priority, discordMinimum) && (priority === 'exceptional' || !digestSelected('Discord'))) channels.push('Discord');
     if (ntfy && meetsMinimumPriority(priority, ntfy.minimumPriority) && (priority === 'exceptional' || !digestSelected('ntfy'))) channels.push('ntfy');
     if (!channels.length) return;
 
