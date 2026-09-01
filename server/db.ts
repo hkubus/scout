@@ -96,7 +96,13 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
       throw error;
     }
   }
-  db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+  // WAL pairs with synchronous=NORMAL: commits skip the fsync (only an OS or
+  // power failure can lose the last commits, which is acceptable for this
+  // data) while crash-safe durability for the process is retained. The write
+  // path performs many small per-row commits, so this removes most fsync
+  // traffic. The extra page cache and mmap window are modest wins for a
+  // dedicated Scout process.
+  db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA cache_size = -16000; PRAGMA mmap_size = 268435456;');
   try { chmodSync(`${absolutePath}-wal`, 0o600); chmodSync(`${absolutePath}-shm`, 0o600); } catch { /* files may not exist until the first write */ }
   db.exec(`CREATE TABLE IF NOT EXISTS marketplace_sessions (
     marketplace TEXT PRIMARY KEY,
