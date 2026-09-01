@@ -546,6 +546,10 @@ export class ScoutService {
     if (!config.apiKey) return { listings, excluded: 0, failed: 0, unknown: 0, notConfigured: true };
     const apiKey = config.apiKey;
     const pendingClassifications = new Map<string, Promise<{ relevant: boolean }>>();
+    // Relevance rows are collected while the batch awaits the AI calls and
+    // flushed in one transaction per batch: a per-row autocommit would mean a
+    // commit per listing, and the transaction must never span an await.
+    const relevanceWrites: Array<Parameters<ScoutService['saveListingRelevance']>[0]> = [];
 
     const classified: Array<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> = [];
     for (let offset = 0; offset < listings.length; offset += 4) {
@@ -567,7 +571,7 @@ export class ScoutService {
             ? cached.relevance_status
             : cached?.error ? 'unknown' : cached?.relevant === 0 ? 'irrelevant' : 'relevant';
           if ((cached?.input_hash === inputHash || cached?.input_hash === legacyInputHash) && cached.model === config.model && cachedStatus !== 'unknown' && !cached.error) {
-            if (cached.input_hash === legacyInputHash) this.saveListingRelevance({ watchId, listing, inputHash, model: config.model, relevant: cachedStatus === 'relevant', status: cachedStatus, reason: cached.reason ?? 'Reused cached relevance decision' });
+            if (cached.input_hash === legacyInputHash) relevanceWrites.push({ watchId, listing, inputHash, model: config.model, relevant: cachedStatus === 'relevant', status: cachedStatus, reason: cached.reason ?? 'Reused cached relevance decision' });
             return { listing, status: cachedStatus };
           }
         }
@@ -577,7 +581,7 @@ export class ScoutService {
           ORDER BY checked_at DESC LIMIT 1`).get(inputHash, config.model) as { relevant?: number; reason?: string; relevance_status?: string } | undefined;
         if (reusable) {
           const status: 'relevant' | 'irrelevant' = reusable.relevance_status === 'irrelevant' || reusable.relevant === 0 ? 'irrelevant' : 'relevant';
-          if (watchId) this.saveListingRelevance({ watchId, listing, inputHash, model: config.model, relevant: status === 'relevant', status, reason: reusable.reason ?? 'Reused cached relevance decision' });
+          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: config.model, relevant: status === 'relevant', status, reason: reusable.reason ?? 'Reused cached relevance decision' });
           return { listing, status };
         }
 
@@ -589,15 +593,21 @@ export class ScoutService {
           }
           const result = await classification;
           const status: 'relevant' | 'irrelevant' = result.relevant ? 'relevant' : 'irrelevant';
-          if (watchId) this.saveListingRelevance({ watchId, listing, inputHash, model: config.model, relevant: result.relevant, status, reason: result.relevant ? 'AI classified listing as relevant' : 'AI classified listing as irrelevant' });
+          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: config.model, relevant: result.relevant, status, reason: result.relevant ? 'AI classified listing as relevant' : 'AI classified listing as irrelevant' });
           return { listing, status };
         } catch (error) {
           const message = (error instanceof Error ? error.message : 'OpenRouter could not classify listing relevance').slice(0, 500);
-          if (watchId) this.saveListingRelevance({ watchId, listing, inputHash, model: config.model, relevant: true, status: 'unknown', reason: 'AI relevance check failed', error: message });
+          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: config.model, relevant: true, status: 'unknown', reason: 'AI relevance check failed', error: message });
           return { listing, status: 'unknown' };
         }
       }));
       classified.push(...batch);
+      if (relevanceWrites.length) {
+        const writes = relevanceWrites.splice(0, relevanceWrites.length);
+        this.transaction(() => {
+          for (const input of writes) this.saveListingRelevance(input);
+        });
+      }
     }
 
     return {
@@ -1482,7 +1492,11 @@ export class ScoutService {
         if (input.shippingOnly) await this.enrichShipping(comparable, source);
         const filtered = filterListings(comparable, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, shippingOnly: input.shippingOnly });
         // One-off search stays deterministic: AI relevance is a watch-scan gate.
-        for (const listing of filtered.slice(0, 100)) this.storeManualListing(listing);
+        // One transaction for the whole batch: each upsert would otherwise be
+        // its own implicit commit (an fsync per listing before WAL=NORMAL).
+        this.transaction(() => {
+          for (const listing of filtered.slice(0, 100)) this.storeManualListing(listing);
+        });
         const pendingShipping = input.shippingOnly ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
         return {
           listings: filtered.slice(0, 100).map((listing): Listing => ({
@@ -2653,6 +2667,9 @@ export class ScoutService {
     }
     if (marketplace === 'OLX') return;
     const unknown = listings.filter((listing) => listing.shippingAvailable === null).slice(0, Math.max(0, options.limit ?? 8));
+    // Shipping rows found by the parallel page fetches are cached in one
+    // commit after the loop instead of one implicit commit per listing.
+    const resolved: NormalizedListing[] = [];
     for (let offset = 0; offset < unknown.length; offset += 2) {
       await Promise.all(unknown.slice(offset, offset + 2).map(async (listing) => {
         try {
@@ -2660,9 +2677,14 @@ export class ScoutService {
           const available = parseShippingAvailability(html, marketplace);
           if (available === null) return;
           listing.shippingAvailable = available;
-          this.cacheShipping(listing);
+          resolved.push(listing);
         } catch { /* unknown remains excluded and will be retried on a later scan */ }
       }));
+    }
+    if (resolved.length) {
+      this.transaction(() => {
+        for (const listing of resolved) this.cacheShipping(listing);
+      });
     }
   }
 
