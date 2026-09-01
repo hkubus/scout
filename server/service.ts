@@ -2088,11 +2088,15 @@ export class ScoutService {
         tokenConfigured: Boolean(ntfy?.token),
         minimumPriority: ntfy?.minimumPriority ?? 'exceptional',
       },
-      ai: {
-        configured: Boolean(this.deepSeekConfig().apiKey),
-        model: this.deepSeekModel(),
-        source: this.deepSeekConfig().source,
-      },
+      ai: (() => {
+        // One config read: each call decrypts the stored API key.
+        const aiConfig = this.deepSeekConfig();
+        return {
+          configured: Boolean(aiConfig.apiKey),
+          model: aiConfig.model,
+          source: aiConfig.source,
+        };
+      })(),
       autoNegotiation: this.autoNegotiationSettings(),
       publicExposureWarning: this.publicExposureWarning,
       marketplaceSessions: this.marketplaceSessions(),
@@ -3186,18 +3190,20 @@ export function filterListings(listings: NormalizedListing[], query: string, inc
     ? includedRaw.split(',').map(normalize).filter(Boolean)
     : normalize(query).split(/\s+/).filter((term) => term.length > 1);
   const excluded = excludedRaw.split(',').map(normalize).filter(Boolean);
+  // Request-level values are identical for every listing: normalize them and
+  // the alias table once instead of per filter pass.
+  const requestedLocation = normalize(options.location ?? '');
+  const requestedCondition = normalize(options.condition ?? '');
+  const conditionAliases: Record<string, string[]> = {
+    'like new': ['like new', 'jak nowy', 'jak nowa', 'idealny', 'idealna'],
+    'very good': ['very good', 'bardzo dobry', 'bardzo dobra'],
+    good: ['good', 'dobry', 'dobra'],
+  };
   return listings.filter((listing) => {
     const title = normalize(listing.title);
-    const requestedLocation = normalize(options.location ?? '');
-    const requestedCondition = normalize(options.condition ?? '');
     const condition = normalize(listing.condition ?? '');
     const location = normalize(listing.location ?? '');
     const isNew = /(^| )(new|nowe|nowy|nowa)( |$)/.test(condition);
-    const conditionAliases: Record<string, string[]> = {
-      'like new': ['like new', 'jak nowy', 'jak nowa', 'idealny', 'idealna'],
-      'very good': ['very good', 'bardzo dobry', 'bardzo dobra'],
-      good: ['good', 'dobry', 'dobra'],
-    };
     const conditionMatches = !requestedCondition || requestedCondition === 'any'
       || (requestedCondition === 'new' ? isNew
         : requestedCondition === 'used' ? Boolean(condition) && !isNew

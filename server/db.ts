@@ -128,27 +128,10 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
     owner_id TEXT NOT NULL,
     expires_at TEXT NOT NULL
   )`);
-  const watchColumns = new Set((db.prepare('PRAGMA table_info(watches)').all() as Array<{ name: string }>).map((column) => column.name));
-  if (!watchColumns.has('shipping_only')) db.exec('ALTER TABLE watches ADD COLUMN shipping_only INTEGER NOT NULL DEFAULT 0');
-  if (!watchColumns.has('ai_relevance')) db.exec('ALTER TABLE watches ADD COLUMN ai_relevance INTEGER NOT NULL DEFAULT 1');
-  if (!watchColumns.has('min_price_pln')) db.exec('ALTER TABLE watches ADD COLUMN min_price_pln REAL');
-  if (!watchColumns.has('max_price_pln')) db.exec('ALTER TABLE watches ADD COLUMN max_price_pln REAL');
-  const listingColumns = new Set((db.prepare('PRAGMA table_info(listings)').all() as Array<{ name: string }>).map((column) => column.name));
-  if (!listingColumns.has('shipping_available')) db.exec('ALTER TABLE listings ADD COLUMN shipping_available INTEGER');
-  if (!listingColumns.has('price_negotiable')) db.exec('ALTER TABLE listings ADD COLUMN price_negotiable INTEGER');
-  if (!listingColumns.has('ai_normalization_json')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_json TEXT');
-  if (!listingColumns.has('ai_normalization_input_hash')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_input_hash TEXT');
-  if (!listingColumns.has('ai_normalization_model')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_model TEXT');
-  if (!listingColumns.has('ai_normalization_at')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_at TEXT');
-  if (!listingColumns.has('ai_normalization_error')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_error TEXT');
-  const marketWatchColumns = new Set((db.prepare('PRAGMA table_info(market_watches)').all() as Array<{ name: string }>).map((column) => column.name));
-  if (!marketWatchColumns.has('included_terms')) db.exec("ALTER TABLE market_watches ADD COLUMN included_terms TEXT NOT NULL DEFAULT ''");
-  if (!marketWatchColumns.has('excluded_terms')) db.exec("ALTER TABLE market_watches ADD COLUMN excluded_terms TEXT NOT NULL DEFAULT ''");
-  if (!marketWatchColumns.has('location')) db.exec("ALTER TABLE market_watches ADD COLUMN location TEXT NOT NULL DEFAULT 'Polska'");
-  if (!marketWatchColumns.has('condition')) db.exec("ALTER TABLE market_watches ADD COLUMN condition TEXT NOT NULL DEFAULT 'Any'");
-  if (!marketWatchColumns.has('min_price_pln')) db.exec('ALTER TABLE market_watches ADD COLUMN min_price_pln REAL');
-  if (!marketWatchColumns.has('max_price_pln')) db.exec('ALTER TABLE market_watches ADD COLUMN max_price_pln REAL');
-  if (!marketWatchColumns.has('shipping_only')) db.exec('ALTER TABLE market_watches ADD COLUMN shipping_only INTEGER NOT NULL DEFAULT 0');
+  // Post-migration safety net: the ensure block above runs only when the
+  // migrations table already existed, and the migrations themselves no longer
+  // carry these columns for every path — re-check once for every database.
+  ensureLegacyColumns();
   db.prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run('default_interval', '5', new Date().toISOString());
   db.prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run('night_interval', '30', new Date().toISOString());
   if (db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'scans'").get()) {
