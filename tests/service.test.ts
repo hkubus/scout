@@ -908,9 +908,13 @@ test('keeps market research separate and reports ended-listing price estimates',
     const listing = context.db.prepare("SELECT id FROM market_listings WHERE listing_id = 'ended-1'").get() as { id: number };
     context.db.prepare('INSERT INTO market_price_observations (market_listing_id, price_pln, observed_at) VALUES (?, ?, ?)').run(listing.id, 2000, now);
     const research = context.service.marketResearch();
-    assert.deepEqual(research.watches[0], {
+    const { saleBand, ...marketWatch } = research.watches[0];
+    assert.deepEqual(marketWatch, {
       id: 'market-watch', name: 'GPU market', query: 'rtx 4070', terms: '12gb', excluded: 'parts', location: 'Warszawa', condition: 'New', sources: ['OLX', 'Vinted'], intervalHours: 24, minPrice: 1000, maxPrice: 2500, shippingOnly: true, typoVariants: false, enabled: true, nextScan: 'due now', lastScan: 'just now', totalListings: 3, activeListings: 1, endedListings: 2, estimatedMedianPrice: 2200,
     });
+    // Both ended rows lack a verified ended reason, so the band stays open.
+    assert.deepEqual({ ...saleBand, computedAt: null }, { p25: null, median: null, p75: null, sampleCount: 2, eligibleCount: 0, excludedStale: 0, windowDays: 90, computedAt: null });
+    assert.ok(saleBand!.computedAt);
     assert.equal(research.watches[0].totalListings, 3);
     assert.equal(research.watches[0].activeListings, 1);
     assert.equal(research.watches[0].endedListings, 2);
@@ -919,6 +923,33 @@ test('keeps market research separate and reports ended-listing price estimates',
     context.service.deleteMarketWatch('market-watch');
     assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM market_listings').get() as { count: number }).count, 0);
     assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM market_price_observations').get() as { count: number }).count, 0);
+  } finally { context.close(); }
+});
+
+test('computes probable-sale bands from eligible ended research listings', () => {
+  const context = fixture();
+  try {
+    context.service.createMarketWatch({ id: 'band-watch', name: 'Band', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
+    const now = Date.now();
+    const daysAgoIso = (days: number) => new Date(now - days * 24 * 60 * 60_000).toISOString();
+    const insert = context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans, ended_at, ended_reason)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ended', 3, ?, ?)`);
+    [100, 200, 300, 400, 500].forEach((price, index) => insert.run('band-watch', 'band-watch:v1', 'OLX', `band-${index}`, `CPU ${index}`, `https://www.olx.pl/d/oferta/band-${index}`, price, price, price, daysAgoIso(2), daysAgoIso(1), daysAgoIso(1), 'Ad not found.'));
+    // Last seen far before disappearance: a stale asking price, not a probable sale.
+    insert.run('band-watch', 'band-watch:v1', 'OLX', 'band-stale', 'CPU stale', 'https://www.olx.pl/d/oferta/band-stale', 900, 900, 900, daysAgoIso(45), daysAgoIso(40), daysAgoIso(1), 'Ad not found.');
+    // Criteria-change rows are never probable sales.
+    insert.run('band-watch', 'band-watch:v1', 'OLX', 'band-criteria', 'CPU criteria', 'https://www.olx.pl/d/oferta/band-criteria', 950, 950, 950, daysAgoIso(2), daysAgoIso(1), daysAgoIso(1), 'Research criteria changed');
+
+    const research = context.service.marketResearch();
+    const band = research.watches.find((watch) => watch.id === 'band-watch')!.saleBand!;
+    assert.equal(band.sampleCount, 7);
+    assert.equal(band.eligibleCount, 5);
+    assert.equal(band.excludedStale, 1);
+    assert.equal(band.windowDays, 90);
+    assert.deepEqual({ p25: band.p25, median: band.median, p75: band.p75 }, { p25: 200, median: 300, p75: 400 });
+    assert.equal(research.aggregates?.saleBand?.eligibleCount, 5);
+    // The raw aggregate median keeps its old semantics: every ended asking price counts.
+    assert.equal(research.aggregates?.overallMedianPrice, 400);
   } finally { context.close(); }
 });
 

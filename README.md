@@ -60,6 +60,17 @@ Research snapshots are separate from deal-watch scoring. A valid empty search pa
 
 Watches and research watches can optionally scan typo variants to catch mispriced listings whose titles misspell the product. Each scan runs at most two extra one-page searches with deterministic misspellings of the query (adjacent transpositions, vowel deletions, doubled-letter removal; Polish diacritics are preserved). The variant set rotates across scans so every variant is eventually covered without ever exceeding the one-page-per-search budget. Toggling the option on a research watch changes its criteria and therefore starts a new comparable series.
 
+### Probable-sale price bands
+
+For every research series Scout computes a p25–median–p75 band of **probable sales** from ended listings. The methodology is deliberately conservative:
+
+- A probable sale is a listing verified as no longer available (three terminal detail checks); its last asking price is used as a probable-sale estimate, **not** a confirmed sale price.
+- Superseded rows (research criteria changed) never count. Rows without a verified ended reason are excluded.
+- An asking price last seen more than 30 days before the listing disappeared is stale and is excluded — it describes an earlier market, not the exit price.
+- Bands cover a rolling 90-day window and open up (report `learning` with the eligible count) below 4 eligible samples. Percentiles use linear interpolation.
+
+The older raw `estimatedMedianPrice` field remains in the API payload for one release; the UI shows the probable-sale band instead.
+
 Changing a research query, term, source, condition, location, shipping rule, or price range starts a new immutable comparable series. The old series is retained as previous history and excluded from current metrics. Main watches can be archived to stop future scans while retaining observations and analytics; permanent deletion is a separate, warned action.
 
 ## Preserved listing copies

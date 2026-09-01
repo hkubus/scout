@@ -10,6 +10,7 @@ import { AllegroMessagingError, sendAllegroMessageOnPage } from './allegro-messa
 import { offerCeiling, recommendNegotiationPrice, type NegotiationRecommendation } from './negotiation';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, median, scoreDeal } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
+import { computeSaleBand, type MarketBandSample } from './marketBand';
 import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
 
 type Database = any;
@@ -86,6 +87,8 @@ const NIGHT_END_HOUR = 8;
 const MAX_RESEARCH_DETAIL_CHECKS = 100;
 /** Extra per-source searches a typo-variant scan may fetch (each still one page). */
 const TYPO_VARIANTS_PER_SCAN = 2;
+/** Rolling window of ended listings that feed probable-sale bands. */
+const SALE_BAND_WINDOW_DAYS = 90;
 /** Bounded per-scan capture of preserved listing copies (description + downloaded images). */
 const SNAPSHOT_CAPTURES_PER_SCAN = 8;
 const SNAPSHOT_MAX_IMAGES = 12;
@@ -1575,6 +1578,20 @@ export class ScoutService {
       prices.push(Number(item.last_price_pln));
       endedPricesByWatch.set(item.market_watch_id, prices);
     }
+    const bandComputedAt = nowIso();
+    const endedSampleRows = this.db.prepare(`SELECT ml.market_watch_id, ml.last_price_pln, ml.last_seen_at, ml.ended_at, ml.ended_reason
+      FROM market_listings ml
+      JOIN market_watches mw ON mw.id = ml.market_watch_id
+      WHERE ml.status = 'ended' AND ml.last_price_pln > 0 AND ml.ended_at IS NOT NULL AND ${versionFilter}`).all() as Array<{ market_watch_id: string; last_price_pln: number; last_seen_at: string; ended_at: string; ended_reason: string | null }>;
+    const bandSamplesByWatch = new Map<string, MarketBandSample[]>();
+    const allBandSamples: MarketBandSample[] = [];
+    for (const item of endedSampleRows) {
+      const sample: MarketBandSample = { price: Number(item.last_price_pln), lastSeenAt: String(item.last_seen_at), endedAt: String(item.ended_at), endedReason: item.ended_reason };
+      const samples = bandSamplesByWatch.get(item.market_watch_id) ?? [];
+      samples.push(sample);
+      bandSamplesByWatch.set(item.market_watch_id, samples);
+      allBandSamples.push(sample);
+    }
     const watches = watchRows.map((row): MarketWatch => {
       const version = versionsByWatch.get(row.id)!;
       const counts = statsByWatch.get(row.id) ?? { total: 0, active: null, ended: null };
@@ -1584,6 +1601,7 @@ export class ScoutService {
         intervalHours: Number(row.interval_hours), minPrice: version.min_price_pln === null || version.min_price_pln === undefined ? null : Number(version.min_price_pln), maxPrice: version.max_price_pln === null || version.max_price_pln === undefined ? null : Number(version.max_price_pln), shippingOnly: Boolean(version.shipping_only), typoVariants: Boolean(version.typo_variants), enabled: Boolean(row.enabled), nextScan: Boolean(row.enabled) ? relativeTimeFuture(row.next_scan_at) : 'Paused',
         lastScan: relativeTime(row.last_scan_at), totalListings: Number(counts.total ?? 0), activeListings: Number(counts.active ?? 0), endedListings: Number(counts.ended ?? 0),
         estimatedMedianPrice: endedPrices.length ? median(endedPrices) : null,
+        saleBand: computeSaleBand(bandSamplesByWatch.get(row.id) ?? [], SALE_BAND_WINDOW_DAYS, bandComputedAt),
       };
     });
     const applicable = [
@@ -1621,7 +1639,7 @@ export class ScoutService {
     return {
       watches,
       listings,
-      aggregates: { overallMedianPrice: aggregatePrices.length ? median(aggregatePrices) : null, endedCount: Number(aggregateCounts?.ended ?? 0), activeCount: Number(aggregateCounts?.active ?? 0) },
+      aggregates: { overallMedianPrice: aggregatePrices.length ? median(aggregatePrices) : null, endedCount: Number(aggregateCounts?.ended ?? 0), activeCount: Number(aggregateCounts?.active ?? 0), saleBand: computeSaleBand(options.watchId ? bandSamplesByWatch.get(options.watchId) ?? [] : allBandSamples, SALE_BAND_WINDOW_DAYS, bandComputedAt) },
       pagination: { page, pageSize, total, hasNext: page * pageSize < total },
     };
   }

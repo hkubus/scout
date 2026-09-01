@@ -30,12 +30,16 @@ import type {
   MarketTrackedListing,
   MarketWatch,
   MarketWatchInput,
+  SaleBand,
 } from "./types";
 
 type ToastType = "success" | "error" | "info";
 
 const formatPln = (value: number | null) =>
   value === null ? "Learning" : `${value.toLocaleString("pl-PL")} zł`;
+
+const SALE_BAND_TOOLTIP =
+  "Listings verified no-longer-available; their last asking price is used as a probable-sale estimate, not a confirmed sale price. Prices stale > 30 days before disappearance are excluded.";
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
@@ -77,12 +81,25 @@ function PageHeader({
   );
 }
 
-function Stat({ label, value, detail }: { label: string; value: string; detail: string }) {
+function Stat({ label, value, detail, title }: { label: string; value: string; detail: string; title?: string }) {
   return (
-    <div className="stat">
+    <div className="stat" title={title}>
       <span>{label}</span>
       <strong>{value}</strong>
       <small>{detail}</small>
+    </div>
+  );
+}
+
+function SaleBandChip({ band }: { band: SaleBand | null }) {
+  if (!band || band.median === null || band.p25 === null || band.p75 === null) {
+    return <div title={SALE_BAND_TOOLTIP}><span>Probable-sale band</span><strong>Learning</strong><small>{band ? `${band.eligibleCount} eligible sale${band.eligibleCount === 1 ? "" : "s"} so far` : "no ended listings yet"}</small></div>;
+  }
+  return (
+    <div title={SALE_BAND_TOOLTIP}>
+      <span>Probable-sale band</span>
+      <strong>{formatPln(band.p25)} — {formatPln(band.median)} — {formatPln(band.p75)}</strong>
+      <small>{band.eligibleCount} probable sale{band.eligibleCount === 1 ? "" : "s"}</small>
     </div>
   );
 }
@@ -223,7 +240,7 @@ export default function MarketResearchPage({
   );
   const totalEnded = data.aggregates?.endedCount ?? data.watches.reduce((sum, watch) => sum + watch.endedListings, 0);
   const totalActive = data.aggregates?.activeCount ?? data.watches.reduce((sum, watch) => sum + watch.activeListings, 0);
-  const overallEstimate = data.aggregates?.overallMedianPrice ?? null;
+  const overallBand = data.aggregates?.saleBand ?? null;
 
   return (
     <>
@@ -233,7 +250,12 @@ export default function MarketResearchPage({
         <Stat label="Research watches" value={String(data.watches.length)} detail={`${data.watches.filter((watch) => watch.enabled).length} active`} />
         <Stat label="Live listings" value={String(totalActive)} detail="currently observed" />
         <Stat label="Ended listings" value={String(totalEnded)} detail="verified unavailable" />
-        <Stat label="Median estimate" value={overallEstimate === null ? "—" : formatPln(overallEstimate)} detail="last asking price" />
+        <Stat
+          label="Probable-sale median"
+          title={SALE_BAND_TOOLTIP}
+          value={overallBand?.median === null || overallBand?.median === undefined ? "Learning" : formatPln(overallBand.median)}
+          detail={overallBand?.median != null ? `p25–p75 band · ${overallBand.eligibleCount} probable sales` : `${overallBand?.eligibleCount ?? 0} eligible so far`}
+        />
       </section>
       <div className="research-section-heading"><h2>Research watches</h2><span>Default cadence: once every 24 hours</span></div>
       {loading ? (
@@ -245,7 +267,7 @@ export default function MarketResearchPage({
               <div className="research-watch-heading"><div><strong>{watch.name}</strong><span>{watch.query}</span></div><span className={`state-chip state-chip--${watch.enabled ? "ready" : "paused"}`}><i />{watch.enabled ? "Active" : "Paused"}</span></div>
               <div className="research-watch-sources">{watch.sources.map((source) => <span key={source}><i style={{ background: marketplaceColors[source] }} />{source}</span>)}</div>
               <MarketWatchFilterSummary watch={watch} />
-              <div className="research-watch-metrics"><div><span>Tracked</span><strong>{watch.totalListings}</strong></div><div><span>Ended</span><strong>{watch.endedListings}</strong></div><div><span>Median estimate</span><strong>{watch.estimatedMedianPrice === null ? "—" : formatPln(watch.estimatedMedianPrice)}</strong></div></div>
+              <div className="research-watch-metrics"><div><span>Tracked</span><strong>{watch.totalListings}</strong></div><div><span>Ended</span><strong>{watch.endedListings}</strong></div><SaleBandChip band={watch.saleBand} /></div>
               <div className="research-watch-footer"><span><Clock3 size={14} />Every {watch.intervalHours}h · Last {watch.lastScan} · Next {watch.nextScan}</span><div><button className="icon-button" title="Edit research filters" aria-label={`Edit ${watch.name}`} disabled={busyIds.has(watch.id)} onClick={() => openEdit(watch)}><SlidersHorizontal size={16} /></button><button className="icon-button" title="Scan research watch now" aria-label={`Scan ${watch.name} now`} disabled={busyIds.has(watch.id) || !watch.enabled} onClick={() => void scan(watch)}>{busyIds.has(watch.id) ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}</button><button className={`toggle ${watch.enabled ? "toggle--on" : ""}`} aria-label={watch.enabled ? `Pause ${watch.name}` : `Resume ${watch.name}`} disabled={busyIds.has(watch.id)} onClick={() => void toggle(watch)}>{watch.enabled ? <Pause size={13} /> : <Play size={13} />}</button><button className="icon-button danger-icon" title="Delete research watch" aria-label={`Delete ${watch.name}`} disabled={busyIds.has(watch.id)} onClick={() => void remove(watch)}><Trash2 size={16} /></button></div></div>
             </article>
           ))}

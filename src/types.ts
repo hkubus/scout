@@ -242,6 +242,18 @@ export interface ManualSearchResponse {
   sources: SearchSourceStatus[];
 }
 
+/** Probable-sale estimate band — never a confirmed/completed-sale price. */
+export interface SaleBand {
+  p25: number | null;
+  median: number | null;
+  p75: number | null;
+  sampleCount: number;
+  eligibleCount: number;
+  excludedStale: number;
+  windowDays: number;
+  computedAt: string;
+}
+
 export interface MarketWatch {
   id: string;
   name: string;
@@ -263,6 +275,7 @@ export interface MarketWatch {
   activeListings: number;
   endedListings: number;
   estimatedMedianPrice: number | null;
+  saleBand: SaleBand | null;
   activeVersionId?: string | null;
 }
 
@@ -319,6 +332,7 @@ export interface MarketResearchData {
     overallMedianPrice: number | null;
     endedCount: number;
     activeCount: number;
+    saleBand?: SaleBand | null;
   };
   pagination?: {
     page: number;
