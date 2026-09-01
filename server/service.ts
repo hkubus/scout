@@ -8,6 +8,7 @@ import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, draftNego
 import { OlxMessagingError, sendOlxMessageOnPage } from './olx-messaging';
 import { AllegroMessagingError, sendAllegroMessageOnPage } from './allegro-messaging';
 import { offerCeiling, recommendNegotiationPrice, type NegotiationRecommendation } from './negotiation';
+import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, median, scoreDeal } from './scoring';
 import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
 
@@ -373,6 +374,11 @@ export class ScoutService {
 
   logs(): LogEntry[] {
     return [...this.logBuffer].reverse();
+  }
+
+  /** Runtime diagnostics (memory, fetch body discards) surfaced through the same log buffer and SSE stream as scan logs. */
+  logDiagnostic(message: string) {
+    this.log('info', 'diagnostics', message);
   }
 
   schedulerTick() {
@@ -2023,11 +2029,11 @@ export class ScoutService {
       headers: { 'user-agent': MARKETPLACE_API_USER_AGENT, accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', referer },
       signal: AbortSignal.timeout(10_000),
     });
-    if (!response.ok) return null;
+    if (!response.ok) { discardResponse(response, 'snapshot-image'); return null; }
     const declared = Number(response.headers.get('content-length') ?? 0);
-    if (declared > SNAPSHOT_MAX_IMAGE_BYTES) return null;
+    if (declared > SNAPSHOT_MAX_IMAGE_BYTES) { discardResponse(response, 'snapshot-image'); return null; }
     const contentType = (response.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
-    if (!contentType.startsWith('image/')) return null;
+    if (!contentType.startsWith('image/')) { discardResponse(response, 'snapshot-image'); return null; }
     const data = Buffer.from(await response.arrayBuffer());
     if (!data.byteLength || data.byteLength > SNAPSHOT_MAX_IMAGE_BYTES) return null;
     return { mime: contentType, data };
@@ -2328,6 +2334,7 @@ export class ScoutService {
     const key = `test-${Date.now()}`;
     try {
       const response = await fetch(webhook, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(12_000) });
+      discardResponse(response, 'discord-webhook');
       if (!response.ok) throw new Error(`Discord returned ${response.status}`);
       this.stmt('INSERT INTO notifications (listing_key, payload_json, status, sent_at, created_at) VALUES (?, ?, ?, ?, ?)').run(key, JSON.stringify({ ...payload, test: true }), 'delivered', sentAt, sentAt);
       this.recordRun('Discord', 'ok', 'Test webhook delivered', sentAt, nowIso());
@@ -2508,6 +2515,7 @@ export class ScoutService {
     const headers = { 'user-agent': MARKETPLACE_API_USER_AGENT, accept: 'application/json' };
     let response = await fetch(validation.url, { redirect: 'manual', headers, signal: AbortSignal.timeout(12_000) });
     if (response.status >= 300 && response.status < 400) {
+      discardResponse(response, 'olx-api');
       const location = response.headers.get('location');
       if (!location) throw new Error(`Unexpected redirect (${response.status})`);
       const redirected = new URL(location, validation.url).toString();
@@ -2537,6 +2545,7 @@ export class ScoutService {
     let response = await this.fetchVintedWithCookies(validation.url);
     if (response.status === 401) {
       this.vintedCookieJar = null;
+      discardResponse(response, 'vinted-api');
       response = await this.fetchVintedWithCookies(validation.url);
     }
     let json: unknown = null;
@@ -2577,12 +2586,14 @@ export class ScoutService {
       if (response.status < 300 || response.status >= 400) break;
       const location = response.headers.get('location');
       if (!location) throw new Error(`Unexpected redirect (${response.status})`);
+      discardResponse(response, 'vinted-bootstrap');
       const redirected = new URL(location, url).toString();
       const redirectValidation = validateSearchUrl(redirected, 'Vinted');
       if (!redirectValidation.valid) throw new Error('Marketplace redirected off the approved domain');
       url = redirectValidation.url;
       response = await fetch(url, { redirect: 'manual', headers, signal: AbortSignal.timeout(12_000) });
     }
+    discardResponse(response, 'vinted-bootstrap');
     if (!jar.has('access_token_web')) {
       throw new Error(`Vinted did not issue an anonymous access token (HTTP ${response.status})`);
     }
@@ -2603,6 +2614,7 @@ export class ScoutService {
     let finalUrl = validation.url;
     let response = await fetch(finalUrl, { redirect: 'manual', headers, signal: AbortSignal.timeout(12_000) });
     if (response.status >= 300 && response.status < 400) {
+      discardResponse(response, 'vinted-item');
       const location = response.headers.get('location');
       if (!location) throw new Error(`Unexpected redirect (${response.status})`);
       const redirected = new URL(location, finalUrl).toString();
@@ -2614,7 +2626,8 @@ export class ScoutService {
     if (response.status === 403 || response.status === 429) {
       return { status: 200, body: await this.renderPublicPage(finalUrl, 'Vinted') };
     }
-    return { status: response.status, body: response.ok ? await response.text() : '' };
+    if (!response.ok) { discardResponse(response, 'vinted-item'); return { status: response.status, body: '' }; }
+    return { status: response.status, body: await response.text() };
   }
 
   /** Anonymous Lokalnie JSON surface (batch condition enrichment); no cookies, no CSRF. */
@@ -2646,6 +2659,7 @@ export class ScoutService {
     }
     let response = await fetch(validation.url, { redirect: 'manual', headers: { 'user-agent': 'Scout/1.0 (+self-hosted public page monitor)', accept: 'text/html,application/xhtml+xml' }, signal: AbortSignal.timeout(12_000) });
     if (response.status >= 300 && response.status < 400) {
+      discardResponse(response, 'public-page');
       const location = response.headers.get('location');
       if (!location) throw new Error(`Unexpected redirect (${response.status})`);
       const redirected = new URL(location, validation.url).toString();
@@ -2654,6 +2668,7 @@ export class ScoutService {
       response = await fetch(redirectValidation.url, { redirect: 'manual', headers: { 'user-agent': 'Scout/1.0 (+self-hosted public page monitor)', accept: 'text/html,application/xhtml+xml' }, signal: AbortSignal.timeout(12_000) });
     }
     if (!response.ok) {
+      discardResponse(response, 'public-page');
       if (response.status === 403 || response.status === 429) return this.renderPublicPage(validation.url, marketplace);
       throw new Error(`Public page returned ${response.status}`);
     }
@@ -2943,6 +2958,7 @@ export class ScoutService {
         const encrypted = this.getSetting('discord_webhook');
         if (!encrypted) throw new Error('Discord webhook is not configured');
         const response = await fetch(validateDiscordWebhook(decryptSecret(encrypted)), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(deliveryPayload), signal: AbortSignal.timeout(12_000) });
+        discardResponse(response, 'discord-webhook');
         if (!response.ok) throw new Error(`Discord returned ${response.status}`);
       } else {
         const config = this.ntfyConfig();
@@ -3091,6 +3107,7 @@ export class ScoutService {
       if (input.channel === 'Discord') {
         if (!input.encryptedDiscord) throw new Error('Discord webhook is not configured');
         const response = await fetch(validateDiscordWebhook(decryptSecret(input.encryptedDiscord)), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(buildDiscordEmbed({ listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence })), signal: AbortSignal.timeout(12_000) });
+        discardResponse(response, 'discord-webhook');
         if (!response.ok) throw new Error(`Discord returned ${response.status}`);
       } else {
         if (!input.ntfy) throw new Error('ntfy is not configured');

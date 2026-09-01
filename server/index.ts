@@ -12,6 +12,7 @@ import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
 import { isPubliclyBoundHost, RateLimiter, securityHeaders } from './security';
 import { ScoutService, ServiceError } from './service';
+import { fetchDiscardSummary } from './fetch-diagnostics';
 
 const port = Number(process.env.PORT ?? 3001);
 if (!Number.isInteger(port) || port < 1 || port > 65_535) {
@@ -93,7 +94,7 @@ app.setErrorHandler((error, _request, reply) => {
   return reply.code(500).send({ error: 'Internal server error' });
 });
 
-app.get('/api/health', async () => ({ status: 'ok', service: 'scout', version: process.env.SCOUT_VERSION ?? '1.0.0', now: nowIso() }));
+app.get('/api/health', async () => ({ status: 'ok', service: 'scout', version: process.env.SCOUT_VERSION ?? '1.0.0', now: nowIso(), memory: process.memoryUsage() }));
 app.get('/api/ready', async (_request, reply) => {
   const readiness = service.readiness();
   return reply.code(readiness.status === 'ready' ? 200 : 503).send(readiness);
@@ -527,7 +528,19 @@ const sseHeartbeat = setInterval(() => {
   emit('ping', { now: nowIso() });
 }, 25_000);
 
-app.addHook('onClose', async () => { clearInterval(scheduler); clearInterval(sseHeartbeat); for (const client of clients) client.end(); db.close(); });
+// Periodic runtime diagnostics: RSS vs heapUsed distinguishes file-backed
+// growth (mmap/page cache) from real heap retention, and the discard counts
+// confirm every fetched response body is being released.
+const formatMemoryLine = () => {
+  const memory = process.memoryUsage();
+  const mb = (bytes: number) => (bytes / 1_048_576).toFixed(1);
+  return `rss=${mb(memory.rss)}MB heapUsed=${mb(memory.heapUsed)}MB heapTotal=${mb(memory.heapTotal)}MB external=${mb(memory.external)}MB arrayBuffers=${mb(memory.arrayBuffers)}MB bodyDiscards: ${fetchDiscardSummary()}`;
+};
+const diagnosticsInterval = setInterval(() => {
+  service.logDiagnostic(formatMemoryLine());
+}, 30 * 60_000);
+
+app.addHook('onClose', async () => { clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); for (const client of clients) client.end(); db.close(); });
 let shuttingDown = false;
 const shutdown = async (signal: string) => {
   if (shuttingDown) return;
@@ -538,4 +551,5 @@ const shutdown = async (signal: string) => {
 process.once('SIGTERM', () => { void shutdown('SIGTERM'); });
 process.once('SIGINT', () => { void shutdown('SIGINT'); });
 await app.listen({ port, host });
+service.logDiagnostic(`started · ${formatMemoryLine()}`);
 service.schedulerTick();

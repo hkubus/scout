@@ -7,7 +7,7 @@ const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
 
 type LevelFilter = "all" | "info" | "error";
-type ScopeFilter = "all" | "watch" | "research";
+type ScopeFilter = "all" | "watch" | "research" | "diagnostics";
 
 function PageHeader({ title, description }: { title: string; description?: string }) {
   return (
@@ -93,7 +93,7 @@ export default function LogsPage({ refreshKey, onToast }: { refreshKey: number; 
             </button>
           ))}
           <span className="log-filter-divider" aria-hidden="true" />
-          {(["all", "watch", "research"] as ScopeFilter[]).map((value) => (
+          {(["all", "watch", "research", "diagnostics"] as ScopeFilter[]).map((value) => (
             <button
               key={value}
               className={`log-filter ${scope === value ? "log-filter--active" : ""}`}

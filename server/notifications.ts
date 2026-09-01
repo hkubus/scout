@@ -2,6 +2,7 @@ import { isIP } from 'node:net';
 import { lookup } from 'node:dns/promises';
 import type { NormalizedListing } from './marketplaces';
 import type { NotificationPriority } from '../src/types';
+import { discardResponse } from './fetch-diagnostics';
 
 const processFetch = globalThis.fetch;
 
@@ -143,6 +144,7 @@ export async function publishNtfy(config: NtfyConfig, payload: NtfyPayload, fetc
     body: JSON.stringify(payload),
     signal: AbortSignal.timeout(12_000),
   });
+  discardResponse(response, 'ntfy');
   if (!response.ok) throw new Error(`ntfy returned ${response.status}`);
 }
 

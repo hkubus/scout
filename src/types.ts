@@ -357,7 +357,7 @@ export interface LogEntry {
   id: number;
   at: string;
   level: 'info' | 'error';
-  scope: 'watch' | 'research';
+  scope: 'watch' | 'research' | 'diagnostics';
   message: string;
 }
 
