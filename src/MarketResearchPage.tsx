@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
   BarChart3,
+  Bell,
   Check,
   ChevronDown,
   Clock3,
@@ -21,6 +22,7 @@ import {
 } from "lucide-react";
 import { api } from "./api";
 import { marketplaceColors } from "./data";
+import { marketWatchInputFromListing } from "./presets";
 import type {
   Marketplace,
   MarketListingSnapshot,
@@ -124,6 +126,8 @@ export default function MarketResearchPage({
   const [busyIds, setBusyIds] = useState<Set<string>>(() => new Set());
   const [rowBusy, setRowBusy] = useState<Set<number>>(() => new Set());
   const [snapshotListing, setSnapshotListing] = useState<MarketTrackedListing | null>(null);
+  const [watchPreset, setWatchPreset] = useState<MarketWatchInput | null>(null);
+  const [dialogNonce, setDialogNonce] = useState(0);
 
   const load = useCallback(async (showLoader = false) => {
     if (showLoader) setLoading(true);
@@ -156,9 +160,15 @@ export default function MarketResearchPage({
       });
     }
   };
-  const openCreate = () => { setEditingWatch(null); setShowDialog(true); };
-  const openEdit = (watch: MarketWatch) => { setEditingWatch(watch); setShowDialog(true); };
-  const closeDialog = () => { if (showDialog) { setShowDialog(false); setEditingWatch(null); } };
+  const openCreate = () => { setEditingWatch(null); setWatchPreset(null); setDialogNonce((value) => value + 1); setShowDialog(true); };
+  const openEdit = (watch: MarketWatch) => { setEditingWatch(watch); setWatchPreset(null); setDialogNonce((value) => value + 1); setShowDialog(true); };
+  const openCreateFromListing = (listing: MarketTrackedListing) => {
+    setEditingWatch(null);
+    setWatchPreset(marketWatchInputFromListing(listing));
+    setDialogNonce((value) => value + 1);
+    setShowDialog(true);
+  };
+  const closeDialog = () => { if (showDialog) { setShowDialog(false); setEditingWatch(null); setWatchPreset(null); } };
   const create = async (input: MarketWatchInput) => {
     const result = await api.createMarketWatch(input);
     closeDialog();
@@ -246,12 +256,12 @@ export default function MarketResearchPage({
       {data.watches.length ? (
         <section className="research-history">
           <div className="section-heading-row"><h2>Saved listings</h2><div className="filters"><SelectControl value={selectedWatch} options={[{ value: "All", label: "All research watches" }, ...data.watches.map((watch) => ({ value: watch.id, label: watch.name }))]} onChange={(value) => { setSelectedWatch(value); setPage(1); }} /><SelectControl value={status} options={[{ value: "All", label: "All statuses" }, { value: "active", label: "Active" }, { value: "ended", label: "No longer available" }, { value: "superseded", label: "Previous series" }]} onChange={(value) => { setStatus(value as typeof status); setPage(1); }} /></div></div>
-          <MarketResearchTable listings={visible} onViewSnapshot={setSnapshotListing} rowBusy={rowBusy} onSaveCopy={saveCopy} />
+          <MarketResearchTable listings={visible} onViewSnapshot={setSnapshotListing} rowBusy={rowBusy} onSaveCopy={saveCopy} onAddWatch={openCreateFromListing} />
           {data.pagination && (data.pagination.page > 1 || data.pagination.hasNext) ? <div className="research-pagination"><button className="outline-button" disabled={page <= 1 || loading} onClick={() => setPage((current) => Math.max(1, current - 1))}>Previous</button><span>Page {data.pagination.page} · {data.pagination.total.toLocaleString("pl-PL")} listings</span><button className="outline-button" disabled={!data.pagination.hasNext || loading} onClick={() => setPage((current) => current + 1)}>Next</button></div> : null}
         </section>
       ) : null}
-      {showDialog ? <MarketWatchDialog key={editingWatch?.id ?? "new"} initialWatch={editingWatch} onClose={closeDialog} onSubmit={editingWatch ? update : create} /> : null}
-      {snapshotListing ? <MarketListingSnapshotModal listing={snapshotListing} onClose={() => setSnapshotListing(null)} onToast={onToast} onSaved={() => void load(false)} /> : null}
+      {showDialog ? <MarketWatchDialog key={editingWatch?.id ?? `new-${dialogNonce}`} initialWatch={editingWatch} preset={watchPreset} onClose={closeDialog} onSubmit={editingWatch ? update : create} /> : null}
+      {snapshotListing ? <MarketListingSnapshotModal listing={snapshotListing} onClose={() => setSnapshotListing(null)} onToast={onToast} onSaved={() => void load(false)} onWatch={openCreateFromListing} /> : null}
     </>
   );
 }
@@ -267,11 +277,12 @@ function MarketWatchFilterSummary({ watch }: { watch: MarketWatch }) {
   return <div className="research-watch-filters">{tags.length ? tags.map((tag) => <span key={tag}>{tag}</span>) : <span>All prices · any condition</span>}</div>;
 }
 
-function MarketResearchTable({ listings, onViewSnapshot, rowBusy, onSaveCopy }: {
+function MarketResearchTable({ listings, onViewSnapshot, rowBusy, onSaveCopy, onAddWatch }: {
   listings: MarketTrackedListing[];
   onViewSnapshot: (listing: MarketTrackedListing) => void;
   rowBusy: Set<number>;
   onSaveCopy: (listing: MarketTrackedListing) => Promise<void>;
+  onAddWatch: (listing: MarketTrackedListing) => void;
 }) {
   if (!listings.length) return <div className="empty-state"><Database size={24} /><strong>No saved listings in this view</strong><span>The first successful snapshot will populate this history.</span></div>;
   return (
@@ -289,7 +300,7 @@ function MarketResearchTable({ listings, onViewSnapshot, rowBusy, onSaveCopy }: 
           <span role="cell" className="research-row-actions">
             <button
               className="icon-button"
-              title={listing.snapshotStatus === "saved" ? "View the preserved listing copy" : "View or preserve a listing copy"}
+              title="View or preserve a listing copy"
               aria-label={`View saved copy of ${listing.title}`}
               onClick={() => onViewSnapshot(listing)}
             >
@@ -304,6 +315,14 @@ function MarketResearchTable({ listings, onViewSnapshot, rowBusy, onSaveCopy }: 
             >
               {rowBusy.has(listing.id) ? <LoaderCircle size={17} className="spin" /> : <Database size={17} />}
             </button>
+            <button
+              className="icon-button"
+              title="Create a research watch from this listing"
+              aria-label={`Create a research watch from ${listing.title}`}
+              onClick={() => onAddWatch(listing)}
+            >
+              <Bell size={17} />
+            </button>
             <a href={listing.url} target="_blank" rel="noreferrer" className="external-link" aria-label={`Open ${listing.title}`}><ExternalLink size={17} /></a>
           </span>
         </div>
@@ -312,11 +331,12 @@ function MarketResearchTable({ listings, onViewSnapshot, rowBusy, onSaveCopy }: 
   );
 }
 
-function MarketListingSnapshotModal({ listing, onClose, onToast, onSaved }: {
+function MarketListingSnapshotModal({ listing, onClose, onToast, onSaved, onWatch }: {
   listing: MarketTrackedListing;
   onClose: () => void;
   onToast: (message: string, type?: ToastType) => void;
   onSaved: () => void;
+  onWatch: (listing: MarketTrackedListing) => void;
 }) {
   const [snapshot, setSnapshot] = useState<MarketListingSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
@@ -417,6 +437,10 @@ function MarketListingSnapshotModal({ listing, onClose, onToast, onSaved }: {
         </div>
         <div className="modal-footer">
           <a className="outline-button" href={listing.url} target="_blank" rel="noreferrer">Open on {listing.marketplace}</a>
+          <button className="outline-button" onClick={() => { onClose(); onWatch(listing); }}>
+            <Bell size={16} />
+            Save as research watch
+          </button>
           {snapshot ? (
             <button className="primary-button" disabled={saving} onClick={() => void saveCopy()}>
               {saving ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}
@@ -442,24 +466,26 @@ function MarketThumbnail({ listing }: { listing: MarketTrackedListing }) {
 
 function MarketWatchDialog({
   initialWatch,
+  preset = null,
   onClose,
   onSubmit,
 }: {
   initialWatch: MarketWatch | null;
+  preset?: MarketWatchInput | null;
   onClose: () => void;
   onSubmit: (watch: MarketWatchInput) => Promise<void>;
 }) {
-  const [name, setName] = useState(initialWatch?.name ?? "");
-  const [query, setQuery] = useState(initialWatch?.query ?? "");
-  const [terms, setTerms] = useState(initialWatch?.terms ?? "");
-  const [excluded, setExcluded] = useState(initialWatch?.excluded ?? "");
-  const [location, setLocation] = useState(initialWatch?.location ?? "Polska");
-  const [condition, setCondition] = useState(initialWatch?.condition ?? "Any");
-  const [interval, setIntervalValue] = useState(String(initialWatch?.intervalHours ?? 24));
-  const [sources, setSources] = useState<Marketplace[]>(initialWatch?.sources ?? ["OLX", "Allegro Lokalnie", "Vinted"]);
-  const [minPrice, setMinPrice] = useState(initialWatch?.minPrice === null || initialWatch?.minPrice === undefined ? "" : String(initialWatch.minPrice));
-  const [maxPrice, setMaxPrice] = useState(initialWatch?.maxPrice === null || initialWatch?.maxPrice === undefined ? "" : String(initialWatch.maxPrice));
-  const [shippingOnly, setShippingOnly] = useState(initialWatch?.shippingOnly ?? false);
+  const [name, setName] = useState(initialWatch?.name ?? preset?.name ?? "");
+  const [query, setQuery] = useState(initialWatch?.query ?? preset?.query ?? "");
+  const [terms, setTerms] = useState(initialWatch?.terms ?? preset?.terms ?? "");
+  const [excluded, setExcluded] = useState(initialWatch?.excluded ?? preset?.excluded ?? "");
+  const [location, setLocation] = useState(initialWatch?.location ?? preset?.location ?? "Polska");
+  const [condition, setCondition] = useState(initialWatch?.condition ?? preset?.condition ?? "Any");
+  const [interval, setIntervalValue] = useState(String(initialWatch?.intervalHours ?? preset?.intervalHours ?? 24));
+  const [sources, setSources] = useState<Marketplace[]>(initialWatch?.sources ?? preset?.sources ?? ["OLX", "Allegro Lokalnie", "Vinted"]);
+  const [minPrice, setMinPrice] = useState(initialWatch?.minPrice === null || initialWatch?.minPrice === undefined ? preset?.minPrice === null || preset?.minPrice === undefined ? "" : String(preset.minPrice) : String(initialWatch.minPrice));
+  const [maxPrice, setMaxPrice] = useState(initialWatch?.maxPrice === null || initialWatch?.maxPrice === undefined ? preset?.maxPrice === null || preset?.maxPrice === undefined ? "" : String(preset.maxPrice) : String(initialWatch.maxPrice));
+  const [shippingOnly, setShippingOnly] = useState(initialWatch?.shippingOnly ?? preset?.shippingOnly ?? false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const numericInterval = Number(interval);

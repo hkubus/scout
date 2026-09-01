@@ -2,19 +2,8 @@ import { useState, type FormEvent } from "react";
 import { AlertTriangle, Bell, Check, ExternalLink, ListFilter, LoaderCircle, Search, Tag } from "lucide-react";
 import { api } from "./api";
 import { marketplaceColors } from "./data";
+import type { WatchPreset } from "./presets";
 import type { Listing, Marketplace, SearchSourceStatus } from "./types";
-
-type WatchPreset = {
-  query: string;
-  terms: string;
-  excluded: string;
-  sources: Marketplace[];
-  location: string;
-  condition: string;
-  minPrice: number | null;
-  maxPrice: number | null;
-  shippingOnly: boolean;
-};
 
 const formatPln = (value: number | null) =>
   value === null ? "Learning" : `${value.toLocaleString("pl-PL")} zł`;

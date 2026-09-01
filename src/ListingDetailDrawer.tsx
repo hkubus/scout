@@ -14,6 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { api } from "./api";
+import { watchPresetFromListing, type WatchPreset } from "./presets";
 import type {
   Listing,
   ListingDecision,
@@ -79,10 +80,12 @@ export default function ListingDetailDrawer({
   listing,
   onClose,
   onUpdated,
+  onCreateWatch,
 }: {
   listing: Listing;
   onClose: () => void;
   onUpdated: (listing: Listing) => void;
+  onCreateWatch?: (preset: WatchPreset) => void;
 }) {
   const [detail, setDetail] = useState<ListingDetail>({
     listing,
@@ -465,6 +468,12 @@ export default function ListingDetailDrawer({
               })}
             </div>
             {decision ? <button className="clear-decision" type="button" disabled={saving} onClick={() => void saveAction(null)}>Clear decision</button> : null}
+            {onCreateWatch ? (
+              <button className="outline-button drawer-save-note" type="button" onClick={() => onCreateWatch(watchPresetFromListing(currentListing))}>
+                <Bell size={15} />
+                Save as watch
+              </button>
+            ) : null}
             <label className="drawer-note-label">
               Note
               <textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="e.g. Ask for a battery-health screenshot" />

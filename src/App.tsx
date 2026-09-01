@@ -26,6 +26,7 @@ import {
 import { api } from "./api";
 import { emptyDashboard } from "./data";
 import ListingTable from "./ListingTable";
+import type { WatchPreset } from "./presets";
 import type {
   Connector,
   DashboardData,
@@ -84,18 +85,6 @@ const routeLoaders: Partial<Record<View, () => Promise<unknown>>> = {
 
 const preloadView = (view: View) => {
   void routeLoaders[view]?.();
-};
-
-type WatchPreset = {
-  query: string;
-  terms: string;
-  excluded: string;
-  sources: Marketplace[];
-  location: string;
-  condition: string;
-  minPrice: number | null;
-  maxPrice: number | null;
-  shippingOnly: boolean;
 };
 
 function viewFromLocation(): View {
@@ -598,6 +587,11 @@ function App() {
             listing={selectedListing}
             onClose={() => setSelectedListing(null)}
             onUpdated={updateListingAction}
+            onCreateWatch={(preset) => {
+              setSelectedListing(null);
+              setWatchPreset(preset);
+              setShowWatchDialog(true);
+            }}
           />
         </Suspense>
       ) : null}

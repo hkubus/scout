@@ -13,19 +13,8 @@ import {
 } from "lucide-react";
 import { api } from "./api";
 import { marketplaceColors } from "./data";
+import type { WatchPreset } from "./presets";
 import type { Marketplace, NotificationRecord, Watch } from "./types";
-
-type WatchPreset = {
-  query: string;
-  terms: string;
-  excluded: string;
-  sources: Marketplace[];
-  location: string;
-  condition: string;
-  minPrice: number | null;
-  maxPrice: number | null;
-  shippingOnly: boolean;
-};
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
