@@ -2770,16 +2770,18 @@ export class ScoutService {
   private storeListing(row: WatchRow, listing: NormalizedListing, scanId: number, baseline: { prices: number[]; firstObservedAt: string | null }): DealNotificationCandidate | null {
     const existingPrices = baseline.prices;
     const observedAt = nowIso();
-    this.stmt(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, availability_status, last_verified_at, first_seen_at, last_seen_at)
+    // RETURNING removes the follow-up SELECT for the row id on both the
+    // insert and the conflict-update branch of each upsert.
+    const stored = this.stmt(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, availability_status, last_verified_at, first_seen_at, last_seen_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, ?)
-      ON CONFLICT(marketplace, listing_id) DO UPDATE SET title = excluded.title, price_pln = excluded.price_pln, url = excluded.url, image_url = COALESCE(excluded.image_url, listings.image_url), condition = COALESCE(excluded.condition, listings.condition), location = COALESCE(excluded.location, listings.location), shipping_available = COALESCE(excluded.shipping_available, listings.shipping_available), price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), availability_status = 'live', ended_reason = NULL, last_verified_at = excluded.last_verified_at, last_seen_at = excluded.last_seen_at`).run(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable === null ? null : listing.shippingAvailable ? 1 : 0, listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0, observedAt, observedAt, observedAt);
+      ON CONFLICT(marketplace, listing_id) DO UPDATE SET title = excluded.title, price_pln = excluded.price_pln, url = excluded.url, image_url = COALESCE(excluded.image_url, listings.image_url), condition = COALESCE(excluded.condition, listings.condition), location = COALESCE(excluded.location, listings.location), shipping_available = COALESCE(excluded.shipping_available, listings.shipping_available), price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), availability_status = 'live', ended_reason = NULL, last_verified_at = excluded.last_verified_at, last_seen_at = excluded.last_seen_at
+      RETURNING id`).get(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable === null ? null : listing.shippingAvailable ? 1 : 0, listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0, observedAt, observedAt, observedAt) as { id: number };
     const inputHash = listingNormalizationInputHash(listing);
     this.stmt('UPDATE listings SET ai_normalization_json = NULL, ai_normalization_input_hash = NULL, ai_normalization_model = NULL, ai_normalization_at = NULL, ai_normalization_error = NULL WHERE marketplace = ? AND listing_id = ? AND ai_normalization_input_hash IS NOT NULL AND ai_normalization_input_hash <> ?').run(listing.marketplace, listing.listingId, inputHash);
-    const stored = this.stmt('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get(listing.marketplace, listing.listingId) as { id: number };
-    this.stmt(`INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at)
+    const association = this.stmt(`INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at)
       VALUES (?, ?, ?, ?)
-      ON CONFLICT(watch_id, listing_id) DO UPDATE SET last_seen_at = excluded.last_seen_at`).run(row.id, stored.id, observedAt, observedAt);
-    const association = this.stmt('SELECT id FROM watch_listings WHERE watch_id = ? AND listing_id = ?').get(row.id, stored.id) as { id: number };
+      ON CONFLICT(watch_id, listing_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
+      RETURNING id`).get(row.id, stored.id, observedAt, observedAt) as { id: number };
     const observedHours = baseline.firstObservedAt ? Math.max(0, (Date.now() - Date.parse(baseline.firstObservedAt)) / 3_600_000) : 0;
     const score = scoreDeal(existingPrices, listing.price, { observedHours, sensitivity: Number(row.sensitivity ?? 1) });
     const observation = this.stmt('INSERT INTO observations (listing_id, watch_id, watch_listing_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?, ?)').run(stored.id, row.id, association.id, scanId, listing.price, observedAt);
