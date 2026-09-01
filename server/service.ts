@@ -1026,17 +1026,27 @@ export class ScoutService {
     if (!row) throw new ServiceError('Watch not found', 404);
     const days = Math.max(7, Math.min(180, Math.floor(rangeDays)));
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60_000).toISOString();
-    const rawRows = this.stmt(`SELECT o.listing_id, l.marketplace, o.price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, o.observed_at
-      FROM observations o
+    // Identical WHERE semantics to the previous full fetch; only the row
+    // shipping changes. Raw-row totals stay exact via the aggregate — the
+    // reduced set cannot represent them.
+    const filters = `FROM observations o
       JOIN listings l ON l.id = o.listing_id
       WHERE o.watch_id = ?
         AND o.observed_at >= ?
         AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND EXISTS (SELECT 1 FROM watches rw WHERE rw.id = r.watch_id AND rw.ai_relevance = 1))
         AND (? = 0 OR l.shipping_available = 1)
         AND (? IS NULL OR o.price_pln >= ?)
-        AND (? IS NULL OR o.price_pln <= ?)
-      ORDER BY o.observed_at ASC`).all(id, cutoff, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln) as Array<Record<string, any>>;
-    const observations = rawRows.map((item): WatchAnalyticsObservation => ({
+        AND (? IS NULL OR o.price_pln <= ?)`;
+    const filterParams = [id, cutoff, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln] as unknown[];
+    const bounds = this.stmt(`SELECT COUNT(*) AS total, MIN(o.observed_at) AS first_at, MAX(o.observed_at) AS last_at ${filters}`).get(...filterParams) as { total?: number; first_at?: string | null; last_at?: string | null };
+    // Daily reduction in SQL: the last observation per listing per day
+    // (ISO-8601 UTC timestamps sort correctly under date()). SQLite takes
+    // bare columns from the MAX(observed_at) row, so price and typical are
+    // the ones observed last — matching the previous JS-side dedupe.
+    const dailyRows = this.stmt(`SELECT date(o.observed_at) AS day, o.listing_id, l.marketplace, o.price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at
+      ${filters}
+      GROUP BY day, o.listing_id`).all(...filterParams) as Array<Record<string, any>>;
+    const observations = dailyRows.map((item): WatchAnalyticsObservation => ({
       listingId: Number(item.listing_id),
       marketplace: item.marketplace as Marketplace,
       price: Number(item.price_pln),
@@ -1075,9 +1085,9 @@ export class ScoutService {
       watchId: id,
       watchName: String(row.name),
       rangeDays: days,
-      firstObservedAt: observations[0]?.observedAt ?? null,
-      lastObservedAt: observations[observations.length - 1]?.observedAt ?? null,
-      totalObservations: observations.length,
+      firstObservedAt: bounds.first_at ?? null,
+      lastObservedAt: bounds.last_at ?? null,
+      totalObservations: Number(bounds.total ?? 0),
       current: {
         medianPrice: current.medianPrice,
         lowerPrice: current.lowerPrice,
