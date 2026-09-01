@@ -5,6 +5,7 @@ import {
   Bell,
   Check,
   CheckCircle2,
+  Copy,
   ExternalLink,
   Info,
   LoaderCircle,
@@ -14,6 +15,7 @@ import {
   X,
 } from "lucide-react";
 import { api } from "./api";
+import { marketplaceColors } from "./data";
 import { watchPresetFromListing, type WatchPreset } from "./presets";
 import { PriceSparkline } from "./PriceSparkline";
 import type {
@@ -415,6 +417,27 @@ export default function ListingDetailDrawer({
               {lastNegotiation ? <div className="negotiation-success"><CheckCircle2 size={15} /><div><strong>Message sent</strong><p>{lastNegotiation.message}</p></div></div> : null}
             </> : <p className="drawer-section-copy">AI seller negotiation is currently available for OLX and Allegro Lokalnie listings.</p>}
           </section>
+
+          {detail.duplicates && detail.duplicates.length ? (
+            <section className="drawer-section drawer-section--duplicates">
+              <div className="drawer-section-heading">
+                <div><span className="drawer-section-kicker">Cross-source matches</span><h3>Cross-posted listings</h3></div>
+                <Copy size={17} />
+              </div>
+              <p className="drawer-section-copy">Scout detected what looks like the same physical item posted elsewhere. Compare before negotiating — the cheapest copy may be the better contact.</p>
+              <div className="duplicate-list">
+                {detail.duplicates.map((duplicate, index) => (
+                  <a key={`${duplicate.marketplace}-${duplicate.url}-${index}`} className="duplicate-row" href={duplicate.url} target="_blank" rel="noreferrer">
+                    <i style={{ background: marketplaceColors[duplicate.marketplace] }} />
+                    <span>{duplicate.marketplace}</span>
+                    <strong>{formatPln(duplicate.price)}</strong>
+                    <em>{duplicate.price < currentListing.price ? `${formatPln(currentListing.price - duplicate.price)} cheaper` : duplicate.price > currentListing.price ? `${formatPln(duplicate.price - currentListing.price)} more` : "same price"}</em>
+                    <ExternalLink size={15} />
+                  </a>
+                ))}
+              </div>
+            </section>
+          ) : null}
 
           <section className="drawer-section drawer-section--decision">
             <div className="drawer-section-heading">

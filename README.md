@@ -81,6 +81,10 @@ A deal watch can point at a research watch (`referenceMarketWatchId`). While the
 
 Separately opt-in in Settings, `Cap offers with a reference series band` uses the reference series' probable-sale band in negotiation math: the ceiling becomes the minimum of the buyer's total-cost ceiling and the band's p75. Because the cap can only *lower* the buyer's ceiling, it also applies to bounded automatic negotiation when enabled — it never widens the room below the asking price.
 
+### Cross-source duplicate detection
+
+Scout detects the same physical item cross-posted across OLX, Allegro Lokalnie, and Vinted. Once a day the scheduler materializes duplicate pairs for listings observed within the last 14 days, matching on title tokens (lowercased, diacritics stripped, marketplace boilerplate removed), price proximity with a hard cut beyond ±25%, condition equality, and an image CDN identity boost. Only pairs at or above the 0.75 similarity threshold are stored. Detected duplicates appear as a badge on listing rows (count plus the cheapest alternative) and as a "Cross-posted listings" section in the listing drawer with external links, so the cheapest copy can be compared before contacting a seller. Pairs age out with the 14-day window; similarity is heuristic and the badge is advisory, never a purchasing decision.
+
 Changing a research query, term, source, condition, location, shipping rule, or price range starts a new immutable comparable series. The old series is retained as previous history and excluded from current metrics. Main watches can be archived to stop future scans while retaining observations and analytics; permanent deletion is a separate, warned action.
 
 ## Preserved listing copies

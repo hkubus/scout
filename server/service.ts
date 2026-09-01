@@ -12,6 +12,7 @@ import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, median, scoreDeal } from './s
 import { pickVariantBatch, typoVariants } from './typos';
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
+import { DUPLICATE_SIMILARITY, DUPLICATE_WINDOW_DAYS, PRICE_RATIO_FLOOR, duplicateSimilarity, normalizeTitleForMatch, type DuplicateCandidate } from './duplicates';
 import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
 
 type Database = any;
@@ -1110,7 +1111,7 @@ export class ScoutService {
     const total = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(500, Math.floor(options.pageSize ?? 200)));
-    const rows = this.db.prepare(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note
+    const rows = this.db.prepare(`SELECT l.id, l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note
       FROM listings l
       JOIN watch_listings wl ON wl.listing_id = l.id
       JOIN watches w ON w.id = wl.watch_id
@@ -1118,7 +1119,16 @@ export class ScoutService {
       WHERE ${where}
       ORDER BY wl.last_seen_at DESC, wl.id DESC LIMIT ? OFFSET ?`).all(...params, pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
     const watches = new Map((knownWatches ?? this.getWatches()).map((watch) => [watch.id, watch]));
-    const listings = rows.map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100));
+    const duplicateSummaries = this.duplicateSummariesForIds(rows.map((row) => Number(row.id)));
+    const listings = rows.map((row) => {
+      const listing = this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100);
+      const summary = duplicateSummaries.get(Number(row.id));
+      if (summary) {
+        listing.duplicateCount = summary.count;
+        listing.duplicateCheapest = summary.cheapest;
+      }
+      return listing;
+    });
     return { listings, pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
   }
 
@@ -1166,6 +1176,7 @@ export class ScoutService {
       descriptionSnapshot,
       firstSeenAt: row.watch_first_seen_at ?? row.first_seen_at,
       lastSeenAt: row.watch_last_seen_at ?? row.last_seen_at,
+      duplicates: this.duplicateRowsFor(row.id).map((item) => this.toDuplicateSummary(item)),
     };
   }
 
@@ -2385,12 +2396,101 @@ export class ScoutService {
 
   queueDue() {
     this.pruneRetention();
+    this.refreshDuplicatePairs();
     void this.processNotificationRetries();
     void this.processDailyDigest();
     const rows = this.db.prepare('SELECT * FROM watches WHERE enabled = 1 AND next_scan_at <= ?').all(nowIso()) as WatchRow[];
     for (const row of rows) void this.runWatch(row);
     const marketRows = this.db.prepare('SELECT * FROM market_watches WHERE enabled = 1 AND next_scan_at <= ?').all(nowIso()) as WatchRow[];
     for (const row of marketRows) void this.runMarketWatch(row);
+  }
+
+  /**
+   * Daily materialization of cross-source duplicate pairs (the same physical
+   * item cross-posted across marketplaces). The candidate pool is bounded to
+   * the rolling window and pre-filtered by price overlap before any title
+   * math; the whole batch is rewritten inside one transaction, which also
+   * ages out pairs whose rows left the window.
+   */
+  private refreshDuplicatePairs() {
+    const last = this.getSetting('last_duplicate_refresh');
+    if (last && Date.now() - Date.parse(last) < 24 * 60 * 60_000) return;
+    const cutoff = new Date(Date.now() - DUPLICATE_WINDOW_DAYS * 24 * 60 * 60_000).toISOString();
+    const rows = this.db.prepare('SELECT id, title, price_pln, condition, image_url FROM listings WHERE last_seen_at >= ? AND price_pln > 0 ORDER BY last_seen_at DESC, price_pln ASC LIMIT 5000').all(cutoff) as Array<Record<string, any>>;
+    const candidates: Array<DuplicateCandidate & { id: number }> = rows.map((row) => ({ id: Number(row.id), title: String(row.title), price: Number(row.price_pln), condition: row.condition ?? null, imageUrl: row.image_url ?? null }));
+    const byPrice = [...candidates].sort((left, right) => left.price - right.price);
+    const pairs: Array<{ a: number; b: number; similarity: number }> = [];
+    for (let i = 0; i < byPrice.length; i += 1) {
+      const left = byPrice[i];
+      const leftTokens = normalizeTitleForMatch(left.title);
+      if (!leftTokens.length) continue;
+      for (let j = i + 1; j < byPrice.length; j += 1) {
+        const right = byPrice[j];
+        if (right.price > left.price / PRICE_RATIO_FLOOR) break;
+        const similarity = duplicateSimilarity(left, right);
+        if (similarity >= DUPLICATE_SIMILARITY) {
+          pairs.push({ a: Math.min(left.id, right.id), b: Math.max(left.id, right.id), similarity });
+        }
+      }
+    }
+    const createdAt = nowIso();
+    this.transaction(() => {
+      this.db.prepare('DELETE FROM listing_duplicate_pairs').run();
+      const insert = this.db.prepare('INSERT OR IGNORE INTO listing_duplicate_pairs (listing_id_a, listing_id_b, similarity, created_at) VALUES (?, ?, ?, ?)');
+      for (const pair of pairs) insert.run(pair.a, pair.b, pair.similarity, createdAt);
+    });
+    this.setSetting('last_duplicate_refresh', createdAt);
+    this.emit('watch', { refresh: true, duplicates: pairs.length });
+  }
+
+  /** Other listings paired with this one, cheapest first. */
+  private duplicateRowsFor(listingId: number) {
+    return this.db.prepare(`SELECT l.marketplace, l.listing_id, l.price_pln, l.url, l.image_url, l.last_seen_at
+      FROM listing_duplicate_pairs p
+      JOIN listings l ON l.id = CASE WHEN p.listing_id_a = ? THEN p.listing_id_b WHEN p.listing_id_b = ? THEN p.listing_id_a END
+      ORDER BY l.price_pln ASC`).all(listingId, listingId) as Array<Record<string, any>>;
+  }
+
+  private toDuplicateSummary(row: Record<string, any>) {
+    return {
+      marketplace: row.marketplace as Marketplace,
+      price: Number(row.price_pln),
+      url: String(row.url),
+      image: row.image_url ?? null,
+      observedAt: String(row.last_seen_at),
+    };
+  }
+
+  /** Duplicate badge info for a page of listing rows, computed with two flat queries (no N+1). */
+  private duplicateSummariesForIds(ids: number[]): Map<number, { count: number; cheapest: { marketplace: Marketplace; price: number; url: string; image: string | null } | null }> {
+    const summaries = new Map<number, { count: number; cheapest: { marketplace: Marketplace; price: number; url: string; image: string | null } | null }>();
+    if (!ids.length) return summaries;
+    const placeholders = ids.map(() => '?').join(',');
+    const pairs = this.db.prepare(`SELECT listing_id_a, listing_id_b FROM listing_duplicate_pairs WHERE listing_id_a IN (${placeholders}) OR listing_id_b IN (${placeholders})`).all(...ids, ...ids) as Array<{ listing_id_a: number; listing_id_b: number }>;
+    const idSet = new Set(ids);
+    const othersByListing = new Map<number, Set<number>>();
+    for (const pair of pairs) {
+      for (const [self, other] of [[pair.listing_id_a, pair.listing_id_b], [pair.listing_id_b, pair.listing_id_a]] as Array<[number, number]>) {
+        if (!idSet.has(self)) continue;
+        const others = othersByListing.get(self) ?? new Set<number>();
+        others.add(other);
+        othersByListing.set(self, others);
+      }
+    }
+    const otherIds = [...new Set([...othersByListing.values()].flatMap((others) => [...others]))];
+    const otherRows = otherIds.length
+      ? this.db.prepare(`SELECT id, marketplace, listing_id, price_pln, url, image_url FROM listings WHERE id IN (${otherIds.map(() => '?').join(',')})`).all(...otherIds) as Array<Record<string, any>>
+      : [];
+    const othersById = new Map(otherRows.map((row) => [Number(row.id), row]));
+    for (const [listingId, others] of othersByListing) {
+      const summariesForListing = [...others].map((otherId) => othersById.get(otherId)).filter(Boolean) as Array<Record<string, any>>;
+      const cheapest = summariesForListing.reduce<{ marketplace: Marketplace; price: number; url: string; image: string | null } | null>((best, row) => {
+        const candidate = { marketplace: row.marketplace as Marketplace, price: Number(row.price_pln), url: String(row.url), image: row.image_url ?? null };
+        return best === null || candidate.price < best.price ? candidate : best;
+      }, null);
+      summaries.set(listingId, { count: summariesForListing.length, cheapest });
+    }
+    return summaries;
   }
 
   private async runWatch(row: WatchRow) {

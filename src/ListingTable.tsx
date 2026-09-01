@@ -103,6 +103,11 @@ function ListingRow({ listing, onSelect }: { listing: Listing; onSelect?: (listi
               series baseline
             </em>
           ) : null}
+          {listing.duplicateCount ? (
+            <em className="decision-chip decision-chip--duplicate" title="The same item was detected on another listing">
+              {listing.duplicateCount}×{listing.duplicateCheapest ? ` · ${listing.duplicateCheapest.marketplace} ${listing.duplicateCheapest.price - listing.price >= 0 ? "+" : "−"}${Math.abs(Math.round(listing.duplicateCheapest.price - listing.price)).toLocaleString("pl-PL")} zł` : ""}
+            </em>
+          ) : null}
         </div>
       </button>
       <div className="marketplace-cell" role="cell">
