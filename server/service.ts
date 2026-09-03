@@ -251,12 +251,14 @@ export function validateNegotiationMessage(message: string, offerPrice: number |
   if (/\b(?:idiot|kretyn|debil|frajer|oszust|złodziej|kurwa|chuj|fuck|scam)\b/i.test(safeMessage)) {
     throw new ServiceError('Negotiation messages must remain polite and non-abusive.', 400);
   }
+  const numericTokens = [...safeMessage.matchAll(/(\d[\d\s.,]*\d|\d)/g)]
+    .map((match) => Number(match[1].replace(/\s/g, '').replace(/,(?=(\d{3}\b))/g, '').replace(',', '.')))
+    .filter((value) => Number.isFinite(value));
   if (offerPrice !== null) {
     const amount = Math.round(offerPrice * 100) / 100;
-    const digits = String(amount).replace(/\.0+$/, '').replace('.', '');
-    const messageDigits = safeMessage.replace(/[^0-9]/g, '');
-    if (!messageDigits.includes(digits)) throw new ServiceError('The message must state the approved opening offer.', 400);
-  } else if (/\d{2,}/.test(safeMessage.replace(/\s/g, ''))) {
+    const matches = numericTokens.some((value) => Math.abs(value - amount) < 0.005);
+    if (!matches) throw new ServiceError('The message must state the approved opening offer.', 400);
+  } else if (numericTokens.some((value) => value >= 10)) {
     throw new ServiceError('A message without an approved opening offer cannot introduce a new numeric amount.', 400);
   }
   return safeMessage;
@@ -327,15 +329,30 @@ export class ScoutService {
     this.publicExposureWarning = dependencies.publicExposureWarning ?? false;
   }
 
-  private transaction<T>(callback: () => T): T {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
-      const result = callback();
-      this.db.exec('COMMIT');
-      return result;
-    } catch (error) {
-      try { this.db.exec('ROLLBACK'); } catch { /* preserve the original database error */ }
-      throw error;
+  private transaction<T>(callback: () => T, retries = 3): T {
+    let attempt = 0;
+    for (;;) {
+      try {
+        this.db.exec('BEGIN IMMEDIATE');
+        try {
+          const result = callback();
+          this.db.exec('COMMIT');
+          return result;
+        } catch (error) {
+          try { this.db.exec('ROLLBACK'); } catch { /* preserve the original database error */ }
+          throw error;
+        }
+      } catch (error) {
+        const busy = error instanceof Error && /SQLITE_BUSY|database is locked|busy/i.test(error.message);
+        if (busy && attempt < retries) {
+          attempt += 1;
+          const wait = attempt * 50;
+          const start = Date.now();
+          while (Date.now() - start < wait) { /* brief backoff for SQLITE_BUSY */ }
+          continue;
+        }
+        throw error;
+      }
     }
   }
 
@@ -346,14 +363,25 @@ export class ScoutService {
   // distinct per shape and no user text ever lands in a key — filters travel
   // through bind parameters.
   private statements = new Map<string, any>();
+  private static readonly STATEMENT_CACHE_LIMIT = 200;
 
   private stmt(sql: string) {
     let statement = this.statements.get(sql);
     if (!statement) {
+      if (this.statements.size >= ScoutService.STATEMENT_CACHE_LIMIT) {
+        // Evict the oldest entry so dynamically shaped pagination queries stay bounded.
+        const oldest = this.statements.keys().next().value;
+        if (oldest !== undefined) this.statements.delete(oldest);
+      }
       statement = this.db.prepare(sql);
       this.statements.set(sql, statement);
     }
     return statement;
+  }
+
+  /** Escape `%`, `_` and `\` so user text cannot widen a LIKE pattern. */
+  private static escapeLike(value: string) {
+    return value.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
   }
 
   private createScan(watchId: string, watchKind: 'watch' | 'research', marketplace: Marketplace, startedAt = nowIso()) {
@@ -598,6 +626,8 @@ export class ScoutService {
     const config = this.deepSeekConfig();
     if (!config.apiKey) return { listings, excluded: 0, failed: 0, unknown: 0, notConfigured: true };
     const apiKey = config.apiKey;
+    const AI_RELEVANCE_BUDGET_PER_SCAN = 40;
+    let aiCalls = 0;
     const pendingClassifications = new Map<string, Promise<{ relevant: boolean }>>();
     // Relevance rows are collected while the batch awaits the AI calls and
     // flushed in one transaction per batch: a per-row autocommit would mean a
@@ -638,9 +668,16 @@ export class ScoutService {
           return { listing, status };
         }
 
+        // Per-scan budget: uncached listings beyond the budget stay unknown
+        // instead of burning quota on every scan before the cache warms.
+        if (aiCalls >= AI_RELEVANCE_BUDGET_PER_SCAN && !pendingClassifications.has(inputHash)) {
+          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: config.model, relevant: true, status: 'unknown', reason: 'AI relevance budget exhausted for this scan' });
+          return { listing, status: 'unknown' as const };
+        }
         try {
           let classification = pendingClassifications.get(inputHash);
           if (!classification) {
+            aiCalls += 1;
             classification = this.classifyListingRelevance(context, { apiKey, model: config.model });
             pendingClassifications.set(inputHash, classification);
           }
@@ -1220,7 +1257,7 @@ export class ScoutService {
     if (options.marketplace) { predicates.push('l.marketplace = ?'); params.push(options.marketplace); }
     if (options.watchId) { predicates.push('w.id = ?'); params.push(options.watchId); }
     const query = options.q?.trim().toLowerCase() ?? '';
-    if (query) { predicates.push("lower(COALESCE(l.title, '') || ' ' || COALESCE(l.subtitle, '')) LIKE ?"); params.push(`%${query}%`); }
+    if (query) { predicates.push("lower(COALESCE(l.title, '') || ' ' || COALESCE(l.subtitle, '')) LIKE ? ESCAPE '\\'"); params.push(`%${ScoutService.escapeLike(query)}%`); }
     const where = predicates.join(' AND ');
     const total = Number((this.stmt(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
@@ -2158,7 +2195,7 @@ export class ScoutService {
     const declared = Number(response.headers.get('content-length') ?? 0);
     if (declared > SNAPSHOT_MAX_IMAGE_BYTES) { discardResponse(response, 'snapshot-image'); return null; }
     const contentType = (response.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
-    if (!contentType.startsWith('image/')) { discardResponse(response, 'snapshot-image'); return null; }
+    if (!new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']).has(contentType)) { discardResponse(response, 'snapshot-image'); return null; }
     const data = Buffer.from(await response.arrayBuffer());
     if (!data.byteLength || data.byteLength > SNAPSHOT_MAX_IMAGE_BYTES) return null;
     return { mime: contentType, data };
@@ -2656,11 +2693,12 @@ export class ScoutService {
     if (!validation.valid) throw new Error(validation.reason);
     const headers = { 'user-agent': MARKETPLACE_API_USER_AGENT, accept: 'application/json' };
     let response = await fetch(validation.url, { redirect: 'manual', headers, signal: AbortSignal.timeout(12_000) });
-    if (response.status >= 300 && response.status < 400) {
-      discardResponse(response, 'olx-api');
+    for (let hop = 0; hop < 3 && response.status >= 300 && response.status < 400; hop += 1) {
       const location = response.headers.get('location');
-      if (!location) throw new Error(`Unexpected redirect (${response.status})`);
-      const redirected = new URL(location, validation.url).toString();
+      const status = response.status;
+      discardResponse(response, 'olx-api');
+      if (!location) throw new Error(`Unexpected redirect (${status})`);
+      const redirected = new URL(location, hop === 0 ? validation.url : response.url ?? validation.url).toString();
       const redirectValidation = validateSearchUrl(redirected, 'OLX');
       if (!redirectValidation.valid) throw new Error('Marketplace redirected off the approved domain');
       response = await fetch(redirectValidation.url, { redirect: 'manual', headers, signal: AbortSignal.timeout(12_000) });
@@ -2755,10 +2793,11 @@ export class ScoutService {
     const headers = { 'user-agent': MARKETPLACE_API_USER_AGENT, accept: 'text/html,application/xhtml+xml', 'accept-language': 'pl-PL,pl;q=0.9' };
     let finalUrl = validation.url;
     let response = await fetch(finalUrl, { redirect: 'manual', headers, signal: AbortSignal.timeout(12_000) });
-    if (response.status >= 300 && response.status < 400) {
-      discardResponse(response, 'vinted-item');
+    for (let hop = 0; hop < 3 && response.status >= 300 && response.status < 400; hop += 1) {
       const location = response.headers.get('location');
-      if (!location) throw new Error(`Unexpected redirect (${response.status})`);
+      const status = response.status;
+      discardResponse(response, 'vinted-item');
+      if (!location) throw new Error(`Unexpected redirect (${status})`);
       const redirected = new URL(location, finalUrl).toString();
       const redirectValidation = validateSearchUrl(redirected, 'Vinted');
       if (!redirectValidation.valid) throw new Error('Marketplace redirected off the approved domain');
@@ -2799,15 +2838,19 @@ export class ScoutService {
         throw new Error(`${marketplace} authenticated session failed: ${message}. Re-import the session after logging in again.`);
       }
     }
-    let response = await fetch(validation.url, { redirect: 'manual', headers: { 'user-agent': 'Scout/1.0 (+self-hosted public page monitor)', accept: 'text/html,application/xhtml+xml' }, signal: AbortSignal.timeout(12_000) });
-    if (response.status >= 300 && response.status < 400) {
-      discardResponse(response, 'public-page');
+    const publicHeaders = { 'user-agent': 'Scout/1.0 (+self-hosted public page monitor)', accept: 'text/html,application/xhtml+xml' };
+    let pageUrl = validation.url;
+    let response = await fetch(pageUrl, { redirect: 'manual', headers: publicHeaders, signal: AbortSignal.timeout(12_000) });
+    for (let hop = 0; hop < 3 && response.status >= 300 && response.status < 400; hop += 1) {
       const location = response.headers.get('location');
-      if (!location) throw new Error(`Unexpected redirect (${response.status})`);
-      const redirected = new URL(location, validation.url).toString();
+      const status = response.status;
+      discardResponse(response, 'public-page');
+      if (!location) throw new Error(`Unexpected redirect (${status})`);
+      const redirected = new URL(location, pageUrl).toString();
       const redirectValidation = validateSearchUrl(redirected, marketplace);
       if (!redirectValidation.valid) throw new Error('Marketplace redirected off the approved domain');
-      response = await fetch(redirectValidation.url, { redirect: 'manual', headers: { 'user-agent': 'Scout/1.0 (+self-hosted public page monitor)', accept: 'text/html,application/xhtml+xml' }, signal: AbortSignal.timeout(12_000) });
+      pageUrl = redirectValidation.url;
+      response = await fetch(pageUrl, { redirect: 'manual', headers: publicHeaders, signal: AbortSignal.timeout(12_000) });
     }
     if (!response.ok) {
       discardResponse(response, 'public-page');
@@ -2835,7 +2878,7 @@ export class ScoutService {
           const ErrorType = marketplace === 'OLX' ? OlxMessagingError : AllegroMessagingError;
           throw new ErrorType('Chromium is not available; configure SCOUT_BROWSER_WS.', 'delivery');
         }
-        browser = await chromium.launch({ executablePath, headless: true, args: ['--no-sandbox', '--disable-gpu'] });
+        browser = await chromium.launch({ executablePath, headless: true, args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'] });
         ownsBrowser = true;
       }
       context = await browser.newContext({ locale: 'pl-PL', storageState: storageState as any });
@@ -2860,25 +2903,19 @@ export class ScoutService {
   private async renderPublicPage(url: string, marketplace: Marketplace, storageState?: MarketplaceStorageState) {
     let browser: Browser | undefined;
     let context: BrowserContext | undefined;
-    let ownsContext = false;
+    let ownsBrowser = false;
     try {
       if (process.env.SCOUT_BROWSER_WS) {
         browser = await chromium.connectOverCDP(process.env.SCOUT_BROWSER_WS, { timeout: 8_000 });
       } else {
         const executablePath = process.env.SCOUT_CHROMIUM_PATH ?? ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'].find(existsSync);
         if (!executablePath) throw new Error('Chromium is not available; configure SCOUT_BROWSER_WS');
-        browser = await chromium.launch({ executablePath, headless: true, args: ['--no-sandbox', '--disable-gpu'] });
+        browser = await chromium.launch({ executablePath, headless: true, args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'] });
+        ownsBrowser = true;
       }
-      const existingContext = browser.contexts()[0];
-      if (storageState) {
-        context = await browser.newContext({ locale: 'pl-PL', storageState: storageState as any });
-        ownsContext = true;
-      } else if (existingContext) {
-        context = existingContext;
-      } else {
-        context = await browser.newContext({ locale: 'pl-PL' });
-        ownsContext = true;
-      }
+      // Always isolate scans in their own context: reusing the shared default
+      // context leaks cookies across marketplaces and concurrent scans.
+      context = await browser.newContext(storageState ? { locale: 'pl-PL', storageState: storageState as any } : { locale: 'pl-PL' });
       if (!context) throw new Error('Chromium context could not be created');
       const page = await context.newPage();
       try {
@@ -2891,9 +2928,9 @@ export class ScoutService {
       } finally { await page.close(); }
     } finally {
       try {
-        if (ownsContext && context) await context.close();
+        if (context) await context.close();
       } finally {
-        if (browser) await browser.close();
+        if (browser) await browser.close().catch(() => undefined);
       }
     }
   }
@@ -3225,7 +3262,7 @@ export class ScoutService {
 
   private latestDeliveryForAlert(watchId: string, listing: NormalizedListing, channel: 'Discord' | 'ntfy') {
     const prefix = `${watchId}|${listing.marketplace}|${listing.listingId}|alert:`;
-    return this.stmt("SELECT listing_key, status, attempt_count, next_attempt_at, updated_at, created_at FROM notification_deliveries WHERE channel = ? AND listing_key LIKE ? ORDER BY id DESC LIMIT 1").get(channel, `${prefix}%|channel:${channel}`) as Record<string, any> | undefined;
+    return this.stmt("SELECT listing_key, status, attempt_count, next_attempt_at, updated_at, created_at FROM notification_deliveries WHERE channel = ? AND listing_key LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT 1").get(channel, `${ScoutService.escapeLike(prefix)}%|channel:${channel}`) as Record<string, any> | undefined;
   }
 
   private alertState(watchId: string, listing: NormalizedListing, channel: 'Discord' | 'ntfy') {

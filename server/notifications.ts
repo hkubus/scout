@@ -100,9 +100,14 @@ function isSafeNetworkHost(hostname: string) {
   return true;
 }
 
-async function assertSafeNtfyDestination(serverUrl: string) {
+function assertSafeNtfyHost(serverUrl: string) {
   const host = new URL(serverUrl).hostname;
   if (!isSafeNetworkHost(host)) throw new Error('ntfy server cannot target a local or private network address');
+}
+
+async function assertSafeNtfyDestination(serverUrl: string) {
+  assertSafeNtfyHost(serverUrl);
+  const host = new URL(serverUrl).hostname;
   if (isIP(host)) return;
   const addresses = await lookup(host, { all: true, verbatim: true });
   if (!addresses.length || addresses.some((address) => isPrivateAddress(address.address))) throw new Error('ntfy server resolved to a local or private network address');
@@ -134,6 +139,7 @@ export function buildNtfyPayload(input: DealNotificationInput, topic: string, pr
 }
 
 export async function publishNtfy(config: NtfyConfig, payload: NtfyPayload, fetcher: typeof fetch = globalThis.fetch) {
+  assertSafeNtfyHost(config.serverUrl);
   if (fetcher === processFetch) await assertSafeNtfyDestination(config.serverUrl);
   const response = await fetcher(`${config.serverUrl}/`, {
     method: 'POST',

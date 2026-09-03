@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent } from "react";
 import { AlertTriangle, Bell, Check, ExternalLink, ListFilter, LoaderCircle, Search, Tag } from "lucide-react";
 import { api } from "./api";
 import { marketplaceColors } from "./data";
@@ -13,6 +13,7 @@ const errorMessage = (error: unknown) =>
 
 function safeImageUrl(value: string | null | undefined) {
   if (!value) return null;
+  if (value.startsWith("data:image/")) return value;
   try {
     const url = new URL(value);
     return url.protocol === "https:" ? url.toString() : null;
@@ -59,6 +60,8 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const searchSequence = useRef(0);
+  const searchController = useRef<AbortController | null>(null);
   const numericMin = minPrice === "" ? null : Number(minPrice);
   const numericMax = maxPrice === "" ? null : Number(maxPrice);
   const validPrices =
@@ -74,6 +77,10 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!query.trim() || !sources.length || !validPrices) return;
+    searchController.current?.abort();
+    const controller = new AbortController();
+    searchController.current = controller;
+    const sequence = ++searchSequence.current;
     setLoading(true);
     setError(null);
     setSearched(true);
@@ -89,14 +96,16 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
         maxPrice: numericMax,
         shippingOnly,
         condition,
-        location: location.trim(),
-      });
+        location: location.trim() || "Polska",
+      }, controller.signal);
+      if (sequence !== searchSequence.current || controller.signal.aborted) return;
       setListings(result.listings);
       setSourceStatuses(result.sources);
     } catch (searchError) {
+      if (sequence !== searchSequence.current || controller.signal.aborted) return;
       setError(errorMessage(searchError));
     } finally {
-      setLoading(false);
+      if (sequence === searchSequence.current) setLoading(false);
     }
   };
   return (
@@ -269,7 +278,7 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
               : "Results"}
           </h2>
           {searched && !loading ? (
-            <div className="search-results-actions"><span className="toolbar-meta">Sorted by lowest price</span><button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, location: location.trim(), condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly })}><Bell size={15} />Save as watch</button></div>
+            <div className="search-results-actions"><span className="toolbar-meta">Sorted by lowest price</span><button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, location: location.trim() || "Polska", condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly })}><Bell size={15} />Save as watch</button></div>
           ) : null}
         </div>
         {loading ? (
@@ -348,7 +357,7 @@ function SearchResultsTable({ listings, onSelect }: { listings: Listing[]; onSel
           <a
             href={listing.url}
             target="_blank"
-            rel="noreferrer"
+            rel="noopener noreferrer"
             className="external-link"
             aria-label={`Open ${listing.title}`}
           >

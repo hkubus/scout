@@ -11,6 +11,15 @@ coverage
 *.sqlite
 *.sqlite-*
 *.backup.sqlite
+*.pre-*.sqlite
+*.before-restore-*
+*.restore-*.tmp
 *.storage-state.json
 NEXT_AGENT.md
+OPTIMIZATION_HANDOFF.md
+docs
+README.md
+pnpm-lock.yaml
+pnpm-workspace.yaml
+*.tsbuildinfo
 tests

@@ -6,9 +6,12 @@ export default defineConfig({
   server: {
     port: 4173,
     proxy: {
-      '/api': 'http://localhost:3001',
-      '/events': 'http://localhost:3001',
+      '/api': process.env.SCOUT_API_PROXY ?? 'http://127.0.0.1:3001',
+      '/events': process.env.SCOUT_API_PROXY ?? 'http://127.0.0.1:3001',
     },
+  },
+  preview: {
+    port: 4173,
   },
   build: {
     outDir: 'dist',

@@ -8,3 +8,5 @@ data
 *.storage-state.json
 *.restore-*.tmp
 *.before-restore-*
+*.backup.sqlite
+*.pre-*.sqlite

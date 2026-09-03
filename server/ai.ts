@@ -348,6 +348,7 @@ export async function normalizeListingWithDeepSeek(
   config: { apiKey: string; model: string },
   fetcher: typeof fetch = fetch,
 ): Promise<ListingNormalization> {
+  return retryStructuredFormat(async () => {
   const response = await fetcher(OPENROUTER_CHAT_COMPLETIONS_URL, {
     method: 'POST',
     headers: {
@@ -401,15 +402,8 @@ export async function normalizeListingWithDeepSeek(
   if (message?.refusal) throw new DeepSeekError('OpenRouter refused to normalize this listing');
   const content = responseContent(message?.content);
   if (!content) throw new DeepSeekError('OpenRouter returned no normalization');
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(content);
-  } catch {
-    throw new DeepSeekError('OpenRouter returned normalization that was not valid JSON');
-  }
-  const result = listingNormalizationSchema.safeParse(parsed);
-  if (!result.success) throw new DeepSeekError('OpenRouter returned normalization with an invalid shape');
-  return result.data;
+  return parseStructuredJson(content, listingNormalizationSchema, 'listing normalization');
+  });
 }
 
 export async function classifyListingRelevanceWithDeepSeek(
@@ -417,6 +411,7 @@ export async function classifyListingRelevanceWithDeepSeek(
   config: { apiKey: string; model: string },
   fetcher: typeof fetch = fetch,
 ): Promise<{ relevant: boolean }> {
+  return retryStructuredFormat(async () => {
   const response = await fetcher(OPENROUTER_CHAT_COMPLETIONS_URL, {
     method: 'POST',
     headers: {
@@ -473,15 +468,8 @@ export async function classifyListingRelevanceWithDeepSeek(
   if (message?.refusal) throw new DeepSeekError('OpenRouter refused to classify this listing');
   const content = responseContent(message?.content);
   if (!content) throw new DeepSeekError('OpenRouter returned no relevance classification');
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(content);
-  } catch {
-    throw new DeepSeekError('OpenRouter returned relevance that was not valid JSON');
-  }
-  const result = listingRelevanceSchema.safeParse(parsed);
-  if (!result.success) throw new DeepSeekError('OpenRouter returned relevance with an invalid shape');
-  return result.data;
+  return parseStructuredJson(content, listingRelevanceSchema, 'listing relevance');
+  });
 }
 
 export async function verifyListingDescriptionWithDeepSeek(
@@ -559,6 +547,7 @@ export async function draftNegotiationMessageWithDeepSeek(
   config: { apiKey: string; model: string },
   fetcher: typeof fetch = fetch,
 ): Promise<{ message: string }> {
+  return retryStructuredFormat(async () => {
   const response = await fetcher(OPENROUTER_CHAT_COMPLETIONS_URL, {
     method: 'POST',
     headers: {
@@ -615,15 +604,8 @@ export async function draftNegotiationMessageWithDeepSeek(
   if (message?.refusal) throw new DeepSeekError('OpenRouter refused to write a negotiation message');
   const content = responseContent(message?.content);
   if (!content) throw new DeepSeekError('OpenRouter returned no negotiation message');
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(content);
-  } catch {
-    throw new DeepSeekError('OpenRouter returned a negotiation message that was not valid JSON');
-  }
-  const result = negotiationMessageSchema.safeParse(parsed);
-  if (!result.success) throw new DeepSeekError('OpenRouter returned a negotiation message with an invalid shape');
-  return result.data;
+  return parseStructuredJson(content, negotiationMessageSchema, 'negotiation message');
+  });
 }
 
 export function parseStoredListingNormalization(value: string | null | undefined): ListingNormalization | null {

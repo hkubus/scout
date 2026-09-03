@@ -11,16 +11,25 @@ export class RateLimiter {
   constructor(private readonly windowMs = 60_000, private readonly maxEntries = 10_000) {}
 
   consume(key: string, limit: number, now = Date.now()) {
+    this.purgeExpired(now);
     let bucket = this.buckets.get(key);
     if (!bucket || bucket.resetAt <= now) bucket = { count: 0, resetAt: now + this.windowMs };
     bucket.count += 1;
     this.buckets.set(key, bucket);
     if (this.buckets.size > this.maxEntries) {
-      for (const [entryKey, entry] of this.buckets) {
-        if (entry.resetAt <= now) this.buckets.delete(entryKey);
+      // Evict the oldest entries first so IP rotation cannot grow memory unbounded.
+      const oldest = [...this.buckets.entries()].sort((a, b) => a[1].resetAt - b[1].resetAt);
+      for (const [entryKey] of oldest.slice(0, this.buckets.size - this.maxEntries)) {
+        this.buckets.delete(entryKey);
       }
     }
     return { allowed: bucket.count <= limit, remaining: Math.max(0, limit - bucket.count), retryAfterSeconds: Math.max(1, Math.ceil((bucket.resetAt - now) / 1000)) };
+  }
+
+  private purgeExpired(now: number) {
+    for (const [entryKey, entry] of this.buckets) {
+      if (entry.resetAt <= now) this.buckets.delete(entryKey);
+    }
   }
 }
 

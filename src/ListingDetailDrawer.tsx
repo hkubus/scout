@@ -33,6 +33,7 @@ const errorMessage = (error: unknown) =>
 
 function safeImageUrl(value: string | null | undefined) {
   if (!value) return null;
+  if (value.startsWith("data:image/")) return value;
   try {
     const url = new URL(value);
     return url.protocol === "https:" ? url.toString() : null;
@@ -89,7 +90,11 @@ export default function ListingDetailDrawer({
   const currentListing = detail.listing;
   const marketplaceListingKey = currentListing.marketplaceListingKey ?? currentListing.id;
   const canMessageMarketplace = currentListing.marketplace === "OLX" || currentListing.marketplace === "Allegro Lokalnie";
-  const totalCost = currentListing.price + (Number(shippingCost) || 0) + (Number(extraCost) || 0);
+  const toFiniteCost = (value: string) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+  const totalCost = currentListing.price + toFiniteCost(shippingCost) + toFiniteCost(extraCost);
   const expectedResale = resalePrice === "" ? null : Number(resalePrice);
   const expectedProfit = expectedResale === null || !Number.isFinite(expectedResale) ? null : expectedResale - totalCost;
   const expectedMargin = expectedProfit === null || totalCost <= 0 ? null : (expectedProfit / totalCost) * 100;
@@ -400,7 +405,7 @@ export default function ListingDetailDrawer({
               </div> : null}
               <label className="drawer-note-label negotiation-offer-label">
                 Opening offer <span>optional · PLN</span>
-                <input type="number" min="1" max={Math.max(1, currentListing.price - 0.01)} step="0.01" value={negotiationOffer} onChange={(event) => { setNegotiationOffer(event.target.value); setNegotiationDraft(null); setDraftMessage(""); }} placeholder="Ask for a reduction without naming a price" disabled={!storedListing || recommending || drafting || negotiating} />
+                <input type="number" min="1" max={Math.max(0.01, currentListing.price - 0.01)} step="0.01" value={negotiationOffer} onChange={(event) => { setNegotiationOffer(event.target.value); setNegotiationDraft(null); setDraftMessage(""); }} placeholder="Ask for a reduction without naming a price" disabled={!storedListing || recommending || drafting || negotiating} />
               </label>
               <button className="primary-button drawer-negotiate-button" type="button" disabled={!storedListing || drafting || negotiating || saving} onClick={() => void negotiateWithAi()}>
                 {drafting ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}
@@ -490,7 +495,7 @@ export default function ListingDetailDrawer({
         </div>
         <div className="listing-drawer-footer">
           <span>{currentListing.observed}</span>
-          <a className="primary-button" href={currentListing.url} target="_blank" rel="noreferrer"><ExternalLink size={16} />Open listing</a>
+          <a className="primary-button" href={currentListing.url} target="_blank" rel="noopener noreferrer"><ExternalLink size={16} />Open listing</a>
         </div>
       </aside>
     </div>

@@ -34,6 +34,13 @@ function PageHeader({
   );
 }
 
+function runHealth(status: string): "OK" | "Warning" | "Degraded" | string {
+  if (status === "ok") return "OK";
+  if (status === "running" || status === "warning") return "Warning";
+  if (status === "error" || status === "degraded") return "Degraded";
+  return status;
+}
+
 export default function ConnectorsPage({
   connectors,
   scanning,
@@ -51,7 +58,8 @@ export default function ConnectorsPage({
   const [runsPagination, setRunsPagination] = useState<{ page: number; pageSize: number; total: number; hasNext: boolean } | null>(null);
   const [loadingRuns, setLoadingRuns] = useState(true);
   const [loadingOlderRuns, setLoadingOlderRuns] = useState(false);
-  const [testing, setTesting] = useState(false);
+  const [testingDiscord, setTestingDiscord] = useState(false);
+  const [testingNtfy, setTestingNtfy] = useState(false);
   const loadRuns = useCallback(async () => {
     try {
       const result = await api.connectorRuns();
@@ -67,7 +75,7 @@ export default function ConnectorsPage({
     void loadRuns();
   }, [loadRuns]);
   const testWebhook = async () => {
-    setTesting(true);
+    setTestingDiscord(true);
     try {
       await api.testWebhook();
       onToast("Discord test delivered.");
@@ -75,11 +83,11 @@ export default function ConnectorsPage({
     } catch (error) {
       onToast(errorMessage(error), "error");
     } finally {
-      setTesting(false);
+      setTestingDiscord(false);
     }
   };
   const testNtfy = async () => {
-    setTesting(true);
+    setTestingNtfy(true);
     try {
       await api.testNtfy();
       onToast("ntfy test delivered.");
@@ -87,7 +95,7 @@ export default function ConnectorsPage({
     } catch (error) {
       onToast(errorMessage(error), "error");
     } finally {
-      setTesting(false);
+      setTestingNtfy(false);
     }
   };
   const connectorColor = (source: string) =>
@@ -129,7 +137,7 @@ export default function ConnectorsPage({
           <ConnectorCard
             connector={connector}
             key={connector.name}
-            testing={testing}
+            testing={connector.name === "ntfy" ? testingNtfy : testingDiscord}
             onTest={connector.name === "Discord" ? testWebhook : connector.name === "ntfy" ? testNtfy : undefined}
           />
         ))}
@@ -168,13 +176,9 @@ export default function ConnectorsPage({
                   <i style={{ background: connectorColor(run.source) }} />
                   {run.source}
                 </span>
-                <span className={`run-result run-result--${run.status}`}>
+                <span className={`run-result run-result--${runHealth(run.status).toLowerCase()}`}>
                   <i />
-                  {run.status === "ok"
-                    ? "Completed"
-                    : run.status === "running"
-                      ? "Running"
-                      : "Failed"}
+                  {runHealth(run.status)}
                 </span>
                 <span>{run.duration}</span>
                 <span title={run.startedAt}>

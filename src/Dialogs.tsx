@@ -28,13 +28,13 @@ export function WatchDialog({
   initialWatch?: Watch | null;
   preset?: WatchPreset | null;
   onClose: () => void;
-  onSubmit: (watch: Watch) => Promise<void>;
+  onSubmit: (watch: Omit<Watch, "id"> & { id?: string }) => Promise<void>;
 }) {
   const [name, setName] = useState(initialWatch?.name ?? (preset?.query ? `${preset.query} watch` : ""));
   const [query, setQuery] = useState(initialWatch?.query ?? preset?.query ?? "");
   const [terms, setTerms] = useState(initialWatch?.terms ?? preset?.terms ?? "");
   const [excluded, setExcluded] = useState(initialWatch?.excluded ?? preset?.excluded ?? "");
-  const [location, setLocation] = useState(initialWatch?.location ?? preset?.location ?? "Polska");
+  const [location, setLocation] = useState(initialWatch?.location?.trim() || preset?.location?.trim() || "Polska");
   const [condition, setCondition] = useState(initialWatch?.condition ?? preset?.condition ?? "Any");
   const [interval, setIntervalValue] = useState(String(initialWatch?.interval ?? 5));
   const [sensitivity, setSensitivity] = useState(String(initialWatch?.sensitivity ?? 1));
@@ -78,7 +78,7 @@ export function WatchDialog({
   }, [onClose, submitting]);
   useEffect(() => {
     let active = true;
-    api.marketResearch({ pageSize: 1 }).then((result) => {
+    api.marketResearch({ pageSize: 100 }).then((result) => {
       if (active) setReferenceOptions(result.watches);
     }).catch(() => { /* the fallback-baseline select stays empty; core dialog works without it */ });
     return () => { active = false; };
@@ -87,9 +87,11 @@ export function WatchDialog({
     if (!canSubmit) return;
     setSubmitting(true);
     setError(null);
+    const rawSensitivity = Number(sensitivity);
+    const safeSensitivity = Number.isFinite(rawSensitivity) && rawSensitivity >= 0.6 && rawSensitivity <= 1.6 ? rawSensitivity : 1;
     try {
       await onSubmit({
-        id: initialWatch?.id ?? `watch-${Date.now()}`,
+        ...(initialWatch?.id ? { id: initialWatch.id } : {}),
         name: name.trim(),
         query: query.trim(),
         terms: terms.trim(),
@@ -109,7 +111,7 @@ export function WatchDialog({
           .split(/\r?\n/)
           .map((url) => url.trim())
           .filter(Boolean),
-        sensitivity: Number(sensitivity),
+        sensitivity: safeSensitivity,
         shippingOnly,
         typoVariants,
         aiRelevance,

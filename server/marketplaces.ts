@@ -145,7 +145,8 @@ export function buildMarketplaceSearchUrl(marketplace: Marketplace, query: strin
 export function parsePolishPrice(value: string | number | null | undefined) {
   if (typeof value === 'number') return Number.isFinite(value) && value > 0 ? Math.round(value * 100) / 100 : null;
   if (!value) return null;
-  const normalized = value.replace(/\u00a0/g, ' ').replace(/zł|PLN/gi, '').replace(/\s/g, '').replace(/,(?=\d{1,2}$)/, '.').replace(/[^\d.\-]/g, '');
+  if (/^\s*-/.test(value)) return null;
+  const normalized = value.replace(/\u00a0/g, ' ').replace(/zł|PLN/gi, '').replace(/\s/g, '').replace(/,(?=\d{1,2}$)/, '.').replace(/[^\d.]/g, '');
   const amount = Number(normalized);
   return Number.isFinite(amount) && amount > 0 ? Math.round(amount * 100) / 100 : null;
 }
@@ -715,6 +716,7 @@ export function buildOlxSearchApiUrl(query: string, filters: MarketplaceSearchFi
   if (filters.maxPrice !== null && filters.maxPrice !== undefined) url.searchParams.set('filter_float_price:to', String(filters.maxPrice));
   const condition = filters.condition?.trim().toLowerCase();
   if (condition === 'new' || condition === 'used') url.searchParams.set('filter_enum_state[0]', condition);
+  if (filters.shippingOnly) url.searchParams.set('courier', 'on');
   if (filters.sort === 'newest') url.searchParams.set('sort_by', 'created_at:desc');
   const page = filters.page;
   if (page !== undefined && Number.isInteger(page) && page > 1 && page <= 10) url.searchParams.set('offset', String((page - 1) * OLX_API_PAGE_LIMIT));
@@ -737,6 +739,9 @@ function olxSearchApiUrlFromSearchPage(url: string) {
   if (from) api.searchParams.set('filter_float_price:from', from);
   if (to) api.searchParams.set('filter_float_price:to', to);
   if (parsed.searchParams.get('search[order]') === 'created_at:desc') api.searchParams.set('sort_by', 'created_at:desc');
+  if (parsed.searchParams.get('courier') === 'on') api.searchParams.set('courier', 'on');
+  const state = parsed.searchParams.get('search[filter_enum_state][0]') ?? parsed.searchParams.get('state');
+  if (state === 'new' || state === 'used') api.searchParams.set('filter_enum_state[0]', state);
   const page = Number(parsed.searchParams.get('page'));
   if (Number.isInteger(page) && page > 1 && page <= 10) api.searchParams.set('offset', String((page - 1) * OLX_API_PAGE_LIMIT));
   api.searchParams.set('limit', String(OLX_API_PAGE_LIMIT));

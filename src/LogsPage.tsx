@@ -34,6 +34,7 @@ export default function LogsPage({ refreshKey, onToast }: { refreshKey: number; 
   const [scope, setScope] = useState<ScopeFilter>("all");
 
   const loadLogs = async () => {
+    setLoading(true);
     try {
       const result = await api.logs();
       setLogs(result.logs);

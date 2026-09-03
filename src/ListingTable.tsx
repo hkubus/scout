@@ -8,6 +8,7 @@ const formatPln = (value: number | null) =>
 
 function safeImageUrl(value: string | null | undefined) {
   if (!value) return null;
+  if (value.startsWith("data:image/")) return value;
   try {
     const url = new URL(value);
     return url.protocol === "https:" ? url.toString() : null;
@@ -122,7 +123,7 @@ function ListingRow({ listing, onSelect }: { listing: Listing; onSelect?: (listi
       <a
         href={listing.url}
         target="_blank"
-        rel="noreferrer"
+        rel="noopener noreferrer"
         className="external-link"
         aria-label={`Open ${listing.title}`}
       >
@@ -134,7 +135,7 @@ function ListingRow({ listing, onSelect }: { listing: Listing; onSelect?: (listi
 
 function DealBars({ strength }: { strength: number }) {
   return (
-    <span className={`deal-bars deal-bars--${strength}`} aria-label={`${strength} of 5 deal strength`}>
+    <span className={`deal-bars deal-bars--${strength}`} role="img" aria-label={`${strength} of 5 deal strength`}>
       {[1, 2, 3, 4, 5].map((bar) => (
         <i key={bar} className={bar <= strength ? "is-filled" : ""} />
       ))}

@@ -38,7 +38,8 @@ export function scoreDeal(prices: number[], price: number, options: { minSamples
   const sampleReadiness = Math.min(1, usablePrices.length / minSamples);
   const timeReadiness = Math.min(1, (options.observedHours ?? 0) / minHours);
   const confidence = Math.round(Math.min(1, sampleReadiness * 0.62 + timeReadiness * 0.38) * 100);
-  const sensitivity = options.sensitivity ?? 1;
+  const rawSensitivity = options.sensitivity ?? 1;
+  const sensitivity = Number.isFinite(rawSensitivity) && rawSensitivity >= 0.6 && rawSensitivity <= 1.6 ? rawSensitivity : 1;
   const isReady = usablePrices.length >= minSamples && (options.observedHours ?? 0) >= minHours;
   const qualifies = isReady && deviation >= 3.1 / sensitivity && discountPercent >= 18;
   return { typical, mad, deviation, discountPercent, confidence, isReady, qualifies };

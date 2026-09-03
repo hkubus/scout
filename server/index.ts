@@ -52,7 +52,7 @@ app.addHook('onRequest', async (request, reply) => {
   const isEvents = url === '/events';
   if (!isApi && !isEvents) return;
 
-  const expensive = /\/search$|\/scan$|\/scans$|\/negotiate(?:\/draft)?$|\/recommendation$|\/normalize-listing$|\/snapshot$|\/settings\/(?:webhook|ntfy)\/test$|\/backup$/.test(url);
+  const expensive = /\/search$|\/scan$|\/scans$|\/negotiate(?:\/draft)?$|\/recommendation$|\/normalize-listing$|\/snapshot$|\/snapshot-images\/|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/backup$/.test(url);
   const limit = expensive ? 30 : 240;
   const bucket = rateLimiter.consume(`${request.ip}:${expensive ? 'expensive' : url}`, limit);
   reply.header('X-RateLimit-Limit', String(limit));
@@ -251,7 +251,14 @@ app.post('/api/watches', async (request, reply) => {
   }
   const id = value.id ?? `watch-${randomUUID()}`;
   const now = nowIso();
-  db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, sensitivity, shipping_only, typo_variants, ai_relevance, reference_market_watch_id, min_price_pln, max_price_pln, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, 1, now, now, now);
+  try {
+    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, sensitivity, shipping_only, typo_variants, ai_relevance, reference_market_watch_id, min_price_pln, max_price_pln, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, 1, now, now, now);
+  } catch (error) {
+    if (error instanceof Error && /UNIQUE|PRIMARY KEY|constraint/i.test(error.message)) {
+      return reply.code(409).send({ error: 'A watch with this id already exists' });
+    }
+    throw error;
+  }
   emit('watch', { id, name: value.name });
   const created = service.getWatches().find((watch) => watch.id === id);
   return reply.code(201).send({ watch: created });
@@ -444,8 +451,12 @@ app.get('/api/market-snapshot-images/:imageId', async (request, reply) => {
   if (!params.success) return reply.code(400).send({ error: 'A valid snapshot image id is required' });
   const image = service.marketSnapshotImage(params.data.imageId);
   if (!image) return reply.code(404).send({ error: 'Snapshot image not found' });
+  const allowedImages = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']);
+  const mime = allowedImages.has(image.mime) ? image.mime : 'application/octet-stream';
   reply.header('cache-control', 'private, max-age=31536000, immutable');
-  return reply.type(image.mime).send(image.data);
+  reply.header('content-disposition', 'inline');
+  reply.header('content-security-policy', "default-src 'none'; sandbox");
+  return reply.type(mime).send(image.data);
 });
 
 app.delete('/api/market-watches/:id', async (request, reply) => {
@@ -534,6 +545,7 @@ app.post('/api/notifications/preview', async (request, reply) => {
 });
 
 app.get('/events', async (request, reply) => {
+  if (clients.size >= 50) return reply.code(429).send({ error: 'Too many live connections. Try again later.' });
   reply.hijack();
   const response = reply.raw;
   response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
@@ -543,7 +555,7 @@ app.get('/events', async (request, reply) => {
   request.raw.on('close', () => clients.delete(client));
 });
 
-const distPath = resolve(process.cwd(), 'dist');
+const distPath = process.env.SCOUT_DIST_PATH?.trim() || resolve(process.cwd(), 'dist');
 if (existsSync(distPath)) {
   await app.register(fastifyStatic, { root: distPath, wildcard: false });
   app.setNotFoundHandler((request, reply) => {
@@ -572,7 +584,7 @@ const diagnosticsInterval = setInterval(() => {
   service.logDiagnostic(formatMemoryLine());
 }, 30 * 60_000);
 
-app.addHook('onClose', async () => { clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); for (const client of clients) client.end(); db.close(); });
+app.addHook('onClose', async () => { clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); for (const client of clients) client.end(); try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ } db.close(); });
 let shuttingDown = false;
 const shutdown = async (signal: string) => {
   if (shuttingDown) return;
