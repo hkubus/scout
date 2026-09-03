@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   BarChart3,
@@ -50,6 +50,7 @@ const errorMessage = (error: unknown) =>
 
 function safeImageUrl(value: string | null | undefined) {
   if (!value) return null;
+  if (value.startsWith("data:image/")) return value;
   try {
     const url = new URL(value);
     return url.protocol === "https:" ? url.toString() : null;
@@ -150,20 +151,29 @@ export default function MarketResearchPage({
   const [watchPreset, setWatchPreset] = useState<MarketWatchInput | null>(null);
   const [dialogNonce, setDialogNonce] = useState(0);
   const [trendWatch, setTrendWatch] = useState<MarketWatch | null>(null);
+  const loadSequence = useRef(0);
+  const loadController = useRef<AbortController | null>(null);
 
   const load = useCallback(async (showLoader = false) => {
+    loadController.current?.abort();
+    const controller = new AbortController();
+    loadController.current = controller;
+    const sequence = ++loadSequence.current;
     if (showLoader) setLoading(true);
     try {
-      setData(await api.marketResearch({
+      const result = await api.marketResearch({
         page,
         pageSize: 100,
         watchId: selectedWatch === "All" ? undefined : selectedWatch,
         status: status === "All" ? undefined : status,
-      }));
+      }, controller.signal);
+      if (sequence !== loadSequence.current || controller.signal.aborted) return;
+      setData(result);
     } catch (error) {
+      if (sequence !== loadSequence.current || controller.signal.aborted) return;
       onToast(errorMessage(error), "error");
     } finally {
-      if (showLoader) setLoading(false);
+      if (showLoader && sequence === loadSequence.current) setLoading(false);
     }
   }, [onToast, page, selectedWatch, status]);
 
@@ -303,19 +313,23 @@ function MarketWatchTrendDialog({ watch, refreshKey, onClose }: {
   const [trend, setTrend] = useState<MarketWatchTrend | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const trendSequence = useRef(0);
 
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
+    const sequence = ++trendSequence.current;
     setLoading(true);
     setError(null);
-    api.marketWatchTrend(watch.id, days).then((result) => {
-      if (!cancelled) setTrend(result);
+    api.marketWatchTrend(watch.id, days, controller.signal).then((result) => {
+      if (sequence !== trendSequence.current || controller.signal.aborted) return;
+      setTrend(result);
     }).catch((requestError) => {
-      if (!cancelled) setError(errorMessage(requestError));
+      if (sequence !== trendSequence.current || controller.signal.aborted) return;
+      setError(errorMessage(requestError));
     }).finally(() => {
-      if (!cancelled) setLoading(false);
+      if (sequence === trendSequence.current && !controller.signal.aborted) setLoading(false);
     });
-    return () => { cancelled = true; };
+    return () => { controller.abort(); };
   }, [watch.id, days, refreshKey]);
 
   useEffect(() => {
@@ -423,7 +437,7 @@ function MarketResearchTable({ listings, onViewSnapshot, rowBusy, onSaveCopy, on
             >
               <Bell size={17} />
             </button>
-            <a href={listing.url} target="_blank" rel="noreferrer" className="external-link" aria-label={`Open ${listing.title}`}><ExternalLink size={17} /></a>
+            <a href={listing.url} target="_blank" rel="noopener noreferrer" className="external-link" aria-label={`Open ${listing.title}`}><ExternalLink size={17} /></a>
           </span>
         </div>
       ))}
@@ -553,7 +567,7 @@ function MarketListingSnapshotModal({ listing, onClose, onToast, onSaved, onWatc
           )}
         </div>
         <div className="modal-footer">
-          <a className="outline-button" href={listing.url} target="_blank" rel="noreferrer">Open on {listing.marketplace}</a>
+          <a className="outline-button" href={listing.url} target="_blank" rel="noopener noreferrer">Open on {listing.marketplace}</a>
           <button className="outline-button" onClick={() => { onClose(); onWatch(listing); }}>
             <Bell size={16} />
             Save as research watch

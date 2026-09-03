@@ -68,7 +68,7 @@ export default function ListingsPage({
         if (!controller.signal.aborted) setLoadingPage(false);
       });
     return () => controller.abort();
-  }, [listings, page, selectedWatchId]);
+  }, [page, selectedWatchId]);
 
   const pageListings = remoteListings ?? listings;
   const filtered = useMemo(() => {
@@ -86,7 +86,7 @@ export default function ListingsPage({
         ? b.dealStrength - a.dealStrength
         : sort === "Price"
           ? a.price - b.price
-          : Date.parse(b.observedAt) - Date.parse(a.observedAt),
+          : (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0),
     );
   }, [pageListings, marketplace, deferredSearch, selectedWatchId, sort, decision]);
 

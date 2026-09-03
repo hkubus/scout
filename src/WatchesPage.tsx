@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
   Archive,
@@ -254,10 +254,10 @@ function WatchRow({
           </strong>
         </div>
         <b>
-          <i style={{ width: `${watch.readiness}%` }} />
+          <i style={{ width: `${Number.isFinite(watch.readiness) ? Math.min(100, Math.max(0, watch.readiness)) : 0}%` }} />
         </b>
         <small>
-          {watch.observationHours}h observed · {watch.readiness}% ready
+          {watch.observationHours}h observed · {Number.isFinite(watch.readiness) ? Math.min(100, Math.max(0, watch.readiness)) : 0}% ready
         </small>
       </div>
       <div className="watch-actions">
@@ -402,19 +402,23 @@ export function WatchAnalyticsDialog({ watch, onClose }: { watch: Watch; onClose
   const [analytics, setAnalytics] = useState<WatchAnalytics | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const sequenceRef = useRef(0);
 
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
+    const sequence = ++sequenceRef.current;
     setLoading(true);
     setError(null);
-    void api.watchAnalytics(watch.id, days).then((result) => {
-      if (!cancelled) setAnalytics(result);
+    void api.watchAnalytics(watch.id, days, controller.signal).then((result) => {
+      if (sequence !== sequenceRef.current || controller.signal.aborted) return;
+      setAnalytics(result);
     }).catch((requestError) => {
-      if (!cancelled) setError(errorMessage(requestError));
+      if (sequence !== sequenceRef.current || controller.signal.aborted) return;
+      setError(errorMessage(requestError));
     }).finally(() => {
-      if (!cancelled) setLoading(false);
+      if (sequence === sequenceRef.current && !controller.signal.aborted) setLoading(false);
     });
-    return () => { cancelled = true; };
+    return () => { controller.abort(); };
   }, [watch.id, days]);
 
   useEffect(() => {

@@ -3,9 +3,27 @@
 // resume after a home-server restart.
 // @ts-ignore node:sqlite is present in the supported Node 22+ runtime.
 import { DatabaseSync } from 'node:sqlite';
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
+
+function prunePreMigrationBackups(absolutePath: string, keep = 5) {
+  try {
+    const dir = dirname(absolutePath);
+    const base = absolutePath.split('/').at(-1) ?? '';
+    if (!existsSync(dir) || !base) return;
+    const stale = readdirSync(dir)
+      .filter((file) => file.startsWith(`${base}.pre-`) && file.endsWith('.sqlite'))
+      .map((file) => {
+        const match = file.match(/\.pre-[^-]+-(\d+)-/);
+        return { file, time: match ? Number(match[1]) : 0 };
+      })
+      .sort((a, b) => b.time - a.time);
+    for (const entry of stale.slice(keep)) {
+      try { unlinkSync(resolve(dir, entry.file)); } catch { /* best-effort */ }
+    }
+  } catch { /* pruning is best-effort */ }
+}
 
 export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data/scout.sqlite') {
   try { process.umask(0o077); } catch { /* permissions are best-effort on non-POSIX runtimes */ }
@@ -13,8 +31,10 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
   mkdirSync(dirname(absolutePath), { recursive: true });
   try { chmodSync(dirname(absolutePath), 0o700); } catch { /* permissions are best-effort on non-POSIX filesystems */ }
   const db = new DatabaseSync(absolutePath);
+  try { db.exec('PRAGMA busy_timeout = 5000;'); } catch { /* best-effort for concurrent writers */ }
   try { chmodSync(absolutePath, 0o600); } catch { /* permissions are best-effort on non-POSIX filesystems */ }
-  const migrationDirectory = resolve(process.cwd(), 'migrations');
+  const candidateMigrationDirs = [resolve(process.cwd(), 'migrations'), resolve(new URL('.', import.meta.url).pathname, '../migrations')];
+  const migrationDirectory = candidateMigrationDirs.find((dir) => existsSync(dir)) ?? resolve(process.cwd(), 'migrations');
   const migrationFiles = existsSync(migrationDirectory)
     ? readdirSync(migrationDirectory)
       .filter((file) => file.endsWith('.sql'))
@@ -76,6 +96,7 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
       }
     }
 
+    prunePreMigrationBackups(absolutePath);
     if (existsSync(absolutePath) && process.env.SCOUT_SKIP_MIGRATION_BACKUP !== 'true') {
       const backupPath = `${absolutePath}.pre-${id}-${Date.now()}-${randomBytes(3).toString('hex')}.sqlite`;
       const escapedBackupPath = backupPath.replace(/'/g, "''");

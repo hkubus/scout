@@ -166,7 +166,8 @@ export default function SettingsPage({
         settings?.ntfy?.configured ||
         ntfyTopic.trim() ||
         ntfyToken.trim() ||
-        ntfyServerUrl.trim() !== "https://ntfy.sh",
+        ntfyServerUrl.trim() !== "https://ntfy.sh" ||
+        ntfyMinimumPriority !== (settings?.ntfy?.minimumPriority ?? "exceptional"),
       );
       const result = await api.saveSettings({
         interval: numericInterval,
@@ -232,11 +233,16 @@ export default function SettingsPage({
   };
   const clearWebhook = async () => {
     if (!window.confirm("Remove the saved Discord webhook?")) return;
+    const numericInterval = Number(interval);
+    if (!Number.isInteger(numericInterval) || numericInterval < 5) {
+      onToast("Polling interval must be at least 5 minutes.", "error");
+      return;
+    }
     setSaving(true);
     try {
       setSettings(
         await api.saveSettings({
-          interval: Number(interval),
+          interval: numericInterval,
           clearWebhook: true,
         }),
       );
@@ -260,10 +266,15 @@ export default function SettingsPage({
   };
   const clearNtfy = async () => {
     if (!window.confirm("Remove the saved ntfy configuration?")) return;
+    const numericInterval = Number(interval);
+    if (!Number.isInteger(numericInterval) || numericInterval < 5) {
+      onToast("Polling interval must be at least 5 minutes.", "error");
+      return;
+    }
     setSaving(true);
     try {
       const result = await api.saveSettings({
-        interval: Number(interval),
+        interval: numericInterval,
         clearNtfy: true,
       });
       setSettings(result);
@@ -280,10 +291,15 @@ export default function SettingsPage({
   };
   const clearAiApiKey = async () => {
     if (!window.confirm("Remove the saved OpenRouter API key?")) return;
+    const numericInterval = Number(interval);
+    if (!Number.isInteger(numericInterval) || numericInterval < 5) {
+      onToast("Polling interval must be at least 5 minutes.", "error");
+      return;
+    }
     setSaving(true);
     try {
       const result = await api.saveSettings({
-        interval: Number(interval),
+        interval: numericInterval,
         ai: { clearApiKey: true },
       });
       setSettings(result);

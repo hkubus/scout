@@ -44,16 +44,17 @@ async function fetchJson<T>(path: string, init?: RequestInit, timeoutMs = 20_000
 async function request<T>(path: string, init?: RequestInit, timeoutMs?: number): Promise<T> {
   const canDedupe = (init?.method ?? 'GET').toUpperCase() === 'GET';
   if (!canDedupe) return fetchJson<T>(path, init, timeoutMs);
+  const dedupeKey = `${path}::${timeoutMs ?? 20_000}`;
 
-  const existing = inFlightGets.get(path);
+  const existing = inFlightGets.get(dedupeKey);
   if (existing) return init?.signal ? abortable(existing as Promise<T>, init.signal) : existing as Promise<T>;
 
   // Keep the shared transport independent from any one component's abort signal.
   // Each caller still gets an abortable view of the same response below.
-  const pending = fetchJson<T>(path);
-  inFlightGets.set(path, pending);
+  const pending = fetchJson<T>(path, undefined, timeoutMs);
+  inFlightGets.set(dedupeKey, pending);
   const clear = () => {
-    if (inFlightGets.get(path) === pending) inFlightGets.delete(path);
+    if (inFlightGets.get(dedupeKey) === pending) inFlightGets.delete(dedupeKey);
   };
   pending.then(clear, clear);
   return init?.signal ? abortable(pending, init.signal) : pending;
@@ -74,27 +75,27 @@ export const api = {
     if (options.watchId) params.set('watchId', options.watchId);
     return request<{ listings: DashboardData['listings']; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/listings${params.toString() ? `?${params}` : ''}`, { signal });
   },
-  watches: (includeArchived = false) => request<{ watches: Watch[] }>(`/api/watches?includeArchived=${includeArchived ? 'true' : 'false'}`),
-  watchAnalytics: (id: string, days = 30) => request<WatchAnalytics>(`/api/watches/${encodeURIComponent(id)}/analytics?days=${days}`),
-  createWatch: (watch: Watch) => request<{ watch: Watch }>('/api/watches', json('POST', watch)),
+  watches: (includeArchived = false, signal?: AbortSignal) => request<{ watches: Watch[] }>(`/api/watches?includeArchived=${includeArchived ? 'true' : 'false'}`, { signal }),
+  watchAnalytics: (id: string, days = 30, signal?: AbortSignal) => request<WatchAnalytics>(`/api/watches/${encodeURIComponent(id)}/analytics?days=${days}`, { signal }),
+  createWatch: (watch: Omit<Watch, 'id'> & { id?: string }) => request<{ watch: Watch }>('/api/watches', json('POST', watch)),
   updateWatch: (id: string, patch: Partial<Pick<Watch, 'name' | 'query' | 'terms' | 'excluded' | 'sources' | 'location' | 'condition' | 'interval' | 'exactUrls' | 'sensitivity' | 'shippingOnly' | 'aiRelevance' | 'typoVariants' | 'referenceMarketWatchId' | 'minPrice' | 'maxPrice' | 'enabled'>> & { archived?: boolean }) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
-  search: (filters: SearchFilters) => request<ManualSearchResponse>('/api/search', json('POST', filters), 60_000),
-  marketResearch: (options: { page?: number; pageSize?: number; watchId?: string; status?: 'active' | 'ended' | 'superseded' } = {}) => {
+  search: (filters: SearchFilters, signal?: AbortSignal) => request<ManualSearchResponse>('/api/search', { ...json('POST', filters), signal }, 60_000),
+  marketResearch: (options: { page?: number; pageSize?: number; watchId?: string; status?: 'active' | 'ended' | 'superseded' } = {}, signal?: AbortSignal) => {
     const params = new URLSearchParams();
     if (options.page !== undefined) params.set('page', String(options.page));
     if (options.pageSize !== undefined) params.set('pageSize', String(options.pageSize));
     if (options.watchId) params.set('watchId', options.watchId);
     if (options.status) params.set('status', options.status);
     const suffix = params.toString() ? `?${params.toString()}` : '';
-    return request<MarketResearchData>(`/api/market-watches${suffix}`);
+    return request<MarketResearchData>(`/api/market-watches${suffix}`, { signal });
   },
   createMarketWatch: (watch: MarketWatchInput) => request<{ watch: MarketWatch }>('/api/market-watches', json('POST', watch)),
   updateMarketWatch: (id: string, patch: Partial<Pick<MarketWatch, 'name' | 'query' | 'enabled' | 'intervalHours' | 'terms' | 'excluded' | 'location' | 'condition' | 'sources' | 'minPrice' | 'maxPrice' | 'shippingOnly' | 'typoVariants'>>) => request<{ ok: true }>(`/api/market-watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
   deleteMarketWatch: (id: string) => request<{ ok: true }>(`/api/market-watches/${encodeURIComponent(id)}`, json('DELETE')),
   scanMarketWatch: (id: string) => request<{ queued: boolean; message: string }>(`/api/market-watches/${encodeURIComponent(id)}/scan`, { method: 'POST' }),
-  marketWatchTrend: (id: string, days = 90) => request<MarketWatchTrend>(`/api/market-watches/${encodeURIComponent(id)}/trend?days=${days}`),
-  marketListingSnapshot: (id: number) => request<{ snapshot: MarketListingSnapshot | null }>(`/api/market-listings/${id}/snapshot`),
-  marketListingHistory: (id: number) => request<{ points: PriceHistoryPoint[] }>(`/api/market-listings/${id}/history`),
+  marketWatchTrend: (id: string, days = 90, signal?: AbortSignal) => request<MarketWatchTrend>(`/api/market-watches/${encodeURIComponent(id)}/trend?days=${days}`, { signal }),
+  marketListingSnapshot: (id: number, signal?: AbortSignal) => request<{ snapshot: MarketListingSnapshot | null }>(`/api/market-listings/${id}/snapshot`, { signal }),
+  marketListingHistory: (id: number, signal?: AbortSignal) => request<{ points: PriceHistoryPoint[] }>(`/api/market-listings/${id}/history`, { signal }),
   captureMarketListingSnapshot: (id: number) => request<{ snapshot: MarketListingSnapshot | null }>(`/api/market-listings/${id}/snapshot`, { method: 'POST' }, 60_000),
   marketSnapshotImageUrl: (imageId: number) => `/api/market-snapshot-images/${imageId}`,
   deleteWatch: (id: string) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('DELETE')),
@@ -103,7 +104,7 @@ export const api = {
   recommendNegotiation: (key: string, input: { maxTotalCost: number | null; shippingCost?: number; otherCosts?: number }) => request<NegotiationRecommendation>('/api/negotiation/recommendation', json('POST', { key, ...input })),
   draftNegotiation: (key: string, offerPrice: number | null = null, budget?: { maxTotalCost: number; shippingCost?: number; otherCosts?: number }) => request<NegotiationDraft>('/api/ai/negotiate/draft', json('POST', { key, offerPrice, ...budget })),
   negotiateAndSend: (key: string, offerPrice: number | null = null, budget?: { maxTotalCost: number; shippingCost?: number; otherCosts?: number }, message?: string) => request<NegotiationResult>('/api/ai/negotiate', json('POST', { key, offerPrice, message, ...budget })),
-  messages: (options: { page?: number; pageSize?: number } = {}) => request<{ messages: SellerMessage[]; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/messages?page=${options.page ?? 1}&pageSize=${options.pageSize ?? 100}`),
+  messages: (options: { page?: number; pageSize?: number } = {}, signal?: AbortSignal) => request<{ messages: SellerMessage[]; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/messages?page=${options.page ?? 1}&pageSize=${options.pageSize ?? 100}`, { signal }),
   listingAction: (key: string) => request<ListingAction>(`/api/listing-actions?key=${encodeURIComponent(key)}`),
   updateListingAction: (key: string, action: { decision: ListingDecision | null; note: string }) => request<{ action: ListingAction }>('/api/listing-actions', json('PATCH', { key, ...action })),
   scan: (watchId?: string) => request<{ queued: boolean; message: string }>('/api/scans', json('POST', watchId ? { watchId } : {})),
@@ -113,9 +114,9 @@ export const api = {
   deleteMarketplaceSession: (marketplace: Marketplace) => request<SettingsData>(`/api/marketplace-sessions/${encodeURIComponent(marketplace)}`, json('DELETE')),
   testWebhook: () => request<{ delivered: boolean }>('/api/settings/webhook/test', { method: 'POST' }),
   testNtfy: () => request<{ delivered: boolean }>('/api/settings/ntfy/test', { method: 'POST' }),
-  notifications: (options: { page?: number; pageSize?: number } = {}) => request<{ notifications: NotificationRecord[]; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/notifications?page=${options.page ?? 1}&pageSize=${options.pageSize ?? 100}`),
-  connectorRuns: (options: { page?: number; pageSize?: number } = {}) => request<{ runs: ConnectorRun[]; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/connector-runs?page=${options.page ?? 1}&pageSize=${options.pageSize ?? 100}`),
-  logs: () => request<{ logs: LogEntry[] }>('/api/logs'),
+  notifications: (options: { page?: number; pageSize?: number } = {}, signal?: AbortSignal) => request<{ notifications: NotificationRecord[]; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/notifications?page=${options.page ?? 1}&pageSize=${options.pageSize ?? 100}`, { signal }),
+  connectorRuns: (options: { page?: number; pageSize?: number } = {}, signal?: AbortSignal) => request<{ runs: ConnectorRun[]; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/connector-runs?page=${options.page ?? 1}&pageSize=${options.pageSize ?? 100}`, { signal }),
+  logs: (signal?: AbortSignal) => request<{ logs: LogEntry[] }>('/api/logs', { signal }),
   exportData: () => request<Record<string, unknown>>('/api/export'),
   backup: () => request<{ backup: string; message: string }>('/api/backup', { method: 'POST' }),
 };

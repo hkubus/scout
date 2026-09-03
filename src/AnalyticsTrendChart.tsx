@@ -9,7 +9,16 @@ export function formatAnalyticsPrice(value: number | null) {
 
 export function formatAnalyticsDate(value: string | null) {
   if (!value) return "—";
-  return new Date(value.includes("T") ? value : `${value}T00:00:00Z`).toLocaleDateString("pl-PL", {
+  let date: Date;
+  if (value.includes("T")) {
+    date = new Date(value);
+  } else {
+    const parts = value.split("-").map(Number);
+    date = parts.length === 3 && parts.every(Number.isFinite)
+      ? new Date(parts[0], parts[1] - 1, parts[2])
+      : new Date(value);
+  }
+  return date.toLocaleDateString("pl-PL", {
     day: "2-digit",
     month: "short",
   });
@@ -31,8 +40,9 @@ export function AnalyticsTrendChart({ analytics, referenceMedian = null }: { ana
     return <div className="analytics-chart-empty">Not enough observations to draw a trend yet.</div>;
   }
   const values = plotted.flatMap(({ point }) => [point.lowerPrice, point.medianPrice, point.upperPrice]).filter((value): value is number => value !== null);
-  const rawMin = Math.min(...values);
-  const rawMax = Math.max(...values);
+  const domainValues = referenceMedian !== null && referenceMedian !== undefined && Number.isFinite(referenceMedian) ? [...values, referenceMedian] : values;
+  const rawMin = Math.min(...domainValues);
+  const rawMax = Math.max(...domainValues);
   const spread = rawMax - rawMin;
   const min = spread ? rawMin : Math.max(0, rawMin - Math.max(rawMin * 0.05, 1));
   const max = spread ? rawMax : rawMax + Math.max(rawMax * 0.05, 1);
@@ -44,7 +54,7 @@ export function AnalyticsTrendChart({ analytics, referenceMedian = null }: { ana
   const lowerPath = plotted.slice().reverse().map(({ point, index }) => `${x(index)},${y(point.lowerPrice ?? point.medianPrice!)}`).join(" ");
   const medianPath = plotted.map(({ point, index }) => `${x(index)},${y(point.medianPrice!)}`).join(" ");
   const labelPoints = analytics.points.length > 2 ? [analytics.points[0], analytics.points[Math.floor((analytics.points.length - 1) / 2)], analytics.points[analytics.points.length - 1]] : analytics.points;
-  const showReference = referenceMedian !== null && referenceMedian >= min && referenceMedian <= max;
+  const showReference = referenceMedian !== null && referenceMedian !== undefined && Number.isFinite(referenceMedian);
   return (
     <>
       <svg className="analytics-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${analytics.watchName} median price trend`}>
@@ -60,7 +70,7 @@ export function AnalyticsTrendChart({ analytics, referenceMedian = null }: { ana
         })}
         <path d={`${upperPath} ${lowerPath} Z`} className="analytics-band" />
         <polyline points={medianPath} className="analytics-line" />
-        {showReference ? <line x1={padding.left} x2={width - padding.right} y1={y(referenceMedian)} y2={y(referenceMedian)} className="analytics-reference-line" /> : null}
+        {showReference ? <line x1={padding.left} x2={width - padding.right} y1={y(referenceMedian as number)} y2={y(referenceMedian as number)} className="analytics-reference-line" /> : null}
         {plotted.map(({ point, index }) => (
           <circle key={`${point.date}-${index}`} cx={x(index)} cy={y(point.medianPrice!)} r="3.5" className="analytics-point">
             <title>{`${formatAnalyticsDate(point.date)} · ${formatAnalyticsPrice(point.medianPrice)}`}</title>

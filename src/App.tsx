@@ -88,8 +88,8 @@ const preloadView = (view: View) => {
 };
 
 function viewFromLocation(): View {
-  const candidate = window.location.pathname.replace(/^\//, "") as View;
-  return navItems.some((item) => item.id === candidate) ? candidate : "overview";
+  const raw = window.location.pathname.split(/[?#]/)[0].replace(/\/+$/, "").replace(/^\//, "") as View;
+  return navItems.some((item) => item.id === raw) ? raw : "overview";
 }
 
 const errorMessage = (error: unknown) =>
@@ -283,7 +283,7 @@ function App() {
       setScanning(false);
     }
   };
-  const createWatch = async (watch: Watch) => {
+  const createWatch = async (watch: Omit<Watch, "id"> & { id?: string }) => {
     const result = await api.createWatch(watch);
     setData((previous) => ({
       ...previous,
@@ -366,20 +366,26 @@ function App() {
         throw error;
       }
     });
-  const updateWatch = async (watch: Watch) =>
-    withBusyWatch(watch, async () => {
+  const updateWatch = async (watch: Omit<Watch, "id"> & { id?: string }) => {
+    if (!watch.id) {
+      notify("Watch id is missing.", "error");
+      throw new Error("Watch id is missing");
+    }
+    const fullWatch = watch as Watch;
+    return withBusyWatch(fullWatch, async () => {
       try {
-        await api.updateWatch(watch.id, { name: watch.name, query: watch.query, terms: watch.terms, excluded: watch.excluded, sources: watch.sources, location: watch.location, condition: watch.condition, interval: watch.interval, exactUrls: watch.exactUrls, sensitivity: watch.sensitivity, shippingOnly: watch.shippingOnly, typoVariants: watch.typoVariants, aiRelevance: watch.aiRelevance, referenceMarketWatchId: watch.referenceMarketWatchId, minPrice: watch.minPrice, maxPrice: watch.maxPrice, enabled: watch.enabled });
+        await api.updateWatch(fullWatch.id, { name: fullWatch.name, query: fullWatch.query, terms: fullWatch.terms, excluded: fullWatch.excluded, sources: fullWatch.sources, location: fullWatch.location, condition: fullWatch.condition, interval: fullWatch.interval, exactUrls: fullWatch.exactUrls, sensitivity: fullWatch.sensitivity, shippingOnly: fullWatch.shippingOnly, typoVariants: fullWatch.typoVariants, aiRelevance: fullWatch.aiRelevance, referenceMarketWatchId: fullWatch.referenceMarketWatchId, minPrice: fullWatch.minPrice, maxPrice: fullWatch.maxPrice, enabled: fullWatch.enabled });
         await refreshData(false);
         setEditingFullWatch(null);
         setAllWatches(null);
         setWatchRefreshKey((value) => value + 1);
-        notify(`${watch.name} updated.`);
+        notify(`${fullWatch.name} updated.`);
       } catch (error) {
         notify(errorMessage(error), "error");
         throw error;
       }
     });
+  };
   const archiveWatch = (watch: Watch) =>
     withBusyWatch(watch, async () => {
       const archived = Boolean(watch.archivedAt);
@@ -743,7 +749,7 @@ function Overview({
         .sort((a, b) =>
           sort === "Deal"
             ? b.dealStrength - a.dealStrength
-            : Date.parse(b.observedAt) - Date.parse(a.observedAt),
+            : (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0),
         ),
     [data.listings, marketplace, strength, sort],
   );
@@ -968,9 +974,9 @@ function LearningPanel({
                 {watch.status}
               </span>
               <span className="readiness">
-                <em>{watch.readiness}%</em>
+                <em>{Number.isFinite(watch.readiness) ? Math.min(100, Math.max(0, watch.readiness)) : 0}%</em>
                 <b>
-                  <i style={{ width: `${watch.readiness}%` }} />
+                  <i style={{ width: `${Number.isFinite(watch.readiness) ? Math.min(100, Math.max(0, watch.readiness)) : 0}%` }} />
                 </b>
               </span>
             </div>
