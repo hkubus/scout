@@ -1,5 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
+import { connect as connectHttp2 } from 'node:http2';
 import { chromium, type Browser, type BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
@@ -113,6 +114,10 @@ const SNAPSHOT_MAX_ATTEMPTS = 3;
  * The anonymous marketplace APIs (OLX offers, Vinted catalog, Lokalnie
  * additional-data) reject Scout's plain identifier UA; a modern Chrome UA plus
  * `Accept: application/json` is the verified anonymous access contract.
+ * OLX additionally requires HTTP/2: its CloudFront distribution answers
+ * HTTP/1.1 API requests with `403 Request blocked` while the same request over
+ * HTTP/2 returns 200, so the OLX fetcher below uses `node:http2` (Node's
+ * undici `fetch` is HTTP/1.1-only).
  */
 const MARKETPLACE_API_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 /** Scan-path log entries kept in memory for the Logs tab; pure diagnostics, never persisted. */
@@ -239,6 +244,77 @@ function parseListingKey(key: string): { marketplace: Marketplace; listingId: st
 
 function safePromptText(value: unknown, limit = 240) {
   return String(value ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
+}
+
+/**
+ * Single OLX offers-API request over HTTP/2. OLX's CloudFront distribution
+ * answers HTTP/1.1 API requests with `403 Request blocked` while the identical
+ * request over HTTP/2 returns 200 (verified 2026-09-14 with curl
+ * `--http1.1` vs default, and Node undici vs `node:http2`), so this bypasses
+ * `fetch` (HTTP/1.1-only in undici) for the OLX path. A fresh session per
+ * request keeps scan volumes simple; bodies are fully consumed before the
+ * session closes, so no socket-diagnostic discard is needed.
+ */
+function fetchOlxApiSingleRequest(url: string, timeoutMs: number): Promise<{ status: number; json: unknown; location: string | null }> {
+  return new Promise((resolve, reject) => {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      reject(new Error('Invalid URL'));
+      return;
+    }
+    const session = connectHttp2(`${parsed.protocol}//${parsed.host}`);
+    let settled = false;
+    const fail = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        session.destroy();
+      } catch { /* session already gone */ }
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const timer = setTimeout(() => fail(new Error('OLX offers API request timed out')), timeoutMs);
+    timer.unref?.();
+    session.on('error', fail);
+    const request = session.request({
+      ':method': 'GET',
+      ':path': `${parsed.pathname}${parsed.search}`,
+      'user-agent': MARKETPLACE_API_USER_AGENT,
+      accept: 'application/json',
+    });
+    request.on('error', fail);
+    request.on('close', () => {
+      if (!settled) fail(new Error('OLX offers API request closed before completing'));
+    });
+    const chunks: Buffer[] = [];
+    let status = 0;
+    let location: string | null = null;
+    request.on('response', (headers) => {
+      status = Number(headers[':status'] ?? 0);
+      const rawLocation = headers.location;
+      location = Array.isArray(rawLocation) ? (rawLocation[0] ?? null) : (rawLocation ?? null);
+    });
+    request.on('data', (chunk) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array));
+    });
+    request.on('end', () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        session.close();
+      } catch { /* session already gone */ }
+      const raw = Buffer.concat(chunks).toString('utf8');
+      let json: unknown = null;
+      try {
+        json = raw ? JSON.parse(raw) : null;
+      } catch { /* non-JSON bodies (e.g. challenge pages) surface through the status */ }
+      resolve({ status, json, location });
+    });
+    request.end();
+  });
 }
 
 export function validateNegotiationMessage(message: string, offerPrice: number | null = null) {
@@ -2691,21 +2767,19 @@ export class ScoutService {
   private async fetchOlxApi(url: string): Promise<OlxApiFetchResult> {
     const validation = validateSearchUrl(url, 'OLX');
     if (!validation.valid) throw new Error(validation.reason);
-    const headers = { 'user-agent': MARKETPLACE_API_USER_AGENT, accept: 'application/json' };
-    let response = await fetch(validation.url, { redirect: 'manual', headers, signal: AbortSignal.timeout(12_000) });
-    for (let hop = 0; hop < 3 && response.status >= 300 && response.status < 400; hop += 1) {
-      const location = response.headers.get('location');
-      const status = response.status;
-      discardResponse(response, 'olx-api');
-      if (!location) throw new Error(`Unexpected redirect (${status})`);
-      const redirected = new URL(location, hop === 0 ? validation.url : response.url ?? validation.url).toString();
-      const redirectValidation = validateSearchUrl(redirected, 'OLX');
-      if (!redirectValidation.valid) throw new Error('Marketplace redirected off the approved domain');
-      response = await fetch(redirectValidation.url, { redirect: 'manual', headers, signal: AbortSignal.timeout(12_000) });
+    let requestUrl = validation.url;
+    for (let hop = 0; hop <= 3; hop += 1) {
+      const hopValidation = validateSearchUrl(requestUrl, 'OLX');
+      if (!hopValidation.valid) throw new Error('Marketplace redirected off the approved domain');
+      const { status, json, location } = await fetchOlxApiSingleRequest(hopValidation.url, 12_000);
+      if (status >= 300 && status < 400 && hop < 3) {
+        if (!location) throw new Error(`Unexpected redirect (${status})`);
+        requestUrl = new URL(location, hopValidation.url).toString();
+        continue;
+      }
+      return { status, json };
     }
-    let json: unknown = null;
-    try { json = await response.json(); } catch { /* non-JSON bodies (e.g. challenge pages) surface through the status */ }
-    return { status: response.status, json };
+    throw new Error('Too many redirects');
   }
 
   private vintedCookieJar: { header: string } | null = null;
