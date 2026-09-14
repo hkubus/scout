@@ -148,7 +148,7 @@ Body: `{"offer_ids": ["<uuid>", ...]}` — the site itself batches **60 per requ
 Response: `200` JSON **array** of GA4-ecommerce-style objects:
 ```jsonc
 {
-  "item_type": "buy_now",              // 'buy_now' | 'classified' (presumably; ogłoszenie)
+  "item_type": "buy_now",              // 'buy_now' | 'classified' | 'bidding' (auction/Licytacja; verified 2026-09)
   "item_id": "lenovo-legion-7-...",     // ⚠️ SLUG, not the uuid
   "item_brand": "Lenovo",
   "item_category": "Laptopy",
@@ -211,6 +211,8 @@ Gotchas (verified):
     "itemCondition": "https://schema.org/NewCondition" } }] }
 ```
 Mapping: `name`→title, `offers.price`→price, `priceCurrency`→currency, `url`→url, `image.url`→imageUrl, `itemCondition`→condition. **Recommend parsing this blob instead of the `mlc-itembox` card regexes** — far more stable. Cards/`data-card-analytics-click` remain the source for the uuid and for location/shipping/negotiable (not in JSON-LD).
+
+⚠️ The JSON-LD `ItemList` includes **auctions**, which have no format field there. Only the rendered cards expose the format (`mlc-itembox__offer-type--buy_now` / `--classified` / `--bidding` = `Kup teraz` / `Ogłoszenie` / `Licytacja`). Scout monitors fixed-price listings, so auction slugs are read off the cards and their JSON-LD twins are dropped (see `allegroAuctionSlugs` in `server/marketplaces.ts`). Without this, auctions leak into results with `shippingAvailable: null`.
 
 ### Official `api.allegro.pl` (OAuth) — buys nothing for Lokalnie
 1. Register at apps.developer.allegro.pl (free, ≤5 app keys, 2FA required on the prod account; sandbox needs none) → Client ID/Secret.

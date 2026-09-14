@@ -312,6 +312,32 @@ function allegroSlugFromUrl(url: string) {
   } catch { return null; }
 }
 
+/**
+ * Scout monitors fixed-price listings, so Lokalnie auctions (`--bidding`,
+ * "Licytacja") are out of scope. The offer-type badge only exists on rendered
+ * cards, while the embedded JSON-LD `ItemList` lists every offer without a
+ * format, so auction slugs are collected from the cards and the JSON-LD twin
+ * is dropped by slug.
+ */
+function allegroAuctionSlugs(html: string): Set<string> {
+  const slugs = new Set<string>();
+  const starts = [...html.matchAll(/<article[^>]*class=["'][^"']*mlc-itembox__container[^"']*["'][^>]*>/gi)];
+  for (let index = 0; index < starts.length; index += 1) {
+    const chunk = html.slice(starts[index].index, starts[index + 1]?.index ?? html.length);
+    const offerTag = chunk.match(/<span[^>]*class=["'][^"']*mlc-itembox__offer-type[^"']*["'][^>]*>[\s\S]*?<\/span>/i)?.[0];
+    if (!offerTag) continue;
+    const offerClass = attribute(offerTag, 'class') ?? '';
+    const isAuction = /mlc-itembox__offer-type--bidding/i.test(offerClass) || /licytacja/i.test(textContent(offerTag));
+    if (!isAuction) continue;
+    const linkTag = [...chunk.matchAll(/<a[^>]*>/gi)].map((match) => match[0]).find((tag) => /itemprop=["']url["']/i.test(tag));
+    const href = linkTag ? attribute(linkTag, 'href') : undefined;
+    if (!href) continue;
+    const slug = allegroSlugFromUrl(new URL(href, 'https://allegrolokalnie.pl').toString());
+    if (slug) slugs.add(slug);
+  }
+  return slugs;
+}
+
 const ALLEGRO_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Map schema.org itemCondition markers onto the Polish labels Scout stores. */
@@ -576,6 +602,7 @@ export function parseStructuredListings(html: string, marketplace: Marketplace) 
     } catch { /* malformed JSON-LD is common in blocked pages */ }
   }
   const unique = new Map<string, NormalizedListing>();
+  const auctionSlugs = marketplace === 'Allegro Lokalnie' ? allegroAuctionSlugs(html) : null;
   const cardListings = marketplace === 'OLX' ? parseOlxCards(html) : marketplace === 'Allegro Lokalnie' ? parseAllegroCards(html) : parseVintedCards(html);
   if (marketplace === 'Allegro Lokalnie') {
     // The Lokalnie SSR search page embeds a schema.org ItemList (the stable
@@ -606,6 +633,10 @@ export function parseStructuredListings(html: string, marketplace: Marketplace) 
     for (const listing of cardListings) listings.push(listing);
   }
   for (const listing of listings) {
+    if (auctionSlugs) {
+      const slug = allegroSlugFromUrl(listing.url);
+      if (slug && auctionSlugs.has(slug)) continue;
+    }
     const key = dedupeKey(listing);
     const previous = unique.get(key);
     unique.set(key, previous && listing.priceNegotiable === null && previous.priceNegotiable !== null && previous.priceNegotiable !== undefined

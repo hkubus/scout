@@ -478,6 +478,28 @@ test('parses Allegro Lokalnie offer type as shipping availability', () => {
   assert.deepEqual(listings.map((listing) => listing.listingId), ['buy-1', 'classified-1']);
 });
 
+test('excludes Allegro Lokalnie auctions that otherwise leak through the JSON-LD ItemList', () => {
+  const jsonLd = `<script type="application/ld+json">${JSON.stringify({
+    '@type': 'ItemList', itemListElement: [
+      { position: 1, item: { name: 'Steam Deck buy now', url: 'https://allegrolokalnie.pl/oferta/steam-deck-buy', offers: { price: '1200' } } },
+      { position: 2, item: { name: 'Steam Deck auction', url: 'https://allegrolokalnie.pl/oferta/steam-deck-auction', offers: { price: '900' } } },
+    ],
+  })}</script>`;
+  const cards = `
+    <article class="mlc-itembox__container" data-card-analytics-click="buy-1">
+      <a href="/oferta/steam-deck-buy" itemprop="url"><h3 itemprop="itemOffered">Steam Deck buy now</h3></a>
+      <span class="mlc-itembox__offer-type mlc-itembox__offer-type--buy_now">Kup teraz</span>
+      <span class="ml-offer-price__dollars">1 200</span>
+    </article>
+    <article class="mlc-itembox__container" data-card-analytics-click="auction-1">
+      <a href="/oferta/steam-deck-auction" itemprop="url"><h3 itemprop="itemOffered">Steam Deck auction</h3></a>
+      <span class="mlc-itembox__offer-type mlc-itembox__offer-type--bidding">Licytacja</span>
+      <span class="ml-offer-price__dollars">900</span>
+    </article>`;
+  const listings = parseStructuredListings(`${jsonLd}${cards}`, 'Allegro Lokalnie');
+  assert.deepEqual(listings.map((listing) => listing.url), ['https://allegrolokalnie.pl/oferta/steam-deck-buy']);
+});
+
 test('reads shipping state from Vinted and marketplace detail-page signals', () => {
     assert.equal(parseShippingAvailability('<div data-testid="item-shipping-banner"><h3>Wysyłka</h3></div>', 'Vinted'), true);
     assert.equal(parseShippingAvailability('<main><p>Tylko odbiór osobisty</p></main>', 'Vinted'), false);

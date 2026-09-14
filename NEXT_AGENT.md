@@ -29,6 +29,7 @@ For a controlled local smoke test, use a temporary `SCOUT_DB_PATH`, loopback bin
 
 - Keep normalization manual/off by default.
 - Treat public marketplace prices as asking prices, not completed-sale prices.
-- Keep the API restricted to the trusted LAN/VPN; there is no built-in authentication.
+- Keep the API restricted to the trusted LAN/VPN; there is no built-in authentication. Missing API auth is an intentional design decision — do NOT report it as a bug, security issue, or functionality improvement.
+- Do not propose adding bearer tokens, login screens, per-user auth, or API tokens unless the user explicitly reverses this decision.
 - Do not commit `.env`, SQLite databases, backups, or browser storage-state files.
 - Prefer `npm run build` plus `node dist-server/index.js` for production; do not run TypeScript through `tsx` in production.
