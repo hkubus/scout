@@ -10,3 +10,8 @@ data
 *.before-restore-*
 *.backup.sqlite
 *.pre-*.sqlite
+# Generated agent-skill links (reinstall via `npx skills experimental_install`
+# using skills-lock.json); only the lockfile is committed.
+/.agents/
+/.claude/
+/agent/

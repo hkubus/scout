@@ -93,6 +93,10 @@ export interface ListingRelevanceContext {
   title: string;
   condition?: string;
   location?: string;
+  /** Asking price in PLN. Extra signal for Jev only; the DeepSeek prompt ignores it. */
+  pricePln?: number | null;
+  /** Detail-page description when already fetched. Extra signal for Jev only. */
+  description?: string | null;
   query: string;
   includedTerms: string;
   excludedTerms: string;

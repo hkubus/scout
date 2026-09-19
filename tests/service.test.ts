@@ -6,7 +6,14 @@ import { tmpdir } from 'node:os';
 import { openDatabase } from '../server/db';
 import { parseMarketplaceStorageState } from '../server/marketplace-sessions';
 import { DeepSeekError } from '../server/ai';
+import { listingDescriptionVerificationInputHash, listingRelevanceInputHash } from '../server/ai';
+import { VisionError } from '../server/vision';
 import { ScoutService, ServiceError, decryptSecret, encryptSecret, filterListings, marketStatusAfterMiss, nextWatchScanAt, validateDiscordWebhook, type ScoutServiceDependencies } from '../server/service';
+
+// Pin the legacy DeepSeek path for pre-existing tests: live Jev is the
+// production default whenever a key is available, but these tests assert
+// legacy behavior. Live-path tests below opt in explicitly via liveJevEnv().
+if (process.env.SCOUT_JEV_MODE === undefined) process.env.SCOUT_JEV_MODE = 'legacy';
 
 function fixture(dependencies: ScoutServiceDependencies = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'scout-service-'));
@@ -964,7 +971,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1303,7 +1310,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 17);
+    assert.equal(after.migrations.count, 18);
   } finally { context.close(); }
 });
 
@@ -1421,6 +1428,330 @@ test('records failed preservation attempts and stops retrying after the cap', as
     assert.equal(context.service.marketListingSnapshot(listingRow.id), null);
   } finally {
     globalThis.fetch = originalFetch;
+    context.close();
+  }
+});
+
+test('keeps Jev shadow logging inert unless shadow mode is explicitly enabled', () => {
+  const context = fixture();
+  const previousMode = process.env.SCOUT_JEV_MODE;
+  const previousKeys = [process.env.SCOUT_OPENROUTER_API_KEY, process.env.OPENROUTER_API_KEY, process.env.SCOUT_DEEPSEEK_API_KEY];
+  try {
+    delete process.env.SCOUT_JEV_MODE;
+    delete process.env.SCOUT_OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.SCOUT_DEEPSEEK_API_KEY;
+    assert.equal((context.service as any).jevShadowConfig(), null);
+    process.env.SCOUT_JEV_MODE = 'live';
+    assert.equal((context.service as any).jevShadowConfig(), null);
+    process.env.SCOUT_JEV_MODE = 'shadow';
+    assert.equal((context.service as any).jevShadowConfig(), null);
+    // A missing table (migration not yet applied) must never break callers.
+    context.db.exec('DROP TABLE jev_shadow_log');
+    assert.doesNotThrow(() => (context.service as any).logJevShadow({
+      task: 'relevance', inputHash: 'abc', jevModel: '~typesafe/jev-latest',
+    }));
+  } finally {
+    if (previousMode === undefined) delete process.env.SCOUT_JEV_MODE;
+    else process.env.SCOUT_JEV_MODE = previousMode;
+    if (previousKeys[0] !== undefined) process.env.SCOUT_OPENROUTER_API_KEY = previousKeys[0];
+    if (previousKeys[1] !== undefined) process.env.OPENROUTER_API_KEY = previousKeys[1];
+    if (previousKeys[2] !== undefined) process.env.SCOUT_DEEPSEEK_API_KEY = previousKeys[2];
+    context.close();
+  }
+});
+
+function liveJevEnv() {
+  const previous = {
+    mode: process.env.SCOUT_JEV_MODE,
+    key: process.env.SCOUT_OPENROUTER_API_KEY,
+    legacy: process.env.OPENROUTER_API_KEY,
+    deep: process.env.SCOUT_DEEPSEEK_API_KEY,
+  };
+  process.env.SCOUT_JEV_MODE = 'live';
+  process.env.SCOUT_OPENROUTER_API_KEY = 'sk-or-v1-test';
+  delete process.env.OPENROUTER_API_KEY;
+  delete process.env.SCOUT_DEEPSEEK_API_KEY;
+  return () => {
+    if (previous.mode === undefined) delete process.env.SCOUT_JEV_MODE;
+    else process.env.SCOUT_JEV_MODE = previous.mode;
+    if (previous.key === undefined) delete process.env.SCOUT_OPENROUTER_API_KEY;
+    else process.env.SCOUT_OPENROUTER_API_KEY = previous.key;
+    if (previous.legacy !== undefined) process.env.OPENROUTER_API_KEY = previous.legacy;
+    if (previous.deep !== undefined) process.env.SCOUT_DEEPSEEK_API_KEY = previous.deep;
+  };
+}
+
+function liveListing(overrides: Record<string, any> = {}) {
+  return {
+    marketplace: 'OLX',
+    listingId: 'live-1',
+    title: 'PS5 console',
+    price: 2000,
+    currency: 'PLN',
+    url: 'https://www.olx.pl/d/oferta/live-1',
+    imageUrl: 'https://img.example/thumb.jpg',
+    condition: 'like-new',
+    location: 'Warszawa',
+    shippingAvailable: null,
+    priceNegotiable: null,
+    observedAt: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+test('decides relevance live with Jev and never calls DeepSeek', async () => {
+  const restore = liveJevEnv();
+  const context = fixture({
+    classifyListingRelevance: async () => { throw new Error('DeepSeek must not be called in live mode'); },
+    classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.92, unsure: false }),
+    classifyListingRelevanceWithVision: async () => { throw new Error('Vision must not be called for sure judgments'); },
+  });
+  try {
+    const result = await (context.service as any).filterListingsByAiRelevance(
+      [liveListing()], { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
+    );
+    assert.equal(result.listings.length, 1);
+    assert.equal(result.excluded, 0);
+    assert.equal(result.unknown, 0);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('escalates unsure live relevance through a bounded detail fetch', async () => {
+  const restore = liveJevEnv();
+  const detailCalls: Array<[string, string]> = [];
+  const context = fixture({
+    classifyListingRelevanceWithJev: async (ctx: any) => ctx.description
+      ? { relevant: false, p: 0.2, unsure: false }
+      : { relevant: true, p: 0.55, unsure: true },
+    fetchListingDetailHtml: async (url: string, marketplace: string) => {
+      detailCalls.push([url, marketplace]);
+      return '<meta property="og:description" content="Only the empty box, console not included.">';
+    },
+    classifyListingRelevanceWithVision: async () => { throw new Error('Vision must not be called after a sure second judgment'); },
+  });
+  try {
+    const result = await (context.service as any).filterListingsByAiRelevance(
+      [liveListing()], { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
+    );
+    assert.equal(result.listings.length, 0);
+    assert.equal(result.excluded, 1);
+    assert.deepEqual(detailCalls, [['https://www.olx.pl/d/oferta/live-1', 'OLX']]);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('uses the vision thumbnail tiebreak when enriched Jev stays unsure, and vision direct on Jev failure', async () => {
+  const restore = liveJevEnv();
+  const seen: Array<{ imageUrl: unknown }> = [];
+  const unsure = fixture({
+    classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.5, unsure: true }),
+    fetchListingDetailHtml: async () => '<html></html>',
+    classifyListingRelevanceWithVision: async (input: any) => {
+      seen.push({ imageUrl: input.imageUrl });
+      return { relevant: true, confidence: 0.66, imagesSeen: 1 };
+    },
+  });
+  const failed = fixture({
+    classifyListingRelevanceWithJev: async () => { throw new Error('Decisions 520'); },
+    classifyListingRelevanceWithVision: async () => ({ relevant: false, confidence: 0.8, imagesSeen: 1 }),
+  });
+  const bothFailed = fixture({
+    classifyListingRelevanceWithJev: async () => { throw new Error('Decisions 520'); },
+    classifyListingRelevanceWithVision: async () => { throw new Error('Vision 502'); },
+  });
+  try {
+    const tiebreak = await (unsure.service as any).filterListingsByAiRelevance(
+      [liveListing()], { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
+    );
+    assert.equal(tiebreak.listings.length, 1);
+    assert.deepEqual(seen, [{ imageUrl: 'https://img.example/thumb.jpg' }]);
+    const direct = await (failed.service as any).filterListingsByAiRelevance(
+      [liveListing()], { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
+    );
+    assert.equal(direct.excluded, 1);
+    const unknown = await (bothFailed.service as any).filterListingsByAiRelevance(
+      [liveListing()], { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
+    );
+    assert.equal(unknown.listings.length, 1);
+    assert.equal(unknown.unknown, 1);
+  } finally {
+    restore();
+    unsure.close();
+    failed.close();
+    bothFailed.close();
+  }
+});
+
+test('verifies high-priority deals live with Jev and vision escalation', async () => {
+  const restore = liveJevEnv();
+  const detailHtml = [
+    '<meta property="og:description" content="Fully working console, complete set, no defects.">',
+    '<meta property="og:image" content="https://ireland.apollo.olxcdn.com/v1/files/def-PL/image;s=644x461">',
+  ].join('');
+  const candidate = {
+    watchId: 'live-watch',
+    listing: liveListing(),
+    typical: 2500,
+    discountPercent: 25,
+    confidence: 0.9,
+    requiresDescriptionVerification: true,
+  };
+  const visionCalls: Array<{ imageUrls: unknown }> = [];
+  const context = fixture({
+    classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.9, unsure: false }),
+    verifyListingDescriptionWithJev: async (ctx: any) => ctx.description?.includes('suspicious')
+      ? { decision: 'reject', confidence: 0.4, unsure: true }
+      : { decision: 'pass', confidence: 0.85, unsure: false },
+    verifyListingDescriptionWithVision: async (input: any) => {
+      visionCalls.push({ imageUrls: input.imageUrls });
+      return { decision: 'pass', confidence: 0.78, issues: [], imagesSeen: input.imageUrls.length };
+    },
+  });
+  (context.service as any).fetchPublicPage = async () => detailHtml;
+  const failing = fixture({
+    verifyListingDescriptionWithJev: async () => { throw new Error('Decisions 520'); },
+    verifyListingDescriptionWithVision: async () => { throw new VisionError('Vision 502', 502); },
+  });
+  (failing.service as any).fetchPublicPage = async () => detailHtml;
+  try {
+    assert.equal(await (context.service as any).verifyHighPriorityDealOnce(candidate), true);
+    assert.equal(visionCalls.length, 0);
+    const suspicious = { ...candidate, listing: liveListing({ listingId: 'live-2', url: 'https://www.olx.pl/d/oferta/live-2' }) };
+    (context.service as any).fetchPublicPage = async () => detailHtml.replace('Fully working', 'suspicious wiring, Fully working');
+    assert.equal(await (context.service as any).verifyHighPriorityDealOnce(suspicious), true);
+    assert.equal(visionCalls.length, 1);
+    assert.equal((visionCalls[0].imageUrls as string[]).length, 1);
+    // Vision outage keeps today's fail-open alert behavior.
+    assert.equal(await (failing.service as any).verifyHighPriorityDealOnce(candidate), true);
+  } finally {
+    restore();
+    context.close();
+    failing.close();
+  }
+});
+
+test('evaluates same-title live listings separately per URL and thumbnail', async () => {
+  const restore = liveJevEnv();
+  const detailUrls: string[] = [];
+  const context = fixture({
+    classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.55, unsure: true }),
+    fetchListingDetailHtml: async (url: string) => {
+      detailUrls.push(url);
+      return '<html></html>';
+    },
+    classifyListingRelevanceWithVision: async (input: any) => ({
+      relevant: String(input.imageUrl).includes('good'),
+      confidence: 0.7,
+      imagesSeen: 1,
+    }),
+  });
+  try {
+    const result = await (context.service as any).filterListingsByAiRelevance(
+      [
+        liveListing({ listingId: 'dup-a', url: 'https://www.olx.pl/d/oferta/dup-a', imageUrl: 'https://img.example/good.jpg' }),
+        liveListing({ listingId: 'dup-b', url: 'https://www.olx.pl/d/oferta/dup-b', imageUrl: 'https://img.example/bad.jpg' }),
+      ],
+      { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
+    );
+    assert.equal(result.listings.length, 1);
+    assert.equal(result.listings[0].listingId, 'dup-a');
+    assert.equal(result.excluded, 1);
+    assert.deepEqual(detailUrls, ['https://www.olx.pl/d/oferta/dup-a', 'https://www.olx.pl/d/oferta/dup-b']);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('live mode ignores cross-listing cache rows scoped by input hash', async () => {
+  const restore = liveJevEnv();
+  const now = new Date().toISOString();
+  const context = fixture({
+    classifyListingRelevanceWithJev: async () => ({ relevant: false, p: 0.1, unsure: false }),
+  });
+  try {
+    seedWatch(context.db, 'other-watch');
+    const hash = listingRelevanceInputHash({
+      marketplace: 'OLX', title: 'PS5 console', condition: 'like-new', location: 'Warszawa',
+      query: 'PS5', includedTerms: '', excludedTerms: '',
+    });
+    context.db.prepare(`INSERT INTO listing_relevance (watch_id, marketplace, listing_id, input_hash, model, relevant, reason, error, checked_at, relevance_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('other-watch', 'OLX', 'other-1', hash, '~typesafe/jev-latest', 1, 'stale cross-listing row', null, now, 'relevant');
+    const result = await (context.service as any).filterListingsByAiRelevance(
+      [liveListing()], { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
+    );
+    assert.equal(result.listings.length, 0);
+    assert.equal(result.excluded, 1);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('live verification ignores cross-listing verification rows', async () => {
+  const restore = liveJevEnv();
+  const now = new Date().toISOString();
+  const context = fixture({
+    verifyListingDescriptionWithJev: async () => ({ decision: 'reject', confidence: 0.9, unsure: false }),
+  });
+  (context.service as any).fetchPublicPage = async () => '<meta property="og:description" content="Cracked case, sold for parts.">';
+  try {
+    const hash = listingDescriptionVerificationInputHash({
+      marketplace: 'OLX', title: 'PS5 console', condition: 'like-new', description: 'Cracked case, sold for parts.',
+    });
+    context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at,
+      ai_description_verification_json, ai_description_verification_input_hash, ai_description_verification_model, ai_description_verification_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('OLX', 'other-9', 'PS5 console', 2000, 'https://www.olx.pl/d/oferta/other-9', now, now,
+      JSON.stringify({ decision: 'pass', confidence: 1, summary: 'stale cross-listing row', issues: [], evidence: [] }),
+      hash, '~typesafe/jev-latest', now);
+    const candidate = {
+      watchId: 'live-watch',
+      listing: liveListing(),
+      typical: 2500,
+      discountPercent: 25,
+      confidence: 0.9,
+      requiresDescriptionVerification: true,
+    };
+    assert.equal(await (context.service as any).verifyHighPriorityDealOnce(candidate), false);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('SCOUT_JEV_MODE=legacy opts out to the DeepSeek path', async () => {
+  const restore = liveJevEnv();
+  process.env.SCOUT_JEV_MODE = 'legacy';
+  let deepseekCalls = 0;
+  const context = fixture({
+    classifyListingRelevance: async () => {
+      deepseekCalls += 1;
+      return { relevant: true };
+    },
+    classifyListingRelevanceWithJev: async () => { throw new Error('Jev must not be called in legacy mode'); },
+  });
+  try {
+    const result = await (context.service as any).filterListingsByAiRelevance(
+      [liveListing()], { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
+    );
+    assert.equal(result.listings.length, 1);
+    assert.equal(deepseekCalls, 1);
+    // Unset mode with a key available defaults to live.
+    delete process.env.SCOUT_JEV_MODE;
+    assert.notEqual((context.service as any).jevLiveConfig(), null);
+    // Unrecognized values (including typos of either mode) fail safe to legacy.
+    process.env.SCOUT_JEV_MODE = 'legasy';
+    assert.equal((context.service as any).jevLiveConfig(), null);
+    process.env.SCOUT_JEV_MODE = 'liev';
+    assert.equal((context.service as any).jevLiveConfig(), null);
+  } finally {
+    restore();
     context.close();
   }
 });

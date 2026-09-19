@@ -6,6 +6,8 @@ import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notification
 import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, draftNegotiationMessageWithDeepSeek, legacyListingNormalizationInputHash, legacyListingRelevanceInputHash, listingDescriptionVerificationInputHash, listingNormalizationInputHash, listingRelevanceInputHash, normalizeListingWithDeepSeek, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseStoredListingNormalization, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type NegotiationListingContext } from './ai';
+import { DEFAULT_JEV_MODEL, JevError, classifyListingRelevanceWithJev, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
+import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, verifyListingDescriptionWithVision, visionToVerification } from './vision';
 import { OlxMessagingError, sendOlxMessageOnPage } from './olx-messaging';
 import { AllegroMessagingError, sendAllegroMessageOnPage } from './allegro-messaging';
 import { offerCeiling, recommendNegotiationPrice, type NegotiationRecommendation } from './negotiation';
@@ -136,6 +138,11 @@ export interface ScoutServiceDependencies {
   classifyListingRelevance?: typeof classifyListingRelevanceWithDeepSeek;
   verifyListingDescription?: typeof verifyListingDescriptionWithDeepSeek;
   draftNegotiation?: typeof draftNegotiationMessageWithDeepSeek;
+  classifyListingRelevanceWithJev?: typeof classifyListingRelevanceWithJev;
+  verifyListingDescriptionWithJev?: typeof verifyListingDescriptionWithJev;
+  classifyListingRelevanceWithVision?: typeof classifyListingRelevanceWithVision;
+  verifyListingDescriptionWithVision?: typeof verifyListingDescriptionWithVision;
+  fetchListingDetailHtml?: (url: string, marketplace: Marketplace) => Promise<string>;
   sendOlxMessage?: (listingUrl: string, message: string) => Promise<void>;
   sendAllegroMessage?: (listingUrl: string, message: string) => Promise<void>;
   publicExposureWarning?: boolean;
@@ -385,6 +392,11 @@ export class ScoutService {
   private readonly classifyListingRelevance: typeof classifyListingRelevanceWithDeepSeek;
   private readonly verifyListingDescription: typeof verifyListingDescriptionWithDeepSeek;
   private readonly draftNegotiation: typeof draftNegotiationMessageWithDeepSeek;
+  private readonly jevRelevance: typeof classifyListingRelevanceWithJev;
+  private readonly jevVerification: typeof verifyListingDescriptionWithJev;
+  private readonly visionRelevance: typeof classifyListingRelevanceWithVision;
+  private readonly visionVerification: typeof verifyListingDescriptionWithVision;
+  private readonly detailHtml: (url: string, marketplace: Marketplace) => Promise<string>;
   private readonly sendOlxMessageOverride?: (listingUrl: string, message: string) => Promise<void>;
   private readonly sendAllegroMessageOverride?: (listingUrl: string, message: string) => Promise<void>;
   private readonly publicExposureWarning: boolean;
@@ -400,6 +412,11 @@ export class ScoutService {
     this.classifyListingRelevance = dependencies.classifyListingRelevance ?? classifyListingRelevanceWithDeepSeek;
     this.verifyListingDescription = dependencies.verifyListingDescription ?? verifyListingDescriptionWithDeepSeek;
     this.draftNegotiation = dependencies.draftNegotiation ?? draftNegotiationMessageWithDeepSeek;
+    this.jevRelevance = dependencies.classifyListingRelevanceWithJev ?? classifyListingRelevanceWithJev;
+    this.jevVerification = dependencies.verifyListingDescriptionWithJev ?? verifyListingDescriptionWithJev;
+    this.visionRelevance = dependencies.classifyListingRelevanceWithVision ?? classifyListingRelevanceWithVision;
+    this.visionVerification = dependencies.verifyListingDescriptionWithVision ?? verifyListingDescriptionWithVision;
+    this.detailHtml = dependencies.fetchListingDetailHtml ?? ((url, marketplace) => this.fetchPublicPage(url, marketplace));
     this.sendOlxMessageOverride = dependencies.sendOlxMessage;
     this.sendAllegroMessageOverride = dependencies.sendAllegroMessage;
     this.publicExposureWarning = dependencies.publicExposureWarning ?? false;
@@ -666,6 +683,349 @@ export class ScoutService {
     };
   }
 
+  /**
+   * Jev shadow configuration (Phase 1: measure-only). Only SCOUT_JEV_MODE=shadow
+   * opts in — shadow calls double AI traffic and must never surprise a
+   * production scan. Reuses the OpenRouter key.
+   */
+  private jevShadowConfig() {
+    const mode = process.env.SCOUT_JEV_MODE?.trim().toLowerCase();
+    if (mode !== 'shadow') return null;
+    const apiKey = this.deepSeekApiKey().apiKey;
+    if (!apiKey) return null;
+    return {
+      mode,
+      apiKey,
+      jevModel: process.env.SCOUT_JEV_MODEL?.trim() || DEFAULT_JEV_MODEL,
+      visionModel: process.env.SCOUT_VISION_MODEL?.trim() || DEFAULT_VISION_MODEL,
+    };
+  }
+
+  /**
+   * Jev live configuration (Phase 2: Jev decides, vision escalates, DeepSeek
+   * is out of the relevance/verification loop). Live is the default whenever
+   * an OpenRouter key is available — opt out explicitly with
+   * SCOUT_JEV_MODE=legacy, or measure against DeepSeek with
+   * SCOUT_JEV_MODE=shadow. Allowlisted on purpose: anything unrecognized
+   * (including typos of either mode) keeps legacy behavior instead of
+   * surprising anyone with new traffic. Normalization and negotiation drafts
+   * always stay on the DeepSeek chat-completions path.
+   */
+  private jevLiveConfig() {
+    const mode = process.env.SCOUT_JEV_MODE?.trim().toLowerCase();
+    if (mode !== undefined && mode !== '' && mode !== 'live') return null;
+    const apiKey = this.deepSeekApiKey().apiKey;
+    if (!apiKey) return null;
+    return {
+      apiKey,
+      jevModel: process.env.SCOUT_JEV_MODEL?.trim() || DEFAULT_JEV_MODEL,
+      visionModel: process.env.SCOUT_VISION_MODEL?.trim() || DEFAULT_VISION_MODEL,
+    };
+  }
+
+  private logJevLive(
+    task: 'relevance' | 'verification',
+    inputHash: string,
+    live: NonNullable<ReturnType<ScoutService['jevLiveConfig']>>,
+    jev: { jevAnswer?: unknown; jevConfidence?: number | null; jevUnsure?: boolean; jevError?: string | null },
+    vision?: { visionVerdict?: string | null; visionConfidence?: number | null; visionImagesSeen?: number | null; visionError?: string | null },
+  ) {
+    this.logJevShadow({
+      task, inputHash, jevModel: live.jevModel,
+      jevAnswer: jev.jevAnswer, jevConfidence: jev.jevConfidence, jevUnsure: jev.jevUnsure, jevError: jev.jevError,
+      deepseekDecision: null, agreement: null,
+      visionVerdict: vision?.visionVerdict, visionConfidence: vision?.visionConfidence,
+      visionImagesSeen: vision?.visionImagesSeen, visionError: vision?.visionError,
+      note: 'live',
+    });
+  }
+
+  private logJevShadow(row: {
+    task: 'relevance' | 'verification';
+    inputHash: string;
+    jevModel: string;
+    jevAnswer?: unknown;
+    jevConfidence?: number | null;
+    jevUnsure?: boolean;
+    jevError?: string | null;
+    deepseekDecision?: string | null;
+    agreement?: boolean | null;
+    visionVerdict?: string | null;
+    visionConfidence?: number | null;
+    visionImagesSeen?: number | null;
+    visionError?: string | null;
+    note?: string | null;
+  }) {
+    try {
+      this.stmt(`INSERT INTO jev_shadow_log (created_at, task, input_hash, jev_model, jev_answer_json, jev_confidence, jev_unsure, jev_error, deepseek_decision, agreement, vision_verdict, vision_confidence, vision_images_seen, vision_error, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        nowIso(),
+        row.task,
+        row.inputHash,
+        row.jevModel,
+        row.jevAnswer !== undefined ? JSON.stringify(row.jevAnswer).slice(0, 2000) : null,
+        row.jevConfidence ?? null,
+        row.jevUnsure ? 1 : 0,
+        row.jevError?.slice(0, 500) ?? null,
+        row.deepseekDecision?.slice(0, 60) ?? null,
+        row.agreement === undefined || row.agreement === null ? null : row.agreement ? 1 : 0,
+        row.visionVerdict?.slice(0, 60) ?? null,
+        row.visionConfidence ?? null,
+        row.visionImagesSeen ?? null,
+        row.visionError?.slice(0, 500) ?? null,
+        row.note?.slice(0, 500) ?? null,
+      );
+    } catch {
+      // Shadow logging must never break scans; a missing table (migration not
+      // yet applied) or locked DB simply drops the sample.
+    }
+  }
+
+  /**
+   * Shadow Jev relevance: runs after the DeepSeek decision, compares, and —
+   * when Jev is unsure — tiebreaks with the vision model over the thumbnail
+   * (option (a)). Fire-and-forget; behavior always follows DeepSeek in Phase 1.
+   */
+  private shadowJevRelevance(
+    context: ListingRelevanceContext,
+    inputHash: string,
+    deepseekRelevant: boolean | null,
+    imageUrl: string | null | undefined,
+    shadow: NonNullable<ReturnType<ScoutService['jevShadowConfig']>>,
+  ) {
+    void (async () => {
+      let judgment: JevRelevanceJudgment;
+      try {
+        judgment = await classifyListingRelevanceWithJev(context, { apiKey: shadow.apiKey, model: shadow.jevModel });
+      } catch (error) {
+        this.logJevShadow({
+          task: 'relevance', inputHash, jevModel: shadow.jevModel,
+          jevError: error instanceof Error ? error.message : String(error),
+          deepseekDecision: deepseekRelevant === null ? 'unknown' : deepseekRelevant ? 'relevant' : 'irrelevant',
+        });
+        return;
+      }
+      const deepseekDecision = deepseekRelevant === null ? 'unknown' : deepseekRelevant ? 'relevant' : 'irrelevant';
+      const agreement = deepseekRelevant === null ? null : (judgment.relevant ? 'relevant' : 'irrelevant') === deepseekDecision;
+      if (!judgment.unsure) {
+        this.logJevShadow({
+          task: 'relevance', inputHash, jevModel: shadow.jevModel,
+          jevAnswer: judgment, jevConfidence: judgment.p, jevUnsure: false,
+          deepseekDecision, agreement,
+        });
+        return;
+      }
+      try {
+        const vision = await classifyListingRelevanceWithVision(
+          { query: context.query, title: context.title, condition: context.condition, imageUrl: imageUrl ?? null },
+          { apiKey: shadow.apiKey, model: shadow.visionModel },
+        );
+        this.logJevShadow({
+          task: 'relevance', inputHash, jevModel: shadow.jevModel,
+          jevAnswer: judgment, jevConfidence: judgment.p, jevUnsure: true,
+          deepseekDecision, agreement,
+          visionVerdict: vision.relevant ? 'relevant' : 'irrelevant',
+          visionConfidence: vision.confidence, visionImagesSeen: vision.imagesSeen,
+        });
+      } catch (error) {
+        this.logJevShadow({
+          task: 'relevance', inputHash, jevModel: shadow.jevModel,
+          jevAnswer: judgment, jevConfidence: judgment.p, jevUnsure: true,
+          deepseekDecision, agreement,
+          visionError: error instanceof Error ? error.message : String(error),
+        });
+      }
+    })().catch(() => { /* shadow path never rejects */ });
+  }
+
+  /**
+   * Shadow Jev verification with vision escalation for high-priority deals:
+   * Jev unsure (unknown verdict or confidence below threshold) or Jev call
+   * failure routes to the vision model over gallery photos parsed from the
+   * already-fetched detail HTML. Measure-only in Phase 1.
+   */
+  private shadowJevVerification(
+    context: ListingDescriptionVerificationContext,
+    inputHash: string,
+    deepseekDecision: string,
+    galleryImageUrls: string[],
+    shadow: NonNullable<ReturnType<ScoutService['jevShadowConfig']>>,
+  ) {
+    void (async () => {
+      let judgment: JevVerificationJudgment;
+      try {
+        judgment = await verifyListingDescriptionWithJev(context, { apiKey: shadow.apiKey, model: shadow.jevModel });
+      } catch (error) {
+        await this.shadowVisionVerification(context, inputHash, deepseekDecision, galleryImageUrls, shadow, {
+          jevModel: shadow.jevModel, jevError: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+      const agreement = judgment.decision === deepseekDecision;
+      if (!judgment.unsure) {
+        this.logJevShadow({
+          task: 'verification', inputHash, jevModel: shadow.jevModel,
+          jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: false,
+          deepseekDecision, agreement,
+        });
+        return;
+      }
+      await this.shadowVisionVerification(context, inputHash, deepseekDecision, galleryImageUrls, shadow, {
+        jevModel: shadow.jevModel, jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: true,
+        agreement,
+      });
+    })().catch(() => { /* shadow path never rejects */ });
+  }
+
+  private async shadowVisionVerification(
+    context: ListingDescriptionVerificationContext,
+    inputHash: string,
+    deepseekDecision: string,
+    galleryImageUrls: string[],
+    shadow: NonNullable<ReturnType<ScoutService['jevShadowConfig']>>,
+    jev: { jevModel: string; jevAnswer?: unknown; jevConfidence?: number | null; jevUnsure?: boolean; jevError?: string | null; agreement?: boolean | null },
+  ) {
+    try {
+      const vision = await verifyListingDescriptionWithVision(
+        { marketplace: context.marketplace, title: context.title, condition: context.condition, description: context.description, imageUrls: galleryImageUrls },
+        { apiKey: shadow.apiKey, model: shadow.visionModel },
+      );
+      this.logJevShadow({
+        task: 'verification', inputHash, ...jev,
+        deepseekDecision,
+        visionVerdict: vision.decision, visionConfidence: vision.confidence, visionImagesSeen: vision.imagesSeen,
+      });
+    } catch (error) {
+      this.logJevShadow({
+        task: 'verification', inputHash, ...jev,
+        deepseekDecision,
+        visionError: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Live relevance decision (Phase 2): Jev decides; unsure triggers one
+   * bounded detail fetch for a description-enriched second judgment, then the
+   * vision tiebreak over the thumbnail; Jev failure goes straight to vision.
+   * Anything still undecided stays 'unknown' (kept, like the legacy path).
+   */
+  private async decideRelevanceLive(
+    listing: NormalizedListing,
+    context: ListingRelevanceContext,
+    inputHash: string,
+    live: NonNullable<ReturnType<ScoutService['jevLiveConfig']>>,
+    detailBudget: { remaining: number },
+  ): Promise<{ relevant: boolean; status: 'relevant' | 'irrelevant' | 'unknown'; reason: string; error?: string }> {
+    const fromJev = (judgment: JevRelevanceJudgment, source: string): { relevant: boolean; status: 'relevant' | 'irrelevant'; reason: string } => {
+      const status: 'relevant' | 'irrelevant' = judgment.relevant ? 'relevant' : 'irrelevant';
+      this.logJevLive('relevance', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.p, jevUnsure: false });
+      return { relevant: judgment.relevant, status, reason: `Jev ${source} classified listing as ${status} (p=${judgment.p.toFixed(2)})` };
+    };
+
+    let lastJudgment: JevRelevanceJudgment | null = null;
+    let jevFailed: string | null = null;
+    try {
+      const first = await this.jevRelevance(context, { apiKey: live.apiKey, model: live.jevModel });
+      if (!first.unsure) return fromJev(first, 'classified');
+      lastJudgment = first;
+      if (detailBudget.remaining > 0) {
+        detailBudget.remaining -= 1;
+        try {
+          const html = await this.detailHtml(listing.url, listing.marketplace);
+          const description = parseListingDescription(html, listing.marketplace);
+          if (description) {
+            const second = await this.jevRelevance({ ...context, description }, { apiKey: live.apiKey, model: live.jevModel });
+            lastJudgment = second;
+            if (!second.unsure) return fromJev(second, 'description-enriched');
+          }
+        } catch {
+          // Detail fetch or enriched judgment failed — thumbnail tiebreak below.
+        }
+      }
+    } catch (error) {
+      jevFailed = error instanceof Error ? error.message : String(error);
+    }
+
+    try {
+      const vision = await this.visionRelevance(
+        { query: context.query, title: context.title, condition: context.condition, imageUrl: listing.imageUrl ?? null },
+        { apiKey: live.apiKey, model: live.visionModel },
+      );
+      const status: 'relevant' | 'irrelevant' = vision.relevant ? 'relevant' : 'irrelevant';
+      this.logJevLive('relevance', inputHash, live,
+        lastJudgment ? { jevAnswer: lastJudgment, jevConfidence: lastJudgment.p, jevUnsure: true } : { jevError: jevFailed },
+        { visionVerdict: status, visionConfidence: vision.confidence, visionImagesSeen: vision.imagesSeen });
+      return { relevant: vision.relevant, status, reason: `Vision tiebreak classified listing as ${status} (confidence ${vision.confidence.toFixed(2)})` };
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : 'Vision could not classify listing relevance').slice(0, 500);
+      this.logJevLive('relevance', inputHash, live,
+        lastJudgment ? { jevAnswer: lastJudgment, jevConfidence: lastJudgment.p, jevUnsure: true } : { jevError: jevFailed },
+        { visionError: message });
+      return { relevant: true, status: 'unknown', reason: 'Jev and vision relevance checks failed', error: message };
+    }
+  }
+
+  /**
+   * Live description verification (Phase 2): Jev decides; unsure or Jev
+   * failure escalates to exactly one vision call over the gallery photos.
+   * Vision failure propagates so the caller keeps today's fail-open alert
+   * behavior for provider outages.
+   */
+  private async verifyDescriptionLive(
+    context: ListingDescriptionVerificationContext,
+    inputHash: string,
+    galleryImageUrls: string[],
+    live: NonNullable<ReturnType<ScoutService['jevLiveConfig']>>,
+  ): Promise<ListingDescriptionVerification> {
+    const visionInput = {
+      marketplace: context.marketplace,
+      title: context.title,
+      condition: context.condition,
+      description: context.description,
+      imageUrls: galleryImageUrls,
+    };
+    const visionConfig = { apiKey: live.apiKey, model: live.visionModel };
+
+    let judgment: JevVerificationJudgment | null = null;
+    let jevFailed: string | null = null;
+    try {
+      judgment = await this.jevVerification(context, { apiKey: live.apiKey, model: live.jevModel });
+      if (!judgment.unsure) {
+        const verification: ListingDescriptionVerification = {
+          decision: judgment.decision,
+          confidence: judgment.confidence ?? 0,
+          summary: `Jev verification ${judgment.decision}.`,
+          issues: [],
+          evidence: [],
+        };
+        this.logJevLive('verification', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: false });
+        return verification;
+      }
+    } catch (error) {
+      jevFailed = error instanceof Error ? error.message : String(error);
+    }
+
+    try {
+      const vision = await this.visionVerification(visionInput, visionConfig);
+      const verification = visionToVerification(vision, judgment ? 'Jev was unsure; vision tiebreak.' : 'Jev failed; vision decided directly.');
+      this.logJevLive('verification', inputHash, live,
+        judgment
+          ? { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: true }
+          : { jevError: jevFailed },
+        { visionVerdict: vision.decision, visionConfidence: vision.confidence, visionImagesSeen: vision.imagesSeen });
+      return verification;
+    } catch (visionError) {
+      const message = visionError instanceof Error ? visionError.message : String(visionError);
+      this.logJevLive('verification', inputHash, live,
+        judgment
+          ? { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: true }
+          : { jevError: jevFailed },
+        { visionError: message.slice(0, 500) });
+      throw visionError;
+    }
+  }
+
   private saveListingRelevance(input: {
     watchId: string;
     listing: NormalizedListing;
@@ -702,9 +1062,21 @@ export class ScoutService {
     const config = this.deepSeekConfig();
     if (!config.apiKey) return { listings, excluded: 0, failed: 0, unknown: 0, notConfigured: true };
     const apiKey = config.apiKey;
+    // Shadow fires only on live DeepSeek calls below: cache hits, cross-listing
+    // reuse, and budget-exhausted rows return before the hook by design (nothing
+    // new to compare), while the error path shadows with a null decision.
+    const jevShadow = this.jevShadowConfig();
+    const jevLive = this.jevLiveConfig();
+    // Live mode scopes every cache read/write to the Jev model so legacy
+    // DeepSeek rows are never reused as live decisions (first live scan
+    // re-evaluates them; afterwards Jev rows reuse normally).
+    const activeModel = jevLive ? jevLive.jevModel : config.model;
     const AI_RELEVANCE_BUDGET_PER_SCAN = 40;
+    const AI_RELEVANCE_DETAIL_BUDGET_PER_SCAN = 8;
     let aiCalls = 0;
+    const detailBudget = { remaining: AI_RELEVANCE_DETAIL_BUDGET_PER_SCAN };
     const pendingClassifications = new Map<string, Promise<{ relevant: boolean }>>();
+    const pendingLive = new Map<string, Promise<{ relevant: boolean; status: 'relevant' | 'irrelevant' | 'unknown'; reason: string; error?: string }>>();
     // Relevance rows are collected while the batch awaits the AI calls and
     // flushed in one transaction per batch: a per-row autocommit would mean a
     // commit per listing, and the transaction must never span an await.
@@ -718,6 +1090,7 @@ export class ScoutService {
           title: listing.title,
           condition: listing.condition,
           location: listing.location,
+          pricePln: listing.price,
           query: search.query,
           includedTerms: search.includedTerms,
           excludedTerms: search.excludedTerms,
@@ -729,26 +1102,49 @@ export class ScoutService {
           const cachedStatus: 'relevant' | 'irrelevant' | 'unknown' = cached?.relevance_status === 'irrelevant' || cached?.relevance_status === 'unknown' || cached?.relevance_status === 'relevant'
             ? cached.relevance_status
             : cached?.error ? 'unknown' : cached?.relevant === 0 ? 'irrelevant' : 'relevant';
-          if ((cached?.input_hash === inputHash || cached?.input_hash === legacyInputHash) && cached.model === config.model && cachedStatus !== 'unknown' && !cached.error) {
-            if (cached.input_hash === legacyInputHash) relevanceWrites.push({ watchId, listing, inputHash, model: config.model, relevant: cachedStatus === 'relevant', status: cachedStatus, reason: cached.reason ?? 'Reused cached relevance decision' });
+          if ((cached?.input_hash === inputHash || cached?.input_hash === legacyInputHash) && cached.model === activeModel && cachedStatus !== 'unknown' && !cached.error) {
+            if (cached.input_hash === legacyInputHash) relevanceWrites.push({ watchId, listing, inputHash, model: activeModel, relevant: cachedStatus === 'relevant', status: cachedStatus, reason: cached.reason ?? 'Reused cached relevance decision' });
             return { listing, status: cachedStatus };
           }
         }
 
-        const reusable = this.stmt(`SELECT relevant, reason, relevance_status FROM listing_relevance
+        // Cross-listing reuse is keyed by input hash, which omits the per-listing
+        // URL/thumbnail live escalation uses — live mode relies on the
+        // per-listing watch cache above instead.
+        const reusable = !jevLive ? this.stmt(`SELECT relevant, reason, relevance_status FROM listing_relevance
           WHERE input_hash = ? AND model = ? AND relevance_status IN ('relevant', 'irrelevant') AND error IS NULL
-          ORDER BY checked_at DESC LIMIT 1`).get(inputHash, config.model) as { relevant?: number; reason?: string; relevance_status?: string } | undefined;
+          ORDER BY checked_at DESC LIMIT 1`).get(inputHash, activeModel) as { relevant?: number; reason?: string; relevance_status?: string } | undefined : undefined;
         if (reusable) {
           const status: 'relevant' | 'irrelevant' = reusable.relevance_status === 'irrelevant' || reusable.relevant === 0 ? 'irrelevant' : 'relevant';
-          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: config.model, relevant: status === 'relevant', status, reason: reusable.reason ?? 'Reused cached relevance decision' });
+          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: activeModel, relevant: status === 'relevant', status, reason: reusable.reason ?? 'Reused cached relevance decision' });
           return { listing, status };
         }
 
         // Per-scan budget: uncached listings beyond the budget stay unknown
         // instead of burning quota on every scan before the cache warms.
-        if (aiCalls >= AI_RELEVANCE_BUDGET_PER_SCAN && !pendingClassifications.has(inputHash)) {
-          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: config.model, relevant: true, status: 'unknown', reason: 'AI relevance budget exhausted for this scan' });
+        // Live dedupe is per listing (not per input hash): the escalation path
+        // uses each listing's own URL and thumbnail, which the hash omits.
+        const liveKey = `${inputHash}|${listing.url}|${listing.imageUrl ?? ''}`;
+        if (aiCalls >= AI_RELEVANCE_BUDGET_PER_SCAN && !pendingClassifications.has(inputHash) && !pendingLive.has(liveKey)) {
+          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: activeModel, relevant: true, status: 'unknown', reason: 'AI relevance budget exhausted for this scan' });
           return { listing, status: 'unknown' as const };
+        }
+        if (jevLive) {
+          try {
+            let decision = pendingLive.get(liveKey);
+            if (!decision) {
+              aiCalls += 1;
+              decision = this.decideRelevanceLive(listing, context, inputHash, jevLive, detailBudget);
+              pendingLive.set(liveKey, decision);
+            }
+            const live = await decision;
+            if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: jevLive.jevModel, relevant: live.relevant, status: live.status, reason: live.reason, error: live.error ?? null });
+            return { listing, status: live.status };
+          } catch (error) {
+            const message = (error instanceof Error ? error.message : 'Jev could not classify listing relevance').slice(0, 500);
+            if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: jevLive.jevModel, relevant: true, status: 'unknown', reason: 'Jev relevance check failed unexpectedly', error: message });
+            return { listing, status: 'unknown' };
+          }
         }
         try {
           let classification = pendingClassifications.get(inputHash);
@@ -758,12 +1154,14 @@ export class ScoutService {
             pendingClassifications.set(inputHash, classification);
           }
           const result = await classification;
+          if (jevShadow) this.shadowJevRelevance(context, inputHash, result.relevant, listing.imageUrl, jevShadow);
           const status: 'relevant' | 'irrelevant' = result.relevant ? 'relevant' : 'irrelevant';
-          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: config.model, relevant: result.relevant, status, reason: result.relevant ? 'AI classified listing as relevant' : 'AI classified listing as irrelevant' });
+          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: activeModel, relevant: result.relevant, status, reason: result.relevant ? 'AI classified listing as relevant' : 'AI classified listing as irrelevant' });
           return { listing, status };
         } catch (error) {
           const message = (error instanceof Error ? error.message : 'OpenRouter could not classify listing relevance').slice(0, 500);
-          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: config.model, relevant: true, status: 'unknown', reason: 'AI relevance check failed', error: message });
+          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: activeModel, relevant: true, status: 'unknown', reason: 'AI relevance check failed', error: message });
+          if (jevShadow) this.shadowJevRelevance(context, inputHash, null, listing.imageUrl, jevShadow);
           return { listing, status: 'unknown' };
         }
       }));
@@ -869,7 +1267,12 @@ export class ScoutService {
     const marketplace = candidate.listing.marketplace;
     const listingId = candidate.listing.listingId;
     const config = notifyContext?.deepSeek ?? this.deepSeekConfig();
-    if (!config.apiKey) {
+    const jevLive = this.jevLiveConfig();
+    // Live mode scopes every cache read/write to the Jev model so legacy
+    // DeepSeek rows are never reused as live decisions.
+    const apiKey = jevLive ? jevLive.apiKey : config.apiKey;
+    const activeModel = jevLive ? jevLive.jevModel : config.model;
+    if (!apiKey) {
       const snapshot = this.captureListingDetailSnapshot(candidate, null);
       this.updateListingDetailSnapshot(snapshot?.id ?? null, 'not-configured', null);
       this.saveDescriptionVerification({ marketplace, listingId, status: 'not-configured' });
@@ -877,14 +1280,25 @@ export class ScoutService {
     }
 
     let description: string | null;
+    let galleryImageUrls: string[] = [];
+    // Read once: gallery parsing below must stay inert when both modes are off,
+    // and this also avoids re-decrypting the OpenRouter key per candidate.
+    const jevShadow = this.jevShadowConfig();
     try {
       const html = await this.fetchPublicPage(candidate.listing.url, marketplace);
       description = parseListingDescription(html, marketplace);
+      if (jevShadow || jevLive) {
+        try {
+          galleryImageUrls = parseListingImageUrls(html, marketplace, 12).slice(0, 3);
+        } catch {
+          galleryImageUrls = [];
+        }
+      }
     } catch (error) {
       const message = (error instanceof Error ? error.message : 'Could not fetch the high-priority listing detail page').slice(0, 500);
       const snapshot = this.captureListingDetailSnapshot(candidate, null);
       this.updateListingDetailSnapshot(snapshot?.id ?? null, 'unknown', null);
-      this.saveDescriptionVerification({ marketplace, listingId, status: 'unknown', model: config.model, error: message });
+      this.saveDescriptionVerification({ marketplace, listingId, status: 'unknown', model: activeModel, error: message });
       this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: 'unknown' });
       return false;
     }
@@ -902,17 +1316,17 @@ export class ScoutService {
       ai_description_verification_status
       FROM listings WHERE marketplace = ? AND listing_id = ?`).get(marketplace, listingId) as Record<string, any> | undefined;
     const cached = parseStoredListingDescriptionVerification(row?.ai_description_verification_json);
-    if (cached && row?.ai_description_verification_input_hash === inputHash && row.ai_description_verification_model === config.model) {
+    if (cached && row?.ai_description_verification_input_hash === inputHash && row.ai_description_verification_model === activeModel) {
       this.updateListingDetailSnapshot(snapshot?.id ?? null, cached.decision, inputHash);
-      this.saveDescriptionVerification({ marketplace, listingId, status: cached.decision, verification: cached, inputHash, model: config.model });
+      this.saveDescriptionVerification({ marketplace, listingId, status: cached.decision, verification: cached, inputHash, model: activeModel });
       return cached.decision === 'pass';
     }
     if (row?.ai_description_verification_error && row.ai_description_verification_input_hash === inputHash
-      && row.ai_description_verification_model === config.model && row.ai_description_verification_at
+      && row.ai_description_verification_model === activeModel && row.ai_description_verification_at
       && Date.now() - Date.parse(row.ai_description_verification_at) < 6 * 60 * 60_000) {
       const status: ListingDescriptionVerificationStatus = row.ai_description_verification_status === 'fallback' ? 'fallback' : 'unknown';
       this.updateListingDetailSnapshot(snapshot?.id ?? null, status, inputHash);
-      this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: config.model, error: row.ai_description_verification_error });
+      this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: activeModel, error: row.ai_description_verification_error });
       return status === 'fallback';
     }
 
@@ -925,36 +1339,43 @@ export class ScoutService {
         evidence: [],
       };
       this.updateListingDetailSnapshot(snapshot?.id ?? null, unknown.decision, inputHash);
-      this.saveDescriptionVerification({ marketplace, listingId, status: unknown.decision, verification: unknown, inputHash, model: config.model });
+      this.saveDescriptionVerification({ marketplace, listingId, status: unknown.decision, verification: unknown, inputHash, model: activeModel });
       this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: unknown.decision });
       return false;
     }
 
-    const reusable = this.stmt(`SELECT ai_description_verification_json
+    // Cross-listing reuse is keyed by input hash, which omits the gallery
+    // photos live escalation uses — live mode relies on the per-listing cache
+    // above instead.
+    const reusable = !jevLive ? this.stmt(`SELECT ai_description_verification_json
       FROM listings
       WHERE ai_description_verification_input_hash = ?
         AND ai_description_verification_model = ?
         AND ai_description_verification_json IS NOT NULL
-      ORDER BY ai_description_verification_at DESC LIMIT 1`).get(inputHash, config.model) as { ai_description_verification_json?: string } | undefined;
+      ORDER BY ai_description_verification_at DESC LIMIT 1`).get(inputHash, activeModel) as { ai_description_verification_json?: string } | undefined : undefined;
     const shared = parseStoredListingDescriptionVerification(reusable?.ai_description_verification_json);
     if (shared) {
       this.updateListingDetailSnapshot(snapshot?.id ?? null, shared.decision, inputHash);
-      this.saveDescriptionVerification({ marketplace, listingId, status: shared.decision, verification: shared, inputHash, model: config.model });
+      this.saveDescriptionVerification({ marketplace, listingId, status: shared.decision, verification: shared, inputHash, model: activeModel });
       return shared.decision === 'pass';
     }
 
     try {
-      this.saveDescriptionVerification({ marketplace, listingId, status: 'pending', model: config.model });
-      const verification = await this.verifyListingDescription(context, { apiKey: config.apiKey, model: config.model });
+      this.saveDescriptionVerification({ marketplace, listingId, status: 'pending', model: activeModel });
+      const verification = jevLive
+        ? await this.verifyDescriptionLive(context, inputHash, galleryImageUrls, jevLive)
+        : await this.verifyListingDescription(context, { apiKey, model: config.model });
+      if (jevShadow) this.shadowJevVerification(context, inputHash, verification.decision, galleryImageUrls, jevShadow);
       this.updateListingDetailSnapshot(snapshot?.id ?? null, verification.decision, inputHash);
-      this.saveDescriptionVerification({ marketplace, listingId, status: verification.decision, verification, inputHash, model: config.model });
+      this.saveDescriptionVerification({ marketplace, listingId, status: verification.decision, verification, inputHash, model: activeModel });
       this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: verification.decision });
       return verification.decision === 'pass';
     } catch (error) {
       const message = (error instanceof Error ? error.message : 'OpenRouter could not verify the listing description').slice(0, 500);
-      const status: ListingDescriptionVerificationStatus = error instanceof DeepSeekError ? 'fallback' : 'unknown';
+      const status: ListingDescriptionVerificationStatus = error instanceof DeepSeekError || error instanceof JevError || error instanceof VisionError ? 'fallback' : 'unknown';
+      if (jevShadow) this.shadowJevVerification(context, inputHash, status, galleryImageUrls, jevShadow);
       this.updateListingDetailSnapshot(snapshot?.id ?? null, status, inputHash);
-      this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: config.model, error: message });
+      this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: activeModel, error: message });
       this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status });
       return status === 'fallback';
     }

@@ -481,7 +481,7 @@ export default function SettingsPage({
             </div>
             <div>
               <h2>AI listing intelligence</h2>
-              <p>Use a DeepSeek model through OpenRouter to filter out accessories, parts, and unrelated matches. Listing normalization stays manual and is off by default.</p>
+              <p>Jev filters out accessories, parts, and unrelated matches, with a vision model as fallback when unsure. The model below powers manual listing normalization and negotiation drafts. Listing normalization stays manual and is off by default.</p>
             </div>
             <span className={`settings-status ${aiConfigured ? "" : "settings-status--idle"}`}>
               <i />
