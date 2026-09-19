@@ -8,7 +8,7 @@ import { parseMarketplaceStorageState } from '../server/marketplace-sessions';
 import { DeepSeekError } from '../server/ai';
 import { listingDescriptionVerificationInputHash, listingRelevanceInputHash } from '../server/ai';
 import { VisionError } from '../server/vision';
-import { ScoutService, ServiceError, decryptSecret, encryptSecret, filterListings, marketStatusAfterMiss, nextWatchScanAt, validateDiscordWebhook, type ScoutServiceDependencies } from '../server/service';
+import { ScoutService, ServiceError, decryptSecret, encryptSecret, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, validateDiscordWebhook, type ScoutServiceDependencies } from '../server/service';
 
 // Pin the legacy DeepSeek path for pre-existing tests: live Jev is the
 // production default whenever a key is available, but these tests assert
@@ -686,7 +686,7 @@ test('filters and caches irrelevant listings per watch', async () => {
   } finally { context.close(); }
 });
 
-test('keeps one-off marketplace search deterministic and skips AI relevance classification', async () => {
+test('applies the same AI relevance gate to one-off marketplace search', async () => {
   let requests = 0;
   const context = fixture({
     classifyListingRelevance: async (listing) => {
@@ -701,10 +701,46 @@ test('keeps one-off marketplace search deterministic and skips AI relevance clas
       { id: 'GPU-2', url: 'https://www.olx.pl/d/oferta/gpu-2', title: 'GPU fan replacement', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 80, currency: 'PLN', negotiable: false } }] },
     ], metadata: { visible_total_count: 2 } } });
     const result = await context.service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
-    assert.deepEqual(result.listings.map((listing) => listing.title), ['GPU fan replacement', 'GPU graphics card RTX 4070']);
-    assert.equal(result.sources[0].message, '2 matches');
-    assert.equal(requests, 0);
+    assert.deepEqual(result.listings.map((listing) => listing.title), ['GPU graphics card RTX 4070']);
+    assert.equal(result.sources[0].message, '1 matches · 1 excluded by AI');
+    assert.equal(requests, 2);
+    assert.equal((context.db.prepare("SELECT COUNT(*) AS count FROM listings WHERE listing_id = 'GPU-2'").get() as { count: number }).count, 0);
   } finally { context.close(); }
+});
+
+test('keeps manual search results when AI relevance fails', async () => {
+  const context = fixture({
+    classifyListingRelevance: async () => { throw new Error('Marketplace timeout'); },
+  });
+  try {
+    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' } });
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'GPU-1', url: 'https://www.olx.pl/d/oferta/gpu-1', title: 'GPU graphics card RTX 4070', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 2000, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 1 } } });
+    const result = await context.service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
+    assert.deepEqual(result.listings.map((listing) => listing.title), ['GPU graphics card RTX 4070']);
+    assert.equal(result.sources[0].message, '1 matches · 1 AI checks unknown');
+  } finally { context.close(); }
+});
+
+test('partitions deterministic misses into term vs condition rescue candidates', () => {
+  const base = (overrides: Record<string, any> = {}) => ({
+    marketplace: 'OLX' as const, listingId: 'x', title: 'Ladowarka Dell 65W', price: 100, currency: 'PLN' as const,
+    url: 'https://www.olx.pl/d/oferta/x', observedAt: new Date().toISOString(), condition: 'Nowe', location: 'Warszawa',
+    shippingAvailable: null, priceNegotiable: null, ...overrides,
+  });
+  const listings = [
+    base({ listingId: 'exact', title: 'Ladowarka Dell 65W' }),
+    base({ listingId: 'inflect', title: 'Ladowarki do laptopa Dell' }),
+    base({ listingId: 'cond', title: 'Ladowarka Dell 65W', condition: 'Uzywane' }),
+    base({ listingId: 'both', title: 'Torba na laptopa', condition: 'Uzywane' }),
+    base({ listingId: 'price', title: 'Ladowarki do laptopa Dell', price: 9999 }),
+  ];
+  const { termCandidates, conditionCandidates } = findFuzzyRescueCandidates(
+    listings as any, 'ladowarka', '', '', { minPrice: null, maxPrice: 500, condition: 'New', location: '' },
+  );
+  assert.deepEqual(termCandidates.map((listing) => listing.listingId), ['inflect']);
+  assert.deepEqual(conditionCandidates.map((listing) => listing.listingId), ['cond']);
 });
 
 test('writes and sends one explicit OLX negotiation message through the configured integrations', async () => {
@@ -1750,6 +1786,175 @@ test('SCOUT_JEV_MODE=legacy opts out to the DeepSeek path', async () => {
     assert.equal((context.service as any).jevLiveConfig(), null);
     process.env.SCOUT_JEV_MODE = 'liev';
     assert.equal((context.service as any).jevLiveConfig(), null);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('rescues term near-misses in manual search on confident Jev pass', async () => {
+  const restore = liveJevEnv();
+  const context = fixture({
+    classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.9, unsure: false }),
+    classifyTermMatchWithJev: async () => ({ decision: 'pass', confidence: 0.85, unsure: false }),
+    classifyConditionMatchWithJev: async () => { throw new Error('condition must not be called without candidates'); },
+    classifyListingRelevanceWithVision: async () => { throw new Error('vision must not be called'); },
+  });
+  try {
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'LAD-1', url: 'https://www.olx.pl/d/oferta/lad-1', title: 'Ladowarka Dell 65W', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 100, currency: 'PLN', negotiable: false } }] },
+      { id: 'LAD-2', url: 'https://www.olx.pl/d/oferta/lad-2', title: 'Ladowarki do laptopa Dell', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 120, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 2 } } });
+    const result = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
+    assert.deepEqual(result.listings.map((listing) => listing.title).sort(), ['Ladowarka Dell 65W', 'Ladowarki do laptopa Dell']);
+    assert.equal(result.sources[0].count, 2);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('keeps deterministic drops when fuzzy rescue is unsure', async () => {
+  const restore = liveJevEnv();
+  const context = fixture({
+    classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.9, unsure: false }),
+    classifyTermMatchWithJev: async () => ({ decision: 'pass', confidence: 0.5, unsure: true }),
+    classifyConditionMatchWithJev: async () => ({ decision: 'unknown', confidence: 0.4, unsure: true }),
+  });
+  try {
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'LAD-1', url: 'https://www.olx.pl/d/oferta/lad-1', title: 'Ladowarka Dell 65W', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 100, currency: 'PLN', negotiable: false } }] },
+      { id: 'LAD-2', url: 'https://www.olx.pl/d/oferta/lad-2', title: 'Ladowarki do laptopa Dell', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 120, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 2 } } });
+    const result = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
+    assert.deepEqual(result.listings.map((listing) => listing.title), ['Ladowarka Dell 65W']);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('upgrades unknown negotiability from description without overriding fixed', async () => {
+  const restore = liveJevEnv();
+  const now = new Date().toISOString();
+  const context = fixture({
+    verifyListingDescriptionWithJev: async () => ({ decision: 'pass', confidence: 0.85, unsure: false }),
+    classifyNegotiabilityWithJev: async () => ({ decision: 'negotiable', confidence: 0.9, unsure: false }),
+  });
+  (context.service as any).fetchPublicPage = async () => '<meta property="og:description" content="Fully working console. Cena do uzgodnienia, zapraszam.">';
+  try {
+    context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at, price_negotiable) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+      'OLX', 'live-1', 'PS5 console', 2000, 'https://www.olx.pl/d/oferta/live-1', now, now, null);
+    context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at, price_negotiable) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+      'OLX', 'live-fixed', 'PS5 console fixed', 2000, 'https://www.olx.pl/d/oferta/live-fixed', now, now, 0);
+    const candidate: any = {
+      watchId: 'live-watch', listing: liveListing(), typical: 2500,
+      discountPercent: 25, confidence: 0.9, requiresDescriptionVerification: true,
+    };
+    assert.equal(await (context.service as any).verifyHighPriorityDealOnce(candidate), true);
+    assert.equal(candidate.listing.priceNegotiable, true);
+    assert.equal((context.db.prepare('SELECT price_negotiable FROM listings WHERE listing_id = ?').get('live-1') as { price_negotiable: number }).price_negotiable, 1);
+
+    const fixed: any = {
+      watchId: 'live-watch',
+      listing: liveListing({ listingId: 'live-fixed', url: 'https://www.olx.pl/d/oferta/live-fixed', title: 'PS5 console fixed', priceNegotiable: false }),
+      typical: 2500, discountPercent: 25, confidence: 0.9, requiresDescriptionVerification: true,
+    };
+    assert.equal(await (context.service as any).verifyHighPriorityDealOnce(fixed), true);
+    assert.equal((context.db.prepare('SELECT price_negotiable FROM listings WHERE listing_id = ?').get('live-fixed') as { price_negotiable: number }).price_negotiable, 0);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('rescues condition misses in manual search on confident Jev match', async () => {
+  const restore = liveJevEnv();
+  const context = fixture({
+    classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.9, unsure: false }),
+    classifyTermMatchWithJev: async () => { throw new Error('term must not be called without candidates'); },
+    classifyConditionMatchWithJev: async () => ({ decision: 'match', confidence: 0.85, unsure: false }),
+  });
+  try {
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'IPH-1', url: 'https://www.olx.pl/d/oferta/iph-1', title: 'iPhone 13', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 2000, currency: 'PLN', negotiable: false } }, { key: 'state', value: { label: 'Nowe' } }] },
+      { id: 'IPH-2', url: 'https://www.olx.pl/d/oferta/iph-2', title: 'iPhone 13 sealed, brand new', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 2100, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 2 } } });
+    const result = await context.service.manualSearch({ query: 'iphone', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'New', location: '' });
+    assert.deepEqual(result.listings.map((listing) => listing.title).sort(), ['iPhone 13', 'iPhone 13 sealed, brand new']);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('keeps deterministic set when fuzzy rescue throws', async () => {
+  const restore = liveJevEnv();
+  const context = fixture({
+    classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.9, unsure: false }),
+    classifyTermMatchWithJev: async () => { throw new Error('Decisions 520'); },
+    classifyConditionMatchWithJev: async () => { throw new Error('Decisions 520'); },
+  });
+  try {
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'LAD-1', url: 'https://www.olx.pl/d/oferta/lad-1', title: 'Ladowarka Dell 65W', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 100, currency: 'PLN', negotiable: false } }] },
+      { id: 'LAD-2', url: 'https://www.olx.pl/d/oferta/lad-2', title: 'Ladowarki do laptopa Dell', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 120, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 2 } } });
+    const result = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
+    assert.deepEqual(result.listings.map((listing) => listing.title), ['Ladowarka Dell 65W']);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('caps fuzzy rescue at ten Jev calls per search', async () => {
+  const restore = liveJevEnv();
+  let calls = 0;
+  const context = fixture({
+    classifyTermMatchWithJev: async () => { calls += 1; return { decision: 'pass', confidence: 0.9, unsure: false }; },
+    classifyConditionMatchWithJev: async () => { calls += 1; return { decision: 'match', confidence: 0.9, unsure: false }; },
+  });
+  try {
+    const now = new Date().toISOString();
+    const listings = Array.from({ length: 12 }, (_, index) => ({
+      marketplace: 'OLX', listingId: `miss-${index}`, title: `Ladowarki model ${index} Dell`, price: 100,
+      currency: 'PLN', url: `https://www.olx.pl/d/oferta/miss-${index}`, observedAt: now, condition: 'Nowe', location: 'Warszawa',
+      shippingAvailable: null, priceNegotiable: null,
+    }));
+    const candidates = findFuzzyRescueCandidates(listings as any, 'ladowarka', '', '', {});
+    assert.equal(candidates.termCandidates.length, 12);
+    const result = await (context.service as any).rescueFuzzyMisses(candidates, {
+      query: 'ladowarka', includedTerms: '', excludedTerms: '', condition: 'Any',
+    }, (context.service as any).jevLiveConfig());
+    assert.equal(calls, 10);
+    assert.equal(result.rescued.length, 10);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('skips negotiability upgrade for Vinted listings', async () => {
+  const restore = liveJevEnv();
+  const now = new Date().toISOString();
+  let jevCalls = 0;
+  const context = fixture({
+    verifyListingDescriptionWithJev: async () => ({ decision: 'pass', confidence: 0.85, unsure: false }),
+    classifyNegotiabilityWithJev: async () => { jevCalls += 1; return { decision: 'negotiable', confidence: 0.9, unsure: false }; },
+  });
+  (context.service as any).fetchPublicPage = async () => '<meta property="og:description" content="Fully working console. Cena do uzgodnienia.">';
+  try {
+    context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at, price_negotiable) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+      'Vinted', 'vinted-1', 'PS5 console', 2000, 'https://www.vinted.pl/items/vinted-1', now, now, null);
+    const candidate: any = {
+      watchId: 'live-watch',
+      listing: { ...liveListing(), marketplace: 'Vinted', listingId: 'vinted-1', url: 'https://www.vinted.pl/items/vinted-1' },
+      typical: 2500, discountPercent: 25, confidence: 0.9, requiresDescriptionVerification: true,
+    };
+    assert.equal(await (context.service as any).verifyHighPriorityDealOnce(candidate), true);
+    assert.equal(jevCalls, 0);
+    assert.equal(candidate.listing.priceNegotiable, null);
   } finally {
     restore();
     context.close();

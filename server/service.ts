@@ -5,8 +5,8 @@ import { chromium, type Browser, type BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
-import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, draftNegotiationMessageWithDeepSeek, legacyListingNormalizationInputHash, legacyListingRelevanceInputHash, listingDescriptionVerificationInputHash, listingNormalizationInputHash, listingRelevanceInputHash, normalizeListingWithDeepSeek, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseStoredListingNormalization, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type NegotiationListingContext } from './ai';
-import { DEFAULT_JEV_MODEL, JevError, classifyListingRelevanceWithJev, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
+import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, draftNegotiationMessageWithDeepSeek, legacyListingNormalizationInputHash, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNormalizationInputHash, listingRelevanceInputHash, normalizeListingWithDeepSeek, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseStoredListingNormalization, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type NegotiationListingContext } from './ai';
+import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
 import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, verifyListingDescriptionWithVision, visionToVerification } from './vision';
 import { OlxMessagingError, sendOlxMessageOnPage } from './olx-messaging';
 import { AllegroMessagingError, sendAllegroMessageOnPage } from './allegro-messaging';
@@ -140,6 +140,9 @@ export interface ScoutServiceDependencies {
   draftNegotiation?: typeof draftNegotiationMessageWithDeepSeek;
   classifyListingRelevanceWithJev?: typeof classifyListingRelevanceWithJev;
   verifyListingDescriptionWithJev?: typeof verifyListingDescriptionWithJev;
+  classifyTermMatchWithJev?: typeof classifyTermMatchWithJev;
+  classifyNegotiabilityWithJev?: typeof classifyNegotiabilityWithJev;
+  classifyConditionMatchWithJev?: typeof classifyConditionMatchWithJev;
   classifyListingRelevanceWithVision?: typeof classifyListingRelevanceWithVision;
   verifyListingDescriptionWithVision?: typeof verifyListingDescriptionWithVision;
   fetchListingDetailHtml?: (url: string, marketplace: Marketplace) => Promise<string>;
@@ -394,6 +397,9 @@ export class ScoutService {
   private readonly draftNegotiation: typeof draftNegotiationMessageWithDeepSeek;
   private readonly jevRelevance: typeof classifyListingRelevanceWithJev;
   private readonly jevVerification: typeof verifyListingDescriptionWithJev;
+  private readonly jevTermMatch: typeof classifyTermMatchWithJev;
+  private readonly jevNegotiability: typeof classifyNegotiabilityWithJev;
+  private readonly jevConditionMatch: typeof classifyConditionMatchWithJev;
   private readonly visionRelevance: typeof classifyListingRelevanceWithVision;
   private readonly visionVerification: typeof verifyListingDescriptionWithVision;
   private readonly detailHtml: (url: string, marketplace: Marketplace) => Promise<string>;
@@ -414,6 +420,9 @@ export class ScoutService {
     this.draftNegotiation = dependencies.draftNegotiation ?? draftNegotiationMessageWithDeepSeek;
     this.jevRelevance = dependencies.classifyListingRelevanceWithJev ?? classifyListingRelevanceWithJev;
     this.jevVerification = dependencies.verifyListingDescriptionWithJev ?? verifyListingDescriptionWithJev;
+    this.jevTermMatch = dependencies.classifyTermMatchWithJev ?? classifyTermMatchWithJev;
+    this.jevNegotiability = dependencies.classifyNegotiabilityWithJev ?? classifyNegotiabilityWithJev;
+    this.jevConditionMatch = dependencies.classifyConditionMatchWithJev ?? classifyConditionMatchWithJev;
     this.visionRelevance = dependencies.classifyListingRelevanceWithVision ?? classifyListingRelevanceWithVision;
     this.visionVerification = dependencies.verifyListingDescriptionWithVision ?? verifyListingDescriptionWithVision;
     this.detailHtml = dependencies.fetchListingDetailHtml ?? ((url, marketplace) => this.fetchPublicPage(url, marketplace));
@@ -724,7 +733,7 @@ export class ScoutService {
   }
 
   private logJevLive(
-    task: 'relevance' | 'verification',
+    task: 'relevance' | 'verification' | 'term-match' | 'negotiability' | 'condition',
     inputHash: string,
     live: NonNullable<ReturnType<ScoutService['jevLiveConfig']>>,
     jev: { jevAnswer?: unknown; jevConfidence?: number | null; jevUnsure?: boolean; jevError?: string | null },
@@ -741,7 +750,7 @@ export class ScoutService {
   }
 
   private logJevShadow(row: {
-    task: 'relevance' | 'verification';
+    task: 'relevance' | 'verification' | 'term-match' | 'negotiability' | 'condition';
     inputHash: string;
     jevModel: string;
     jevAnswer?: unknown;
@@ -1183,6 +1192,144 @@ export class ScoutService {
     };
   }
 
+  /**
+   * P1/P3: rescue deterministic near-misses with Jev. Only listings that fail
+   * exactly one fuzzy dimension (terms XOR condition) while passing price,
+   * shipping, and location are considered, at most 10 per call, fail-closed
+   * (Jev error/unsure keeps the drop). Returns rescued listings to merge.
+   */
+  private async rescueFuzzyMisses(
+    candidates: { termCandidates: NormalizedListing[]; conditionCandidates: NormalizedListing[] },
+    search: { query: string; includedTerms: string; excludedTerms: string; condition?: string },
+    live: NonNullable<ReturnType<ScoutService['jevLiveConfig']>>,
+  ): Promise<{ rescued: NormalizedListing[]; rescuedByTerm: number; rescuedByCondition: number }> {
+    const rescued: NormalizedListing[] = [];
+    let rescuedByTerm = 0;
+    let rescuedByCondition = 0;
+    if (!live) return { rescued, rescuedByTerm, rescuedByCondition };
+    const FUZZY_RESCUE_BUDGET = 10;
+    let budget = FUZZY_RESCUE_BUDGET;
+    const termSlice = candidates.termCandidates.slice(0, FUZZY_RESCUE_BUDGET);
+    budget -= termSlice.length;
+    const conditionSlice = candidates.conditionCandidates.slice(0, Math.max(0, budget));
+    for (const listing of termSlice) {
+      const inputHash = listingRelevanceInputHash({
+        marketplace: listing.marketplace, title: listing.title, condition: listing.condition,
+        location: listing.location, query: search.query,
+        includedTerms: search.includedTerms, excludedTerms: search.excludedTerms,
+      });
+      try {
+        const judgment = await this.jevTermMatch({
+          query: search.query, includedTerms: search.includedTerms, excludedTerms: search.excludedTerms,
+          title: listing.title, condition: listing.condition,
+        }, { apiKey: live.apiKey, model: live.jevModel });
+        this.logJevLive('term-match', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
+        if (judgment.decision === 'pass' && !judgment.unsure) {
+          rescued.push(listing);
+          rescuedByTerm += 1;
+        }
+      } catch (error) {
+        this.logJevLive('term-match', inputHash, live, { jevError: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    for (const listing of conditionSlice) {
+      const inputHash = listingConditionMatchInputHash({
+        title: listing.title, listingCondition: listing.condition, requestedCondition: search.condition ?? 'Any',
+      });
+      try {
+        const judgment = await this.jevConditionMatch({
+          requestedCondition: search.condition ?? 'Any', listingCondition: listing.condition, title: listing.title,
+        }, { apiKey: live.apiKey, model: live.jevModel });
+        this.logJevLive('condition', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
+        if (judgment.decision === 'match' && !judgment.unsure) {
+          rescued.push(listing);
+          rescuedByCondition += 1;
+        }
+      } catch (error) {
+        this.logJevLive('condition', inputHash, live, { jevError: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    return { rescued, rescuedByTerm, rescuedByCondition };
+  }
+
+  /**
+   * P1/P3 entry point shared by watch scans and manual search. Candidates are
+   * collected from `fetched` ignoring shipping (near-misses never reach the
+   * enriched `comparable` set), then the small pool is shipping-enriched when
+   * the final filters require it, re-checked against the final filters, and
+   * sent to the bounded Jev rescue. Returns listings to merge into `filtered`.
+   */
+  private async fuzzyRescueForSearch(
+    fetched: NormalizedListing[],
+    search: { query: string; includedTerms: string; excludedTerms: string; condition?: string },
+    finalFilters: { minPrice?: number | null; maxPrice?: number | null; condition?: string; location?: string; shippingOnly: boolean },
+    source: Marketplace,
+  ): Promise<NormalizedListing[]> {
+    const live = this.jevLiveConfig();
+    if (!live) return [];
+    const unshipped = { ...finalFilters, shippingOnly: false };
+    const candidates = findFuzzyRescueCandidates(fetched, search.query, search.includedTerms, search.excludedTerms, unshipped);
+    const pool = [...candidates.termCandidates, ...candidates.conditionCandidates].slice(0, 10);
+    if (!pool.length) return [];
+    if (finalFilters.shippingOnly) {
+      await this.enrichShipping(pool, source, { limit: 8 });
+      const shippable = pool.filter((listing) => listing.shippingAvailable === true);
+      if (!shippable.length) return [];
+      const rechecked = findFuzzyRescueCandidates(shippable, search.query, search.includedTerms, search.excludedTerms, finalFilters);
+      // Candidates that no longer qualify (e.g. price/location edge) stay dropped.
+      const rescue = await this.rescueFuzzyMisses(rechecked, search, live);
+      return rescue.rescued;
+    }
+    const aligned = findFuzzyRescueCandidates(pool, search.query, search.includedTerms, search.excludedTerms, finalFilters);
+    const rescue = await this.rescueFuzzyMisses(aligned, search, live);
+    return rescue.rescued;
+  }
+
+  /**
+   * P2: upgrade unknown negotiability to negotiable from description text.
+   * Never overrides an explicit signal: only runs when the in-memory listing
+   * and the stored row are both null/unknown, requires a confident Jev
+   * `negotiable` verdict, and writes with `WHERE price_negotiable IS NULL`.
+   * Mutates candidate.listing.priceNegotiable so the same-scan auto-negotiate
+   * gate sees the upgrade without a re-scan. Fail-open: any error is a no-op.
+   */
+  private async upgradeNegotiabilityFromDescription(
+    candidate: DealNotificationCandidate,
+    description: string | null,
+    live: NonNullable<ReturnType<ScoutService['jevLiveConfig']>>,
+  ): Promise<boolean> {
+    if (!live || !description) return false;
+    if (candidate.listing.marketplace !== 'OLX' && candidate.listing.marketplace !== 'Allegro Lokalnie') return false;
+    if (candidate.listing.priceNegotiable != null) return false;
+    try {
+      const stored = this.stmt('SELECT price_negotiable FROM listings WHERE marketplace = ? AND listing_id = ?').get(
+        candidate.listing.marketplace, candidate.listing.listingId,
+      ) as { price_negotiable?: number | null } | undefined;
+      if (!stored) return false;
+      if (stored.price_negotiable !== null && stored.price_negotiable !== undefined) return false;
+      const judgment = await this.jevNegotiability({
+        marketplace: candidate.listing.marketplace, title: candidate.listing.title,
+        condition: candidate.listing.condition, description,
+      }, { apiKey: live.apiKey, model: live.jevModel });
+      const inputHash = listingDescriptionVerificationInputHash({
+        marketplace: candidate.listing.marketplace, title: candidate.listing.title,
+        condition: candidate.listing.condition, description,
+      });
+      this.logJevLive('negotiability', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
+      if (judgment.decision !== 'negotiable' || judgment.unsure) return false;
+      const result = this.stmt('UPDATE listings SET price_negotiable = 1 WHERE marketplace = ? AND listing_id = ? AND price_negotiable IS NULL').run(
+        candidate.listing.marketplace, candidate.listing.listingId,
+      );
+      if ((result as { changes?: number }).changes) {
+        candidate.listing.priceNegotiable = true;
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
   private saveDescriptionVerification(input: {
     marketplace: Marketplace;
     listingId: string;
@@ -1311,6 +1458,13 @@ export class ScoutService {
     };
     const inputHash = listingDescriptionVerificationInputHash(context);
     const snapshot = this.captureListingDetailSnapshot(candidate, description);
+    // P2: same description upgrades unknown negotiability (null -> true only,
+    // confident Jev verdict, IS NULL-guarded write). Runs before the
+    // verification cache early-return so previously-verified listings still
+    // get the upgrade. Fail-open no-op.
+    if (jevLive && description) {
+      await this.upgradeNegotiabilityFromDescription(candidate, description, jevLive);
+    }
     const row = this.stmt(`SELECT ai_description_verification_json, ai_description_verification_input_hash,
       ai_description_verification_model, ai_description_verification_at, ai_description_verification_error,
       ai_description_verification_status
@@ -2155,23 +2309,62 @@ export class ScoutService {
         // Cache-first like watch scans: only a few cold listings fetch an item
         // page per search; the rest surface as pending delivery checks.
         if (input.shippingOnly) await this.enrichShipping(comparable, source);
-        const filtered = filterListings(comparable, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, shippingOnly: input.shippingOnly });
-        // One-off search stays deterministic: AI relevance is a watch-scan gate.
+        let filtered = filterListings(comparable, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, shippingOnly: input.shippingOnly });
+        // P1/P3 near-miss rescue: deterministic substring misses that pass
+        // everything else get one bounded Jev judgment each. Fail-closed:
+        // any failure keeps the deterministic set.
+        try {
+          const rescued = await this.fuzzyRescueForSearch(fetched, {
+            query: input.query, includedTerms: input.terms ?? '', excludedTerms: input.excluded ?? '', condition: input.condition,
+          }, { ...deterministicFilters, shippingOnly: Boolean(input.shippingOnly) }, source);
+          if (rescued.length) {
+            const seen = new Set(filtered.map((listing) => `${listing.marketplace}:${listing.listingId}`));
+            for (const listing of rescued) {
+              const key = `${listing.marketplace}:${listing.listingId}`;
+              if (!seen.has(key)) {
+                seen.add(key);
+                filtered.push(listing);
+              }
+            }
+          }
+        } catch {
+          // Rescue is recall-only; any failure keeps the deterministic set.
+        }
+        // Same AI relevance gate as watch scans (Jev live, DeepSeek legacy):
+        // fail-open, so unknown/not-configured keeps the deterministic set.
+        // An unexpected throw (e.g. cache/transaction failure) must not turn
+        // a good deterministic result into a user-visible search error.
+        let relevant = filtered;
+        let relevanceNote = '';
+        try {
+          const relevance = await this.filterListingsByAiRelevance(filtered, {
+            query: input.query,
+            includedTerms: input.terms ?? '',
+            excludedTerms: input.excluded ?? '',
+          }, undefined, true);
+          relevant = relevance.listings;
+          relevanceNote = relevance.notConfigured
+            ? ''
+            : relevance.unknown ? ` · ${relevance.unknown} AI checks unknown`
+              : relevance.excluded ? ` · ${relevance.excluded} excluded by AI` : '';
+        } catch (error) {
+          this.log('error', 'watch', `Manual search AI relevance fallback to deterministic: ${error instanceof Error ? error.message : String(error)}`.slice(0, 500));
+        }
         // One transaction for the whole batch: each upsert would otherwise be
         // its own implicit commit (an fsync per listing before WAL=NORMAL).
         this.transaction(() => {
-          for (const listing of filtered.slice(0, 100)) this.storeManualListing(listing);
+          for (const listing of relevant.slice(0, 100)) this.storeManualListing(listing);
         });
         const pendingShipping = input.shippingOnly ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
         return {
-          listings: filtered.slice(0, 100).map((listing): Listing => ({
+          listings: relevant.slice(0, 100).map((listing): Listing => ({
             id: `${listing.marketplace}:${listing.listingId}`, title: listing.title,
             subtitle: [listing.condition, listing.location].filter(Boolean).join(' · '), marketplace: listing.marketplace,
             price: listing.price, typical: null, belowTypical: null, observed: 'just now', observedAt: listing.observedAt,
             dealStrength: 1, dealLabel: 'Watch', image: listing.imageUrl ?? '', url: listing.url, watch: 'Manual search',
             condition: listing.condition, location: listing.location, shippingAvailable: listing.shippingAvailable ?? null, priceNegotiable: listing.priceNegotiable ?? null,
           })),
-          status: { source, status: 'ok' as const, count: filtered.length, pendingShipping, durationMs: Date.now() - started, message: filtered.length ? `${filtered.length} matches` : 'No matching listings' },
+          status: { source, status: 'ok' as const, count: relevant.length, pendingShipping, durationMs: Date.now() - started, message: relevant.length ? `${relevant.length} matches${relevanceNote}` : 'No matching listings' },
         };
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Search failed';
@@ -3104,7 +3297,26 @@ export class ScoutService {
           const deterministicFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, location: row.location, shippingOnly: false };
           const comparable = filterListings(fetched, row.query, row.included_terms, row.excluded_terms, deterministicFilters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
-          const filtered = filterListings(comparable, row.query, row.included_terms, row.excluded_terms, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) });
+          let filtered = filterListings(comparable, row.query, row.included_terms, row.excluded_terms, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) });
+          try {
+            if (!matchingExact.length) {
+              const rescued = await this.fuzzyRescueForSearch(fetched, {
+                query: row.query, includedTerms: row.included_terms ?? '', excludedTerms: row.excluded_terms ?? '', condition: row.condition,
+              }, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) }, source);
+              if (rescued.length) {
+                const seen = new Set(filtered.map((listing) => `${listing.marketplace}:${listing.listingId}`));
+                for (const listing of rescued) {
+                  const key = `${listing.marketplace}:${listing.listingId}`;
+                  if (!seen.has(key)) {
+                    seen.add(key);
+                    filtered.push(listing);
+                  }
+                }
+              }
+            }
+          } catch {
+            // Rescue is recall-only; any failure keeps the deterministic set.
+          }
           const relevance = await this.filterListingsByAiRelevance(filtered, {
             query: row.query,
             includedTerms: row.included_terms ?? '',
@@ -3967,37 +4179,97 @@ function relativeTimeFuture(value?: string | null) {
 
 export type ListingFilters = { shippingOnly?: boolean; minPrice?: number | null; maxPrice?: number | null; condition?: string; location?: string };
 
+function normalizeFilterText(value: string) {
+  return value.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function parseIncludedExcluded(query: string, includedRaw: string, excludedRaw: string) {
+  const included = includedRaw.trim()
+    ? includedRaw.split(',').map(normalizeFilterText).filter(Boolean)
+    : normalizeFilterText(query).split(/\s+/).filter((term) => term.length > 1);
+  const excluded = excludedRaw.split(',').map(normalizeFilterText).filter(Boolean);
+  return { included, excluded };
+}
+
+const CONDITION_ALIASES: Record<string, string[]> = {
+  'like new': ['like new', 'jak nowy', 'jak nowa', 'idealny', 'idealna'],
+  'very good': ['very good', 'bardzo dobry', 'bardzo dobra'],
+  good: ['good', 'dobry', 'dobra'],
+};
+
+function matchesRequestedCondition(requestedCondition: string, listingCondition: string) {
+  if (!requestedCondition || requestedCondition === 'any') return true;
+  const isNew = /(^| )(new|nowe|nowy|nowa)( |$)/.test(listingCondition);
+  if (requestedCondition === 'new') return isNew;
+  if (requestedCondition === 'used') return Boolean(listingCondition) && !isNew;
+  return (CONDITION_ALIASES[requestedCondition.replace(/\s+$/, '')] ?? [requestedCondition]).some((alias) => listingCondition.includes(alias));
+}
+
+function evaluateDeterministic(
+  listing: NormalizedListing,
+  title: string,
+  condition: string,
+  location: string,
+  included: string[],
+  excluded: string[],
+  requestedCondition: string,
+  requestedLocation: string,
+  options: ListingFilters,
+) {
+  const termOk = included.every((term) => title.includes(term)) && !excluded.some((term) => title.includes(term));
+  const conditionOk = matchesRequestedCondition(requestedCondition, condition);
+  const locationOk = !requestedLocation || requestedLocation === 'polska' || location.includes(requestedLocation);
+  const priceOk = (options.minPrice === null || options.minPrice === undefined || listing.price >= options.minPrice)
+    && (options.maxPrice === null || options.maxPrice === undefined || listing.price <= options.maxPrice);
+  const shippingOk = !options.shippingOnly || listing.shippingAvailable === true;
+  return { termOk, conditionOk, locationOk, priceOk, shippingOk };
+}
+
 export function filterListings(listings: NormalizedListing[], query: string, includedRaw: string, excludedRaw: string, filters: ListingFilters | boolean = {}) {
   const options = typeof filters === 'boolean' ? { shippingOnly: filters } : filters;
-  const normalize = (value: string) => value.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
-  const included = includedRaw.trim()
-    ? includedRaw.split(',').map(normalize).filter(Boolean)
-    : normalize(query).split(/\s+/).filter((term) => term.length > 1);
-  const excluded = excludedRaw.split(',').map(normalize).filter(Boolean);
+  const { included, excluded } = parseIncludedExcluded(query, includedRaw, excludedRaw);
   // Request-level values are identical for every listing: normalize them and
   // the alias table once instead of per filter pass.
-  const requestedLocation = normalize(options.location ?? '');
-  const requestedCondition = normalize(options.condition ?? '');
-  const conditionAliases: Record<string, string[]> = {
-    'like new': ['like new', 'jak nowy', 'jak nowa', 'idealny', 'idealna'],
-    'very good': ['very good', 'bardzo dobry', 'bardzo dobra'],
-    good: ['good', 'dobry', 'dobra'],
-  };
+  const requestedLocation = normalizeFilterText(options.location ?? '');
+  const requestedCondition = normalizeFilterText(options.condition ?? '');
   return listings.filter((listing) => {
-    const title = normalize(listing.title);
-    const condition = normalize(listing.condition ?? '');
-    const location = normalize(listing.location ?? '');
-    const isNew = /(^| )(new|nowe|nowy|nowa)( |$)/.test(condition);
-    const conditionMatches = !requestedCondition || requestedCondition === 'any'
-      || (requestedCondition === 'new' ? isNew
-        : requestedCondition === 'used' ? Boolean(condition) && !isNew
-          : (conditionAliases[requestedCondition.replace(/\s+$/, '')] ?? [requestedCondition]).some((alias) => condition.includes(alias)));
-    const locationMatches = !requestedLocation || requestedLocation === 'polska' || location.includes(requestedLocation);
-    return included.every((term) => title.includes(term))
-      && !excluded.some((term) => title.includes(term))
-      && (!options.shippingOnly || listing.shippingAvailable === true)
-      && (options.minPrice === null || options.minPrice === undefined || listing.price >= options.minPrice)
-      && (options.maxPrice === null || options.maxPrice === undefined || listing.price <= options.maxPrice)
-      && conditionMatches && locationMatches;
+    const title = normalizeFilterText(listing.title);
+    const condition = normalizeFilterText(listing.condition ?? '');
+    const location = normalizeFilterText(listing.location ?? '');
+    const evaluated = evaluateDeterministic(listing, title, condition, location, included, excluded, requestedCondition, requestedLocation, options);
+    return evaluated.termOk && evaluated.conditionOk && evaluated.locationOk && evaluated.priceOk && evaluated.shippingOk;
   });
+}
+
+/**
+ * P1/P3: near-miss rescue candidates. Returns listings that pass every
+ * deterministic check except exactly one fuzzy dimension (terms XOR
+ * condition). Callers send each subset to the matching Jev question; a
+ * confident pass rescues the listing, anything else keeps the drop.
+ */
+export function findFuzzyRescueCandidates(
+  listings: NormalizedListing[],
+  query: string,
+  includedRaw: string,
+  excludedRaw: string,
+  filters: ListingFilters | boolean = {},
+) {
+  const options = typeof filters === 'boolean' ? { shippingOnly: filters } : filters;
+  const { included, excluded } = parseIncludedExcluded(query, includedRaw, excludedRaw);
+  const requestedLocation = normalizeFilterText(options.location ?? '');
+  const requestedCondition = normalizeFilterText(options.condition ?? '');
+  const hasTermFilter = included.length > 0 || excluded.length > 0;
+  const hasConditionFilter = Boolean(requestedCondition) && requestedCondition !== 'any';
+  const termCandidates: NormalizedListing[] = [];
+  const conditionCandidates: NormalizedListing[] = [];
+  for (const listing of listings) {
+    const title = normalizeFilterText(listing.title);
+    const condition = normalizeFilterText(listing.condition ?? '');
+    const location = normalizeFilterText(listing.location ?? '');
+    const evaluated = evaluateDeterministic(listing, title, condition, location, included, excluded, requestedCondition, requestedLocation, options);
+    if (!evaluated.locationOk || !evaluated.priceOk || !evaluated.shippingOk) continue;
+    if (!evaluated.termOk && evaluated.conditionOk && hasTermFilter) termCandidates.push(listing);
+    else if (!evaluated.conditionOk && evaluated.termOk && hasConditionFilter) conditionCandidates.push(listing);
+  }
+  return { termCandidates, conditionCandidates };
 }

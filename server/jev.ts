@@ -20,6 +20,9 @@ export const DEFAULT_JEV_MODEL = '~typesafe/jev-latest';
 
 const JEV_RELEVANCE_SESSION_ID = 'scout:jev-relevance:v1';
 const JEV_VERIFICATION_SESSION_ID = 'scout:jev-verification:v1';
+const JEV_TERM_MATCH_SESSION_ID = 'scout:jev-term-match:v1';
+const JEV_NEGOTIABILITY_SESSION_ID = 'scout:jev-negotiability:v1';
+const JEV_CONDITION_SESSION_ID = 'scout:jev-condition:v1';
 
 /** Model is configurable: explicit config wins, then env, then the alias. */
 export function resolveJevModel(configured?: string | null): string {
@@ -39,6 +42,12 @@ export const RELEVANCE_UNSURE_HIGH = 0.7;
 /** Minimum Choice confidence for a verification verdict to stand without escalation. */
 export const VERIFICATION_MIN_CONFIDENCE = 0.6;
 
+/** Minimum Choice confidence to rescue a deterministic term/condition miss. Conservative: only a confident pass widens results. */
+export const FUZZY_MATCH_MIN_CONFIDENCE = 0.75;
+
+/** Minimum Choice confidence to upgrade unknown negotiability to negotiable. Never flips an explicit fixed signal. */
+export const NEGOTIABILITY_MIN_CONFIDENCE = 0.8;
+
 export function isRelevanceUnsure(p: number): boolean {
   return p > RELEVANCE_UNSURE_LOW && p < RELEVANCE_UNSURE_HIGH;
 }
@@ -46,6 +55,16 @@ export function isRelevanceUnsure(p: number): boolean {
 export function isVerificationUnsure(decision: string, confidence: number | null): boolean {
   if (decision === 'unknown') return true;
   return confidence === null || !Number.isFinite(confidence) || confidence < VERIFICATION_MIN_CONFIDENCE;
+}
+
+export function isFuzzyMatchUnsure(decision: string, confidence: number | null): boolean {
+  if (decision === 'unknown') return true;
+  return confidence === null || !Number.isFinite(confidence) || confidence < FUZZY_MATCH_MIN_CONFIDENCE;
+}
+
+export function isNegotiabilityUnsure(decision: string, confidence: number | null): boolean {
+  if (decision === 'unknown') return true;
+  return confidence === null || !Number.isFinite(confidence) || confidence < NEGOTIABILITY_MIN_CONFIDENCE;
 }
 
 export class JevError extends Error {
@@ -84,6 +103,45 @@ export interface JevRelevanceJudgment {
 
 export interface JevVerificationJudgment {
   decision: 'pass' | 'reject' | 'unknown';
+  confidence: number | null;
+  unsure: boolean;
+}
+
+export interface JevTermMatchContext {
+  query: string;
+  includedTerms: string;
+  excludedTerms: string;
+  title: string;
+  condition?: string | null;
+}
+
+export interface JevTermMatchJudgment {
+  decision: 'pass' | 'reject' | 'unknown';
+  confidence: number | null;
+  unsure: boolean;
+}
+
+export interface JevNegotiabilityContext {
+  marketplace: string;
+  title: string;
+  condition?: string | null;
+  description: string | null;
+}
+
+export interface JevNegotiabilityJudgment {
+  decision: 'negotiable' | 'fixed' | 'unknown';
+  confidence: number | null;
+  unsure: boolean;
+}
+
+export interface JevConditionMatchContext {
+  requestedCondition: string;
+  listingCondition?: string | null;
+  title: string;
+}
+
+export interface JevConditionMatchJudgment {
+  decision: 'match' | 'mismatch' | 'unknown';
   confidence: number | null;
   unsure: boolean;
 }
@@ -212,4 +270,121 @@ export async function verifyListingDescriptionWithJev(
     ? parsed.data.confidence
     : null;
   return { decision, confidence, unsure: isVerificationUnsure(decision, confidence) };
+}
+
+/** P1: near-miss rescue for deterministic term filtering. Only a confident pass widens results; unknown/reject keeps the drop. */
+export async function classifyTermMatchWithJev(
+  context: JevTermMatchContext,
+  config: { apiKey: string; model?: string | null },
+  fetcher: typeof fetch = fetch,
+): Promise<JevTermMatchJudgment> {
+  const answers = await postDecisions({
+    model: resolveJevModel(config.model),
+    session_id: JEV_TERM_MATCH_SESSION_ID,
+    state: {
+      query: context.query,
+      includedTerms: context.includedTerms || null,
+      excludedTerms: context.excludedTerms || null,
+      listing: {
+        title: context.title,
+        condition: context.condition ?? null,
+      },
+    },
+    questions: {
+      termMatch: {
+        type: 'choice',
+        instructions: 'Given `query`, `includedTerms`, `excludedTerms`, and `listing.title`, does the listing title denote the sought item honoring the include/exclude intent? Accept inflections, synonyms, abbreviations, and word-order variants (e.g. Polish declensions, `PS5` vs `Playstation 5`). Reject only when the title is a different item or clearly hits an excluded meaning.',
+        criteria: {
+          pass: 'The title denotes the sought item and honors include/exclude intent despite wording differences.',
+          reject: 'The title is a different item, an accessory/part, or clearly matches an excluded meaning.',
+          unknown: 'Title too short, ambiguous, or not enough evidence to decide. Do not guess from price or general product knowledge.',
+        },
+      },
+    },
+  }, config.apiKey, 'listing term match', fetcher);
+
+  const parsed = choiceAnswerSchema.safeParse(answers.termMatch);
+  if (!parsed.success) throw new JevError('OpenRouter Decisions returned listing term match with an invalid shape', 502, 'format');
+  const decision = parsed.data.choice === 'pass' || parsed.data.choice === 'reject' ? parsed.data.choice : 'unknown';
+  const confidence = typeof parsed.data.confidence === 'number' && Number.isFinite(parsed.data.confidence)
+    ? parsed.data.confidence
+    : null;
+  return { decision, confidence, unsure: isFuzzyMatchUnsure(decision, confidence) };
+}
+
+/** P2: negotiability judgment over already-fetched description text. Only upgrades unknown; never overrides explicit fixed. */
+export async function classifyNegotiabilityWithJev(
+  context: JevNegotiabilityContext,
+  config: { apiKey: string; model?: string | null },
+  fetcher: typeof fetch = fetch,
+): Promise<JevNegotiabilityJudgment> {
+  const answers = await postDecisions({
+    model: resolveJevModel(config.model),
+    session_id: JEV_NEGOTIABILITY_SESSION_ID,
+    state: {
+      listing: {
+        marketplace: context.marketplace,
+        title: context.title,
+        condition: context.condition ?? null,
+        description: context.description,
+      },
+    },
+    questions: {
+      negotiability: {
+        type: 'choice',
+        instructions: 'Given `listing.title` and `listing.description`, does the seller invite price negotiation or an offer? Accept explicit and clearly implied invitations in any language (e.g. `do negocjacji`, `cena do uzgodnienia`, `mozna sie dogadac`, `negotiable`, `open to offers`). Fixed means an explicit firm-price or no-negotiation statement.',
+        criteria: {
+          negotiable: 'Explicit or clearly implied invitation to negotiate, make an offer, or agree on price.',
+          fixed: 'Explicit fixed, firm, non-negotiable price, or refusal to negotiate.',
+          unknown: 'No negotiation signal either way, ambiguous, or not enough evidence. Do not infer from a low price or title alone.',
+        },
+      },
+    },
+  }, config.apiKey, 'listing negotiability', fetcher);
+
+  const parsed = choiceAnswerSchema.safeParse(answers.negotiability);
+  if (!parsed.success) throw new JevError('OpenRouter Decisions returned listing negotiability with an invalid shape', 502, 'format');
+  const decision = parsed.data.choice === 'negotiable' || parsed.data.choice === 'fixed' ? parsed.data.choice : 'unknown';
+  const confidence = typeof parsed.data.confidence === 'number' && Number.isFinite(parsed.data.confidence)
+    ? parsed.data.confidence
+    : null;
+  return { decision, confidence, unsure: isNegotiabilityUnsure(decision, confidence) };
+}
+
+/** P3: condition-filter judgment for Polish marketplace labels. Only a confident match rescues a deterministic miss. */
+export async function classifyConditionMatchWithJev(
+  context: JevConditionMatchContext,
+  config: { apiKey: string; model?: string | null },
+  fetcher: typeof fetch = fetch,
+): Promise<JevConditionMatchJudgment> {
+  const answers = await postDecisions({
+    model: resolveJevModel(config.model),
+    session_id: JEV_CONDITION_SESSION_ID,
+    state: {
+      requestedCondition: context.requestedCondition,
+      listing: {
+        condition: context.listingCondition ?? null,
+        title: context.title,
+      },
+    },
+    questions: {
+      conditionMatch: {
+        type: 'choice',
+        instructions: 'Given `requestedCondition` and `listing.condition` (with `listing.title` as fallback), does the listing satisfy the requested condition? `new` means factory-new only (`Nowe`, `new`); `used` means any stated non-new condition. Accept Polish labels and synonyms (`Jak nowy`, `Idealny`, `Bardzo dobry`, `Uzywane`). Missing condition cannot satisfy a specific request.',
+        criteria: {
+          match: 'The listing condition clearly satisfies the requested condition.',
+          mismatch: 'The listing condition clearly does not satisfy the requested condition.',
+          unknown: 'Condition missing, ambiguous, or not enough evidence. Do not guess from price or title alone.',
+        },
+      },
+    },
+  }, config.apiKey, 'listing condition match', fetcher);
+
+  const parsed = choiceAnswerSchema.safeParse(answers.conditionMatch);
+  if (!parsed.success) throw new JevError('OpenRouter Decisions returned listing condition match with an invalid shape', 502, 'format');
+  const decision = parsed.data.choice === 'match' || parsed.data.choice === 'mismatch' ? parsed.data.choice : 'unknown';
+  const confidence = typeof parsed.data.confidence === 'number' && Number.isFinite(parsed.data.confidence)
+    ? parsed.data.confidence
+    : null;
+  return { decision, confidence, unsure: isFuzzyMatchUnsure(decision, confidence) };
 }
