@@ -1127,6 +1127,9 @@ test('does not fetch listing details for shipping when manual search does not re
         { id: 123, title: 'CPU', price: { amount: '150', currency_code: 'PLN' }, url: 'https://www.vinted.pl/items/123-cpu', status: 'Bardzo dobry' },
       ], pagination: { current_page: 1, total_pages: 1, total_entries: 1, per_page: 20 }, code: 0 } };
     };
+    // SSR catalog page is primary; force the opportunistic JSON path here to
+    // keep this shipping-logic test hermetic (no live network).
+    (context.service as any).fetchVintedItemPage = async () => ({ status: 403, body: '' });
     (context.service as any).fetchPublicPage = async (url: string) => {
       throw new Error(`unexpected public page fetch: ${url}`);
     };

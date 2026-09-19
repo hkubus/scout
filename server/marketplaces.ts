@@ -1164,6 +1164,19 @@ export function createVintedJsonAdapter(
       const validation = validateSearchUrl(url, marketplace);
       if (!validation.valid) throw new Error(validation.reason);
       const apiUrl = vintedSearchApiUrlFromCatalogUrl(validation.url);
+      // Primary: SSR catalog page (verified 2026-09-19 scan — 96 cards/page,
+      // pagination via catalog-pagination links). The JSON route
+      // /api/v2/catalog/items answers 404, so it is only opportunistic now.
+      let pageError: unknown;
+      try {
+        const page = await pageFetcher(validation.url);
+        if (page.status < 200 || page.status >= 300) throw new Error(`Vinted catalog page returned HTTP ${page.status}`);
+        if (!page.body) throw new Error('Vinted catalog page returned no usable markup');
+        onPath?.('vinted-catalog-page');
+        return parseSearchPage(page.body, marketplace);
+      } catch (error) {
+        pageError = error;
+      }
       if (apiUrl) {
         const apiValidation = validateSearchUrl(apiUrl, marketplace);
         if (apiValidation.valid) {
@@ -1173,32 +1186,19 @@ export function createVintedJsonAdapter(
             onPath?.('vinted-catalog-api');
             return parseVintedCatalogApi(json);
           } catch (apiError) {
-            // JSON failures (expired bootstrap, Cloudflare fence, retired
-            // route — /api/v2/catalog/items answers 404 as of 2026-09-19,
-            // 403 on flagged IPs) fail closed to the Chrome-UA catalog page
-            // first (same fetcher + Chromium fallback as item pages), then to
-            // the public-page adapter.
-            try {
-              const page = await pageFetcher(validation.url);
-              if (page.status < 200 || page.status >= 300) throw new Error(`Vinted catalog page returned HTTP ${page.status}`);
-              if (!page.body) throw new Error('Vinted catalog page returned no usable markup');
-              onPath?.('vinted-catalog-page');
-              return parseSearchPage(page.body, marketplace);
-            } catch (pageError) {
-              if (!fallback) {
-                throw pageError instanceof Error ? new Error(pageError.message, { cause: apiError }) : pageError;
-              }
-              onPath?.('vinted-catalog-api-fallback');
-              return fallback.fetchPublicSearch(url);
+            if (!fallback) {
+              throw pageError instanceof Error ? new Error(pageError.message, { cause: apiError }) : pageError;
             }
+            onPath?.('vinted-catalog-api-fallback');
+            return fallback.fetchPublicSearch(url);
           }
         }
       }
-      const page = await pageFetcher(validation.url);
-      if (page.status < 200 || page.status >= 300) throw new Error(`Vinted catalog page returned HTTP ${page.status}`);
-      if (!page.body) throw new Error('Vinted catalog page returned no usable markup');
-      onPath?.('vinted-catalog-page');
-      return parseSearchPage(page.body, marketplace);
+      if (!fallback) {
+        throw pageError;
+      }
+      onPath?.('vinted-catalog-api-fallback');
+      return fallback.fetchPublicSearch(url);
     },
     async fetchDetail(url) {
       const validation = validateSearchUrl(url, marketplace);
