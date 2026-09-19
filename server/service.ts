@@ -3370,10 +3370,11 @@ export class ScoutService {
 
   /**
    * Every marketplace runs on a dedicated anonymous path: OLX on its verified
-   * offers API, Vinted on its cookie-bootstrapped catalog API (falling back to
-   * the public-page adapter, which owns the Chromium render), and Allegro
-   * Lokalnie on plain-HTTP SSR pages enriched through its anonymous batch API.
-   * Chromium is only reachable through those explicit fallbacks.
+   * offers API, Vinted on the SSR catalog page first (pageFetcher owns the
+   * Chromium fallback, catalog JSON only opportunistically), then the
+   * public-page adapter, and Allegro Lokalnie on plain-HTTP SSR pages
+   * enriched through its anonymous batch API. Chromium is only reachable
+   * through those explicit fallbacks.
    */
   private createConnectorAdapter(source: Marketplace, onPath?: ConnectorPathReporter): ConnectorAdapter {
     if (source === 'OLX') return createOlxJsonAdapter(source, (url) => this.fetchOlxApi(url), onPath);
