@@ -9,6 +9,8 @@ const LISTING_NORMALIZATION_CACHE_VERSION = 'v3';
 const LISTING_RELEVANCE_CACHE_VERSION = 'v5';
 const LISTING_DESCRIPTION_VERIFICATION_CACHE_VERSION = 'v2';
 const LISTING_CONDITION_MATCH_CACHE_VERSION = 'v1';
+const LISTING_TERM_MATCH_CACHE_VERSION = 'v1';
+const LISTING_NEGOTIABILITY_CACHE_VERSION = 'v1';
 export const LISTING_DESCRIPTION_MAX_CHARS = 6_000;
 
 const responseHealingPlugins = [{ id: 'response-healing' }] as const;
@@ -253,6 +255,31 @@ export function listingConditionMatchInputHash(context: { title: string; listing
       title: normalizeCacheText(context.title),
       listingCondition: normalizeCacheText(context.listingCondition),
       requestedCondition: normalizeCacheText(context.requestedCondition),
+    }))
+    .digest('hex');
+}
+
+export function listingTermMatchInputHash(context: { query: string; includedTerms: string; excludedTerms: string; title: string; listingCondition?: string | null }) {
+  return createHash('sha256')
+    .update(JSON.stringify({
+      version: LISTING_TERM_MATCH_CACHE_VERSION,
+      title: normalizeCacheText(context.title),
+      listingCondition: normalizeCacheText(context.listingCondition),
+      query: normalizeCacheText(context.query),
+      includedTerms: normalizeCacheTerms(context.includedTerms),
+      excludedTerms: normalizeCacheTerms(context.excludedTerms),
+    }))
+    .digest('hex');
+}
+
+export function listingNegotiabilityInputHash(context: { marketplace: string; title: string; condition?: string | null; description: string | null }) {
+  return createHash('sha256')
+    .update(JSON.stringify({
+      version: LISTING_NEGOTIABILITY_CACHE_VERSION,
+      marketplace: normalizeCacheText(context.marketplace),
+      title: normalizeCacheText(context.title),
+      condition: normalizeCacheText(context.condition),
+      description: normalizeCacheText(context.description)?.slice(0, LISTING_DESCRIPTION_MAX_CHARS) ?? null,
     }))
     .digest('hex');
 }

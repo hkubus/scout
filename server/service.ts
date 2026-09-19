@@ -5,7 +5,7 @@ import { chromium, type Browser, type BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
-import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, draftNegotiationMessageWithDeepSeek, legacyListingNormalizationInputHash, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNormalizationInputHash, listingRelevanceInputHash, normalizeListingWithDeepSeek, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseStoredListingNormalization, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type NegotiationListingContext } from './ai';
+import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, draftNegotiationMessageWithDeepSeek, legacyListingNormalizationInputHash, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingNormalizationInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeListingWithDeepSeek, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseStoredListingNormalization, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type NegotiationListingContext } from './ai';
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
 import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, verifyListingDescriptionWithVision, visionToVerification } from './vision';
 import { OlxMessagingError, sendOlxMessageOnPage } from './olx-messaging';
@@ -1213,9 +1213,9 @@ export class ScoutService {
     budget -= termSlice.length;
     const conditionSlice = candidates.conditionCandidates.slice(0, Math.max(0, budget));
     for (const listing of termSlice) {
-      const inputHash = listingRelevanceInputHash({
-        marketplace: listing.marketplace, title: listing.title, condition: listing.condition,
-        location: listing.location, query: search.query,
+      const inputHash = listingTermMatchInputHash({
+        title: listing.title, listingCondition: listing.condition,
+        query: search.query,
         includedTerms: search.includedTerms, excludedTerms: search.excludedTerms,
       });
       try {
@@ -1272,7 +1272,7 @@ export class ScoutService {
     const pool = [...candidates.termCandidates, ...candidates.conditionCandidates].slice(0, 10);
     if (!pool.length) return [];
     if (finalFilters.shippingOnly) {
-      await this.enrichShipping(pool, source, { limit: 8 });
+      await this.enrichShipping(pool, source, { limit: 10 });
       const shippable = pool.filter((listing) => listing.shippingAvailable === true);
       if (!shippable.length) return [];
       const rechecked = findFuzzyRescueCandidates(shippable, search.query, search.includedTerms, search.excludedTerms, finalFilters);
@@ -1311,7 +1311,7 @@ export class ScoutService {
         marketplace: candidate.listing.marketplace, title: candidate.listing.title,
         condition: candidate.listing.condition, description,
       }, { apiKey: live.apiKey, model: live.jevModel });
-      const inputHash = listingDescriptionVerificationInputHash({
+      const inputHash = listingNegotiabilityInputHash({
         marketplace: candidate.listing.marketplace, title: candidate.listing.title,
         condition: candidate.listing.condition, description,
       });
