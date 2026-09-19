@@ -1,5 +1,5 @@
 export type Theme = 'light' | 'dark' | 'system';
-export type View = 'overview' | 'search' | 'watches' | 'market-research' | 'listings' | 'messages' | 'connectors' | 'logs' | 'settings';
+export type View = 'overview' | 'search' | 'watches' | 'market-research' | 'analytics' | 'listings' | 'messages' | 'connectors' | 'logs' | 'settings';
 export type Marketplace = 'OLX' | 'Allegro Lokalnie' | 'Vinted';
 export type DealLabel = 'Exceptional' | 'Very strong' | 'Strong' | 'Watch';
 export type NotificationPriority = 'strong' | 'very-strong' | 'exceptional';
@@ -217,6 +217,92 @@ export interface WatchAnalytics {
   medianChangePercent: number | null;
   points: WatchAnalyticsPoint[];
   sources: WatchAnalyticsSource[];
+}
+
+export interface AnalyticsDiscountBucket {
+  label: string;
+  count: number;
+}
+
+export interface AnalyticsTrendPoint {
+  date: string;
+  medianPrice: number | null;
+  lowerPrice: number | null;
+  upperPrice: number | null;
+  listingCount: number;
+  strongDealCount: number;
+}
+
+export interface AnalyticsWatchLeaderboardRow {
+  watchId: string;
+  watchName: string;
+  listings: number;
+  strongDeals: number;
+  medianDiscountPercent: number | null;
+  lastSeenAt: string | null;
+}
+
+export interface AnalyticsMarketplaceDeals {
+  marketplace: Marketplace;
+  listings: number;
+  strongDeals: number;
+  medianDiscountPercent: number | null;
+}
+
+/**
+ * A daily-deduped observation, one per (day, watch, listing). Aggregate deals
+ * metrics live on the asking price versus the learned baseline; discount is
+ * derived, never a confirmed sale.
+ */
+export interface AnalyticsMarketplaceRow extends AnalyticsMarketplaceDeals {
+  scanRuns: number;
+  scanSuccessRate: number | null;
+  averageLatencyMs: number | null;
+}
+
+export interface AnalyticsOverview {
+  trackedListings: number;
+  newListings: number;
+  strongDeals: number;
+  medianDiscountPercent: number | null;
+  scanRuns: number;
+  scanSuccessRate: number | null;
+}
+
+export interface AnalyticsTriage {
+  buy: number;
+  watch: number;
+  pass: number;
+  none: number;
+}
+
+export interface AnalyticsNegotiation {
+  offersSent: number;
+  successRate: number | null;
+  automatic: number;
+  averageDiscountPercent: number | null;
+}
+
+export interface AnalyticsAiQuality {
+  relevanceJudged: number;
+  relevancePassRate: number | null;
+  shadowJudged: number;
+  shadowAgreementRate: number | null;
+}
+
+export interface AnalyticsData {
+  rangeDays: number;
+  watchId: string | null;
+  marketplace: Marketplace | null;
+  generatedAt: string;
+  overview: AnalyticsOverview;
+  trend: AnalyticsTrendPoint[];
+  discountDistribution: AnalyticsDiscountBucket[];
+  watchLeaderboard: AnalyticsWatchLeaderboardRow[];
+  marketplaceComparison: AnalyticsMarketplaceRow[];
+  triage: AnalyticsTriage;
+  negotiation: AnalyticsNegotiation;
+  aiQuality: AnalyticsAiQuality;
 }
 
 export interface SearchFilters {

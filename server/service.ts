@@ -16,7 +16,8 @@ import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, median, scoreDeal } from './s
 import { pickVariantBatch, typoVariants } from './typos';
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
-import type { AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
+import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsNegotiation, AnalyticsOverview, AnalyticsTriage, AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -1891,6 +1892,140 @@ export class ScoutService {
       medianChangePercent,
       points,
       sources,
+    };
+  }
+
+  /**
+   * Cross-watch analytics for the Analytics page. Deal metrics come from
+   * daily-deduped `observations` (asking price vs learned baseline); triage,
+   * negotiation, and AI-quality sections are operational signals that are not
+   * watch-scoped, so they honor only the range and marketplace filters.
+   */
+  analytics(options: { days?: number; watchId?: string; marketplace?: Marketplace } = {}): AnalyticsData {
+    const days = Math.max(7, Math.min(180, Math.floor(options.days ?? 30)));
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60_000).toISOString();
+    const watchId = options.watchId ?? null;
+    const marketplace = options.marketplace ?? null;
+
+    // Identical relevance/shipping/price semantics to watchAnalytics so the
+    // page never counts listings a watch itself would ignore.
+    const predicates = [
+      'w.archived_at IS NULL',
+      'o.observed_at >= ?',
+      "NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)",
+      '(w.shipping_only = 0 OR l.shipping_available = 1)',
+      '(w.min_price_pln IS NULL OR o.price_pln >= w.min_price_pln)',
+      '(w.max_price_pln IS NULL OR o.price_pln <= w.max_price_pln)',
+    ];
+    const params: unknown[] = [cutoff];
+    if (watchId) { predicates.push('o.watch_id = ?'); params.push(watchId); }
+    if (marketplace) { predicates.push('l.marketplace = ?'); params.push(marketplace); }
+    const rows = this.stmt(`SELECT date(o.observed_at) AS day, o.listing_id AS listing_id, o.watch_id AS watch_id, w.name AS watch_name, l.marketplace AS marketplace, o.price_pln AS price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at, wl.first_seen_at AS first_seen_at
+      FROM observations o
+      JOIN listings l ON l.id = o.listing_id
+      JOIN watches w ON w.id = o.watch_id
+      JOIN watch_listings wl ON wl.watch_id = o.watch_id AND wl.listing_id = o.listing_id
+      WHERE ${predicates.join(' AND ')}
+      GROUP BY day, o.watch_id, o.listing_id`).all(...params) as Array<Record<string, any>>;
+    const observations: AnalyticsObservation[] = rows.map((row) => ({
+      day: String(row.day),
+      listingId: Number(row.listing_id),
+      watchId: String(row.watch_id),
+      watchName: String(row.watch_name),
+      marketplace: row.marketplace as Marketplace,
+      price: Number(row.price_pln),
+      typical: row.typical_pln === null || row.typical_pln === undefined ? null : Number(row.typical_pln),
+      observedAt: String(row.observed_at),
+      firstSeenAt: String(row.first_seen_at),
+    }));
+
+    const scanPredicates = ["watch_kind = 'watch'", 'started_at >= ?'];
+    const scanParams: unknown[] = [cutoff];
+    if (marketplace) { scanPredicates.push('marketplace = ?'); scanParams.push(marketplace); }
+    if (watchId) { scanPredicates.push('watch_id = ?'); scanParams.push(watchId); }
+    const scanRows = this.stmt(`SELECT marketplace, COUNT(*) AS runs, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed, AVG(CASE WHEN completed_at IS NOT NULL THEN (julianday(completed_at) - julianday(started_at)) * 86400000 END) AS average_ms
+      FROM scans WHERE ${scanPredicates.join(' AND ')} GROUP BY marketplace`).all(...scanParams) as Array<Record<string, any>>;
+    const scanByMarketplace = new Map<string, { runs: number; completed: number; averageMs: number | null }>();
+    let scanRuns = 0;
+    let scansCompleted = 0;
+    for (const row of scanRows) {
+      const runs = Number(row.runs);
+      const completed = Number(row.completed);
+      scanRuns += runs;
+      scansCompleted += completed;
+      scanByMarketplace.set(String(row.marketplace), {
+        runs,
+        completed,
+        averageMs: row.average_ms === null || row.average_ms === undefined ? null : Number(row.average_ms),
+      });
+    }
+    const marketplaceComparison: AnalyticsMarketplaceRow[] = marketplaceDeals(observations).map((row) => {
+      const scan = scanByMarketplace.get(row.marketplace);
+      return {
+        ...row,
+        scanRuns: scan?.runs ?? 0,
+        scanSuccessRate: scan && scan.runs > 0 ? (scan.completed / scan.runs) * 100 : null,
+        averageLatencyMs: scan?.averageMs ?? null,
+      };
+    });
+
+    const triagePredicates = ['a.updated_at >= ?'];
+    const triageParams: unknown[] = [cutoff];
+    if (marketplace) { triagePredicates.push('a.marketplace = ?'); triageParams.push(marketplace); }
+    const triageRows = this.stmt(`SELECT a.decision AS decision, COUNT(*) AS count FROM listing_actions a WHERE ${triagePredicates.join(' AND ')} GROUP BY a.decision`).all(...triageParams) as Array<{ decision?: string | null; count: number }>;
+    const triage: AnalyticsTriage = { buy: 0, watch: 0, pass: 0, none: 0 };
+    for (const row of triageRows) {
+      const count = Number(row.count);
+      if (row.decision === 'buy') triage.buy += count;
+      else if (row.decision === 'watch') triage.watch += count;
+      else if (row.decision === 'pass') triage.pass += count;
+      else triage.none += count;
+    }
+
+    const activityPredicates = ['created_at >= ?'];
+    const activityParams: unknown[] = [cutoff];
+    if (marketplace) { activityPredicates.push('marketplace = ?'); activityParams.push(marketplace); }
+    const activityWhere = activityPredicates.join(' AND ');
+    const messageRow = this.stmt(`SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent FROM seller_messages WHERE ${activityWhere}`).get(...activityParams) as { total?: number; sent?: number };
+    const autoRow = this.stmt(`SELECT COUNT(*) AS total, AVG(discount_percent) AS average_discount FROM automatic_negotiations WHERE ${activityWhere}`).get(...activityParams) as { total?: number; average_discount?: number | null };
+    const offersSent = Number(messageRow.total ?? 0);
+    const negotiation: AnalyticsNegotiation = {
+      offersSent,
+      successRate: offersSent > 0 ? (Number(messageRow.sent ?? 0) / offersSent) * 100 : null,
+      automatic: Number(autoRow.total ?? 0),
+      averageDiscountPercent: autoRow.average_discount === null || autoRow.average_discount === undefined ? null : Number(autoRow.average_discount),
+    };
+
+    const relevanceRow = this.stmt("SELECT SUM(CASE WHEN relevance_status IN ('relevant', 'irrelevant') THEN 1 ELSE 0 END) AS judged, SUM(CASE WHEN relevance_status = 'relevant' THEN 1 ELSE 0 END) AS passed FROM listing_relevance WHERE checked_at >= ?").get(cutoff) as { judged?: number; passed?: number };
+    const shadowRow = this.stmt('SELECT SUM(CASE WHEN agreement IS NOT NULL THEN 1 ELSE 0 END) AS judged, SUM(CASE WHEN agreement = 1 THEN 1 ELSE 0 END) AS agreed FROM jev_shadow_log WHERE created_at >= ?').get(cutoff) as { judged?: number; agreed?: number };
+    const relevanceJudged = Number(relevanceRow.judged ?? 0);
+    const shadowJudged = Number(shadowRow.judged ?? 0);
+    const aiQuality: AnalyticsAiQuality = {
+      relevanceJudged,
+      relevancePassRate: relevanceJudged > 0 ? (Number(relevanceRow.passed ?? 0) / relevanceJudged) * 100 : null,
+      shadowJudged,
+      shadowAgreementRate: shadowJudged > 0 ? (Number(shadowRow.agreed ?? 0) / shadowJudged) * 100 : null,
+    };
+
+    const overview: AnalyticsOverview = {
+      ...dealOverview(observations, cutoff),
+      scanRuns,
+      scanSuccessRate: scanRuns > 0 ? (scansCompleted / scanRuns) * 100 : null,
+    };
+
+    return {
+      rangeDays: days,
+      watchId,
+      marketplace,
+      generatedAt: nowIso(),
+      overview,
+      trend: trendPoints(observations),
+      discountDistribution: discountDistribution(observations),
+      watchLeaderboard: watchLeaderboard(observations),
+      marketplaceComparison,
+      triage,
+      negotiation,
+      aiQuality,
     };
   }
 
