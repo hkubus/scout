@@ -3333,7 +3333,13 @@ export class ScoutService {
         throw new Error(`${marketplace} authenticated session failed: ${message}. Re-import the session after logging in again.`);
       }
     }
-    const publicHeaders = { 'user-agent': 'Scout/1.0 (+self-hosted public page monitor)', accept: 'text/html,application/xhtml+xml' };
+    // Vinted fences the self-identifying Scout UA (403 on flagged IPs) while the
+    // same page answers 200 to the Chrome UA (verified 2026-09-19: catalog and
+    // item pages 200 via Chrome UA, API 404). Other marketplaces keep the
+    // polite identifier.
+    const publicHeaders: Record<string, string> = marketplace === 'Vinted'
+      ? { 'user-agent': MARKETPLACE_API_USER_AGENT, accept: 'text/html,application/xhtml+xml', 'accept-language': 'pl-PL,pl;q=0.9' }
+      : { 'user-agent': 'Scout/1.0 (+self-hosted public page monitor)', accept: 'text/html,application/xhtml+xml' };
     let pageUrl = validation.url;
     let response = await fetch(pageUrl, { redirect: 'manual', headers: publicHeaders, signal: AbortSignal.timeout(12_000) });
     for (let hop = 0; hop < 3 && response.status >= 300 && response.status < 400; hop += 1) {
@@ -3405,20 +3411,41 @@ export class ScoutService {
       } else {
         const executablePath = process.env.SCOUT_CHROMIUM_PATH ?? ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'].find(existsSync);
         if (!executablePath) throw new Error('Chromium is not available; configure SCOUT_BROWSER_WS');
-        browser = await chromium.launch({ executablePath, headless: true, args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'] });
+        browser = await chromium.launch({ executablePath, headless: true, args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'] });
         ownsBrowser = true;
       }
       // Always isolate scans in their own context: reusing the shared default
       // context leaks cookies across marketplaces and concurrent scans.
-      context = await browser.newContext(storageState ? { locale: 'pl-PL', storageState: storageState as any } : { locale: 'pl-PL' });
+      // A real Chrome UA + viewport hides the headless default (DataDome and
+      // Cloudflare Turnstile fence HeadlessChrome on flagged IPs).
+      context = await browser.newContext(storageState
+        ? { locale: 'pl-PL', storageState: storageState as any, userAgent: MARKETPLACE_API_USER_AGENT, viewport: { width: 1366, height: 768 } }
+        : { locale: 'pl-PL', userAgent: MARKETPLACE_API_USER_AGENT, viewport: { width: 1366, height: 768 } });
       if (!context) throw new Error('Chromium context could not be created');
       const page = await context.newPage();
       try {
-        const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 });
+        // Vinted-only warm-up: the homepage sets the anonymous session cookies
+        // (access_token_web, __cf_bm) and lets JS challenges settle before the
+        // target navigation goes out cold. Other marketplaces keep the direct
+        // navigation to avoid extra latency and challenge surface.
+        if (marketplace === 'Vinted') {
+          try {
+            const root = new URL(url).origin + '/';
+            if (root !== url) await page.goto(root, { waitUntil: 'domcontentloaded', timeout: 15_000 });
+          } catch { /* warm-up is opportunistic; the target navigation still runs */ }
+        }
+        let response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 });
         await page.waitForTimeout(800);
+        if (response && (response.status() === 403 || response.status() === 429)) {
+          // Cloudflare Turnstile / DataDome challenges can auto-resolve given
+          // a moment in a real browser; one reload beats an instant failure.
+          await page.waitForTimeout(3_000);
+          response = await page.reload({ waitUntil: 'domcontentloaded', timeout: 25_000 });
+          await page.waitForTimeout(800);
+        }
         const finalValidation = validateSearchUrl(page.url(), marketplace);
         if (!finalValidation.valid) throw new Error('Marketplace redirected off the approved domain');
-        if (response && !response.ok()) throw new Error(`Chromium page returned ${response.status()}`);
+        if (response && !response.ok()) throw new Error(`Chromium page returned ${response.status()} for ${marketplace} (anonymous browser blocked; import a session in Settings or retry from a residential IP)`);
         return await page.content();
       } finally { await page.close(); }
     } finally {

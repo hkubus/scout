@@ -347,6 +347,75 @@ test('translates Vinted catalog pages to the API and falls back to public pages'
   await assert.rejects(() => adapter.fetchPublicSearch('https://vinted.pl.evil.example/catalog?search_text=lego'), /approved/i);
 });
 
+test('falls back to the Chrome-UA catalog page when the Vinted catalog API is retired', async () => {
+  const cardHtml = `<html><body><div class="Grid-module-scss-module__HmDNda__feed-grid__item"><div class="ItemBox-module-scss-module__NoC3Da__new-item-box__image"><img src="https://images1.vinted.net/t/item.webp" alt="x"/></div><a href="/items/10057436612-lego-mix-polybagow?referrer=catalog" data-testid="product-item-id-10057436612--overlay-link" title="Lego Mix polybagów, Marka: LEGO, Stan: Nowy bez metki, 50.00 zł, 55.40 zł"></a></div></body></html>`;
+  const paths: string[] = [];
+  let fallbackSearches = 0;
+  const fallback: ConnectorAdapter = {
+    marketplace: 'Vinted',
+    fetchPublicSearch: async () => {
+      fallbackSearches += 1;
+      return parseSearchPage('<html><body></body></html>', 'Vinted');
+    },
+    fetchDetail: async () => ({ availability: { status: 'unknown', reason: 'unused' } }),
+    verifyAvailability: async () => ({ status: 'unknown', reason: 'unused' }),
+  };
+  const adapter = createVintedJsonAdapter(
+    'Vinted',
+    // /api/v2/catalog/items answers 404 (HTML body, JSON content-type) as of 2026-09-19.
+    async () => ({ status: 404, json: null }),
+    async () => ({ status: 200, body: cardHtml }),
+    fallback,
+    (path) => paths.push(path),
+  );
+  const search = await adapter.fetchPublicSearch(buildMarketplaceSearchUrl('Vinted', 'lego', {}));
+  assert.equal(search.length, 1);
+  assert.equal(search[0].listingId, '10057436612');
+  assert.equal(search[0].price, 50);
+  assert.equal(fallbackSearches, 0);
+  assert.deepEqual(paths, ['vinted-catalog-page']);
+});
+
+test('falls through to the generic adapter when the Vinted catalog page also fails', async () => {
+  const paths: string[] = [];
+  let fallbackSearches = 0;
+  const fallback: ConnectorAdapter = {
+    marketplace: 'Vinted',
+    fetchPublicSearch: async () => {
+      fallbackSearches += 1;
+      return parseSearchPage('<html><body><div data-testid="no-results">Brak wyników</div></body></html>', 'Vinted');
+    },
+    fetchDetail: async () => ({ availability: { status: 'unknown', reason: 'unused' } }),
+    verifyAvailability: async () => ({ status: 'unknown', reason: 'unused' }),
+  };
+  const adapter = createVintedJsonAdapter(
+    'Vinted',
+    async () => ({ status: 404, json: null }),
+    async () => ({ status: 403, body: '' }),
+    fallback,
+    (path) => paths.push(path),
+  );
+  const result = await adapter.fetchPublicSearch(buildMarketplaceSearchUrl('Vinted', 'lego', {}));
+  assert.equal(result.empty, true);
+  assert.equal(fallbackSearches, 1);
+  assert.deepEqual(paths, ['vinted-catalog-api-fallback']);
+});
+
+test('preserves the API cause when Vinted page and API both fail without a fallback', async () => {
+  const adapter = createVintedJsonAdapter(
+    'Vinted',
+    async () => { throw new Error('Vinted did not issue an anonymous access token (HTTP 403)'); },
+    async () => ({ status: 403, body: '' }),
+    undefined,
+  );
+  const error = await adapter.fetchPublicSearch(buildMarketplaceSearchUrl('Vinted', 'lego', {})).then(
+    () => { throw new Error('expected fetchPublicSearch to throw'); },
+    (error: unknown) => error,
+  );
+  assert.match((error as Error).message, /Vinted catalog page returned HTTP 403/);
+  assert.match(String(((error as Error).cause as Error)?.message ?? ''), /anonymous access token/);
+});
+
 test('classifies Vinted item pages as live, terminal, or unknown without JSON routes', async () => {
   const itemHtml = `<html><head><script type="application/ld+json">${JSON.stringify({
     '@type': 'Product', name: 'Lego Technic Porsche', image: ['https://images1.vinted.net/t/item.jpeg'],

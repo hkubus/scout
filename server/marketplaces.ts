@@ -1172,17 +1172,31 @@ export function createVintedJsonAdapter(
             if (status < 200 || status >= 300) throw new Error(`Vinted catalog API returned HTTP ${status}`);
             onPath?.('vinted-catalog-api');
             return parseVintedCatalogApi(json);
-          } catch (error) {
-            // JSON failures (expired bootstrap, Cloudflare fence, schema
-            // drift) fail closed to the public-page adapter, whose fetcher
-            // owns the Chromium render fallback.
-            if (!fallback) throw error;
-            onPath?.('vinted-catalog-api-fallback');
-            return fallback.fetchPublicSearch(url);
+          } catch (apiError) {
+            // JSON failures (expired bootstrap, Cloudflare fence, retired
+            // route — /api/v2/catalog/items answers 404 as of 2026-09-19,
+            // 403 on flagged IPs) fail closed to the Chrome-UA catalog page
+            // first (same fetcher + Chromium fallback as item pages), then to
+            // the public-page adapter.
+            try {
+              const page = await pageFetcher(validation.url);
+              if (page.status < 200 || page.status >= 300) throw new Error(`Vinted catalog page returned HTTP ${page.status}`);
+              if (!page.body) throw new Error('Vinted catalog page returned no usable markup');
+              onPath?.('vinted-catalog-page');
+              return parseSearchPage(page.body, marketplace);
+            } catch (pageError) {
+              if (!fallback) {
+                throw pageError instanceof Error ? new Error(pageError.message, { cause: apiError }) : pageError;
+              }
+              onPath?.('vinted-catalog-api-fallback');
+              return fallback.fetchPublicSearch(url);
+            }
           }
         }
       }
       const page = await pageFetcher(validation.url);
+      if (page.status < 200 || page.status >= 300) throw new Error(`Vinted catalog page returned HTTP ${page.status}`);
+      if (!page.body) throw new Error('Vinted catalog page returned no usable markup');
       onPath?.('vinted-catalog-page');
       return parseSearchPage(page.body, marketplace);
     },
