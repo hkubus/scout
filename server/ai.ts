@@ -8,6 +8,7 @@ export const OPENROUTER_CHAT_COMPLETIONS_URL = 'https://openrouter.ai/api/v1/cha
 const LISTING_NORMALIZATION_CACHE_VERSION = 'v3';
 const LISTING_RELEVANCE_CACHE_VERSION = 'v5';
 const LISTING_DESCRIPTION_VERIFICATION_CACHE_VERSION = 'v2';
+const LISTING_CONDITION_MATCH_CACHE_VERSION = 'v1';
 export const LISTING_DESCRIPTION_MAX_CHARS = 6_000;
 
 const responseHealingPlugins = [{ id: 'response-healing' }] as const;
@@ -241,6 +242,17 @@ export function listingDescriptionVerificationInputHash(context: ListingDescript
       title: normalizeCacheText(context.title),
       condition: normalizeCacheText(context.condition),
       description: normalizeCacheText(context.description)?.slice(0, LISTING_DESCRIPTION_MAX_CHARS) ?? null,
+    }))
+    .digest('hex');
+}
+
+export function listingConditionMatchInputHash(context: { title: string; listingCondition?: string | null; requestedCondition: string }) {
+  return createHash('sha256')
+    .update(JSON.stringify({
+      version: LISTING_CONDITION_MATCH_CACHE_VERSION,
+      title: normalizeCacheText(context.title),
+      listingCondition: normalizeCacheText(context.listingCondition),
+      requestedCondition: normalizeCacheText(context.requestedCondition),
     }))
     .digest('hex');
 }

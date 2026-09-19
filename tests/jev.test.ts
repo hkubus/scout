@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULT_JEV_MODEL, JEV_DECISIONS_URL, RELEVANCE_UNSURE_HIGH, RELEVANCE_UNSURE_LOW, VERIFICATION_MIN_CONFIDENCE, classifyListingRelevanceWithJev, isRelevanceUnsure, isVerificationUnsure, resolveJevModel, verifyListingDescriptionWithJev } from '../server/jev';
+import { DEFAULT_JEV_MODEL, FUZZY_MATCH_MIN_CONFIDENCE, JEV_DECISIONS_URL, NEGOTIABILITY_MIN_CONFIDENCE, RELEVANCE_UNSURE_HIGH, RELEVANCE_UNSURE_LOW, VERIFICATION_MIN_CONFIDENCE, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, isFuzzyMatchUnsure, isNegotiabilityUnsure, isRelevanceUnsure, isVerificationUnsure, resolveJevModel, verifyListingDescriptionWithJev } from '../server/jev';
 import { DEFAULT_VISION_MODEL, VISION_MAX_IMAGES, classifyListingRelevanceWithVision, resolveVisionModel, verifyListingDescriptionWithVision } from '../server/vision';
 
 const relevanceContext = {
@@ -237,4 +237,70 @@ test('tiebreaks unsure relevance through vision with the thumbnail', async () =>
     })),
   );
   assert.deepEqual(result, { relevant: false, confidence: 0.62, imagesSeen: 1 });
+});
+
+test('rescues term near-misses only on confident pass', async () => {
+  const pass = await classifyTermMatchWithJev(
+    { query: 'ladowarka', includedTerms: '', excludedTerms: '', title: 'Ładowarki do laptopa', condition: null },
+    { apiKey: 'sk-or-v1-test' },
+    (input, init) => {
+      assert.equal(String(input), JEV_DECISIONS_URL);
+      const body = JSON.parse(String((init as RequestInit)?.body)) as Record<string, any>;
+      assert.equal(body.session_id, 'scout:jev-term-match:v1');
+      assert.equal(body.questions.termMatch.type, 'choice');
+      return Promise.resolve(Response.json({
+        model: 'm', answers: { termMatch: { type: 'choice', choice: 'pass', confidence: 0.85 } },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }));
+    },
+  );
+  assert.deepEqual(pass, { decision: 'pass', confidence: 0.85, unsure: false });
+
+  const weak = await classifyTermMatchWithJev(
+    { query: 'ps5', includedTerms: '', excludedTerms: '', title: 'PS5', condition: null },
+    { apiKey: 'sk-or-v1-test' },
+    () => Promise.resolve(Response.json({
+      model: 'm', answers: { termMatch: { type: 'choice', choice: 'pass', confidence: 0.5 } },
+      usage: { input_tokens: 1, output_tokens: 1 },
+    })),
+  );
+  assert.equal(weak.unsure, true);
+  assert.equal(isFuzzyMatchUnsure('pass', 0.5), true);
+  assert.equal(isFuzzyMatchUnsure('pass', FUZZY_MATCH_MIN_CONFIDENCE), false);
+  assert.equal(isFuzzyMatchUnsure('unknown', 0.99), true);
+});
+
+test('upgrades negotiability only on confident negotiable', async () => {
+  const result = await classifyNegotiabilityWithJev(
+    { marketplace: 'OLX', title: 'Rower', condition: null, description: 'Cena do uzgodnienia, zapraszam.' },
+    { apiKey: 'sk-or-v1-test' },
+    (input, init) => {
+      const body = JSON.parse(String((init as RequestInit)?.body)) as Record<string, any>;
+      assert.equal(body.session_id, 'scout:jev-negotiability:v1');
+      return Promise.resolve(Response.json({
+        model: 'm', answers: { negotiability: { type: 'choice', choice: 'negotiable', confidence: 0.9 } },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }));
+    },
+  );
+  assert.deepEqual(result, { decision: 'negotiable', confidence: 0.9, unsure: false });
+  assert.equal(isNegotiabilityUnsure('negotiable', 0.5), true);
+  assert.equal(isNegotiabilityUnsure('negotiable', NEGOTIABILITY_MIN_CONFIDENCE), false);
+  assert.equal(isNegotiabilityUnsure('unknown', 0.99), true);
+});
+
+test('matches condition labels only on confident match', async () => {
+  const result = await classifyConditionMatchWithJev(
+    { requestedCondition: 'New', listingCondition: 'Jak nowy', title: 'Telefon jak nowy' },
+    { apiKey: 'sk-or-v1-test' },
+    (input, init) => {
+      const body = JSON.parse(String((init as RequestInit)?.body)) as Record<string, any>;
+      assert.equal(body.session_id, 'scout:jev-condition:v1');
+      return Promise.resolve(Response.json({
+        model: 'm', answers: { conditionMatch: { type: 'choice', choice: 'match', confidence: 0.8 } },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }));
+    },
+  );
+  assert.deepEqual(result, { decision: 'match', confidence: 0.8, unsure: false });
 });
