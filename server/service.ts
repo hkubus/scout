@@ -972,6 +972,13 @@ export class ScoutService {
       this.logJevLive('relevance', inputHash, live,
         lastJudgment ? { jevAnswer: lastJudgment, jevConfidence: lastJudgment.p, jevUnsure: true } : { jevError: jevFailed },
         { visionError: message });
+      // When Jev produced an unsure judgment, fall back to its lean rather
+      // than blindly keeping the listing: an accessory-leaning judgment
+      // excludes the listing outright instead of alerting on it.
+      if (lastJudgment) {
+        const status: 'relevant' | 'irrelevant' = lastJudgment.relevant ? 'relevant' : 'irrelevant';
+        return { relevant: lastJudgment.relevant, status, reason: `Jev leaned ${status} (p=${lastJudgment.p.toFixed(2)}) and vision relevance failed`, error: message };
+      }
       return { relevant: true, status: 'unknown', reason: 'Jev and vision relevance checks failed', error: message };
     }
   }
@@ -1527,7 +1534,11 @@ export class ScoutService {
       return verification.decision === 'pass';
     } catch (error) {
       const message = (error instanceof Error ? error.message : 'OpenRouter could not verify the listing description').slice(0, 500);
-      const status: ListingDescriptionVerificationStatus = error instanceof DeepSeekError || error instanceof JevError || error instanceof VisionError ? 'fallback' : 'unknown';
+      // Only genuine provider outages keep the historical fail-open alert. A
+      // malformed or refused model reply means no AI check completed, so the
+      // alert is held as unknown instead of sent without verification.
+      const errorKind = error instanceof DeepSeekError || error instanceof JevError || error instanceof VisionError ? error.kind : null;
+      const status: ListingDescriptionVerificationStatus = errorKind === 'provider' ? 'fallback' : 'unknown';
       if (jevShadow) this.shadowJevVerification(context, inputHash, status, galleryImageUrls, jevShadow);
       this.updateListingDetailSnapshot(snapshot?.id ?? null, status, inputHash);
       this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: activeModel, error: message });
@@ -3824,6 +3835,38 @@ export class ScoutService {
     this.stmt("DELETE FROM market_watch_versions WHERE closed_at IS NOT NULL AND closed_at < ? AND id NOT IN (SELECT active_version_id FROM market_watches WHERE active_version_id IS NOT NULL)").run(cutoff);
     this.stmt('DELETE FROM listings WHERE last_seen_at < ? AND NOT EXISTS (SELECT 1 FROM observations WHERE observations.listing_id = listings.id)').run(cutoff);
     this.setSetting('last_prune', nowIso());
+  }
+
+  /** Testing hook: clear every cached AI result so the next scan re-evaluates. */
+  resetAiResults() {
+    return this.transaction(() => {
+      const relevance = this.stmt('DELETE FROM listing_relevance').run() as { changes?: number };
+      const shadow = this.stmt('DELETE FROM jev_shadow_log').run() as { changes?: number };
+      const snapshots = this.stmt('DELETE FROM listing_detail_snapshots').run() as { changes?: number };
+      const normalization = this.stmt(`UPDATE listings SET
+        ai_normalization_json = NULL,
+        ai_normalization_input_hash = NULL,
+        ai_normalization_model = NULL,
+        ai_normalization_at = NULL,
+        ai_normalization_error = NULL`).run() as { changes?: number };
+      const verification = this.stmt(`UPDATE listings SET
+        ai_description_verification_json = NULL,
+        ai_description_verification_input_hash = NULL,
+        ai_description_verification_model = NULL,
+        ai_description_verification_at = NULL,
+        ai_description_verification_status = NULL,
+        ai_description_verification_error = NULL`).run() as { changes?: number };
+      return {
+        ok: true as const,
+        cleared: {
+          relevance: relevance.changes ?? 0,
+          shadowLog: shadow.changes ?? 0,
+          detailSnapshots: snapshots.changes ?? 0,
+          normalization: normalization.changes ?? 0,
+          verification: verification.changes ?? 0,
+        },
+      };
+    });
   }
 
   private async enrichShipping(listings: NormalizedListing[], marketplace: Marketplace, options: { limit?: number } = {}) {

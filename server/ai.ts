@@ -316,7 +316,7 @@ function safeProviderMessage(value: string) {
   return value.replace(/\s+/g, ' ').trim().slice(0, 500) || 'OpenRouter request failed';
 }
 
-function structuredJsonCandidates(value: string) {
+export function structuredJsonCandidates(value: string) {
   const candidates = new Set<string>();
   const trimmed = value.trim();
   if (trimmed) candidates.add(trimmed);

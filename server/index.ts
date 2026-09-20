@@ -52,7 +52,7 @@ app.addHook('onRequest', async (request, reply) => {
   const isEvents = url === '/events';
   if (!isApi && !isEvents) return;
 
-  const expensive = /\/search$|\/scan$|\/scans$|\/negotiate(?:\/draft)?$|\/recommendation$|\/normalize-listing$|\/snapshot$|\/snapshot-images\/|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/backup$/.test(url);
+  const expensive = /\/search$|\/scan$|\/scans$|\/negotiate(?:\/draft)?$|\/recommendation$|\/normalize-listing$|\/snapshot$|\/snapshot-images\/|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$/.test(url);
   const limit = expensive ? 30 : 240;
   const bucket = rateLimiter.consume(`${request.ip}:${expensive ? 'expensive' : url}`, limit);
   reply.header('X-RateLimit-Limit', String(limit));
@@ -535,6 +535,7 @@ app.patch('/api/settings', async (request, reply) => {
 
 app.post('/api/settings/webhook/test', async () => service.testWebhook());
 app.post('/api/settings/ntfy/test', async () => service.testNtfy());
+app.post('/api/settings/ai/reset', async () => service.resetAiResults());
 
 app.post('/api/notifications/preview', async (request, reply) => {
   const parsed = z.object({

@@ -78,6 +78,7 @@ export default function SettingsPage({
   const [storageStateFile, setStorageStateFile] = useState("");
   const [savingSession, setSavingSession] = useState(false);
   const [recoveryBusy, setRecoveryBusy] = useState(false);
+  const [resettingAi, setResettingAi] = useState(false);
   const loadSettings = useCallback(async () => {
     try {
       const result = await api.settings();
@@ -390,6 +391,19 @@ export default function SettingsPage({
       onToast(errorMessage(error), "error");
     } finally {
       setRecoveryBusy(false);
+    }
+  };
+  const resetAiResults = async () => {
+    if (!window.confirm("Delete all cached AI results (relevance, description verification, shadow log)? The next scan re-runs every AI check. This cannot be undone.")) return;
+    setResettingAi(true);
+    try {
+      const result = await api.resetAiResults();
+      const { relevance, verification, shadowLog } = result.cleared;
+      onToast(`AI results cleared: ${relevance} relevance, ${verification} verification, ${shadowLog} shadow rows.`);
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+    } finally {
+      setResettingAi(false);
     }
   };
   const configured = settings?.webhookConfigured ?? false;
@@ -893,8 +907,9 @@ export default function SettingsPage({
             <div><h2>Data recovery</h2><p>Export readable history or create a WAL-aware SQLite restore point.</p></div>
           </div>
           <div className="settings-actions">
-            <button className="outline-button" disabled={recoveryBusy || !settingsLoaded} onClick={() => void exportData()}><Database size={15} />Download safe export</button>
-            <button className="outline-button" disabled={recoveryBusy || !settingsLoaded} onClick={() => void createBackup()}><ShieldCheck size={15} />Create database backup</button>
+            <button className="outline-button" disabled={recoveryBusy || resettingAi || !settingsLoaded} onClick={() => void exportData()}><Database size={15} />Download safe export</button>
+            <button className="outline-button" disabled={recoveryBusy || resettingAi || !settingsLoaded} onClick={() => void createBackup()}><ShieldCheck size={15} />Create database backup</button>
+            <button className="outline-button danger-outline" disabled={recoveryBusy || resettingAi || !settingsLoaded} onClick={() => void resetAiResults()}>{resettingAi ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}Reset AI results</button>
           </div>
           <div className="security-note"><ShieldCheck size={17} /><span>Exports omit encrypted credentials and marketplace sessions. Backups include the encrypted database and should be stored with the deployment secret.</span></div>
         </section>

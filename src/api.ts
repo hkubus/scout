@@ -121,6 +121,7 @@ export const api = {
   deleteMarketplaceSession: (marketplace: Marketplace) => request<SettingsData>(`/api/marketplace-sessions/${encodeURIComponent(marketplace)}`, json('DELETE')),
   testWebhook: () => request<{ delivered: boolean }>('/api/settings/webhook/test', { method: 'POST' }),
   testNtfy: () => request<{ delivered: boolean }>('/api/settings/ntfy/test', { method: 'POST' }),
+  resetAiResults: () => request<{ ok: true; cleared: { relevance: number; shadowLog: number; detailSnapshots: number; normalization: number; verification: number } }>('/api/settings/ai/reset', { method: 'POST' }, 60_000),
   notifications: (options: { page?: number; pageSize?: number } = {}, signal?: AbortSignal) => request<{ notifications: NotificationRecord[]; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/notifications?page=${options.page ?? 1}&pageSize=${options.pageSize ?? 100}`, { signal }),
   connectorRuns: (options: { page?: number; pageSize?: number } = {}, signal?: AbortSignal) => request<{ runs: ConnectorRun[]; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/connector-runs?page=${options.page ?? 1}&pageSize=${options.pageSize ?? 100}`, { signal }),
   logs: (signal?: AbortSignal) => request<{ logs: LogEntry[] }>('/api/logs', { signal }),

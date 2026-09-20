@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { structuredJsonCandidates } from './ai';
 import { PROVIDER_MAX_ATTEMPTS, isRetryableProviderStatus, isTransientFetchError, providerBackoffMs, sleep } from './openrouter';
 import type { ListingDescriptionVerification } from '../src/types';
 
@@ -102,8 +103,11 @@ async function postChatCompletions(body: Record<string, unknown>, apiKey: string
     try {
       return await attemptChatCompletions(body, apiKey, label, fetcher);
     } catch (error) {
+      // Format failures get exactly one retry (a malformed or truncated reply
+      // may succeed on a second sampling); provider failures retry on the
+      // usual retryable statuses. Everything else propagates.
       const retryable = error instanceof VisionError
-        ? error.kind === 'provider' && isRetryableProviderStatus(error.status)
+        ? (error.kind === 'provider' && isRetryableProviderStatus(error.status)) || (error.kind === 'format' && attempt === 0)
         : isTransientFetchError(error);
       if (!retryable || attempt === PROVIDER_MAX_ATTEMPTS - 1) throw error;
       await sleep(providerBackoffMs(attempt));
@@ -124,7 +128,7 @@ async function attemptChatCompletions(body: Record<string, unknown>, apiKey: str
   });
 
   const rawBody = await response.text();
-  let parsed: { error?: { message?: unknown } | string; choices?: Array<{ message?: { content?: unknown } }> } | null;
+  let parsed: { error?: { message?: unknown } | string; choices?: Array<{ finish_reason?: unknown; message?: { content?: unknown } }> } | null;
   try {
     parsed = JSON.parse(rawBody) as typeof parsed;
   } catch {
@@ -137,7 +141,9 @@ async function attemptChatCompletions(body: Record<string, unknown>, apiKey: str
     const providerError = typeof parsed.error === 'string' ? parsed.error : parsed.error?.message;
     throw new VisionError(safeProviderMessage(typeof providerError === 'string' ? providerError : `OpenRouter returned ${response.status}`), response.status);
   }
-  const content = parsed.choices?.[0]?.message?.content;
+  const choice = parsed.choices?.[0];
+  if (choice?.finish_reason === 'length') throw new VisionError(`OpenRouter truncated ${label} (max_tokens)`, 502, 'format');
+  const content = choice?.message?.content;
   const text = typeof content === 'string'
     ? content
     : Array.isArray(content)
@@ -147,11 +153,17 @@ async function attemptChatCompletions(body: Record<string, unknown>, apiKey: str
         .join('')
       : '';
   if (!text.trim()) throw new VisionError(`OpenRouter returned no ${label}`, 502, 'format');
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    throw new VisionError(`OpenRouter returned ${label} that was not valid JSON`, 502, 'format');
+  // Models wrap structured output in markdown fences or explanatory prose, so
+  // unwrap the first parseable JSON fragment instead of requiring a raw
+  // JSON document (same lenient extraction as the legacy DeepSeek path).
+  for (const candidate of structuredJsonCandidates(text)) {
+    try {
+      return JSON.parse(candidate) as unknown;
+    } catch {
+      // Try the next candidate.
+    }
   }
+  throw new VisionError(`OpenRouter returned ${label} that was not valid JSON`, 502, 'format');
 }
 
 export interface VisionVerificationResult {
@@ -176,7 +188,7 @@ export async function verifyListingDescriptionWithVision(
     model: config.model?.trim() || resolveVisionModel(),
     session_id: VISION_SESSION_VERIFICATION,
     temperature: 0,
-    max_tokens: 150,
+    max_tokens: 256,
     provider: { require_parameters: true },
     stream: false,
     messages: [
@@ -234,7 +246,7 @@ export async function classifyListingRelevanceWithVision(
     model: config.model?.trim() || resolveVisionModel(),
     session_id: VISION_SESSION_RELEVANCE,
     temperature: 0,
-    max_tokens: 32,
+    max_tokens: 64,
     provider: { require_parameters: true },
     stream: false,
     messages: [

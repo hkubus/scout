@@ -605,12 +605,47 @@ test('fetches and verifies descriptions for very strong and exceptional deals be
   }
 });
 
-test('sends a high-priority alert when OpenRouter verification fails technically', async () => {
+test('holds a high-priority alert when OpenRouter verification output is malformed', async () => {
   let verificationRequests = 0;
   const context = fixture({
     verifyListingDescription: async () => {
       verificationRequests += 1;
       throw new DeepSeekError('OpenRouter returned verification that was not valid JSON', 502, 'format');
+    },
+  });
+  try {
+    const now = new Date().toISOString();
+    context.service.saveSettings({
+      ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' },
+      webhook: 'https://discord.com/api/webhooks/123/token',
+    });
+    seedWatch(context.db, 'fallback-watch');
+    context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+      'OLX', 'fallback-listing', 'CPU', 650, 'https://www.olx.pl/d/oferta/fallback-listing', now, now,
+    );
+    (context.service as any).fetchPublicPage = async () => '<div data-testid="description">Fully working and complete.</div>';
+    const listing = { marketplace: 'OLX' as const, listingId: 'fallback-listing', title: 'CPU', price: 650, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/fallback-listing', observedAt: now };
+    const candidate = { watchId: 'fallback-watch', listing, typical: 1000, discountPercent: 35, confidence: 96, requiresDescriptionVerification: true };
+
+    const allowed = await (context.service as any).verifyHighPriorityDeal(candidate);
+    assert.equal(allowed, false);
+    assert.equal(verificationRequests, 1);
+    assert.equal((context.db.prepare('SELECT ai_description_verification_status FROM listings WHERE listing_id = ?').get('fallback-listing') as { ai_description_verification_status: string }).ai_description_verification_status, 'unknown');
+
+    const reusedUnknown = await (context.service as any).verifyHighPriorityDeal(candidate);
+    assert.equal(reusedUnknown, false);
+    assert.equal(verificationRequests, 1);
+  } finally {
+    context.close();
+  }
+});
+
+test('sends a high-priority alert when OpenRouter verification fails with a provider error', async () => {
+  let verificationRequests = 0;
+  const context = fixture({
+    verifyListingDescription: async () => {
+      verificationRequests += 1;
+      throw new DeepSeekError('OpenRouter returned 502', 502, 'provider');
     },
   });
   const originalFetch = globalThis.fetch;
@@ -647,6 +682,41 @@ test('sends a high-priority alert when OpenRouter verification fails technically
     assert.equal(verificationRequests, 1);
   } finally {
     globalThis.fetch = originalFetch;
+    context.close();
+  }
+});
+
+test('resets cached AI results', () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    seedWatch(context.db, 'ai-reset-watch');
+    context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+      'OLX', 'ai-reset-listing', 'CPU', 650, 'https://www.olx.pl/d/oferta/ai-reset-listing', now, now,
+    );
+    const stored = context.db.prepare('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get('OLX', 'ai-reset-listing') as { id: number };
+    context.db.prepare(`INSERT INTO listing_relevance (watch_id, marketplace, listing_id, input_hash, model, relevant, reason, checked_at, relevance_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('ai-reset-watch', 'OLX', 'ai-reset-listing', 'hash-1', 'model-1', 1, 'relevant', now, 'relevant');
+    context.db.prepare(`INSERT INTO jev_shadow_log (created_at, task, input_hash, jev_model) VALUES (?, ?, ?, ?)`).run(now, 'relevance', 'hash-1', 'model-1');
+    context.db.prepare(`INSERT INTO listing_detail_snapshots (listing_id, marketplace, external_listing_id, title, price_pln, url, state_hash, verification_status, captured_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(stored.id, 'OLX', 'ai-reset-listing', 'CPU', 650, 'https://www.olx.pl/d/oferta/ai-reset-listing', 'state-1', 'pass', now);
+    context.db.prepare(`UPDATE listings SET ai_normalization_json = ?, ai_normalization_model = ?,
+      ai_description_verification_json = ?, ai_description_verification_status = ?, ai_description_verification_error = ?
+      WHERE id = ?`).run('{}', 'model-1', '{}', 'fallback', 'boom', stored.id);
+
+    const result = context.service.resetAiResults();
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.cleared, { relevance: 1, shadowLog: 1, detailSnapshots: 1, normalization: 1, verification: 1 });
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM listing_relevance').get() as { count: number }).count, 0);
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM jev_shadow_log').get() as { count: number }).count, 0);
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM listing_detail_snapshots').get() as { count: number }).count, 0);
+    const cleared = context.db.prepare(`SELECT ai_normalization_json, ai_normalization_model,
+      ai_description_verification_json, ai_description_verification_status, ai_description_verification_error
+      FROM listings WHERE id = ?`).get(stored.id) as Record<string, unknown>;
+    for (const column of ['ai_normalization_json', 'ai_normalization_model', 'ai_description_verification_json', 'ai_description_verification_status', 'ai_description_verification_error']) {
+      assert.equal(cleared[column], null);
+    }
+  } finally {
     context.close();
   }
 });
