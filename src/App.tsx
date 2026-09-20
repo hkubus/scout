@@ -21,6 +21,7 @@ import {
   Settings2,
   SlidersHorizontal,
   Tag,
+  TrendingUp,
   WifiOff,
 } from "lucide-react";
 import { api } from "./api";
@@ -42,6 +43,7 @@ const navItems: Array<{ id: View; label: string; icon: typeof Grid2X2 }> = [
   { id: "search", label: "Search", icon: Search },
   { id: "watches", label: "Watches", icon: Bell },
   { id: "market-research", label: "Market research", icon: BarChart3 },
+  { id: "analytics", label: "Analytics", icon: TrendingUp },
   { id: "listings", label: "Listings", icon: Tag },
   { id: "messages", label: "Messages", icon: MessageSquare },
   { id: "connectors", label: "Connectors", icon: PlugZap },
@@ -51,6 +53,7 @@ const navItems: Array<{ id: View; label: string; icon: typeof Grid2X2 }> = [
 
 const loadMessagesPage = () => import("./MessagesPage");
 const loadMarketResearchPage = () => import("./MarketResearchPage");
+const loadAnalyticsPage = () => import("./AnalyticsPage");
 const loadSettingsPage = () => import("./SettingsPage");
 const loadConnectorsPage = () => import("./ConnectorsPage");
 const loadLogsPage = () => import("./LogsPage");
@@ -58,6 +61,7 @@ const loadSearchPage = () => import("./SearchPage");
 const loadListingsPage = () => import("./ListingsPage");
 const LazyMessagesPage = lazy(loadMessagesPage);
 const LazyMarketResearchPage = lazy(loadMarketResearchPage);
+const LazyAnalyticsPage = lazy(loadAnalyticsPage);
 const LazySettingsPage = lazy(loadSettingsPage);
 const LazyConnectorsPage = lazy(loadConnectorsPage);
 const LazyLogsPage = lazy(loadLogsPage);
@@ -76,6 +80,7 @@ const routeLoaders: Partial<Record<View, () => Promise<unknown>>> = {
   search: loadSearchPage,
   watches: loadWatchesPage,
   "market-research": loadMarketResearchPage,
+  analytics: loadAnalyticsPage,
   listings: loadListingsPage,
   messages: loadMessagesPage,
   connectors: loadConnectorsPage,
@@ -135,6 +140,7 @@ function App() {
   const [editingFullWatch, setEditingFullWatch] = useState<Watch | null>(null);
   const [showHistory, setShowHistory] = useState(false);
   const [marketRefreshKey, setMarketRefreshKey] = useState(0);
+  const [analyticsRefreshKey, setAnalyticsRefreshKey] = useState(0);
   const [messagesRefreshKey, setMessagesRefreshKey] = useState(0);
   const [logsRefreshKey, setLogsRefreshKey] = useState(0);
   const [selectedWatchId, setSelectedWatchId] = useState<string | null>(
@@ -185,6 +191,7 @@ function App() {
     const source = new EventSource("/events");
     let refreshTimer: number | null = null;
     const refresh = () => {
+      setAnalyticsRefreshKey((value) => value + 1);
       if (refreshTimer !== null) return;
       refreshTimer = window.setTimeout(() => {
         refreshTimer = null;
@@ -198,8 +205,8 @@ function App() {
     source.addEventListener("listing-action", refresh);
     source.addEventListener("ai-normalization", refresh);
     source.addEventListener("ai-description-verification", refresh);
-    source.addEventListener("market-watch", () => setMarketRefreshKey((value) => value + 1));
-    source.addEventListener("seller-message", () => setMessagesRefreshKey((value) => value + 1));
+    source.addEventListener("market-watch", () => { setMarketRefreshKey((value) => value + 1); setAnalyticsRefreshKey((value) => value + 1); });
+    source.addEventListener("seller-message", () => { setMessagesRefreshKey((value) => value + 1); setAnalyticsRefreshKey((value) => value + 1); });
     source.addEventListener("log", () => setLogsRefreshKey((value) => value + 1));
     source.onerror = () => setConnection("offline");
     return () => {
@@ -510,6 +517,11 @@ function App() {
         {view === "market-research" ? (
           <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading market research…</div>}>
             <LazyMarketResearchPage refreshKey={marketRefreshKey} onToast={notify} />
+          </Suspense>
+        ) : null}
+        {view === "analytics" ? (
+          <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading analytics…</div>}>
+            <LazyAnalyticsPage watches={data.watches} refreshKey={analyticsRefreshKey} onToast={notify} />
           </Suspense>
         ) : null}
         {view === "listings" ? (

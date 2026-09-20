@@ -68,7 +68,7 @@ export function AnalyticsTrendChart({ analytics, referenceMedian = null }: { ana
             </g>
           );
         })}
-        <path d={`${upperPath} ${lowerPath} Z`} className="analytics-band" />
+        <path d={`M ${upperPath} ${lowerPath} Z`} className="analytics-band" />
         <polyline points={medianPath} className="analytics-line" />
         {showReference ? <line x1={padding.left} x2={width - padding.right} y1={y(referenceMedian as number)} y2={y(referenceMedian as number)} className="analytics-reference-line" /> : null}
         {plotted.map(({ point, index }) => (

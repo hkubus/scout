@@ -187,6 +187,15 @@ app.get('/api/watches/:id/analytics', async (request, reply) => {
   if (!parsed.success) return reply.code(400).send({ error: 'Analytics range must be between 7 and 180 days' });
   return service.watchAnalytics(params.data.id, parsed.data.days);
 });
+app.get('/api/analytics', async (request, reply) => {
+  const parsed = z.object({
+    days: z.coerce.number().int().min(7).max(180).default(30),
+    watchId: z.string().trim().min(1).max(160).optional(),
+    marketplace: marketplaceParam.optional(),
+  }).strict().safeParse(request.query);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid analytics filters' });
+  return service.analytics(parsed.data);
+});
 app.get('/api/connectors', async () => ({ connectors: service.getConnectors() }));
 app.get('/api/notifications', async (request, reply) => {
   const parsed = z.object({ page: z.coerce.number().int().min(1).optional().default(1), pageSize: z.coerce.number().int().min(1).max(200).optional().default(100) }).strict().safeParse(request.query);

@@ -1,4 +1,4 @@
-import type { ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, NegotiationDraft, NegotiationRecommendation, NegotiationResult, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SettingsData, Watch, WatchAnalytics } from './types';
+import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, NegotiationDraft, NegotiationRecommendation, NegotiationResult, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SettingsData, Watch, WatchAnalytics } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -77,6 +77,13 @@ export const api = {
   },
   watches: (includeArchived = false, signal?: AbortSignal) => request<{ watches: Watch[] }>(`/api/watches?includeArchived=${includeArchived ? 'true' : 'false'}`, { signal }),
   watchAnalytics: (id: string, days = 30, signal?: AbortSignal) => request<WatchAnalytics>(`/api/watches/${encodeURIComponent(id)}/analytics?days=${days}`, { signal }),
+  analytics: (options: { days?: number; watchId?: string; marketplace?: Marketplace } = {}, signal?: AbortSignal) => {
+    const params = new URLSearchParams();
+    params.set('days', String(options.days ?? 30));
+    if (options.watchId) params.set('watchId', options.watchId);
+    if (options.marketplace) params.set('marketplace', options.marketplace);
+    return request<AnalyticsData>(`/api/analytics?${params}`, { signal });
+  },
   createWatch: (watch: Omit<Watch, 'id'> & { id?: string }) => request<{ watch: Watch }>('/api/watches', json('POST', watch)),
   updateWatch: (id: string, patch: Partial<Pick<Watch, 'name' | 'query' | 'terms' | 'excluded' | 'sources' | 'location' | 'condition' | 'interval' | 'exactUrls' | 'sensitivity' | 'shippingOnly' | 'aiRelevance' | 'typoVariants' | 'referenceMarketWatchId' | 'minPrice' | 'maxPrice' | 'enabled'>> & { archived?: boolean }) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
   search: (filters: SearchFilters, signal?: AbortSignal) => request<ManualSearchResponse>('/api/search', { ...json('POST', filters), signal }, 60_000),
