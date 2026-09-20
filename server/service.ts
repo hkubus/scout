@@ -17,7 +17,7 @@ import { pickVariantBatch, typoVariants } from './typos';
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
-import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsNegotiation, AnalyticsOverview, AnalyticsTriage, AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsNegotiation, AnalyticsOverview, AnalyticsTriage, AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -2108,6 +2108,42 @@ export class ScoutService {
       capturedAt: String(snapshotRow.captured_at),
       verificationStatus: snapshotStatus,
     } : null;
+    const verificationInputHash: string | null = typeof row.ai_description_verification_input_hash === 'string' ? row.ai_description_verification_input_hash : null;
+    const verificationModel: string | null = typeof row.ai_description_verification_model === 'string' ? row.ai_description_verification_model : null;
+    let verificationTrace: VerificationTraceEntry[] | null = null;
+    if (verificationInputHash) {
+      try {
+        const traceRows = this.stmt(`SELECT id, created_at, input_hash, jev_model, jev_answer_json, jev_confidence, jev_unsure, jev_error, deepseek_decision, agreement, vision_verdict, vision_confidence, vision_images_seen, vision_error, note
+          FROM jev_shadow_log WHERE task = 'verification' AND input_hash = ? ORDER BY created_at DESC, id DESC LIMIT 5`).all(verificationInputHash) as Array<Record<string, any>>;
+        verificationTrace = traceRows.map((trace): VerificationTraceEntry => {
+          let jevAnswer: unknown | null = null;
+          try {
+            jevAnswer = trace.jev_answer_json ? JSON.parse(String(trace.jev_answer_json)) : null;
+          } catch {
+            jevAnswer = trace.jev_answer_json ?? null;
+          }
+          return {
+            id: Number(trace.id),
+            createdAt: String(trace.created_at),
+            inputHash: String(trace.input_hash),
+            jevModel: String(trace.jev_model),
+            jevAnswer,
+            jevConfidence: trace.jev_confidence === null || trace.jev_confidence === undefined ? null : Number(trace.jev_confidence),
+            jevUnsure: Boolean(trace.jev_unsure),
+            jevError: trace.jev_error ?? null,
+            deepseekDecision: trace.deepseek_decision ?? null,
+            agreement: trace.agreement === null || trace.agreement === undefined ? null : Boolean(trace.agreement),
+            visionVerdict: trace.vision_verdict ?? null,
+            visionConfidence: trace.vision_confidence === null || trace.vision_confidence === undefined ? null : Number(trace.vision_confidence),
+            visionImagesSeen: trace.vision_images_seen === null || trace.vision_images_seen === undefined ? null : Number(trace.vision_images_seen),
+            visionError: trace.vision_error ?? null,
+            note: trace.note ?? null,
+          };
+        });
+      } catch {
+        verificationTrace = null;
+      }
+    }
     return {
       listing,
       history,
@@ -2115,7 +2151,47 @@ export class ScoutService {
       descriptionSnapshot,
       firstSeenAt: row.watch_first_seen_at ?? row.first_seen_at,
       lastSeenAt: row.watch_last_seen_at ?? row.last_seen_at,
+      verificationTrace,
+      verificationInputHash,
+      verificationModel,
     };
+  }
+
+  async compareVerificationByKey(key: string): Promise<VerificationComparison> {
+    const { marketplace, listingId } = parseListingKey(key);
+    const row = this.stmt('SELECT title, condition FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as { title?: string; condition?: string | null } | undefined;
+    if (!row) throw new ServiceError('Listing detail is not available yet', 404);
+    const listingRow = this.stmt('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as { id?: number } | undefined;
+    const snapshotRow = listingRow?.id ? this.stmt('SELECT description FROM listing_detail_snapshots WHERE listing_id = ? ORDER BY captured_at DESC, id DESC LIMIT 1').get(listingRow.id) as { description?: string | null } | undefined : undefined;
+    const description: string | null = typeof snapshotRow?.description === 'string' ? snapshotRow.description : null;
+    const context = {
+      marketplace,
+      title: String(row.title ?? ''),
+      condition: row.condition ? String(row.condition) : undefined,
+      description,
+    };
+    const inputHash = listingDescriptionVerificationInputHash(context);
+    const deepSeek = this.deepSeekConfig();
+    const apiKey = deepSeek.apiKey;
+    if (!apiKey) throw new ServiceError('OpenRouter is not configured. Add an API key in Settings or set SCOUT_OPENROUTER_API_KEY.', 409);
+    const jevLive = this.jevLiveConfig();
+    const jevModel = jevLive?.jevModel ?? process.env.SCOUT_JEV_MODEL?.trim() ?? DEFAULT_JEV_MODEL;
+    const llmModel = deepSeek.model;
+    let jev: VerificationComparison['jev'];
+    try {
+      const judgment = await verifyListingDescriptionWithJev(context, { apiKey, model: jevModel });
+      jev = { ok: true, judgment: { decision: judgment.decision, confidence: judgment.confidence, unsure: judgment.unsure }, raw: judgment };
+    } catch (error) {
+      jev = { ok: false, error: (error instanceof Error ? error.message : String(error)).slice(0, 500) };
+    }
+    let llm: VerificationComparison['llm'];
+    try {
+      const verification = await verifyListingDescriptionWithDeepSeek(context, { apiKey, model: llmModel });
+      llm = { ok: true, verification, raw: verification };
+    } catch (error) {
+      llm = { ok: false, error: (error instanceof Error ? error.message : String(error)).slice(0, 500) };
+    }
+    return { key: `${marketplace}:${listingId}`, inputHash, jevModel, llmModel, jev, llm };
   }
 
   private async normalizeStoredListing(marketplace: Marketplace, listingId: string, force = false) {

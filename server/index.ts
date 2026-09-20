@@ -52,7 +52,7 @@ app.addHook('onRequest', async (request, reply) => {
   const isEvents = url === '/events';
   if (!isApi && !isEvents) return;
 
-  const expensive = /\/search$|\/scan$|\/scans$|\/negotiate(?:\/draft)?$|\/recommendation$|\/normalize-listing$|\/snapshot$|\/snapshot-images\/|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$/.test(url);
+  const expensive = /\/search$|\/scan$|\/scans$|\/negotiate(?:\/draft)?$|\/recommendation$|\/normalize-listing$|\/compare-verification$|\/snapshot$|\/snapshot-images\/|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$/.test(url);
   const limit = expensive ? 30 : 240;
   const bucket = rateLimiter.consume(`${request.ip}:${expensive ? 'expensive' : url}`, limit);
   reply.header('X-RateLimit-Limit', String(limit));
@@ -116,6 +116,11 @@ app.post('/api/ai/normalize-listing', async (request, reply) => {
   const parsed = z.object({ key: z.string().min(3).max(500), force: z.boolean().optional().default(false) }).strict().safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: 'A valid listing key is required' });
   return service.normalizeListingByKey(parsed.data.key, parsed.data.force);
+});
+app.post('/api/ai/compare-verification', async (request, reply) => {
+  const parsed = z.object({ key: z.string().min(3).max(500) }).strict().safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'A valid listing key is required' });
+  return service.compareVerificationByKey(parsed.data.key);
 });
 app.get('/api/messages', async (request, reply) => {
   const parsed = z.object({ page: z.coerce.number().int().min(1).optional().default(1), pageSize: z.coerce.number().int().min(1).max(200).optional().default(100) }).strict().safeParse(request.query);

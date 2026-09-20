@@ -8,6 +8,7 @@ import {
   ExternalLink,
   Info,
   LoaderCircle,
+  Scale,
   Send,
   ShieldCheck,
   Tag,
@@ -23,6 +24,7 @@ import type {
   NegotiationDraft,
   NegotiationRecommendation,
   SellerMessage,
+  VerificationComparison,
 } from "./types";
 
 const formatPln = (value: number | null) =>
@@ -84,6 +86,8 @@ export default function ListingDetailDrawer({
   const [negotiationDraft, setNegotiationDraft] = useState<NegotiationDraft | null>(null);
   const [draftMessage, setDraftMessage] = useState("");
   const [drafting, setDrafting] = useState(false);
+  const [comparison, setComparison] = useState<VerificationComparison | null>(null);
+  const [comparing, setComparing] = useState(false);
   const [lastNegotiation, setLastNegotiation] = useState<SellerMessage | null>(null);
   const [storedListing, setStoredListing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -123,6 +127,7 @@ export default function ListingDetailDrawer({
     setNegotiationRecommendation(null);
     setNegotiationDraft(null);
     setDraftMessage("");
+    setComparison(null);
     setLastNegotiation(null);
     setError(null);
     setLoading(true);
@@ -195,6 +200,20 @@ export default function ListingDetailDrawer({
       setError(errorMessage(normalizeError));
     } finally {
       setNormalizing(false);
+    }
+  };
+
+  const compareJevVsLlm = async () => {
+    if (!storedListing || comparing) return;
+    setComparing(true);
+    setError(null);
+    try {
+      const result = await api.compareVerification(marketplaceListingKey);
+      setComparison(result);
+    } catch (compareError) {
+      setError(errorMessage(compareError));
+    } finally {
+      setComparing(false);
     }
   };
 
@@ -364,6 +383,52 @@ export default function ListingDetailDrawer({
             {currentListing.aiDescriptionVerification?.issues.length ? <div className="ai-normalization-warning"><AlertTriangle size={14} />{currentListing.aiDescriptionVerification.issues.join(" · ")}</div> : null}
             {currentListing.aiDescriptionVerification?.evidence.length ? <p className="drawer-section-copy">Evidence: {currentListing.aiDescriptionVerification.evidence.join(" · ")}</p> : null}
             {currentListing.aiDescriptionVerificationError ? <div className="ai-normalization-error"><AlertTriangle size={14} />{currentListing.aiDescriptionVerificationError}</div> : null}
+          </section> : null}
+
+          {showDescriptionSafeguard ? <section className="drawer-section drawer-section--ai">
+            <div className="drawer-section-heading">
+              <div><span className="drawer-section-kicker">Jev vs LLM</span><h3>What each engine returned</h3></div>
+              <Scale size={17} />
+            </div>
+            <p className="drawer-section-copy">Jev returns a typed judgment only (decision + confidence). The LLM returns a full verification (decision + confidence + summary + issues + evidence).</p>
+            {detail.verificationInputHash ? <p className="drawer-section-copy">Input hash <strong>{detail.verificationInputHash.slice(0, 12)}…</strong>{detail.verificationModel ? <> · stored model <strong>{detail.verificationModel}</strong></> : null}</p> : null}
+            {detail.verificationTrace?.length ? (
+              <div className="ai-normalization-tags" style={{ flexDirection: "column", alignItems: "stretch", gap: 8 }}>
+                {detail.verificationTrace.map((entry) => (
+                  <div key={entry.id} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    <span><strong>Jev</strong> · {entry.jevModel} · {new Date(entry.createdAt).toLocaleString("pl-PL")}{entry.note ? ` · ${entry.note}` : ""}</span>
+                    <span>{entry.jevError ? `Jev error: ${entry.jevError}` : `answer: ${JSON.stringify(entry.jevAnswer)}${entry.jevConfidence !== null ? ` · confidence ${entry.jevConfidence.toFixed(2)}` : ""}${entry.jevUnsure ? " · unsure" : ""}`}</span>
+                    {(entry.visionVerdict || entry.visionError || entry.deepseekDecision) ? (
+                      <span>Vision: {entry.visionError ? entry.visionError : `${entry.visionVerdict ?? "—"}${entry.visionConfidence !== null && entry.visionConfidence !== undefined ? ` (${entry.visionConfidence.toFixed(2)})` : ""}${entry.visionImagesSeen !== null && entry.visionImagesSeen !== undefined ? ` · ${entry.visionImagesSeen} photo(s)` : ""}`} · LLM: {entry.deepseekDecision ?? "—"}{entry.agreement !== null && entry.agreement !== undefined ? (entry.agreement ? " · agree" : " · disagree") : ""}</span>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            ) : <p className="drawer-section-copy">No stored Jev trace for this description yet — run a comparison below.</p>}
+            {storedListing ? <button className="outline-button ai-normalize-button" type="button" disabled={comparing} onClick={() => void compareJevVsLlm()}>{comparing ? <LoaderCircle size={15} className="spin" /> : <Scale size={15} />}{comparing ? "Comparing…" : comparison ? "Re-run comparison" : "Compare Jev vs LLM"}</button> : <span className="drawer-muted">Comparison is available after a listing is saved by a watch.</span>}
+            {comparison ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
+                <div className="ai-normalization-tags" style={{ flexDirection: "column", alignItems: "stretch" }}>
+                  <span><strong>Jev</strong> · {comparison.jevModel}</span>
+                  {comparison.jev.ok
+                    ? <span>decision <strong>{comparison.jev.judgment.decision}</strong> · confidence {comparison.jev.judgment.confidence === null ? "null" : comparison.jev.judgment.confidence.toFixed(2)}{comparison.jev.judgment.unsure ? " · unsure → would escalate to vision" : " · firm"}</span>
+                    : <span>Jev error: {comparison.jev.error}</span>}
+                  <details><summary className="drawer-muted">Raw Jev JSON</summary><pre style={{ whiteSpace: "pre-wrap", fontSize: 12, margin: "4px 0 0" }}>{JSON.stringify(comparison.jev.ok ? comparison.jev.raw : { error: comparison.jev.error }, null, 2)}</pre></details>
+                </div>
+                <div className="ai-normalization-tags" style={{ flexDirection: "column", alignItems: "stretch" }}>
+                  <span><strong>LLM</strong> · {comparison.llmModel}</span>
+                  {comparison.llm.ok
+                    ? <>
+                      <span>decision <strong>{comparison.llm.verification.decision}</strong> · confidence {comparison.llm.verification.confidence.toFixed(2)}</span>
+                      <span>{comparison.llm.verification.summary}</span>
+                      {comparison.llm.verification.issues.length ? <span>Issues: {comparison.llm.verification.issues.join(" · ")}</span> : null}
+                      {comparison.llm.verification.evidence.length ? <span>Evidence: {comparison.llm.verification.evidence.join(" · ")}</span> : null}
+                    </>
+                    : <span>LLM error: {comparison.llm.error}</span>}
+                  <details><summary className="drawer-muted">Raw LLM JSON</summary><pre style={{ whiteSpace: "pre-wrap", fontSize: 12, margin: "4px 0 0" }}>{JSON.stringify(comparison.llm.ok ? comparison.llm.raw : { error: comparison.llm.error }, null, 2)}</pre></details>
+                </div>
+              </div>
+            ) : null}
           </section> : null}
 
           <section className="drawer-section drawer-section--negotiation">

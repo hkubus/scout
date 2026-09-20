@@ -1,4 +1,4 @@
-import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, NegotiationDraft, NegotiationRecommendation, NegotiationResult, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SettingsData, Watch, WatchAnalytics } from './types';
+import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, NegotiationDraft, NegotiationRecommendation, NegotiationResult, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SettingsData, VerificationComparison, Watch, WatchAnalytics } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -108,6 +108,7 @@ export const api = {
   deleteWatch: (id: string) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('DELETE')),
   listingDetail: (key: string, watchId?: string | null) => request<ListingDetail>(`/api/listing-detail?key=${encodeURIComponent(key)}${watchId ? `&watchId=${encodeURIComponent(watchId)}` : ''}`),
   normalizeListing: (key: string, force = false) => request<ListingDetail>('/api/ai/normalize-listing', json('POST', { key, force })),
+  compareVerification: (key: string) => request<VerificationComparison>('/api/ai/compare-verification', json('POST', { key }), 60_000),
   recommendNegotiation: (key: string, input: { maxTotalCost: number | null; shippingCost?: number; otherCosts?: number }) => request<NegotiationRecommendation>('/api/negotiation/recommendation', json('POST', { key, ...input })),
   draftNegotiation: (key: string, offerPrice: number | null = null, budget?: { maxTotalCost: number; shippingCost?: number; otherCosts?: number }) => request<NegotiationDraft>('/api/ai/negotiate/draft', json('POST', { key, offerPrice, ...budget })),
   negotiateAndSend: (key: string, offerPrice: number | null = null, budget?: { maxTotalCost: number; shippingCost?: number; otherCosts?: number }, message?: string) => request<NegotiationResult>('/api/ai/negotiate', json('POST', { key, offerPrice, message, ...budget })),

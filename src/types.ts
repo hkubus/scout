@@ -105,6 +105,36 @@ export interface ListingDetail {
   descriptionSnapshot?: ListingDetailSnapshot | null;
   firstSeenAt: string;
   lastSeenAt: string;
+  verificationTrace?: VerificationTraceEntry[] | null;
+  verificationInputHash?: string | null;
+  verificationModel?: string | null;
+}
+
+export interface VerificationTraceEntry {
+  id: number;
+  createdAt: string;
+  inputHash: string;
+  jevModel: string;
+  jevAnswer: unknown | null;
+  jevConfidence: number | null;
+  jevUnsure: boolean;
+  jevError: string | null;
+  deepseekDecision: string | null;
+  agreement: boolean | null;
+  visionVerdict: string | null;
+  visionConfidence: number | null;
+  visionImagesSeen: number | null;
+  visionError: string | null;
+  note: string | null;
+}
+
+export interface VerificationComparison {
+  key: string;
+  inputHash: string;
+  jevModel: string;
+  llmModel: string;
+  jev: { ok: true; judgment: { decision: string; confidence: number | null; unsure: boolean }; raw: unknown } | { ok: false; error: string };
+  llm: { ok: true; verification: ListingDescriptionVerification; raw: unknown } | { ok: false; error: string };
 }
 
 export type SellerMessageStatus = 'sent' | 'failed';
