@@ -708,6 +708,29 @@ test('applies the same AI relevance gate to one-off marketplace search', async (
   } finally { context.close(); }
 });
 
+test('includes AI-eliminated listings only when the show-filtered flag is set', () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    seedWatch(context.db, 'excluded-watch');
+    context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run('OLX', 'excluded-listing', 'GPU fan replacement', 80, 'https://www.olx.pl/d/oferta/excluded-listing', now, now);
+    const listing = context.db.prepare("SELECT id FROM listings WHERE listing_id = 'excluded-listing'").get() as { id: number };
+    context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)').run(listing.id, 'excluded-watch', 80, now);
+    context.db.prepare(`INSERT INTO listing_relevance (watch_id, marketplace, listing_id, input_hash, model, relevant, reason, error, checked_at, relevance_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('excluded-watch', 'OLX', 'excluded-listing', 'hash', 'model', 0, 'accessory', null, now, 'irrelevant');
+
+    assert.deepEqual(context.service.getListings().map((item) => item.listingId), []);
+    assert.deepEqual(context.service.dashboard().listings.map((item) => item.listingId), []);
+    assert.deepEqual(context.service.dashboard(true).stats, { watching: 1, newToday: 0, strongDeals: 0 });
+
+    const shown = context.service.getListings(undefined, true);
+    assert.deepEqual(shown.map((item) => item.listingId), ['excluded-listing']);
+    assert.equal(shown[0].excludedByAi, true);
+    const page = context.service.listingsPage({ includeExcluded: true });
+    assert.equal(page.listings[0].excludedByAi, true);
+    assert.equal(context.service.dashboard(true).listings[0].excludedByAi, true);
+  } finally { context.close(); }
+});
+
 test('keeps manual search results when AI relevance fails', async () => {
   const context = fixture({
     classifyListingRelevance: async () => { throw new Error('Marketplace timeout'); },

@@ -1784,6 +1784,7 @@ export class ScoutService {
           : null,
         aiDescriptionVerificationError: row.ai_description_verification_error ?? null,
       } : {}),
+      ...(row.excluded_by_ai !== undefined ? { excludedByAi: Boolean(row.excluded_by_ai) } : {}),
     };
   }
 
@@ -2029,12 +2030,14 @@ export class ScoutService {
     };
   }
 
-  listingsPage(options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string } = {}, knownWatches?: Watch[]) {
+  listingsPage(options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string; includeExcluded?: boolean } = {}, knownWatches?: Watch[]) {
     const freshnessCutoff = new Date(Date.now() - MATCH_VISIBILITY_MS).toISOString();
+    const excludedByAi = 'EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = \'irrelevant\' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)';
+    const includeExcluded = Boolean(options.includeExcluded);
     const predicates = [
       'w.archived_at IS NULL',
       'wl.last_seen_at > ?',
-      'NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = \'irrelevant\' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)',
+      ...(includeExcluded ? [] : [`NOT ${excludedByAi}`]),
       '(w.shipping_only = 0 OR l.shipping_available = 1)',
       '(w.min_price_pln IS NULL OR l.price_pln >= w.min_price_pln)',
       '(w.max_price_pln IS NULL OR l.price_pln <= w.max_price_pln)',
@@ -2048,7 +2051,8 @@ export class ScoutService {
     const total = Number((this.stmt(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(500, Math.floor(options.pageSize ?? 200)));
-    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note
+    const excludedSelect = includeExcluded ? `, ${excludedByAi} AS excluded_by_ai` : '';
+    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note${excludedSelect}
       FROM listings l
       JOIN watch_listings wl ON wl.listing_id = l.id
       JOIN watches w ON w.id = wl.watch_id
@@ -2060,8 +2064,8 @@ export class ScoutService {
     return { listings, pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
   }
 
-  getListings(knownWatches?: Watch[]) {
-    return this.listingsPage({ page: 1, pageSize: 500 }, knownWatches).listings;
+  getListings(knownWatches?: Watch[], includeExcluded = false) {
+    return this.listingsPage({ page: 1, pageSize: 500, includeExcluded }, knownWatches).listings;
   }
 
   listingDetail(key: string, watchId?: string | null): ListingDetail {
@@ -3091,15 +3095,16 @@ export class ScoutService {
     });
   }
 
-  dashboard(): DashboardData {
+  dashboard(includeExcluded = false): DashboardData {
     const watches = this.getWatches();
-    const listings = this.getListings(watches);
+    const listings = this.getListings(watches, includeExcluded);
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const todayTime = today.getTime();
     let newToday = 0;
     let strongDeals = 0;
     for (const listing of listings) {
+      if (listing.excludedByAi) continue;
       if (Date.parse(listing.observedAt) >= todayTime) newToday += 1;
       if (listing.dealStrength >= 4) strongDeals += 1;
     }

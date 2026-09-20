@@ -104,6 +104,11 @@ function ListingRow({ listing, onSelect }: { listing: Listing; onSelect?: (listi
               series baseline
             </em>
           ) : null}
+          {listing.excludedByAi ? (
+            <em className="decision-chip decision-chip--ai-filtered" title="Eliminated by the AI relevance filter; hidden unless you show AI-filtered listings">
+              AI filtered
+            </em>
+          ) : null}
         </div>
       </button>
       <div className="marketplace-cell" role="cell">

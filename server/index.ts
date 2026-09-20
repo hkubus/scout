@@ -14,6 +14,8 @@ import { isPubliclyBoundHost, RateLimiter, securityHeaders } from './security';
 import { ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 
+const strictBoolean = z.union([z.boolean(), z.string().regex(/^(?:true|false)$/i).transform((value) => value.toLowerCase() === 'true')]);
+
 const port = Number(process.env.PORT ?? 3001);
 if (!Number.isInteger(port) || port < 1 || port > 65_535) {
   throw new Error('PORT must be an integer between 1 and 65535');
@@ -99,12 +101,16 @@ app.get('/api/ready', async (_request, reply) => {
   const readiness = service.readiness();
   return reply.code(readiness.status === 'ready' ? 200 : 503).send(readiness);
 });
-app.get('/api/dashboard', async () => service.dashboard());
+app.get('/api/dashboard', async (request, reply) => {
+  const parsed = z.object({ includeExcluded: strictBoolean.optional().default(false) }).strict().safeParse(request.query);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid dashboard filters' });
+  return service.dashboard(parsed.data.includeExcluded);
+});
 app.get('/api/listings', async (request, reply) => {
-  const parsed = z.object({ marketplace: marketplaceParam.optional(), q: z.string().max(240).optional(), watchId: z.string().trim().min(1).max(160).optional(), page: z.coerce.number().int().min(1).optional().default(1), pageSize: z.coerce.number().int().min(1).max(500).optional().default(200) }).strict().safeParse(request.query);
+  const parsed = z.object({ marketplace: marketplaceParam.optional(), q: z.string().max(240).optional(), watchId: z.string().trim().min(1).max(160).optional(), page: z.coerce.number().int().min(1).optional().default(1), pageSize: z.coerce.number().int().min(1).max(500).optional().default(200), includeExcluded: strictBoolean.optional().default(false) }).strict().safeParse(request.query);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid listing filters' });
   const query = parsed.data;
-  const page = service.listingsPage({ marketplace: query.marketplace, q: query.q, watchId: query.watchId, page: query.page, pageSize: query.pageSize });
+  const page = service.listingsPage({ marketplace: query.marketplace, q: query.q, watchId: query.watchId, page: query.page, pageSize: query.pageSize, includeExcluded: query.includeExcluded });
   return { listings: page.listings, pagination: page.pagination };
 });
 app.get('/api/listing-detail', async (request, reply) => {
@@ -175,7 +181,6 @@ app.patch('/api/listing-actions', async (request, reply) => {
   return { action: service.updateListingAction(parsed.data.key, parsed.data.decision, parsed.data.note) };
 });
 app.get('/api/watches', async (request, reply) => {
-  const strictBoolean = z.union([z.boolean(), z.string().regex(/^(?:true|false)$/i).transform((value) => value.toLowerCase() === 'true')]);
   const parsed = z.object({ includeArchived: strictBoolean.optional().default(false) }).strict().safeParse(request.query);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid watch filters' });
   return { watches: parsed.data.includeArchived ? service.allWatches() : service.getWatches() };

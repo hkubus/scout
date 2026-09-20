@@ -41,6 +41,7 @@ export default function ListingsPage({
   const [marketplace, setMarketplace] = useState<"All" | Marketplace>("All");
   const [sort, setSort] = useState<"Newest" | "Strongest" | "Price">("Newest");
   const [decision, setDecision] = useState<"All" | ListingDecision>("All");
+  const [showAiFiltered, setShowAiFiltered] = useState(false);
   const [page, setPage] = useState(1);
   const [remoteListings, setRemoteListings] = useState<Listing[] | null>(null);
   const [pagination, setPagination] = useState<{ page: number; pageSize: number; total: number; hasNext: boolean } | null>(null);
@@ -49,12 +50,12 @@ export default function ListingsPage({
 
   useEffect(() => {
     setPage(1);
-  }, [selectedWatchId]);
+  }, [selectedWatchId, showAiFiltered]);
 
   useEffect(() => {
     const controller = new AbortController();
     setLoadingPage(true);
-    api.listings({ page, pageSize: 500, watchId: selectedWatchId ?? undefined }, controller.signal)
+    api.listings({ page, pageSize: 500, watchId: selectedWatchId ?? undefined, includeExcluded: showAiFiltered }, controller.signal)
       .then((result) => {
         setRemoteListings(result.listings);
         setPagination(result.pagination);
@@ -68,7 +69,7 @@ export default function ListingsPage({
         if (!controller.signal.aborted) setLoadingPage(false);
       });
     return () => controller.abort();
-  }, [page, selectedWatchId]);
+  }, [page, selectedWatchId, showAiFiltered]);
 
   const pageListings = remoteListings ?? listings;
   const filtered = useMemo(() => {
@@ -123,6 +124,15 @@ export default function ListingsPage({
           options={["All decisions", "Buy", "Watch", "Pass"]}
           onChange={(value) => setDecision(value === "Buy" ? "buy" : value === "Watch" ? "watch" : value === "Pass" ? "pass" : "All")}
         />
+        <button
+          type="button"
+          className={`filter-toggle ${showAiFiltered ? "filter-toggle--on" : ""}`}
+          aria-pressed={showAiFiltered}
+          title="Listings eliminated by the AI relevance filter are hidden by default"
+          onClick={() => setShowAiFiltered((value) => !value)}
+        >
+          {showAiFiltered ? "Hide AI-filtered" : "Show AI-filtered"}
+        </button>
       </div>
       {selectedWatchId ? (
         <div className="active-filter">

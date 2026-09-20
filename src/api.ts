@@ -65,14 +65,19 @@ const json = (method: string, body?: unknown): RequestInit => body === undefined
   : { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) };
 
 export const api = {
-  dashboard: (signal?: AbortSignal) => request<DashboardData>('/api/dashboard', { signal }),
-  listings: (options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string } = {}, signal?: AbortSignal) => {
+  dashboard: (options: { includeExcluded?: boolean } = {}, signal?: AbortSignal) => {
+    const params = new URLSearchParams();
+    if (options.includeExcluded) params.set('includeExcluded', 'true');
+    return request<DashboardData>(`/api/dashboard${params.toString() ? `?${params}` : ''}`, { signal });
+  },
+  listings: (options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string; includeExcluded?: boolean } = {}, signal?: AbortSignal) => {
     const params = new URLSearchParams();
     if (options.page !== undefined) params.set('page', String(options.page));
     if (options.pageSize !== undefined) params.set('pageSize', String(options.pageSize));
     if (options.marketplace) params.set('marketplace', options.marketplace);
     if (options.q) params.set('q', options.q);
     if (options.watchId) params.set('watchId', options.watchId);
+    if (options.includeExcluded) params.set('includeExcluded', 'true');
     return request<{ listings: DashboardData['listings']; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/listings${params.toString() ? `?${params}` : ''}`, { signal });
   },
   watches: (includeArchived = false, signal?: AbortSignal) => request<{ watches: Watch[] }>(`/api/watches?includeArchived=${includeArchived ? 'true' : 'false'}`, { signal }),

@@ -68,6 +68,8 @@ export interface Listing {
   observedAt: string;
   dealStrength: number;
   dealLabel: DealLabel;
+  /** Set when the listing is returned via the "show AI-filtered" path: its watch's AI relevance filter eliminated it. */
+  excludedByAi?: boolean;
   image: string;
   url: string;
   watch: string;

@@ -155,6 +155,8 @@ function App() {
   const [toast, setToast] = useState<Toast | null>(null);
   const [allWatches, setAllWatches] = useState<Watch[] | null>(null);
   const [watchRefreshKey, setWatchRefreshKey] = useState(0);
+  const [showAiFiltered, setShowAiFiltered] = useState(false);
+  const showAiFilteredRef = useRef(false);
   const refreshSequence = useRef(0);
 
   const notify = useCallback(
@@ -167,7 +169,7 @@ function App() {
       const sequence = ++refreshSequence.current;
       if (showLoader) setIsLoading(true);
       try {
-        const next = await api.dashboard();
+        const next = await api.dashboard({ includeExcluded: showAiFilteredRef.current });
         if (sequence !== refreshSequence.current) return;
         setData(next);
         setConnection("online");
@@ -183,6 +185,13 @@ function App() {
     },
     [notify],
   );
+
+  const toggleAiFiltered = useCallback(() => {
+    const next = !showAiFilteredRef.current;
+    showAiFilteredRef.current = next;
+    setShowAiFiltered(next);
+    void refreshData(false);
+  }, [refreshData]);
 
   useEffect(() => {
     void refreshData(true);
@@ -484,6 +493,8 @@ function App() {
           data={data}
           isLoading={isLoading}
           scanning={scanning}
+          showAiFiltered={showAiFiltered}
+          onToggleAiFiltered={toggleAiFiltered}
           onNewWatch={() => { setWatchPreset(null); setShowWatchDialog(true); }}
           onNavigate={openView}
           onScan={() => requestScan()}
@@ -725,6 +736,8 @@ function Overview({
   data,
   isLoading,
   scanning,
+  showAiFiltered,
+  onToggleAiFiltered,
   onNewWatch,
   onNavigate,
   onScan,
@@ -733,6 +746,8 @@ function Overview({
   data: DashboardData;
   isLoading: boolean;
   scanning: boolean;
+  showAiFiltered: boolean;
+  onToggleAiFiltered: () => void;
   onNewWatch: () => void;
   onNavigate: (view: View) => void;
   onScan: () => void;
@@ -742,10 +757,11 @@ function Overview({
   const [strength, setStrength] = useState<"All" | "Strong" | "Exceptional">(
     "All",
   );
-  const [sort, setSort] = useState<"Newest" | "Deal">("Newest");
+  const [sort, setSort] = useState<"Newest" | "Deal">("Deal");
   const visibleListings = useMemo(
     () =>
       data.listings
+        .filter((listing) => showAiFiltered || !listing.excludedByAi)
         .filter(
           (listing) =>
             marketplace === "All" || listing.marketplace === marketplace,
@@ -763,7 +779,7 @@ function Overview({
             ? b.dealStrength - a.dealStrength
             : (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0),
         ),
-    [data.listings, marketplace, strength, sort],
+    [data.listings, marketplace, strength, sort, showAiFiltered],
   );
   return (
     <>
@@ -859,6 +875,15 @@ function Overview({
                 )
               }
             />
+            <button
+              type="button"
+              className={`filter-toggle ${showAiFiltered ? "filter-toggle--on" : ""}`}
+              aria-pressed={showAiFiltered}
+              title="Listings eliminated by the AI relevance filter are hidden by default"
+              onClick={onToggleAiFiltered}
+            >
+              {showAiFiltered ? "Hide AI-filtered" : "Show AI-filtered"}
+            </button>
             <SelectControl
               value={sort === "Newest" ? "Newest first" : "Strongest first"}
               options={["Newest first", "Strongest first"]}
