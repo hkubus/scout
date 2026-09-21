@@ -81,8 +81,9 @@ function ListingThumbnail({ listing }: { listing: Listing }) {
 }
 
 function ListingRow({ listing, onSelect }: { listing: Listing; onSelect?: (listing: Listing) => void }) {
+  const aiFiltered = Boolean(listing.aiFiltered);
   return (
-    <div className="listing-table listing-row" role="row">
+    <div className={`listing-table listing-row${aiFiltered ? " listing-row--ai-filtered" : ""}`} role="row">
       <button
         type="button"
         className="listing-item listing-item--button"
@@ -102,6 +103,11 @@ function ListingRow({ listing, onSelect }: { listing: Listing; onSelect?: (listi
           {listing.typicalSource === "reference-band" ? (
             <em className="decision-chip decision-chip--reference" title="Typical shown from the watch's reference research series while its own baseline is learning">
               series baseline
+            </em>
+          ) : null}
+          {aiFiltered ? (
+            <em className="decision-chip decision-chip--ai-filtered" title="Hidden by AI relevance filtering">
+              Filtered by AI
             </em>
           ) : null}
         </div>
