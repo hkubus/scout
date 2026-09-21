@@ -161,8 +161,7 @@ export default function WatchesPage({
         <span>
           Scout reads public pages by default. Optional authenticated sessions
           can be configured in Settings; Scout never captures passwords or
-          bypasses CAPTCHAs. Seller messages are sent only after you review
-          and confirm them; automatic negotiation is off by default.
+          bypasses CAPTCHAs.
         </span>
       </div>
     </>

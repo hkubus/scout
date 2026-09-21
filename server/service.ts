@@ -5,19 +5,16 @@ import { chromium, type Browser, type BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
-import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, draftNegotiationMessageWithDeepSeek, legacyListingNormalizationInputHash, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingNormalizationInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeListingWithDeepSeek, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseStoredListingNormalization, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type NegotiationListingContext } from './ai';
+import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext } from './ai';
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
 import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, verifyListingDescriptionWithVision, visionToVerification } from './vision';
-import { OlxMessagingError, sendOlxMessageOnPage } from './olx-messaging';
-import { AllegroMessagingError, sendAllegroMessageOnPage } from './allegro-messaging';
-import { offerCeiling, recommendNegotiationPrice, type NegotiationRecommendation } from './negotiation';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, median, scoreDeal } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
-import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsNegotiation, AnalyticsOverview, AnalyticsTriage, AutoNegotiationSettings, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SellerMessage, SellerMessageSource, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -56,7 +53,6 @@ type ScanNotifyContext = {
   deepSeek: { apiKey: string | null; model: string; source: 'settings' | 'environment' | 'none' };
 };
 
-type AutoNegotiationConfig = Omit<AutoNegotiationSettings, 'sentToday' | 'attemptedToday'>;
 type DigestChannel = 'Discord' | 'ntfy';
 type DailyDigestConfig = Omit<DailyDigestSettings, 'lastSentAt'>;
 
@@ -76,16 +72,6 @@ type DigestCandidateRow = {
   confidence: number;
   priority: NotificationPriority;
   observed_at: string;
-};
-
-const DEFAULT_AUTO_NEGOTIATION_CONFIG: AutoNegotiationConfig = {
-  enabled: false,
-  maxTotalCost: null,
-  shippingCost: 0,
-  otherCosts: 0,
-  minimumDiscountPercent: 18,
-  openingDiscountPercent: 12,
-  dailyLimit: 3,
 };
 
 const DEFAULT_DAILY_DIGEST_CONFIG: DailyDigestConfig = {
@@ -142,7 +128,6 @@ export class ServiceError extends Error {
 export interface ScoutServiceDependencies {
   classifyListingRelevance?: typeof classifyListingRelevanceWithDeepSeek;
   verifyListingDescription?: typeof verifyListingDescriptionWithDeepSeek;
-  draftNegotiation?: typeof draftNegotiationMessageWithDeepSeek;
   classifyListingRelevanceWithJev?: typeof classifyListingRelevanceWithJev;
   verifyListingDescriptionWithJev?: typeof verifyListingDescriptionWithJev;
   classifyTermMatchWithJev?: typeof classifyTermMatchWithJev;
@@ -151,8 +136,6 @@ export interface ScoutServiceDependencies {
   classifyListingRelevanceWithVision?: typeof classifyListingRelevanceWithVision;
   verifyListingDescriptionWithVision?: typeof verifyListingDescriptionWithVision;
   fetchListingDetailHtml?: (url: string, marketplace: Marketplace) => Promise<string>;
-  sendOlxMessage?: (listingUrl: string, message: string) => Promise<void>;
-  sendAllegroMessage?: (listingUrl: string, message: string) => Promise<void>;
   publicExposureWarning?: boolean;
 }
 
@@ -257,10 +240,6 @@ function parseListingKey(key: string): { marketplace: Marketplace; listingId: st
   return { marketplace: marketplace as Marketplace, listingId };
 }
 
-function safePromptText(value: unknown, limit = 240) {
-  return String(value ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
-}
-
 /**
  * Single OLX offers-API request over HTTP/2. OLX's CloudFront distribution
  * answers HTTP/1.1 API requests with `403 Request blocked` while the identical
@@ -332,29 +311,6 @@ function fetchOlxApiSingleRequest(url: string, timeoutMs: number): Promise<{ sta
   });
 }
 
-export function validateNegotiationMessage(message: string, offerPrice: number | null = null) {
-  const safeMessage = message.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
-  if (!safeMessage) throw new ServiceError('The negotiation message is empty.', 400);
-  if (safeMessage.length > 450) throw new ServiceError('Negotiation messages must be 450 characters or fewer.', 400);
-  if (/(?:https?:\/\/|www\.|\b(?:email|e-mail|adres\s+e-mail|telefon|tel\.?|whatsapp|telegram|signal|przelew|poza\s+platforma)\b|@[a-z0-9._%+-]+\.[a-z]{2,})/i.test(safeMessage)) {
-    throw new ServiceError('Negotiation messages cannot include links, contact details, or off-platform payment instructions.', 400);
-  }
-  if (/\b(?:idiot|kretyn|debil|frajer|oszust|złodziej|kurwa|chuj|fuck|scam)\b/i.test(safeMessage)) {
-    throw new ServiceError('Negotiation messages must remain polite and non-abusive.', 400);
-  }
-  const numericTokens = [...safeMessage.matchAll(/(\d[\d\s.,]*\d|\d)/g)]
-    .map((match) => Number(match[1].replace(/\s/g, '').replace(/,(?=(\d{3}\b))/g, '').replace(',', '.')))
-    .filter((value) => Number.isFinite(value));
-  if (offerPrice !== null) {
-    const amount = Math.round(offerPrice * 100) / 100;
-    const matches = numericTokens.some((value) => Math.abs(value - amount) < 0.005);
-    if (!matches) throw new ServiceError('The message must state the approved opening offer.', 400);
-  } else if (numericTokens.some((value) => value >= 10)) {
-    throw new ServiceError('A message without an approved opening offer cannot introduce a new numeric amount.', 400);
-  }
-  return safeMessage;
-}
-
 function parseListingDecision(value: unknown): ListingDecision | null {
   return value === 'buy' || value === 'watch' || value === 'pass' ? value : null;
 }
@@ -399,7 +355,6 @@ export class ScoutService {
   private digestRunning = false;
   private readonly classifyListingRelevance: typeof classifyListingRelevanceWithDeepSeek;
   private readonly verifyListingDescription: typeof verifyListingDescriptionWithDeepSeek;
-  private readonly draftNegotiation: typeof draftNegotiationMessageWithDeepSeek;
   private readonly jevRelevance: typeof classifyListingRelevanceWithJev;
   private readonly jevVerification: typeof verifyListingDescriptionWithJev;
   private readonly jevTermMatch: typeof classifyTermMatchWithJev;
@@ -408,12 +363,9 @@ export class ScoutService {
   private readonly visionRelevance: typeof classifyListingRelevanceWithVision;
   private readonly visionVerification: typeof verifyListingDescriptionWithVision;
   private readonly detailHtml: (url: string, marketplace: Marketplace) => Promise<string>;
-  private readonly sendOlxMessageOverride?: (listingUrl: string, message: string) => Promise<void>;
-  private readonly sendAllegroMessageOverride?: (listingUrl: string, message: string) => Promise<void>;
   private readonly publicExposureWarning: boolean;
   private readonly schedulerOwner = `scheduler-${process.pid}-${randomBytes(8).toString('hex')}`;
   private activeManualSearches = 0;
-  private readonly messagingInFlight = new Set<string>();
   private logSequence = 0;
   private readonly logBuffer: LogEntry[] = [];
 
@@ -422,7 +374,6 @@ export class ScoutService {
     this.emit = emit;
     this.classifyListingRelevance = dependencies.classifyListingRelevance ?? classifyListingRelevanceWithDeepSeek;
     this.verifyListingDescription = dependencies.verifyListingDescription ?? verifyListingDescriptionWithDeepSeek;
-    this.draftNegotiation = dependencies.draftNegotiation ?? draftNegotiationMessageWithDeepSeek;
     this.jevRelevance = dependencies.classifyListingRelevanceWithJev ?? classifyListingRelevanceWithJev;
     this.jevVerification = dependencies.verifyListingDescriptionWithJev ?? verifyListingDescriptionWithJev;
     this.jevTermMatch = dependencies.classifyTermMatchWithJev ?? classifyTermMatchWithJev;
@@ -431,8 +382,6 @@ export class ScoutService {
     this.visionRelevance = dependencies.classifyListingRelevanceWithVision ?? classifyListingRelevanceWithVision;
     this.visionVerification = dependencies.verifyListingDescriptionWithVision ?? verifyListingDescriptionWithVision;
     this.detailHtml = dependencies.fetchListingDetailHtml ?? ((url, marketplace) => this.fetchPublicPage(url, marketplace));
-    this.sendOlxMessageOverride = dependencies.sendOlxMessage;
-    this.sendAllegroMessageOverride = dependencies.sendAllegroMessage;
     this.publicExposureWarning = dependencies.publicExposureWarning ?? false;
   }
 
@@ -600,24 +549,6 @@ export class ScoutService {
     this.stmt('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run(key, value, nowIso());
   }
 
-  private autoNegotiationConfig(): AutoNegotiationConfig {
-    const stored = parseJson<Partial<AutoNegotiationConfig>>(this.getSetting('auto_negotiation_config'), {});
-    const finite = (value: unknown, fallback: number, minimum: number, maximum?: number) => {
-      const parsed = typeof value === 'number' ? value : Number(value);
-      return Number.isFinite(parsed) && parsed >= minimum && (maximum === undefined || parsed <= maximum) ? parsed : fallback;
-    };
-    const maxTotalCost = stored.maxTotalCost === null ? null : finite(stored.maxTotalCost, 0, 0.01);
-    return {
-      enabled: stored.enabled === true,
-      maxTotalCost: maxTotalCost === 0 ? null : maxTotalCost,
-      shippingCost: finite(stored.shippingCost, DEFAULT_AUTO_NEGOTIATION_CONFIG.shippingCost, 0),
-      otherCosts: finite(stored.otherCosts, DEFAULT_AUTO_NEGOTIATION_CONFIG.otherCosts, 0),
-      minimumDiscountPercent: finite(stored.minimumDiscountPercent, DEFAULT_AUTO_NEGOTIATION_CONFIG.minimumDiscountPercent, 18, 80),
-      openingDiscountPercent: finite(stored.openingDiscountPercent, DEFAULT_AUTO_NEGOTIATION_CONFIG.openingDiscountPercent, 1, 50),
-      dailyLimit: Math.floor(finite(stored.dailyLimit, DEFAULT_AUTO_NEGOTIATION_CONFIG.dailyLimit, 1, 50)),
-    };
-  }
-
   private dailyDigestConfig(): DailyDigestConfig {
     const stored = parseJson<Partial<DailyDigestConfig>>(this.getSetting('daily_digest_config'), {});
     const time = typeof stored.time === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(stored.time)
@@ -640,23 +571,6 @@ export class ScoutService {
     return {
       date: `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`,
       time: `${pad(value.getHours())}:${pad(value.getMinutes())}`,
-    };
-  }
-
-  private currentDayStart() {
-    const start = new Date();
-    start.setHours(0, 0, 0, 0);
-    return start.toISOString();
-  }
-
-  private autoNegotiationSettings(): AutoNegotiationSettings {
-    const config = this.autoNegotiationConfig();
-    const counts = this.stmt(`SELECT COUNT(*) AS attempted, SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent
-      FROM automatic_negotiations WHERE created_at >= ?`).get(this.currentDayStart()) as { attempted?: number; sent?: number } | undefined;
-    return {
-      ...config,
-      sentToday: Number(counts?.sent ?? 0),
-      attemptedToday: Number(counts?.attempted ?? 0),
     };
   }
 
@@ -722,8 +636,7 @@ export class ScoutService {
    * SCOUT_JEV_MODE=legacy, or measure against DeepSeek with
    * SCOUT_JEV_MODE=shadow. Allowlisted on purpose: anything unrecognized
    * (including typos of either mode) keeps legacy behavior instead of
-   * surprising anyone with new traffic. Normalization and negotiation drafts
-   * always stay on the DeepSeek chat-completions path.
+   * surprising anyone with new traffic.
    */
   private jevLiveConfig() {
     const mode = process.env.SCOUT_JEV_MODE?.trim().toLowerCase();
@@ -1304,8 +1217,8 @@ export class ScoutService {
    * Never overrides an explicit signal: only runs when the in-memory listing
    * and the stored row are both null/unknown, requires a confident Jev
    * `negotiable` verdict, and writes with `WHERE price_negotiable IS NULL`.
-   * Mutates candidate.listing.priceNegotiable so the same-scan auto-negotiate
-   * gate sees the upgrade without a re-scan. Fail-open: any error is a no-op.
+   * Mutates candidate.listing.priceNegotiable so same-scan consumers see the
+   * upgrade without a re-scan. Fail-open: any error is a no-op.
    */
   private async upgradeNegotiabilityFromDescription(
     candidate: DealNotificationCandidate,
@@ -1583,8 +1496,7 @@ export class ScoutService {
    * spend their time on marketplace and OpenRouter round trips. Candidates
    * for the same listing are grouped and each group is consumed sequentially
    * — the alert-state and delivery-claim logic is per listing and must not
-   * race itself. Two workers also stay within the messagingInFlight cap of
-   * two concurrent seller messages.
+   * race itself.
    */
   private async processDealCandidates(candidates: DealNotificationCandidate[], buildContext: () => ScanNotifyContext) {
     if (!candidates.length) return;
@@ -1604,7 +1516,6 @@ export class ScoutService {
         for (const candidate of group) {
           if (candidate.requiresDescriptionVerification && !await this.verifyHighPriorityDeal(candidate, context)) continue;
           await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence, context);
-          await this.automaticallyNegotiate(candidate, context);
         }
       }
     };
@@ -1787,11 +1698,6 @@ export class ScoutService {
       decision: parseListingDecision(row.listing_decision),
       note: typeof row.listing_note === 'string' ? row.listing_note : '',
       aiFiltered: row.ai_filtered === undefined ? undefined : Number(row.ai_filtered) === 1,
-      ...(row.ai_normalization_json !== undefined ? {
-        aiNormalization: parseStoredListingNormalization(row.ai_normalization_json),
-        aiNormalizationAt: row.ai_normalization_at ?? null,
-        aiNormalizationError: row.ai_normalization_error ?? null,
-      } : {}),
       ...(row.ai_description_verification_json !== undefined ? {
         aiDescriptionVerification: parseStoredListingDescriptionVerification(row.ai_description_verification_json),
         aiDescriptionVerificationAt: row.ai_description_verification_at ?? null,
@@ -1918,9 +1824,9 @@ export class ScoutService {
 
   /**
    * Cross-watch analytics for the Analytics page. Deal metrics come from
-   * daily-deduped `observations` (asking price vs learned baseline); triage,
-   * negotiation, and AI-quality sections are operational signals that are not
-   * watch-scoped, so they honor only the range and marketplace filters.
+   * daily-deduped `observations` (asking price vs learned baseline); triage
+   * and AI-quality sections are operational signals that are not watch-scoped,
+   * so they honor only the range and marketplace filters.
    */
   analytics(options: { days?: number; watchId?: string; marketplace?: Marketplace } = {}): AnalyticsData {
     const days = Math.max(7, Math.min(180, Math.floor(options.days ?? 30)));
@@ -2003,20 +1909,6 @@ export class ScoutService {
       else triage.none += count;
     }
 
-    const activityPredicates = ['created_at >= ?'];
-    const activityParams: unknown[] = [cutoff];
-    if (marketplace) { activityPredicates.push('marketplace = ?'); activityParams.push(marketplace); }
-    const activityWhere = activityPredicates.join(' AND ');
-    const messageRow = this.stmt(`SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent FROM seller_messages WHERE ${activityWhere}`).get(...activityParams) as { total?: number; sent?: number };
-    const autoRow = this.stmt(`SELECT COUNT(*) AS total, AVG(discount_percent) AS average_discount FROM automatic_negotiations WHERE ${activityWhere}`).get(...activityParams) as { total?: number; average_discount?: number | null };
-    const offersSent = Number(messageRow.total ?? 0);
-    const negotiation: AnalyticsNegotiation = {
-      offersSent,
-      successRate: offersSent > 0 ? (Number(messageRow.sent ?? 0) / offersSent) * 100 : null,
-      automatic: Number(autoRow.total ?? 0),
-      averageDiscountPercent: autoRow.average_discount === null || autoRow.average_discount === undefined ? null : Number(autoRow.average_discount),
-    };
-
     const relevanceRow = this.stmt("SELECT SUM(CASE WHEN relevance_status IN ('relevant', 'irrelevant') THEN 1 ELSE 0 END) AS judged, SUM(CASE WHEN relevance_status = 'relevant' THEN 1 ELSE 0 END) AS passed FROM listing_relevance WHERE checked_at >= ?").get(cutoff) as { judged?: number; passed?: number };
     const shadowRow = this.stmt('SELECT SUM(CASE WHEN agreement IS NOT NULL THEN 1 ELSE 0 END) AS judged, SUM(CASE WHEN agreement = 1 THEN 1 ELSE 0 END) AS agreed FROM jev_shadow_log WHERE created_at >= ?').get(cutoff) as { judged?: number; agreed?: number };
     const relevanceJudged = Number(relevanceRow.judged ?? 0);
@@ -2045,7 +1937,6 @@ export class ScoutService {
       watchLeaderboard: watchLeaderboard(observations),
       marketplaceComparison,
       triage,
-      negotiation,
       aiQuality,
     };
   }
@@ -2205,65 +2096,6 @@ export class ScoutService {
     return { key: `${marketplace}:${listingId}`, inputHash, jevModel, llmModel, jev, llm };
   }
 
-  private async normalizeStoredListing(marketplace: Marketplace, listingId: string, force = false) {
-    const config = this.deepSeekConfig();
-    if (!config.apiKey) throw new ServiceError('OpenRouter is not configured. Add an API key in Settings or set SCOUT_OPENROUTER_API_KEY.', 409);
-    const row = this.stmt('SELECT marketplace, listing_id, title, condition, location, ai_normalization_json, ai_normalization_input_hash, ai_normalization_model, ai_normalization_at, ai_normalization_error FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as Record<string, any> | undefined;
-    if (!row) throw new ServiceError('Listing detail is not available yet', 404);
-
-    const source = {
-      marketplace,
-      title: String(row.title ?? ''),
-      condition: row.condition ? String(row.condition) : undefined,
-      location: row.location ? String(row.location) : undefined,
-    };
-    const inputHash = listingNormalizationInputHash(source);
-    const legacyInputHash = legacyListingNormalizationInputHash(source);
-    const cached = parseStoredListingNormalization(row.ai_normalization_json);
-    const sameInput = row.ai_normalization_input_hash === inputHash && row.ai_normalization_model === config.model;
-    if (!force && sameInput && cached) return cached;
-    if (!force && row.ai_normalization_input_hash === legacyInputHash && row.ai_normalization_model === config.model && cached) {
-      this.stmt('UPDATE listings SET ai_normalization_input_hash = ? WHERE marketplace = ? AND listing_id = ?').run(inputHash, marketplace, listingId);
-      return cached;
-    }
-    if (!force && sameInput && row.ai_normalization_error && row.ai_normalization_at && Date.now() - Date.parse(row.ai_normalization_at) < 6 * 60 * 60_000) {
-      throw new ServiceError(String(row.ai_normalization_error), 502);
-    }
-    if (!force) {
-      const reusable = this.stmt(`SELECT ai_normalization_json FROM listings
-        WHERE ai_normalization_input_hash = ? AND ai_normalization_model = ? AND ai_normalization_json IS NOT NULL
-        ORDER BY ai_normalization_at DESC LIMIT 1`).get(inputHash, config.model) as { ai_normalization_json?: string } | undefined;
-      const shared = parseStoredListingNormalization(reusable?.ai_normalization_json);
-      if (shared) {
-        const normalizedAt = nowIso();
-        this.stmt('UPDATE listings SET ai_normalization_json = ?, ai_normalization_input_hash = ?, ai_normalization_model = ?, ai_normalization_at = ?, ai_normalization_error = NULL WHERE marketplace = ? AND listing_id = ?').run(JSON.stringify(shared), inputHash, config.model, normalizedAt, marketplace, listingId);
-        this.emit('ai-normalization', { key: `${marketplace}:${listingId}`, status: 'ready' });
-        return shared;
-      }
-    }
-
-    try {
-      const normalization = await normalizeListingWithDeepSeek(source, { apiKey: config.apiKey, model: config.model });
-      const normalizedAt = nowIso();
-      this.stmt('UPDATE listings SET ai_normalization_json = ?, ai_normalization_input_hash = ?, ai_normalization_model = ?, ai_normalization_at = ?, ai_normalization_error = NULL WHERE marketplace = ? AND listing_id = ?').run(JSON.stringify(normalization), inputHash, config.model, normalizedAt, marketplace, listingId);
-      this.emit('ai-normalization', { key: `${marketplace}:${listingId}`, status: 'ready' });
-      return normalization;
-    } catch (error) {
-      const message = (error instanceof ServiceError ? error.message : error instanceof Error ? error.message : 'Listing normalization failed').slice(0, 500);
-      const attemptedAt = nowIso();
-      this.stmt('UPDATE listings SET ai_normalization_json = NULL, ai_normalization_input_hash = ?, ai_normalization_model = ?, ai_normalization_at = ?, ai_normalization_error = ? WHERE marketplace = ? AND listing_id = ?').run(inputHash, config.model, attemptedAt, message, marketplace, listingId);
-      this.emit('ai-normalization', { key: `${marketplace}:${listingId}`, status: 'error' });
-      if (error instanceof ServiceError) throw error;
-      throw new ServiceError(message, error instanceof DeepSeekError ? 502 : 500);
-    }
-  }
-
-  async normalizeListingByKey(key: string, force = false) {
-    const { marketplace, listingId } = parseListingKey(key);
-    await this.normalizeStoredListing(marketplace, listingId, force);
-    return this.listingDetail(key);
-  }
-
   listingAction(key: string): ListingAction {
     const { marketplace, listingId } = parseListingKey(key);
     const row = this.stmt('SELECT decision, note, updated_at FROM listing_actions WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as { decision?: unknown; note?: string; updated_at?: string } | undefined;
@@ -2281,241 +2113,6 @@ export class ScoutService {
     }
     this.emit('listing-action', { key, decision });
     return { decision, note: safeNote, updatedAt: safeNote || decision ? timestamp : null };
-  }
-
-  private sellerMessageFromRow(row: Record<string, any>): SellerMessage {
-    return {
-      id: Number(row.id),
-      marketplace: row.marketplace as Marketplace,
-      listingId: String(row.listing_id),
-      listingTitle: String(row.listing_title),
-      listingUrl: String(row.listing_url),
-      message: String(row.message),
-      offerPrice: row.offer_price_pln === null || row.offer_price_pln === undefined ? null : Number(row.offer_price_pln),
-      model: String(row.model),
-      source: row.source === 'automatic' ? 'automatic' : 'manual',
-      status: row.status === 'failed' ? 'failed' : 'sent',
-      error: row.error ? String(row.error) : null,
-      createdAt: String(row.created_at),
-      sentAt: row.sent_at ? String(row.sent_at) : null,
-    };
-  }
-
-  messages(): SellerMessage[] {
-    return this.messagesPage().messages;
-  }
-
-  messagesPage(options: { page?: number; pageSize?: number } = {}) {
-    const page = Math.max(1, Math.floor(options.page ?? 1));
-    const pageSize = Math.max(1, Math.min(200, Math.floor(options.pageSize ?? 100)));
-    const total = Number((this.stmt('SELECT COUNT(*) AS count FROM seller_messages').get() as { count?: number }).count ?? 0);
-    const rows = this.stmt('SELECT * FROM seller_messages ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?').all(pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
-    return { messages: rows.map((row) => this.sellerMessageFromRow(row)), pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
-  }
-
-  private saveSellerMessage(input: {
-    marketplace: Marketplace;
-    listingId: string;
-    listingTitle: string;
-    listingUrl: string;
-    message: string;
-    offerPrice: number | null;
-    model: string;
-    source?: SellerMessageSource;
-    status: 'sent' | 'failed';
-    error?: string | null;
-    createdAt: string;
-    sentAt?: string | null;
-  }) {
-    const result = this.stmt(`INSERT INTO seller_messages (marketplace, listing_id, listing_title, listing_url, message, offer_price_pln, model, source, status, error, created_at, sent_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      input.marketplace,
-      input.listingId,
-      input.listingTitle,
-      input.listingUrl,
-      input.message,
-      input.offerPrice,
-      input.model,
-      input.source ?? 'manual',
-      input.status,
-      input.error ? input.error.slice(0, 500) : null,
-      input.createdAt,
-      input.sentAt ?? null,
-    );
-    return this.sellerMessageFromRow(this.stmt('SELECT * FROM seller_messages WHERE id = ?').get(Number(result.lastInsertRowid)) as Record<string, any>);
-  }
-
-  recommendNegotiationPriceByKey(key: string, maxTotalCost: number | null = null, shippingCost = 0, otherCosts = 0, openingDiscountPercent?: number): NegotiationRecommendation {
-    const { marketplace } = parseListingKey(key);
-    if (marketplace !== 'OLX' && marketplace !== 'Allegro Lokalnie') throw new ServiceError('AI seller negotiation is currently available for OLX and Allegro Lokalnie only.', 409);
-    const detail = this.listingDetail(key);
-    const fairPriceBand = this.negotiationFairPriceBand(detail.listing.watchId);
-    try {
-      return recommendNegotiationPrice({
-        askingPrice: detail.listing.price,
-        priceNegotiable: detail.listing.priceNegotiable ?? null,
-        maxTotalCost,
-        shippingCost,
-        otherCosts,
-        openingDiscountPercent,
-        ...(fairPriceBand ? { fairPriceBand } : {}),
-      });
-    } catch (error) {
-      throw new ServiceError(error instanceof Error ? error.message : 'Could not calculate a negotiation price.', 400);
-    }
-  }
-
-  private prepareNegotiation(key: string, offerPrice: number | null, budget: { maxTotalCost: number; shippingCost?: number; otherCosts?: number } | undefined, source: SellerMessageSource) {
-    const { marketplace, listingId } = parseListingKey(key);
-    if (marketplace !== 'OLX' && marketplace !== 'Allegro Lokalnie') throw new ServiceError('AI seller negotiation is currently available for OLX and Allegro Lokalnie only.', 409);
-    const row = this.stmt('SELECT marketplace, listing_id, title, price_pln, url, condition, location, price_negotiable FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as Record<string, any> | undefined;
-    if (!row) throw new ServiceError('Listing detail is not available yet', 404);
-
-    const config = this.deepSeekConfig();
-    if (!config.apiKey) throw new ServiceError('OpenRouter is not configured. Add an API key in Settings or set SCOUT_OPENROUTER_API_KEY.', 409);
-
-    const askingPrice = Number(row.price_pln);
-    if (!Number.isFinite(askingPrice) || askingPrice <= 0) throw new ServiceError('The listing does not have a valid positive asking price.', 409);
-    if (source === 'automatic' && row.price_negotiable !== 1) {
-      throw new ServiceError('Automatic negotiation requires an explicit negotiable-price signal.', 409);
-    }
-    const normalizedOffer = offerPrice === null || offerPrice === undefined ? null : Math.round(Number(offerPrice) * 100) / 100;
-    if (normalizedOffer !== null && (!Number.isFinite(normalizedOffer) || normalizedOffer <= 0 || normalizedOffer >= askingPrice)) {
-      throw new ServiceError('Opening offer must be positive and lower than the listing price.', 400);
-    }
-    if (normalizedOffer !== null && budget) {
-      let ceiling: number;
-      try {
-        ceiling = offerCeiling(budget.maxTotalCost, askingPrice, budget.shippingCost ?? 0, budget.otherCosts ?? 0);
-      } catch (error) {
-        throw new ServiceError(error instanceof Error ? error.message : 'Invalid negotiation budget.', 400);
-      }
-      if (normalizedOffer > ceiling) {
-        throw new ServiceError(`Opening offer cannot exceed your ${ceiling.toLocaleString('pl-PL')} zł total-cost ceiling after known costs.`, 400);
-      }
-    }
-
-    const context: NegotiationListingContext = {
-      marketplace,
-      title: safePromptText(row.title, 180),
-      price: askingPrice,
-      condition: row.condition ? safePromptText(row.condition, 80) : undefined,
-      location: row.location ? safePromptText(row.location, 100) : undefined,
-      priceNegotiable: row.price_negotiable === null || row.price_negotiable === undefined ? null : Boolean(row.price_negotiable),
-      offerPrice: normalizedOffer,
-    };
-    return { marketplace, listingId, row, config, askingPrice, normalizedOffer, context };
-  }
-
-  async draftNegotiationByKey(key: string, offerPrice: number | null = null, budget?: { maxTotalCost: number; shippingCost?: number; otherCosts?: number }) {
-    const prepared = this.prepareNegotiation(key, offerPrice, budget, 'manual');
-    let draft: { message: string };
-    try {
-      draft = await this.draftNegotiation(prepared.context, { apiKey: prepared.config.apiKey!, model: prepared.config.model });
-    } catch (error) {
-      const message = (error instanceof Error ? error.message : 'OpenRouter could not write a negotiation message').slice(0, 500);
-      throw new ServiceError(message, error instanceof DeepSeekError ? error.status : 502);
-    }
-    const message = validateNegotiationMessage(draft.message, prepared.normalizedOffer);
-    return { message, model: prepared.config.model, askingPrice: prepared.askingPrice, offerPrice: prepared.normalizedOffer, marketplace: prepared.marketplace, listingId: prepared.listingId, title: safePromptText(prepared.row.title, 240) };
-  }
-
-  async negotiateAndSendByKey(key: string, offerPrice: number | null = null, budget?: { maxTotalCost: number; shippingCost?: number; otherCosts?: number }, source: SellerMessageSource = 'manual', messageOverride?: string) {
-    const prepared = this.prepareNegotiation(key, offerPrice, budget, source);
-    const messageKey = `${prepared.marketplace}:${prepared.listingId}`;
-    if (this.messagingInFlight.has(messageKey)) throw new ServiceError('A message for this listing is already being delivered.', 409);
-    if (this.messagingInFlight.size >= 2) throw new ServiceError('Two marketplace messages are already being delivered. Try again shortly.', 429);
-    this.messagingInFlight.add(messageKey);
-    try {
-      const draft = messageOverride === undefined
-        ? await this.draftNegotiationByKey(key, offerPrice, budget)
-        : { message: validateNegotiationMessage(messageOverride, prepared.normalizedOffer), model: prepared.config.model };
-
-      try {
-        if (!this.readMarketplaceSession(prepared.marketplace)) throw new ServiceError(`Connect your ${prepared.marketplace} account in Settings before sending seller messages.`, 409);
-      } catch (error) {
-        if (error instanceof ServiceError) throw error;
-        throw new ServiceError(error instanceof Error ? error.message : `The ${prepared.marketplace} session could not be read. Re-import it in Settings.`, 409);
-      }
-
-      const createdAt = nowIso();
-      try {
-        await this.sendMarketplaceMessage(prepared.marketplace, String(prepared.row.url), draft.message);
-      } catch (error) {
-        const message = (error instanceof Error ? error.message : `${prepared.marketplace} could not send the negotiation message`).slice(0, 500);
-        const failed = this.saveSellerMessage({ marketplace: prepared.marketplace, listingId: prepared.listingId, listingTitle: String(prepared.row.title), listingUrl: String(prepared.row.url), message: draft.message, offerPrice: prepared.normalizedOffer, model: prepared.config.model, source, status: 'failed', error: message, createdAt });
-        this.emit('seller-message', { id: failed.id, key, status: failed.status });
-        const status = ((error instanceof OlxMessagingError || error instanceof AllegroMessagingError) && error.code === 'session') ? 409 : 502;
-        throw new ServiceError(message, status);
-      }
-
-      const sentAt = nowIso();
-      const sent = this.saveSellerMessage({ marketplace: prepared.marketplace, listingId: prepared.listingId, listingTitle: String(prepared.row.title), listingUrl: String(prepared.row.url), message: draft.message, offerPrice: prepared.normalizedOffer, model: prepared.config.model, source, status: 'sent', createdAt, sentAt });
-      this.emit('seller-message', { id: sent.id, key, status: sent.status });
-      return { message: sent };
-    } finally {
-      this.messagingInFlight.delete(messageKey);
-    }
-  }
-
-  private claimAutomaticNegotiation(candidate: DealNotificationCandidate, recommendation: NegotiationRecommendation, config: AutoNegotiationConfig) {
-    if (config.maxTotalCost === null || recommendation.openingOffer === null) return false;
-    const now = nowIso();
-    return this.transaction(() => {
-      const existing = this.stmt('SELECT status, attempt_count, updated_at FROM automatic_negotiations WHERE marketplace = ? AND listing_id = ?').get(candidate.listing.marketplace, candidate.listing.listingId) as { status?: string; attempt_count?: number; updated_at?: string } | undefined;
-      if (existing?.status === 'sent') return false;
-      if (existing?.status === 'processing' && existing.updated_at && Date.parse(existing.updated_at) > Date.now() - 15 * 60_000) return false;
-      if (existing && Number(existing.attempt_count ?? 0) >= 5) return false;
-      const attemptedToday = this.stmt('SELECT COUNT(*) AS count FROM automatic_negotiations WHERE created_at >= ?').get(this.currentDayStart()) as { count?: number } | undefined;
-      if (Number(attemptedToday?.count ?? 0) >= config.dailyLimit) return false;
-      if (existing) {
-        this.stmt(`UPDATE automatic_negotiations SET watch_id = ?, status = 'processing', asking_price_pln = ?, offer_price_pln = ?, max_total_cost_pln = ?, known_costs_pln = ?, discount_percent = ?, attempt_count = attempt_count + 1, error = NULL, updated_at = ?
-          WHERE marketplace = ? AND listing_id = ?`).run(candidate.watchId, recommendation.askingPrice, recommendation.openingOffer, config.maxTotalCost, recommendation.knownCosts, candidate.discountPercent, now, candidate.listing.marketplace, candidate.listing.listingId);
-      } else {
-        this.stmt(`INSERT INTO automatic_negotiations (marketplace, listing_id, watch_id, status, asking_price_pln, offer_price_pln, max_total_cost_pln, known_costs_pln, discount_percent, attempt_count, created_at, updated_at)
-          VALUES (?, ?, ?, 'processing', ?, ?, ?, ?, ?, 1, ?, ?)`).run(candidate.listing.marketplace, candidate.listing.listingId, candidate.watchId, recommendation.askingPrice, recommendation.openingOffer, config.maxTotalCost, recommendation.knownCosts, candidate.discountPercent, now, now);
-      }
-      return true;
-    });
-  }
-
-  private finishAutomaticNegotiation(key: string, status: 'sent' | 'failed', messageId: number | null, error?: unknown) {
-    const { marketplace, listingId } = parseListingKey(key);
-    const safeError = error === undefined || error === null ? null : (error instanceof Error ? error.message : String(error)).slice(0, 500);
-    this.stmt('UPDATE automatic_negotiations SET status = ?, message_id = ?, error = ?, updated_at = ? WHERE marketplace = ? AND listing_id = ?').run(status, messageId, safeError, nowIso(), marketplace, listingId);
-  }
-
-  private async automaticallyNegotiate(candidate: DealNotificationCandidate, context?: ScanNotifyContext) {
-    const config = this.autoNegotiationConfig();
-    if (!config.enabled || (candidate.listing.marketplace !== 'OLX' && candidate.listing.marketplace !== 'Allegro Lokalnie') || config.maxTotalCost === null) return;
-    if (candidate.discountPercent < config.minimumDiscountPercent || candidate.listing.priceNegotiable !== true) return;
-    if (!(context?.deepSeek ?? this.deepSeekConfig()).apiKey) return;
-    try {
-      if (!this.readMarketplaceSession(candidate.listing.marketplace)) return;
-    } catch {
-      return;
-    }
-
-    const key = `${candidate.listing.marketplace}:${candidate.listing.listingId}`;
-    let recommendation: NegotiationRecommendation;
-    try {
-      recommendation = this.recommendNegotiationPriceByKey(key, config.maxTotalCost, config.shippingCost, config.otherCosts, config.openingDiscountPercent);
-    } catch {
-      return;
-    }
-    if (recommendation.status !== 'ready' || recommendation.openingOffer === null) return;
-    if (!this.claimAutomaticNegotiation(candidate, recommendation, config)) return;
-
-    try {
-      const result = await this.negotiateAndSendByKey(key, recommendation.openingOffer, {
-        maxTotalCost: config.maxTotalCost,
-        shippingCost: config.shippingCost,
-        otherCosts: config.otherCosts,
-      }, 'automatic');
-      this.finishAutomaticNegotiation(key, 'sent', result.message.id);
-    } catch (error) {
-      this.finishAutomaticNegotiation(key, 'failed', null, error);
-    }
   }
 
   /**
@@ -2747,16 +2344,6 @@ export class ScoutService {
     const samples = this.endedSaleBandRows(marketWatchId).map((item) => this.toBandSample(item));
     const band = computeSaleBand(samples, SALE_BAND_WINDOW_DAYS, nowIso());
     return band.eligibleCount >= MIN_BAND_SAMPLES && band.median !== null ? band.median : null;
-  }
-
-  /** Fair-price band for negotiation when the watch's reference series is opted in. */
-  private negotiationFairPriceBand(watchId: string | null | undefined): { low: number; high: number } | null {
-    if (!watchId || this.getSetting('negotiation_use_band') !== '1') return null;
-    const row = this.stmt('SELECT reference_market_watch_id FROM watches WHERE id = ?').get(watchId) as { reference_market_watch_id?: string | null } | undefined;
-    if (!row?.reference_market_watch_id) return null;
-    const band = computeSaleBand(this.endedSaleBandRows(String(row.reference_market_watch_id)).map((item) => this.toBandSample(item)), SALE_BAND_WINDOW_DAYS, nowIso());
-    if (band.eligibleCount < MIN_BAND_SAMPLES || band.p25 === null || band.p75 === null) return null;
-    return { low: band.p25, high: band.p75 };
   }
 
   /**
@@ -3232,13 +2819,11 @@ export class ScoutService {
       listingRelevance: rows('listing_relevance'),
       scans: rows('scans'),
       notificationDeliveries: rows('notification_deliveries'),
-      automaticNegotiations: rows('automatic_negotiations'),
       marketWatches: rows('market_watches'),
       marketWatchVersions: rows('market_watch_versions'),
       marketListings: rows('market_listings'),
       marketPriceObservations: rows('market_price_observations'),
       listingActions: rows('listing_actions'),
-      sellerMessages: rows('seller_messages'),
       notifications: rows('notifications'),
       connectorRuns: rows('connector_runs'),
       settings,
@@ -3271,8 +2856,6 @@ export class ScoutService {
           source: aiConfig.source,
         };
       })(),
-      autoNegotiation: this.autoNegotiationSettings(),
-      negotiationUseBand: this.getSetting('negotiation_use_band') === '1',
       publicExposureWarning: this.publicExposureWarning,
       marketplaceSessions: this.marketplaceSessions(),
     };
@@ -3288,16 +2871,6 @@ export class ScoutService {
     clearNtfy?: boolean;
     ntfy?: { serverUrl?: string; topic?: string; token?: string; minimumPriority?: NotificationPriority };
     ai?: { apiKey?: string; clearApiKey?: boolean; model?: string };
-    negotiationUseBand?: boolean;
-    autoNegotiation?: {
-      enabled?: boolean;
-      maxTotalCost?: number | null;
-      shippingCost?: number;
-      otherCosts?: number;
-      minimumDiscountPercent?: number;
-      openingDiscountPercent?: number;
-      dailyLimit?: number;
-    };
   }) {
     if (input.interval !== undefined) {
       if (!Number.isInteger(input.interval) || input.interval < 5 || input.interval > 1440) throw new ServiceError('Polling interval must be between 5 and 1440 minutes');
@@ -3346,26 +2919,6 @@ export class ScoutService {
       const model = input.ai.model.trim();
       if (!model || model.length > 200 || /\s/.test(model)) throw new ServiceError('OpenRouter model must be a non-empty model slug without spaces');
       this.setSetting('deepseek_model', model);
-    }
-    if (input.negotiationUseBand !== undefined) this.setSetting('negotiation_use_band', input.negotiationUseBand ? '1' : '0');
-    if (input.autoNegotiation !== undefined) {
-      const current = this.autoNegotiationConfig();
-      const next = {
-        enabled: input.autoNegotiation.enabled ?? current.enabled,
-        maxTotalCost: input.autoNegotiation.maxTotalCost === undefined ? current.maxTotalCost : input.autoNegotiation.maxTotalCost,
-        shippingCost: input.autoNegotiation.shippingCost ?? current.shippingCost,
-        otherCosts: input.autoNegotiation.otherCosts ?? current.otherCosts,
-        minimumDiscountPercent: input.autoNegotiation.minimumDiscountPercent ?? current.minimumDiscountPercent,
-        openingDiscountPercent: input.autoNegotiation.openingDiscountPercent ?? current.openingDiscountPercent,
-        dailyLimit: input.autoNegotiation.dailyLimit ?? current.dailyLimit,
-      };
-      if (next.maxTotalCost !== null && (!Number.isFinite(next.maxTotalCost) || next.maxTotalCost <= 0)) throw new ServiceError('Automatic negotiation maximum total cost must be positive when provided.');
-      if (![next.shippingCost, next.otherCosts].every((value) => Number.isFinite(value) && value >= 0)) throw new ServiceError('Automatic negotiation known costs must be zero or positive.');
-      if (!Number.isInteger(next.dailyLimit) || next.dailyLimit < 1 || next.dailyLimit > 50) throw new ServiceError('Automatic negotiation daily limit must be between 1 and 50 attempts.');
-      if (!Number.isFinite(next.minimumDiscountPercent) || next.minimumDiscountPercent < 18 || next.minimumDiscountPercent > 80) throw new ServiceError('Automatic negotiation minimum discount must be between 18% and 80%.');
-      if (!Number.isFinite(next.openingDiscountPercent) || next.openingDiscountPercent < 1 || next.openingDiscountPercent > 50) throw new ServiceError('Automatic negotiation opening discount must be between 1% and 50%.');
-      if (next.enabled && next.maxTotalCost === null) throw new ServiceError('Set a maximum total cost before enabling automatic negotiation.');
-      this.setSetting('auto_negotiation_config', JSON.stringify(next));
     }
     return this.settings();
   }
@@ -3808,46 +3361,6 @@ export class ScoutService {
     return response.text();
   }
 
-  private async sendMarketplaceMessage(marketplace: 'OLX' | 'Allegro Lokalnie', listingUrl: string, message: string) {
-    if (marketplace === 'OLX' && this.sendOlxMessageOverride) return this.sendOlxMessageOverride(listingUrl, message);
-    if (marketplace === 'Allegro Lokalnie' && this.sendAllegroMessageOverride) return this.sendAllegroMessageOverride(listingUrl, message);
-    const storageState = this.readMarketplaceSession(marketplace);
-    if (!storageState) throw new ServiceError(`Connect your ${marketplace} account in Settings before sending seller messages.`, 409);
-
-    let browser: Browser | undefined;
-    let context: BrowserContext | undefined;
-    let ownsBrowser = false;
-    try {
-      if (process.env.SCOUT_BROWSER_WS) {
-        browser = await chromium.connectOverCDP(process.env.SCOUT_BROWSER_WS, { timeout: 8_000 });
-      } else {
-        const executablePath = process.env.SCOUT_CHROMIUM_PATH ?? ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'].find(existsSync);
-        if (!executablePath) {
-          const ErrorType = marketplace === 'OLX' ? OlxMessagingError : AllegroMessagingError;
-          throw new ErrorType('Chromium is not available; configure SCOUT_BROWSER_WS.', 'delivery');
-        }
-        browser = await chromium.launch({ executablePath, headless: true, args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'] });
-        ownsBrowser = true;
-      }
-      context = await browser.newContext({ locale: 'pl-PL', storageState: storageState as any });
-      const page = await context.newPage();
-      if (marketplace === 'OLX') await sendOlxMessageOnPage(page, listingUrl, message);
-      else await sendAllegroMessageOnPage(page, listingUrl, message);
-      this.touchMarketplaceSession(marketplace);
-    } catch (error) {
-      if ((error instanceof OlxMessagingError || error instanceof AllegroMessagingError) && error.code === 'session') {
-        this.setMarketplaceSessionError(marketplace, error.message);
-      }
-      throw error;
-    } finally {
-      try {
-        if (context) await context.close();
-      } finally {
-        if (ownsBrowser && browser) await browser.close();
-      }
-    }
-  }
-
   private async renderPublicPage(url: string, marketplace: Marketplace, storageState?: MarketplaceStorageState) {
     let browser: Browser | undefined;
     let context: BrowserContext | undefined;
@@ -3914,8 +3427,6 @@ export class ScoutService {
     this.stmt('DELETE FROM listing_relevance WHERE checked_at < ?').run(cutoff);
     this.stmt('DELETE FROM connector_runs WHERE started_at < ?').run(cutoff);
     this.stmt('DELETE FROM scans WHERE started_at < ?').run(cutoff);
-    this.stmt('DELETE FROM seller_messages WHERE created_at < ?').run(cutoff);
-    this.stmt('DELETE FROM automatic_negotiations WHERE created_at < ?').run(cutoff);
     this.stmt('DELETE FROM notification_deliveries WHERE created_at < ?').run(cutoff);
     this.stmt('DELETE FROM notifications WHERE created_at < ?').run(cutoff);
     this.stmt('DELETE FROM daily_digest_candidates WHERE (digest_date IS NOT NULL AND digest_date < ?) OR (digest_date IS NULL AND observed_at < ?)').run(cutoff.slice(0, 10), cutoff);
@@ -3931,12 +3442,6 @@ export class ScoutService {
       const relevance = this.stmt('DELETE FROM listing_relevance').run() as { changes?: number };
       const shadow = this.stmt('DELETE FROM jev_shadow_log').run() as { changes?: number };
       const snapshots = this.stmt('DELETE FROM listing_detail_snapshots').run() as { changes?: number };
-      const normalization = this.stmt(`UPDATE listings SET
-        ai_normalization_json = NULL,
-        ai_normalization_input_hash = NULL,
-        ai_normalization_model = NULL,
-        ai_normalization_at = NULL,
-        ai_normalization_error = NULL`).run() as { changes?: number };
       const verification = this.stmt(`UPDATE listings SET
         ai_description_verification_json = NULL,
         ai_description_verification_input_hash = NULL,
@@ -3950,7 +3455,6 @@ export class ScoutService {
           relevance: relevance.changes ?? 0,
           shadowLog: shadow.changes ?? 0,
           detailSnapshots: snapshots.changes ?? 0,
-          normalization: normalization.changes ?? 0,
           verification: verification.changes ?? 0,
         },
       };
@@ -4049,8 +3553,6 @@ export class ScoutService {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, ?)
       ON CONFLICT(marketplace, listing_id) DO UPDATE SET title = excluded.title, price_pln = excluded.price_pln, url = excluded.url, image_url = COALESCE(excluded.image_url, listings.image_url), condition = COALESCE(excluded.condition, listings.condition), location = COALESCE(excluded.location, listings.location), shipping_available = COALESCE(excluded.shipping_available, listings.shipping_available), price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), availability_status = 'live', ended_reason = NULL, last_verified_at = excluded.last_verified_at, last_seen_at = excluded.last_seen_at
       RETURNING id`).get(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable === null ? null : listing.shippingAvailable ? 1 : 0, listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0, observedAt, observedAt, observedAt) as { id: number };
-    const inputHash = listingNormalizationInputHash(listing);
-    this.stmt('UPDATE listings SET ai_normalization_json = NULL, ai_normalization_input_hash = NULL, ai_normalization_model = NULL, ai_normalization_at = NULL, ai_normalization_error = NULL WHERE marketplace = ? AND listing_id = ? AND ai_normalization_input_hash IS NOT NULL AND ai_normalization_input_hash <> ?').run(listing.marketplace, listing.listingId, inputHash);
     const association = this.stmt(`INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at)
       VALUES (?, ?, ?, ?)
       ON CONFLICT(watch_id, listing_id) DO UPDATE SET last_seen_at = excluded.last_seen_at

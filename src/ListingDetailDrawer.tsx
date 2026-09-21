@@ -9,7 +9,6 @@ import {
   Info,
   LoaderCircle,
   Scale,
-  Send,
   ShieldCheck,
   Tag,
   X,
@@ -21,9 +20,6 @@ import type {
   Listing,
   ListingDecision,
   ListingDetail,
-  NegotiationDraft,
-  NegotiationRecommendation,
-  SellerMessage,
   VerificationComparison,
 } from "./types";
 
@@ -75,25 +71,12 @@ export default function ListingDetailDrawer({
   const [resalePrice, setResalePrice] = useState(listing.typical === null ? "" : String(listing.typical));
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [normalizing, setNormalizing] = useState(false);
-  const [negotiating, setNegotiating] = useState(false);
-  const [recommending, setRecommending] = useState(false);
-  const [negotiationMaxTotal, setNegotiationMaxTotal] = useState("");
-  const [negotiationShippingCost, setNegotiationShippingCost] = useState("");
-  const [negotiationOtherCosts, setNegotiationOtherCosts] = useState("");
-  const [negotiationOffer, setNegotiationOffer] = useState("");
-  const [negotiationRecommendation, setNegotiationRecommendation] = useState<NegotiationRecommendation | null>(null);
-  const [negotiationDraft, setNegotiationDraft] = useState<NegotiationDraft | null>(null);
-  const [draftMessage, setDraftMessage] = useState("");
-  const [drafting, setDrafting] = useState(false);
   const [comparison, setComparison] = useState<VerificationComparison | null>(null);
   const [comparing, setComparing] = useState(false);
-  const [lastNegotiation, setLastNegotiation] = useState<SellerMessage | null>(null);
   const [storedListing, setStoredListing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const currentListing = detail.listing;
   const marketplaceListingKey = currentListing.marketplaceListingKey ?? currentListing.id;
-  const canMessageMarketplace = currentListing.marketplace === "OLX" || currentListing.marketplace === "Allegro Lokalnie";
   const toFiniteCost = (value: string) => {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : 0;
@@ -120,15 +103,7 @@ export default function ListingDetailDrawer({
     setResalePrice(listing.typical === null ? "" : String(listing.typical));
     setShippingCost("");
     setExtraCost("");
-    setNegotiationOffer("");
-    setNegotiationMaxTotal("");
-    setNegotiationShippingCost("");
-    setNegotiationOtherCosts("");
-    setNegotiationRecommendation(null);
-    setNegotiationDraft(null);
-    setDraftMessage("");
     setComparison(null);
-    setLastNegotiation(null);
     setError(null);
     setLoading(true);
     setStoredListing(false);
@@ -187,22 +162,6 @@ export default function ListingDetailDrawer({
     }
   };
 
-  const normalizeWithAi = async () => {
-    setNormalizing(true);
-    setError(null);
-    try {
-      const result = await api.normalizeListing(marketplaceListingKey, Boolean(currentListing.aiNormalizationError));
-      setDetail(result);
-      setDecision(result.action.decision);
-      setNote(result.action.note);
-      onUpdated(result.listing);
-    } catch (normalizeError) {
-      setError(errorMessage(normalizeError));
-    } finally {
-      setNormalizing(false);
-    }
-  };
-
   const compareJevVsLlm = async () => {
     if (!storedListing || comparing) return;
     setComparing(true);
@@ -214,89 +173,6 @@ export default function ListingDetailDrawer({
       setError(errorMessage(compareError));
     } finally {
       setComparing(false);
-    }
-  };
-
-  const suggestNegotiationOffer = async () => {
-    if (!canMessageMarketplace || !storedListing) return;
-    const maxTotalCost = Number(negotiationMaxTotal);
-    const shippingCost = negotiationShippingCost.trim() === "" ? 0 : Number(negotiationShippingCost);
-    const otherCosts = negotiationOtherCosts.trim() === "" ? 0 : Number(negotiationOtherCosts);
-    if (!Number.isFinite(maxTotalCost) || maxTotalCost <= 0) {
-      setError("Enter a positive maximum total cost before asking for a suggestion.");
-      return;
-    }
-    if (![shippingCost, otherCosts].every((value) => Number.isFinite(value) && value >= 0)) {
-      setError("Known delivery and fee costs must be zero or positive.");
-      return;
-    }
-    setRecommending(true);
-    setError(null);
-    try {
-      const result = await api.recommendNegotiation(marketplaceListingKey, { maxTotalCost, shippingCost, otherCosts });
-      setNegotiationRecommendation(result);
-      if (result.openingOffer !== null) setNegotiationOffer(String(result.openingOffer));
-    } catch (recommendationError) {
-      setError(errorMessage(recommendationError));
-    } finally {
-      setRecommending(false);
-    }
-  };
-
-  const negotiateWithAi = async () => {
-    if (!canMessageMarketplace || !storedListing) return;
-    const offerPrice = negotiationOffer.trim() === "" ? null : Number(negotiationOffer);
-    if (offerPrice !== null && (!Number.isFinite(offerPrice) || offerPrice <= 0 || offerPrice >= currentListing.price)) {
-      setError("Opening offer must be positive and lower than the listing price.");
-      return;
-    }
-    const maxTotalCost = negotiationMaxTotal.trim() === "" ? null : Number(negotiationMaxTotal);
-    const shippingCost = negotiationShippingCost.trim() === "" ? 0 : Number(negotiationShippingCost);
-    const otherCosts = negotiationOtherCosts.trim() === "" ? 0 : Number(negotiationOtherCosts);
-    if (maxTotalCost !== null && (!Number.isFinite(maxTotalCost) || maxTotalCost <= 0)) {
-      setError("Maximum total cost must be positive when provided.");
-      return;
-    }
-    if (![shippingCost, otherCosts].every((value) => Number.isFinite(value) && value >= 0)) {
-      setError("Known delivery and fee costs must be zero or positive.");
-      return;
-    }
-    setDrafting(true);
-    setError(null);
-    try {
-      const budget = maxTotalCost === null ? undefined : { maxTotalCost, shippingCost, otherCosts };
-      const result = await api.draftNegotiation(marketplaceListingKey, offerPrice, budget);
-      setNegotiationDraft(result);
-      setDraftMessage(result.message);
-    } catch (draftError) {
-      setError(errorMessage(draftError));
-    } finally {
-      setDrafting(false);
-    }
-  };
-
-  const sendNegotiation = async () => {
-    if (!negotiationDraft || !draftMessage.trim()) return;
-    if (draftMessage.trim().length > 450) {
-      setError("Keep the reviewed message to 450 characters or fewer.");
-      return;
-    }
-    if (!window.confirm(`Send this reviewed message to the ${currentListing.marketplace} seller?\n\n${draftMessage.trim()}`)) return;
-    setNegotiating(true);
-    setError(null);
-    try {
-      const maxTotalCost = negotiationMaxTotal.trim() === "" ? null : Number(negotiationMaxTotal);
-      const shippingCost = negotiationShippingCost.trim() === "" ? 0 : Number(negotiationShippingCost);
-      const otherCosts = negotiationOtherCosts.trim() === "" ? 0 : Number(negotiationOtherCosts);
-      const budget = maxTotalCost === null ? undefined : { maxTotalCost, shippingCost, otherCosts };
-      const result = await api.negotiateAndSend(marketplaceListingKey, negotiationDraft.offerPrice, budget, draftMessage.trim());
-      setLastNegotiation(result.message);
-      setNegotiationDraft(null);
-      setDraftMessage("");
-    } catch (negotiationError) {
-      setError(errorMessage(negotiationError));
-    } finally {
-      setNegotiating(false);
     }
   };
 
@@ -331,37 +207,6 @@ export default function ListingDetailDrawer({
               <small>{currentListing.condition || "Condition not specified"}{currentListing.location ? ` · ${currentListing.location}` : ""}</small>
             </div>
           </div>
-
-          <section className="drawer-section drawer-section--ai">
-            <div className="drawer-section-heading">
-              <div><span className="drawer-section-kicker">AI enrichment</span><h3>Listing normalization</h3></div>
-              <Tag size={17} />
-            </div>
-            {currentListing.aiNormalization ? (
-              <>
-                <div className="ai-normalization-title">
-                  <strong>{currentListing.aiNormalization.canonicalTitle}</strong>
-                  <span>{currentListing.aiNormalization.category}{currentListing.aiNormalization.confidence < 0.65 ? " · low confidence" : ""}</span>
-                </div>
-                <div className="ai-normalization-fields">
-                  {[
-                    ["Brand", currentListing.aiNormalization.brand],
-                    ["Model", currentListing.aiNormalization.model],
-                    ["Variant", currentListing.aiNormalization.variant],
-                    ["Condition", currentListing.aiNormalization.condition],
-                  ].filter(([, value]) => value).map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong></div>)}
-                </div>
-                {currentListing.aiNormalization.attributes.length ? <div className="ai-normalization-tags">{currentListing.aiNormalization.attributes.map((attribute) => <span key={`${attribute.name}-${attribute.value}`}>{attribute.name}: {attribute.value}</span>)}</div> : null}
-                {currentListing.aiNormalization.flags.length ? <div className="ai-normalization-warning"><AlertTriangle size={14} />{currentListing.aiNormalization.flags.join(" · ")}</div> : null}
-                {currentListing.aiNormalization.conditionNotes.length ? <p className="drawer-section-copy">Condition signals: {currentListing.aiNormalization.conditionNotes.join(" · ")}</p> : null}
-                {currentListing.aiNormalization.evidence.length ? <p className="drawer-section-copy">Evidence: {currentListing.aiNormalization.evidence.join(" · ")}</p> : null}
-              </>
-            ) : (
-              <p className="drawer-section-copy">No normalized product identity has been stored for this listing yet.</p>
-            )}
-            {storedListing ? <button className="outline-button ai-normalize-button" type="button" disabled={normalizing} onClick={() => void normalizeWithAi()}>{normalizing ? <LoaderCircle size={15} className="spin" /> : <Tag size={15} />}{normalizing ? "Normalizing…" : currentListing.aiNormalizationError ? "Retry normalization" : currentListing.aiNormalization ? "Refresh normalization" : "Normalize with AI"}</button> : <span className="drawer-muted">AI normalization is available after a listing is saved by a watch.</span>}
-            {currentListing.aiNormalizationError ? <div className="ai-normalization-error"><AlertTriangle size={14} />{currentListing.aiNormalizationError}</div> : null}
-          </section>
 
           {showDescriptionSafeguard ? <section className="drawer-section drawer-section--verification">
             <div className="drawer-section-heading">
@@ -430,61 +275,6 @@ export default function ListingDetailDrawer({
               </div>
             ) : null}
           </section> : null}
-
-          <section className="drawer-section drawer-section--negotiation">
-            <div className="drawer-section-heading">
-              <div><span className="drawer-section-kicker">Seller contact</span><h3>Negotiate with AI</h3></div>
-              <Send size={17} />
-            </div>
-            {canMessageMarketplace ? <>
-              <p className="drawer-section-copy">Scout calculates the money first from the current asking price and your total-cost limit. OpenRouter only writes the final Polish message with the configured DeepSeek model.</p>
-              <div className="negotiation-budget-grid">
-                <label className="drawer-note-label negotiation-budget-label">
-                  Maximum total cost <span>required for a suggestion · PLN</span>
-                  <input type="number" min="1" step="1" value={negotiationMaxTotal} onChange={(event) => { setNegotiationMaxTotal(event.target.value); setNegotiationRecommendation(null); setNegotiationDraft(null); setDraftMessage(""); setNegotiationOffer(""); }} placeholder="e.g. 2100" disabled={!storedListing || recommending || drafting || negotiating} />
-                </label>
-                <label className="drawer-note-label negotiation-budget-label">
-                  Delivery and fees <span>optional · PLN</span>
-                  <input type="number" min="0" step="1" value={negotiationShippingCost} onChange={(event) => { setNegotiationShippingCost(event.target.value); setNegotiationRecommendation(null); setNegotiationDraft(null); setDraftMessage(""); setNegotiationOffer(""); }} placeholder="e.g. 15" disabled={!storedListing || recommending || drafting || negotiating} />
-                </label>
-              </div>
-              <label className="drawer-note-label negotiation-budget-label">
-                Other known costs <span>optional · PLN</span>
-                <input type="number" min="0" step="1" value={negotiationOtherCosts} onChange={(event) => { setNegotiationOtherCosts(event.target.value); setNegotiationRecommendation(null); setNegotiationDraft(null); setDraftMessage(""); setNegotiationOffer(""); }} placeholder="0" disabled={!storedListing || recommending || drafting || negotiating} />
-              </label>
-              <button className="outline-button negotiation-suggest-button" type="button" disabled={!storedListing || recommending || negotiating} onClick={() => void suggestNegotiationOffer()}>
-                {recommending ? <LoaderCircle size={15} className="spin" /> : <Calculator size={15} />}
-                {recommending ? "Calculating…" : "Suggest an offer"}
-              </button>
-              {negotiationRecommendation ? <div className={`negotiation-recommendation negotiation-recommendation--${negotiationRecommendation.status}`} aria-live="polite">
-                <div className="negotiation-recommendation-heading">
-                  <div>
-                    <span className="drawer-section-kicker">Deterministic price policy</span>
-                    <strong>{negotiationRecommendation.status === "ready" ? "Suggested opening offer" : negotiationRecommendation.status === "budget-required" ? "Budget needed" : negotiationRecommendation.status === "not-negotiable" ? "Fixed-price listing" : negotiationRecommendation.status === "manual-review" ? "Manual review needed" : negotiationRecommendation.status === "budget-too-low" ? "Budget is too low" : "No safe offer"}</strong>
-                  </div>
-                  {negotiationRecommendation.openingOffer !== null ? <b>{formatPln(negotiationRecommendation.openingOffer)}</b> : null}
-                </div>
-                {negotiationRecommendation.openingOffer !== null ? <div className="negotiation-recommendation-metrics"><span>Current ask <strong>{formatPln(negotiationRecommendation.askingPrice)}</strong></span><span>Ceiling <strong>{formatPln(negotiationRecommendation.ceilingPrice)}</strong></span><span>Opening gap <strong>{negotiationRecommendation.openingDiscountPercent?.toFixed(1)}%</strong></span></div> : null}
-                <p>{negotiationRecommendation.rationale}</p>
-                {negotiationRecommendation.counterOffers.length ? <small>Possible path: {negotiationRecommendation.counterOffers.map((offer) => formatPln(offer)).join(" → ")}</small> : null}
-              </div> : null}
-              <label className="drawer-note-label negotiation-offer-label">
-                Opening offer <span>optional · PLN</span>
-                <input type="number" min="1" max={Math.max(0.01, currentListing.price - 0.01)} step="0.01" value={negotiationOffer} onChange={(event) => { setNegotiationOffer(event.target.value); setNegotiationDraft(null); setDraftMessage(""); }} placeholder="Ask for a reduction without naming a price" disabled={!storedListing || recommending || drafting || negotiating} />
-              </label>
-              <button className="primary-button drawer-negotiate-button" type="button" disabled={!storedListing || drafting || negotiating || saving} onClick={() => void negotiateWithAi()}>
-                {drafting ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}
-                {drafting ? "Writing draft…" : negotiationDraft ? "Regenerate draft" : "Draft message with AI"}
-              </button>
-              {negotiationDraft ? <div className="negotiation-draft">
-                <div className="negotiation-draft-heading"><strong>Review before sending</strong><span>{negotiationDraft.model}</span></div>
-                <textarea aria-label="Reviewed negotiation message" maxLength={450} value={draftMessage} onChange={(event) => setDraftMessage(event.target.value)} disabled={negotiating} />
-                <div className="negotiation-draft-footer"><small>{draftMessage.length}/450 characters · Scout checks links, contact details, tone, and the approved offer before delivery.</small><button className="primary-button" type="button" disabled={negotiating || !draftMessage.trim()} onClick={() => void sendNegotiation()}>{negotiating ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}{negotiating ? "Sending…" : "Send reviewed message"}</button></div>
-              </div> : null}
-              {!storedListing ? <span className="drawer-muted">Save this listing through a watch before contacting the seller.</span> : null}
-              {lastNegotiation ? <div className="negotiation-success"><CheckCircle2 size={15} /><div><strong>Message sent</strong><p>{lastNegotiation.message}</p></div></div> : null}
-            </> : <p className="drawer-section-copy">AI seller negotiation is currently available for OLX and Allegro Lokalnie listings.</p>}
-          </section>
 
           <section className="drawer-section drawer-section--decision">
             <div className="drawer-section-heading">

@@ -58,11 +58,6 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
       const columns = new Set((db.prepare('PRAGMA table_info(listings)').all() as Array<{ name: string }>).map((column) => column.name));
       if (!columns.has('shipping_available')) db.exec('ALTER TABLE listings ADD COLUMN shipping_available INTEGER');
       if (!columns.has('price_negotiable')) db.exec('ALTER TABLE listings ADD COLUMN price_negotiable INTEGER');
-      if (!columns.has('ai_normalization_json')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_json TEXT');
-      if (!columns.has('ai_normalization_input_hash')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_input_hash TEXT');
-      if (!columns.has('ai_normalization_model')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_model TEXT');
-      if (!columns.has('ai_normalization_at')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_at TEXT');
-      if (!columns.has('ai_normalization_error')) db.exec('ALTER TABLE listings ADD COLUMN ai_normalization_error TEXT');
     }
     if (hasTable('market_watches')) {
       const columns = new Set((db.prepare('PRAGMA table_info(market_watches)').all() as Array<{ name: string }>).map((column) => column.name));
@@ -157,9 +152,6 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
   db.prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run('night_interval', '30', new Date().toISOString());
   if (db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'scans'").get()) {
     db.prepare("UPDATE scans SET status = 'interrupted', completed_at = ?, error = COALESCE(error, 'Process restarted before scan completed') WHERE status = 'running'").run(new Date().toISOString());
-  }
-  if (db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'automatic_negotiations'").get()) {
-    db.prepare("UPDATE automatic_negotiations SET status = 'failed', error = COALESCE(error, 'Process restarted before automatic negotiation completed'), updated_at = ? WHERE status = 'processing'").run(new Date().toISOString());
   }
   return db;
 }

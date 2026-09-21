@@ -481,7 +481,6 @@ test('returns listing price history and persists Buy/Watch/Pass triage actions',
     const lastSeen = new Date().toISOString();
     context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run('triage-watch', 'Triage watch', 'headphones', '["OLX"]', 1, lastSeen, firstSeen, lastSeen);
     context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, price_negotiable, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run('OLX', 'triage-listing', 'Headphones', 400, 1, 'https://www.olx.pl/d/oferta/triage-listing', firstSeen, lastSeen);
-    context.db.prepare("UPDATE listings SET ai_normalization_json = '{}' WHERE listing_id = 'triage-listing'").run();
     const listing = context.db.prepare('SELECT id FROM listings WHERE listing_id = ?').get('triage-listing') as { id: number };
     context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)').run(listing.id, 'triage-watch', 450, firstSeen);
     context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)').run(listing.id, 'triage-watch', 400, lastSeen);
@@ -496,9 +495,7 @@ test('returns listing price history and persists Buy/Watch/Pass triage actions',
     const feedListing = context.service.getListings()[0];
     assert.equal(feedListing.decision, 'buy');
     assert.equal(feedListing.priceNegotiable, true);
-    assert.equal(Object.hasOwn(feedListing, 'aiNormalization'), false);
     const detail = context.service.listingDetail('OLX:triage-listing');
-    assert.equal(Object.hasOwn(detail.listing, 'aiNormalization'), true);
     assert.deepEqual(detail.history.map((point) => point.price), [450, 400]);
     assert.equal(detail.action.decision, 'buy');
     assert.equal(detail.action.note, 'Ask for a battery screenshot');
@@ -507,46 +504,6 @@ test('returns listing price history and persists Buy/Watch/Pass triage actions',
     assert.equal(context.service.listingDetail('OLX:triage-listing').action.decision, null);
     assert.equal(context.service.listingDetail('OLX:triage-listing').action.note, '');
   } finally { context.close(); }
-});
-
-test('normalizes and caches a stored listing through the configured DeepSeek client', async () => {
-  const context = fixture();
-  const originalFetch = globalThis.fetch;
-  let requests = 0;
-  globalThis.fetch = (async (_input, init) => {
-    requests += 1;
-    assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer sk-deepseek-secret');
-    return Response.json({ choices: [{ message: { content: JSON.stringify({
-      canonicalTitle: 'Sony WH-1000XM5',
-      category: 'headphones',
-      brand: 'Sony',
-      model: 'WH-1000XM5',
-      variant: 'black',
-      attributes: [{ name: 'color', value: 'black' }],
-      condition: 'like-new',
-      conditionNotes: ['The title says “stan idealny”.'],
-      flags: [],
-      confidence: 0.91,
-      evidence: ['Sony WH-1000XM5 czarne', 'stan idealny'],
-    }) } }] });
-  }) as typeof fetch;
-  try {
-    const now = new Date().toISOString();
-    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' } });
-    context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, condition, location, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('OLX', 'ai-listing', 'Sony WH-1000XM5 czarne · stan idealny', 749, 'https://www.olx.pl/d/oferta/ai-listing', 'Like new', 'Warszawa', now, now);
-
-    const detail = await context.service.normalizeListingByKey('OLX:ai-listing');
-    assert.equal(detail.listing.aiNormalization?.canonicalTitle, 'Sony WH-1000XM5');
-    assert.equal(detail.listing.aiNormalization?.attributes[0].value, 'black');
-    assert.equal(requests, 1);
-
-    const cached = await context.service.normalizeListingByKey('OLX:ai-listing');
-    assert.equal(cached.listing.aiNormalization?.model, 'WH-1000XM5');
-    assert.equal(requests, 1);
-  } finally {
-    globalThis.fetch = originalFetch;
-    context.close();
-  }
 });
 
 test('fetches and verifies descriptions for very strong and exceptional deals before alerting', async () => {
@@ -700,20 +657,20 @@ test('resets cached AI results', () => {
     context.db.prepare(`INSERT INTO jev_shadow_log (created_at, task, input_hash, jev_model) VALUES (?, ?, ?, ?)`).run(now, 'relevance', 'hash-1', 'model-1');
     context.db.prepare(`INSERT INTO listing_detail_snapshots (listing_id, marketplace, external_listing_id, title, price_pln, url, state_hash, verification_status, captured_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(stored.id, 'OLX', 'ai-reset-listing', 'CPU', 650, 'https://www.olx.pl/d/oferta/ai-reset-listing', 'state-1', 'pass', now);
-    context.db.prepare(`UPDATE listings SET ai_normalization_json = ?, ai_normalization_model = ?,
+    context.db.prepare(`UPDATE listings SET
       ai_description_verification_json = ?, ai_description_verification_status = ?, ai_description_verification_error = ?
-      WHERE id = ?`).run('{}', 'model-1', '{}', 'fallback', 'boom', stored.id);
+      WHERE id = ?`).run('{}', 'fallback', 'boom', stored.id);
 
     const result = context.service.resetAiResults();
     assert.equal(result.ok, true);
-    assert.deepEqual(result.cleared, { relevance: 1, shadowLog: 1, detailSnapshots: 1, normalization: 1, verification: 1 });
+    assert.deepEqual(result.cleared, { relevance: 1, shadowLog: 1, detailSnapshots: 1, verification: 1 });
     assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM listing_relevance').get() as { count: number }).count, 0);
     assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM jev_shadow_log').get() as { count: number }).count, 0);
     assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM listing_detail_snapshots').get() as { count: number }).count, 0);
-    const cleared = context.db.prepare(`SELECT ai_normalization_json, ai_normalization_model,
+    const cleared = context.db.prepare(`SELECT
       ai_description_verification_json, ai_description_verification_status, ai_description_verification_error
       FROM listings WHERE id = ?`).get(stored.id) as Record<string, unknown>;
-    for (const column of ['ai_normalization_json', 'ai_normalization_model', 'ai_description_verification_json', 'ai_description_verification_status', 'ai_description_verification_error']) {
+    for (const column of ['ai_description_verification_json', 'ai_description_verification_status', 'ai_description_verification_error']) {
       assert.equal(cleared[column], null);
     }
   } finally {
@@ -811,160 +768,6 @@ test('partitions deterministic misses into term vs condition rescue candidates',
   );
   assert.deepEqual(termCandidates.map((listing) => listing.listingId), ['inflect']);
   assert.deepEqual(conditionCandidates.map((listing) => listing.listingId), ['cond']);
-});
-
-test('writes and sends one explicit OLX negotiation message through the configured integrations', async () => {
-  let sentUrl = '';
-  let sentMessage = '';
-  const context = fixture({
-    draftNegotiation: async (listing) => {
-      assert.equal(listing.marketplace, 'OLX');
-      assert.equal(listing.offerPrice, 1700);
-      return { message: 'Dzień dobry, czy rozważy Pan/Pani 1700 zł za ten przedmiot?' };
-    },
-    sendOlxMessage: async (listingUrl, message) => {
-      sentUrl = listingUrl;
-      sentMessage = message;
-    },
-  });
-  try {
-    const now = new Date().toISOString();
-    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' } });
-    context.service.saveMarketplaceSession('OLX', 'Personal', { cookies: [{ name: 'session', value: 'private-token', domain: '.olx.pl', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' }] });
-    context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, price_negotiable, url, condition, location, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('OLX', 'negotiation-listing', 'Steam Deck OLED 512GB', 1899, 1, 'https://www.olx.pl/d/oferta/negotiation-listing', 'Like new', 'Warszawa', now, now);
-
-    const result = await context.service.negotiateAndSendByKey('OLX:negotiation-listing', 1700);
-    assert.equal(sentUrl, 'https://www.olx.pl/d/oferta/negotiation-listing');
-    assert.equal(sentMessage, 'Dzień dobry, czy rozważy Pan/Pani 1700 zł za ten przedmiot?');
-    assert.equal(result.message.status, 'sent');
-    assert.equal(result.message.offerPrice, 1700);
-    assert.equal(context.service.messages()[0].message, sentMessage);
-  } finally { context.close(); }
-});
-
-test('writes and sends one explicit Allegro Lokalnie negotiation message through its session', async () => {
-  let sentUrl = '';
-  let sentMessage = '';
-  const context = fixture({
-    draftNegotiation: async (listing) => {
-      assert.equal(listing.marketplace, 'Allegro Lokalnie');
-      assert.equal(listing.offerPrice, 1700);
-      return { message: 'Dzień dobry, czy rozważy Pan/Pani 1700 zł za ten przedmiot?' };
-    },
-    sendAllegroMessage: async (listingUrl, message) => {
-      sentUrl = listingUrl;
-      sentMessage = message;
-    },
-  });
-  try {
-    const now = new Date().toISOString();
-    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' } });
-    context.service.saveMarketplaceSession('Allegro Lokalnie', 'Personal', { cookies: [{ name: 'session', value: 'private-token', domain: '.allegrolokalnie.pl', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' }] });
-    context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, price_negotiable, url, condition, location, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('Allegro Lokalnie', 'negotiation-listing', 'Steam Deck OLED 512GB', 1899, 1, 'https://allegrolokalnie.pl/oferta/negotiation-listing', 'Like new', 'Warszawa', now, now);
-
-    const result = await context.service.negotiateAndSendByKey('Allegro Lokalnie:negotiation-listing', 1700);
-    assert.equal(sentUrl, 'https://allegrolokalnie.pl/oferta/negotiation-listing');
-    assert.equal(sentMessage, 'Dzień dobry, czy rozważy Pan/Pani 1700 zł za ten przedmiot?');
-    assert.equal(result.message.marketplace, 'Allegro Lokalnie');
-    assert.equal(result.message.status, 'sent');
-    assert.equal(context.service.messages()[0].marketplace, 'Allegro Lokalnie');
-  } finally { context.close(); }
-});
-
-test('enforces a total-cost ceiling before sending an OLX offer', async () => {
-  let sendCount = 0;
-  const context = fixture({
-    draftNegotiation: async () => ({ message: 'Dzień dobry, czy rozważy Pan/Pani 900 zł?' }),
-    sendOlxMessage: async () => { sendCount += 1; },
-  });
-  try {
-    const now = new Date().toISOString();
-    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' } });
-    context.service.saveMarketplaceSession('OLX', 'Personal', { cookies: [{ name: 'session', value: 'private-token', domain: '.olx.pl', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' }] });
-    context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, price_negotiable, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run('OLX', 'budget-listing', 'Steam Deck OLED 512GB', 1000, 1, 'https://www.olx.pl/d/oferta/budget-listing', now, now);
-
-    await assert.rejects(
-      () => context.service.negotiateAndSendByKey('OLX:budget-listing', 900, { maxTotalCost: 920, shippingCost: 50 }),
-      /cannot exceed your 870 zł total-cost ceiling/,
-    );
-    assert.equal(sendCount, 0);
-  } finally { context.close(); }
-});
-
-test('runs one bounded automatic OLX negotiation per qualifying listing', async () => {
-  let sendCount = 0;
-  const context = fixture({
-    draftNegotiation: async (listing) => {
-      assert.equal(listing.offerPrice, 1670);
-      return { message: 'Dzień dobry, czy rozważy Pan/Pani 1670 zł za ten przedmiot?' };
-    },
-    sendOlxMessage: async () => { sendCount += 1; },
-  });
-  try {
-    const now = new Date().toISOString();
-    context.service.saveSettings({
-      ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' },
-      autoNegotiation: { enabled: true, maxTotalCost: 1800, shippingCost: 50, dailyLimit: 2 },
-    });
-    context.service.saveMarketplaceSession('OLX', 'Personal', { cookies: [{ name: 'session', value: 'private-token', domain: '.olx.pl', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' }] });
-    context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, price_negotiable, url, condition, location, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('OLX', 'automatic-listing', 'Steam Deck OLED 512GB', 1899, 1, 'https://www.olx.pl/d/oferta/automatic-listing', 'Like new', 'Warszawa', now, now);
-    const candidate = {
-      watchId: 'automatic-watch',
-      listing: { marketplace: 'OLX' as const, listingId: 'automatic-listing', title: 'Steam Deck OLED 512GB', price: 1899, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/automatic-listing', observedAt: now, priceNegotiable: true },
-      typical: 2500,
-      discountPercent: 24,
-      confidence: 95,
-    };
-
-    await (context.service as any).automaticallyNegotiate(candidate);
-    await (context.service as any).automaticallyNegotiate(candidate);
-
-    assert.equal(sendCount, 1);
-    assert.equal((context.db.prepare('SELECT status, offer_price_pln FROM automatic_negotiations WHERE marketplace = ? AND listing_id = ?').get('OLX', 'automatic-listing') as { status: string; offer_price_pln: number }).status, 'sent');
-    assert.equal((context.db.prepare('SELECT offer_price_pln FROM automatic_negotiations WHERE marketplace = ? AND listing_id = ?').get('OLX', 'automatic-listing') as { offer_price_pln: number }).offer_price_pln, 1670);
-    assert.equal(context.service.messages()[0].source, 'automatic');
-    assert.equal(context.service.settings().autoNegotiation.attemptedToday, 1);
-    assert.equal(context.service.settings().autoNegotiation.sentToday, 1);
-  } finally { context.close(); }
-});
-
-test('runs one bounded automatic Allegro Lokalnie negotiation per qualifying listing', async () => {
-  let sendCount = 0;
-  const context = fixture({
-    draftNegotiation: async (listing) => {
-      assert.equal(listing.marketplace, 'Allegro Lokalnie');
-      assert.equal(listing.offerPrice, 1670);
-      return { message: 'Dzień dobry, czy rozważy Pan/Pani 1670 zł za ten przedmiot?' };
-    },
-    sendAllegroMessage: async () => { sendCount += 1; },
-  });
-  try {
-    const now = new Date().toISOString();
-    context.service.saveSettings({
-      ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' },
-      autoNegotiation: { enabled: true, maxTotalCost: 1800, shippingCost: 50, dailyLimit: 2 },
-    });
-    context.service.saveMarketplaceSession('Allegro Lokalnie', 'Personal', { cookies: [{ name: 'session', value: 'private-token', domain: '.allegrolokalnie.pl', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' }] });
-    context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, price_negotiable, url, condition, location, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('Allegro Lokalnie', 'automatic-listing', 'Steam Deck OLED 512GB', 1899, 1, 'https://allegrolokalnie.pl/oferta/automatic-listing', 'Like new', 'Warszawa', now, now);
-    const candidate = {
-      watchId: 'automatic-watch',
-      listing: { marketplace: 'Allegro Lokalnie' as const, listingId: 'automatic-listing', title: 'Steam Deck OLED 512GB', price: 1899, currency: 'PLN' as const, url: 'https://allegrolokalnie.pl/oferta/automatic-listing', observedAt: now, priceNegotiable: true },
-      typical: 2500,
-      discountPercent: 24,
-      confidence: 95,
-    };
-
-    await (context.service as any).automaticallyNegotiate(candidate);
-    await (context.service as any).automaticallyNegotiate(candidate);
-
-    assert.equal(sendCount, 1);
-    assert.equal((context.db.prepare('SELECT status, offer_price_pln FROM automatic_negotiations WHERE marketplace = ? AND listing_id = ?').get('Allegro Lokalnie', 'automatic-listing') as { status: string; offer_price_pln: number }).status, 'sent');
-    assert.equal((context.db.prepare('SELECT offer_price_pln FROM automatic_negotiations WHERE marketplace = ? AND listing_id = ?').get('Allegro Lokalnie', 'automatic-listing') as { status: string; offer_price_pln: number }).offer_price_pln, 1670);
-    assert.equal(context.service.messages()[0].marketplace, 'Allegro Lokalnie');
-    assert.equal(context.service.messages()[0].source, 'automatic');
-    assert.equal(context.service.settings().autoNegotiation.attemptedToday, 1);
-    assert.equal(context.service.settings().autoNegotiation.sentToday, 1);
-  } finally { context.close(); }
 });
 
 test('shipping-only watches hide pickup-only history and count only shippable samples', () => {
@@ -1077,7 +880,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '020_drop_messaging_negotiation']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1419,7 +1222,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 18);
+    assert.equal(after.migrations.count, 20);
   } finally { context.close(); }
 });
 

@@ -58,17 +58,12 @@ export function titleQueryFromText(title: string): string {
     .slice(0, 120);
 }
 
-/** Prefill for a deal watch, built only from already-stored listing data (never AI enrichment calls). */
+/** Prefill for a deal watch, built only from already-stored listing data. */
 export function watchPresetFromListing(listing: Listing): WatchPreset {
-  const normalization = listing.aiNormalization ?? null;
   const price = Number.isFinite(listing.price) && listing.price > 0 ? listing.price : null;
-  const terms = [normalization?.brand, normalization?.model]
-    .map((value) => (typeof value === "string" ? value.trim() : ""))
-    .filter(Boolean)
-    .join(", ");
   return {
-    query: titleQueryFromText(normalization?.canonicalTitle ?? listing.title),
-    terms,
+    query: titleQueryFromText(listing.title),
+    terms: "",
     excluded: "",
     sources: [listing.marketplace],
     location: listing.location?.trim() || "Polska",
