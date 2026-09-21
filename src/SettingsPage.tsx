@@ -12,6 +12,7 @@ import {
   Settings2,
   ShieldCheck,
   SlidersHorizontal,
+  RefreshCw,
   Sun,
   Trash2,
   Zap,
@@ -71,6 +72,8 @@ export default function SettingsPage({
   const [savingSession, setSavingSession] = useState(false);
   const [recoveryBusy, setRecoveryBusy] = useState(false);
   const [resettingAi, setResettingAi] = useState(false);
+  const [updating, setUpdating] = useState(false);
+  const [updateOutput, setUpdateOutput] = useState<string | null>(null);
   const loadSettings = useCallback(async () => {
     try {
       const result = await api.settings();
@@ -344,6 +347,21 @@ export default function SettingsPage({
       onToast(errorMessage(error), "error");
     } finally {
       setResettingAi(false);
+    }
+  };
+  const runSystemUpdate = async () => {
+    if (!window.confirm("Pull latest code, rebuild, and restart Scout? The page will go down for a moment.")) return;
+    setUpdating(true);
+    setUpdateOutput(null);
+    try {
+      const result = await api.systemUpdate();
+      const log = result.steps.map((step) => `$ ${step.command}\n${step.output}`).join("\n\n");
+      setUpdateOutput(log);
+      onToast("Updated. Scout is restarting…");
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+    } finally {
+      setUpdating(false);
     }
   };
   const configured = settings?.webhookConfigured ?? false;
@@ -778,6 +796,20 @@ export default function SettingsPage({
             <button className="outline-button danger-outline" disabled={recoveryBusy || resettingAi || !settingsLoaded} onClick={() => void resetAiResults()}>{resettingAi ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}Reset AI results</button>
           </div>
           <div className="security-note"><ShieldCheck size={17} /><span>Exports omit encrypted credentials and marketplace sessions. Backups include the encrypted database and should be stored with the deployment secret.</span></div>
+        </section>
+        <section className="settings-section settings-section--wide">
+          <div className="settings-section-heading">
+            <div className="settings-symbol settings-symbol--blue"><RefreshCw size={18} /></div>
+            <div><h2>System update</h2><p>Pull latest code, rebuild, and restart the Scout service.</p></div>
+          </div>
+          <div className="settings-actions">
+            <button className="outline-button" disabled={updating || !settingsLoaded} onClick={() => void runSystemUpdate()}>{updating ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}{updating ? "Updating…" : "Update Scout"}</button>
+          </div>
+          {updateOutput ? (
+            <pre className="security-note" style={{ whiteSpace: "pre-wrap", maxHeight: 240, overflow: "auto" }}>{updateOutput}</pre>
+          ) : (
+            <div className="security-note"><Info size={17} /><span>Runs git pull, npm run build, then systemctl restart scout. The UI will briefly go offline.</span></div>
+          )}
         </section>
         <section
           className={`settings-section warning-section ${settings?.publicExposureWarning ? "warning-section--active" : ""}`}

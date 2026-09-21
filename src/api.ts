@@ -123,4 +123,5 @@ export const api = {
   logs: (signal?: AbortSignal) => request<{ logs: LogEntry[] }>('/api/logs', { signal }),
   exportData: () => request<Record<string, unknown>>('/api/export'),
   backup: () => request<{ backup: string; message: string }>('/api/backup', { method: 'POST' }),
+  systemUpdate: () => request<{ ok: true; message: string; steps: { command: string; success: boolean; output: string }[] }>('/api/system/update', { method: 'POST' }, 360_000),
 };

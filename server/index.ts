@@ -1,9 +1,11 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
+import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
+import { promisify } from 'node:util';
 import { z } from 'zod';
 import { listings as seedListings, watches as seedWatches } from '../src/data';
 import type { Marketplace } from '../src/types';
@@ -52,7 +54,7 @@ app.addHook('onRequest', async (request, reply) => {
   const isEvents = url === '/events';
   if (!isApi && !isEvents) return;
 
-  const expensive = /\/search$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/snapshot-images\/|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$/.test(url);
+  const expensive = /\/search$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/snapshot-images\/|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(url);
   const limit = expensive ? 30 : 240;
   const bucket = rateLimiter.consume(`${request.ip}:${expensive ? 'expensive' : url}`, limit);
   reply.header('X-RateLimit-Limit', String(limit));
@@ -484,6 +486,38 @@ app.patch('/api/settings', async (request, reply) => {
 app.post('/api/settings/webhook/test', async () => service.testWebhook());
 app.post('/api/settings/ntfy/test', async () => service.testNtfy());
 app.post('/api/settings/ai/reset', async () => service.resetAiResults());
+
+const execFileAsync = promisify(execFile);
+
+async function runUpdateStep(command: string, args: string[]) {
+  try {
+    const { stdout, stderr } = await execFileAsync(command, args, {
+      cwd: process.cwd(),
+      timeout: 5 * 60_000,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    return { command: `${command} ${args.join(' ')}`, success: true as const, output: `${stdout}${stderr}`.trim().slice(-4000) };
+  } catch (error) {
+    const err = error as { stdout?: string; stderr?: string; message?: string };
+    const output = `${err.stdout ?? ''}${err.stderr ?? ''}${err.message ?? ''}`.trim().slice(-4000);
+    return { command: `${command} ${args.join(' ')}`, success: false as const, output };
+  }
+}
+
+app.post('/api/system/update', async (_request, reply) => {
+  const steps = [];
+  const gitPull = await runUpdateStep('git', ['pull']);
+  steps.push(gitPull);
+  if (!gitPull.success) return reply.code(500).send({ error: 'git pull failed', details: gitPull.output, steps });
+  const build = await runUpdateStep('npm', ['run', 'build']);
+  steps.push(build);
+  if (!build.success) return reply.code(500).send({ error: 'npm run build failed', details: build.output, steps });
+  // Restart after the response is flushed so the client sees the result.
+  setTimeout(() => {
+    execFile('systemctl', ['restart', 'scout'], { cwd: process.cwd() }, () => {});
+  }, 1000).unref?.();
+  return { ok: true, message: 'Updated. Restarting Scout…', steps };
+});
 
 app.post('/api/notifications/preview', async (request, reply) => {
   const parsed = z.object({

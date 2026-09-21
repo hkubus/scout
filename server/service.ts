@@ -34,6 +34,10 @@ type DealNotificationCandidate = {
   discountPercent: number;
   confidence: number;
   requiresDescriptionVerification: boolean;
+  /** Watch search terms naming the sought item; verification uses them to reject accessories/parts. */
+  query?: string;
+  includedTerms?: string;
+  excludedTerms?: string;
 };
 
 /**
@@ -914,6 +918,9 @@ export class ScoutService {
       condition: context.condition,
       description: context.description,
       imageUrls: galleryImageUrls,
+      query: context.query,
+      includedTerms: context.includedTerms,
+      excludedTerms: context.excludedTerms,
     };
     const visionConfig = { apiKey: live.apiKey, model: live.visionModel };
 
@@ -1375,6 +1382,9 @@ export class ScoutService {
       title: candidate.listing.title,
       condition: candidate.listing.condition,
       description,
+      query: candidate.query?.trim() ? candidate.query : null,
+      includedTerms: candidate.includedTerms?.trim() ? candidate.includedTerms : null,
+      excludedTerms: candidate.excludedTerms?.trim() ? candidate.excludedTerms : null,
     };
     const inputHash = listingDescriptionVerificationInputHash(context);
     const snapshot = this.captureListingDetailSnapshot(candidate, description);
@@ -3568,6 +3578,9 @@ export class ScoutService {
         discountPercent,
         confidence: score.confidence,
         requiresDescriptionVerification: dealStrength >= 4,
+        query: String(row.query ?? ''),
+        includedTerms: String(row.included_terms ?? ''),
+        excludedTerms: String(row.excluded_terms ?? ''),
       };
     } else if (useReference && score.typical !== null) {
       // Band-seeded display values; the readiness gate is untouched, so no
