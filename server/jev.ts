@@ -18,7 +18,7 @@ import { PROVIDER_MAX_ATTEMPTS, isRetryableProviderStatus, isTransientFetchError
 export const JEV_DECISIONS_URL = 'https://openrouter.ai/api/alpha/decisions';
 export const DEFAULT_JEV_MODEL = '~typesafe/jev-latest';
 
-const JEV_RELEVANCE_SESSION_ID = 'scout:jev-relevance:v1';
+const JEV_RELEVANCE_SESSION_ID = 'scout:jev-relevance:v2';
 const JEV_VERIFICATION_SESSION_ID = 'scout:jev-verification:v1';
 const JEV_TERM_MATCH_SESSION_ID = 'scout:jev-term-match:v1';
 const JEV_NEGOTIABILITY_SESSION_ID = 'scout:jev-negotiability:v1';
@@ -210,18 +210,17 @@ export async function classifyListingRelevanceWithJev(
         title: context.title,
         condition: context.condition ?? null,
         location: context.location ?? null,
-        pricePln: context.pricePln ?? null,
         description: context.description ?? null,
       },
     },
     questions: {
       relevant: {
         type: 'noul',
-        instructions: 'Is the listing for the sought item itself (`listing.title`), rather than an accessory, part, or unrelated good merely compatible with the sought item (`query`)? Answer yes only when the sought item is the primary subject of the listing. Use `listing.pricePln` only as a supporting signal (e.g. a bundle priced far above a single unit); never infer condition, authenticity, or specifications from price.',
+        instructions: 'Is the listing for the sought item itself, rather than an accessory, part, or unrelated good merely mentioning or compatible with the sought item (`query`)? Answer yes only when the sought item is the primary subject of the listing (`listing.title`). A different component or device that merely mentions the sought item as a specification, included chip, or compatibility (e.g. a motherboard from a laptop that has the sought GPU, a laptop containing it, a cooler or case for it) is not the sought item, even when the model numbers look close. Use `listing.title` and `listing.condition` as evidence: a title or condition stating the item is broken, damaged, non-working, defective, incomplete, for repair, or for parts — in any language (e.g. Polish `uszkodzony`, `uszkodzona`, `niesprawny`, `na czesci`, `dawca czesci`, `do naprawy`) — means no, even without a description.',
         criteria: {
           // OpenRouter requires both keys when criteria is present on a noul.
-          true: 'The sought item itself is the primary subject of the listing (legitimate variants or bundles centered on it count).',
-          false: 'Accessories/parts for it, other goods that merely include or feature it, services, wanted ads, unrelated items, compatibility-only mentions, or items explicitly broken/for-parts.',
+          true: 'The sought item itself is the primary subject of the listing (legitimate variants or bundles centered on it count), with no indication it is broken or for parts.',
+          false: 'Accessories/parts for it, other goods that merely include, mention, or feature it (including a different component or device that only cites it as a spec, chip, or compatibility), services, wanted ads, unrelated items, compatibility-only mentions, or items explicitly broken, damaged, non-working, defective, incomplete, for repair, or for parts in any language.',
         },
       },
     },

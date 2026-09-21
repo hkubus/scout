@@ -1107,7 +1107,6 @@ export class ScoutService {
           title: listing.title,
           condition: listing.condition,
           location: listing.location,
-          pricePln: listing.price,
           query: search.query,
           includedTerms: search.includedTerms,
           excludedTerms: search.excludedTerms,

@@ -74,18 +74,18 @@ interface RelevanceCase {
   query: string;
   title: string;
   condition?: string;
-  pricePln?: number | null;
   imageUrl?: string | null;
 }
 
 // Curated to span: clear hit, accessory, parts-only, unrelated, ambiguous.
 const relevanceCases: RelevanceCase[] = [
-  { name: 'rel-hit', query: 'LEGO Technic 42115', title: 'LEGO Technic Lamborghini Sian 42115 komplet', condition: 'very-good', pricePln: 1899 },
-  { name: 'rel-accessory', query: 'iPhone 13', title: 'Etui i pasek do iPhone 13, nowe', condition: 'new', pricePln: 49 },
-  { name: 'rel-parts', query: 'ThinkPad T480', title: 'ThinkPad T480 na części, uszkodzona płyta główna', condition: 'for-parts', pricePln: 250 },
-  { name: 'rel-unrelated', query: 'RTX 3060', title: 'Rower górski Kross, rama 19 cali', condition: 'good', pricePln: 1200 },
-  { name: 'rel-bundle', query: 'PS5', title: 'Konsola PS5 + 2 pady + 5 gier, zestaw', condition: 'like-new', pricePln: 2400 },
-  { name: 'rel-ambiguous', query: 'Dyson V11', title: 'Odkurzacz Dyson, mocny, sprawny', condition: 'good', pricePln: 900 },
+  { name: 'rel-hit', query: 'LEGO Technic 42115', title: 'LEGO Technic Lamborghini Sian 42115 komplet', condition: 'very-good' },
+  { name: 'rel-accessory', query: 'iPhone 13', title: 'Etui i pasek do iPhone 13, nowe', condition: 'new' },
+  { name: 'rel-parts', query: 'ThinkPad T480', title: 'ThinkPad T480 na części, uszkodzona płyta główna', condition: 'for-parts' },
+  { name: 'rel-unrelated', query: 'RTX 3060', title: 'Rower górski Kross, rama 19 cali', condition: 'good' },
+  { name: 'rel-broken-motherboard', query: 'rtx 3070', title: 'Uszkodzona płyta główna Lenovo Legion 5 Pro 16IAH7H RTX 3070 Ti – dawca części', condition: 'Uszkodzone' },
+  { name: 'rel-bundle', query: 'PS5', title: 'Konsola PS5 + 2 pady + 5 gier, zestaw', condition: 'like-new' },
+  { name: 'rel-ambiguous', query: 'Dyson V11', title: 'Odkurzacz Dyson, mocny, sprawny', condition: 'good' },
 ];
 
 interface VerificationCase {
@@ -115,7 +115,6 @@ for (const sample of relevanceCases) {
     title: sample.title,
     condition: sample.condition,
     location: 'Warszawa',
-    pricePln: sample.pricePln ?? null,
     query: sample.query,
     includedTerms: '',
     excludedTerms: '',
