@@ -8,7 +8,6 @@ const relevanceContext = {
   title: 'LEGO Technic 42115 Lamborghini Sian',
   condition: 'very-good',
   location: 'Warszawa',
-  pricePln: 1899,
   query: 'LEGO Technic 42115',
   includedTerms: '',
   excludedTerms: '',
@@ -52,18 +51,20 @@ test('classifies relevance through Jev Decisions via OpenRouter', async () => {
   assert.equal(new Headers(requestInit?.headers).get('authorization'), 'Bearer sk-or-v1-test');
   const body = JSON.parse(String(requestInit?.body)) as Record<string, any>;
   assert.equal(body.model, '~typesafe/jev-latest');
-  assert.equal(body.session_id, 'scout:jev-relevance:v1');
+  assert.equal(body.session_id, 'scout:jev-relevance:v2');
   assert.deepEqual(body.state.listing, {
     marketplace: 'OLX',
     title: 'LEGO Technic 42115 Lamborghini Sian',
     condition: 'very-good',
     location: 'Warszawa',
-    pricePln: 1899,
     description: null,
   });
   assert.equal(body.questions.relevant.type, 'noul');
   assert.ok(body.questions.relevant.criteria.true);
   assert.ok(body.questions.relevant.criteria.false);
+  assert.match(body.questions.relevant.instructions, /different component or device that merely mentions/i);
+  assert.match(body.questions.relevant.instructions, /uszkodzona/i);
+  assert.match(body.questions.relevant.criteria.false, /in any language/i);
 });
 
 test('marks mid-band relevance probabilities as unsure', () => {
