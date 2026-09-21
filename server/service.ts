@@ -1114,7 +1114,6 @@ export class ScoutService {
           title: listing.title,
           condition: listing.condition,
           location: listing.location,
-          pricePln: listing.price,
           query: search.query,
           includedTerms: search.includedTerms,
           excludedTerms: search.excludedTerms,
@@ -1787,6 +1786,7 @@ export class ScoutService {
       listingId: String(row.listing_id),
       decision: parseListingDecision(row.listing_decision),
       note: typeof row.listing_note === 'string' ? row.listing_note : '',
+      aiFiltered: row.ai_filtered === undefined ? undefined : Number(row.ai_filtered) === 1,
       ...(row.ai_normalization_json !== undefined ? {
         aiNormalization: parseStoredListingNormalization(row.ai_normalization_json),
         aiNormalizationAt: row.ai_normalization_at ?? null,
@@ -2050,12 +2050,13 @@ export class ScoutService {
     };
   }
 
-  listingsPage(options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string } = {}, knownWatches?: Watch[]) {
+  listingsPage(options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string; includeAiFiltered?: boolean } = {}, knownWatches?: Watch[]) {
     const freshnessCutoff = new Date(Date.now() - MATCH_VISIBILITY_MS).toISOString();
+    const aiFilteredPredicate = 'EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = \'irrelevant\' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)';
     const predicates = [
       'w.archived_at IS NULL',
       'wl.last_seen_at > ?',
-      'NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = \'irrelevant\' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)',
+      ...(options.includeAiFiltered ? [] : [`NOT (${aiFilteredPredicate})`]),
       '(w.shipping_only = 0 OR l.shipping_available = 1)',
       '(w.min_price_pln IS NULL OR l.price_pln >= w.min_price_pln)',
       '(w.max_price_pln IS NULL OR l.price_pln <= w.max_price_pln)',
@@ -2069,7 +2070,7 @@ export class ScoutService {
     const total = Number((this.stmt(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(500, Math.floor(options.pageSize ?? 200)));
-    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note
+    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note, CASE WHEN ${aiFilteredPredicate} THEN 1 ELSE 0 END AS ai_filtered
       FROM listings l
       JOIN watch_listings wl ON wl.listing_id = l.id
       JOIN watches w ON w.id = wl.watch_id
@@ -2081,8 +2082,8 @@ export class ScoutService {
     return { listings, pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
   }
 
-  getListings(knownWatches?: Watch[]) {
-    return this.listingsPage({ page: 1, pageSize: 500 }, knownWatches).listings;
+  getListings(knownWatches?: Watch[], includeAiFiltered = false) {
+    return this.listingsPage({ page: 1, pageSize: 500, includeAiFiltered }, knownWatches).listings;
   }
 
   listingDetail(key: string, watchId?: string | null): ListingDetail {
@@ -3190,13 +3191,14 @@ export class ScoutService {
 
   dashboard(): DashboardData {
     const watches = this.getWatches();
-    const listings = this.getListings(watches);
+    const listings = this.getListings(watches, true);
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const todayTime = today.getTime();
     let newToday = 0;
     let strongDeals = 0;
     for (const listing of listings) {
+      if (listing.aiFiltered) continue;
       if (Date.parse(listing.observedAt) >= todayTime) newToday += 1;
       if (listing.dealStrength >= 4) strongDeals += 1;
     }

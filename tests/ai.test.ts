@@ -148,12 +148,14 @@ test('classifies accessories and broken items as irrelevant through DeepSeek JSO
   assert.deepEqual(body.response_format.json_schema.schema.required, ['relevant']);
   assert.deepEqual(body.provider, { require_parameters: true });
   assert.deepEqual(body.reasoning, { effort: 'none' });
-  assert.equal(body.session_id, 'scout:listing-relevance:v5');
+  assert.equal(body.session_id, 'scout:listing-relevance:v6');
   assert.equal(body.max_tokens, 32);
   assert.equal(body.thinking, undefined);
   assert.equal(body.stream, false);
   assert.equal(body.messages[1].content.includes('gpu'), true);
   assert.match(body.messages[0].content, /broken, damaged.*non-working.*for repair.*parts only/i);
+  assert.match(body.messages[0].content, /different component or device that merely mentions/i);
+  assert.match(body.messages[0].content, /title or condition stating the item is broken/i);
   assert.match(body.messages[0].content, /merely include, hold, or feature it/i);
   assert.match(body.messages[0].content, /centerpiece is the item itself/i);
 });

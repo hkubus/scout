@@ -77,7 +77,6 @@ function buildRequest(options: DemoOptions): JevRequest {
         title: options.title,
         condition: options.condition,
         location: 'Warszawa',
-        pricePln: 1899,
         description: options.description,
       },
     },
@@ -87,7 +86,7 @@ function buildRequest(options: DemoOptions): JevRequest {
     questions: {
       relevant: {
         type: 'noul',
-        instructions: 'Is the listing for the sought item itself (`listing.title`), rather than an accessory, part, or unrelated good merely compatible with the sought item (`query`)? Answer yes only when the sought item is the primary subject of the listing. Use `listing.pricePln` only as a supporting signal; never infer condition, authenticity, or specifications from price.',
+        instructions: 'Is the listing for the sought item itself (`listing.title`), rather than an accessory, part, or unrelated good merely compatible with the sought item (`query`)? Answer yes only when the sought item is the primary subject of the listing.',
         criteria: {
           true: 'The sought item itself is the primary subject of the listing (legitimate variants or bundles centered on it count).',
           false: 'Accessories/parts for it, other goods that merely include or feature it, services, wanted ads, unrelated items, compatibility-only mentions, or items explicitly broken/for-parts.',

@@ -141,6 +141,14 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .listing-row, .research-listing-row, .messages-thread { content-visibility: auto; contain-intrinsic-size: auto 72px; }
 .listing-row:first-of-type { border-top-color: var(--line-strong); }
 .listing-row:hover { background: var(--surface-muted); }
+.listing-row--ai-filtered { min-height: 52px; background: var(--surface-muted); color: var(--muted); font-size: 12px; opacity: .72; }
+.listing-row--ai-filtered:hover { background: var(--surface-muted); }
+.listing-row--ai-filtered .listing-item { gap: 10px; }
+.listing-row--ai-filtered .listing-item img, .listing-row--ai-filtered .listing-thumb-placeholder { width: 56px; height: 34px; filter: grayscale(1); opacity: .75; }
+.listing-row--ai-filtered .listing-item strong { color: var(--muted); font-size: 12.5px; font-weight: 550; }
+.listing-row--ai-filtered .price-cell { color: var(--muted); font-size: 13px; }
+.listing-row--ai-filtered .discount-cell { color: var(--muted); font-size: 12px; font-weight: 500; }
+.listing-row--ai-filtered .deal-bars i.is-filled { background: var(--soft); }
 .listing-item { min-width: 0; display: flex; align-items: center; gap: 14px; }
 .listing-item img { flex: 0 0 auto; width: 78px; height: 48px; object-fit: cover; border-radius: 8px; border: 1px solid rgba(110, 126, 149, .16); background: #eef1f4; }
 .listing-thumb-placeholder { flex: 0 0 auto; width: 78px; height: 48px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-muted); color: var(--soft); }
@@ -803,6 +811,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .decision-chip--watch { color: var(--blue); background: var(--blue-soft); }
 .decision-chip--pass { color: var(--orange); background: rgba(241, 90, 53, .1); }
 .decision-chip--reference { color: var(--teal); background: rgba(21, 155, 150, .12); }
+.decision-chip--ai-filtered { color: var(--muted); background: var(--surface-muted); border: 1px dashed var(--line-strong); font-weight: 600; }
 .snapshot-price-history { margin-top: 12px; display: grid; gap: 8px; }
 .snapshot-price-history > strong { font-size: 12px; }
 .listing-drawer-backdrop { position: fixed; inset: 0; z-index: 60; display: flex; justify-content: flex-end; background: rgba(12, 17, 26, .48); backdrop-filter: blur(3px); }
