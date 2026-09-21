@@ -742,7 +742,7 @@ function Overview({
   const [strength, setStrength] = useState<"All" | "Strong" | "Exceptional">(
     "All",
   );
-  const [sort, setSort] = useState<"Newest" | "Deal">("Newest");
+  const [sort, setSort] = useState<"Newest" | "Deal">("Deal");
   const visibleListings = useMemo(
     () =>
       data.listings
@@ -758,11 +758,21 @@ function Overview({
               : listing.dealStrength >= 3),
         )
         .slice()
-        .sort((a, b) =>
-          sort === "Deal"
-            ? b.dealStrength - a.dealStrength
-            : (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0),
-        ),
+        .sort((a, b) => {
+          const aFiltered = a.aiFiltered ? 1 : 0;
+          const bFiltered = b.aiFiltered ? 1 : 0;
+          if (aFiltered !== bFiltered) return aFiltered - bFiltered;
+          if (sort === "Deal") {
+            if (b.dealStrength !== a.dealStrength)
+              return b.dealStrength - a.dealStrength;
+            return (
+              (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0)
+            );
+          }
+          return (
+            (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0)
+          );
+        }),
     [data.listings, marketplace, strength, sort],
   );
   return (

@@ -78,6 +78,8 @@ export interface Listing {
   listingId?: string;
   decision?: ListingDecision | null;
   note?: string;
+  /** True when the watch's AI relevance filter classified this listing as irrelevant. Shown greyed-out on overview. */
+  aiFiltered?: boolean;
   aiNormalization?: ListingNormalization | null;
   aiNormalizationAt?: string | null;
   aiNormalizationError?: string | null;
