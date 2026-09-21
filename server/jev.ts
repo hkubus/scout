@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { ListingDescriptionVerificationContext, ListingRelevanceContext } from './ai';
+import { normalizeModelConfidence, normalizeModelDecision } from './ai';
 import { PROVIDER_MAX_ATTEMPTS, isRetryableProviderStatus, isTransientFetchError, providerBackoffMs, sleep } from './openrouter';
 
 /**
@@ -88,12 +89,36 @@ const noulAnswerSchema = z.object({
   noul: z.number().min(0).max(1),
 }).strict().catchall(z.unknown());
 
-const choiceAnswerSchema = z.object({
-  type: z.literal('choice'),
-  choice: z.string(),
-  confidence: z.number().min(0).max(1).nullish(),
-  probabilities: z.record(z.string(), z.number()).nullish(),
-}).strict().catchall(z.unknown());
+const choiceAnswerSchema = z.preprocess(
+  (raw) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw;
+    const record = raw as Record<string, unknown>;
+    const hasChoice = 'choice' in record;
+    return {
+      ...record,
+      // A missing `type` is treated as the keyed choice answer only when a
+      // `choice` is present (answers are already namespaced per question); a
+      // present but different type, or an object with neither, still fails
+      // validation so a wrong answer kind is never trusted.
+      type: normalizeModelDecision(record.type) ?? (hasChoice ? 'choice' : undefined),
+      // An unrecognized choice maps to `unknown` downstream (safe hold),
+      // never to a trusted pass/reject.
+      choice: normalizeModelDecision(record.choice) ?? '',
+      // Unparseable or out-of-range confidence becomes null, which the
+      // `unsure` thresholds treat as "escalate", instead of failing the
+      // whole judgment with an invalid shape.
+      confidence: normalizeModelConfidence(record.confidence) ?? null,
+    };
+  },
+  z.object({
+    type: z.literal('choice'),
+    choice: z.string(),
+    confidence: z.number().min(0).max(1).nullish(),
+    // Unused downstream; accept anything so stray provider metadata never
+    // fails validation.
+    probabilities: z.unknown().nullish(),
+  }),
+);
 
 export interface JevRelevanceJudgment {
   relevant: boolean;
@@ -248,14 +273,19 @@ export async function verifyListingDescriptionWithJev(
         condition: context.condition ?? null,
         description: context.description,
       },
+      watch: {
+        query: context.query?.trim() || null,
+        includedTerms: context.includedTerms?.trim() || null,
+        excludedTerms: context.excludedTerms?.trim() || null,
+      },
     },
     questions: {
       verification: {
         type: 'choice',
-        instructions: 'Given `listing.title`, `listing.condition`, and `listing.description`, is this second-hand listing safe to surface as a very strong or exceptional deal?',
+        instructions: 'Given `listing.title`, `listing.condition`, `listing.description`, and the sought item named by `watch.query`, is this second-hand listing safe to surface as a very strong or exceptional deal?',
         criteria: {
           pass: 'The description clearly says the sought item is functional and discloses no material problem.',
-          reject: 'Explicit broken, defective, non-working, repair/for-parts, missing essential component, fake/replica, or another material issue.',
+          reject: 'Explicit broken, defective, non-working, repair/for-parts, missing essential component, fake/replica, or another material issue — or the title shows the listing is for an accessory, part, or replacement component (fan, cooler, cooling, case, cable, adapter, battery) rather than the sought item itself, even when that accessory is functional.',
           unknown: 'Description missing, ambiguous, contradictory, too short to establish condition, or otherwise not enough evidence. Do not infer safety from a low price, title, or general product knowledge.',
         },
       },

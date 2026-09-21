@@ -2033,3 +2033,46 @@ test('skips negotiability upgrade for Vinted listings', async () => {
     context.close();
   }
 });
+
+test('passes the watch query into description verification', async () => {
+  const restore = liveJevEnv();
+  const seen: Array<Record<string, any>> = [];
+  const visionInputs: Array<Record<string, any>> = [];
+  const context = fixture({
+    verifyListingDescriptionWithJev: async (ctx: any) => {
+      seen.push({ ...ctx });
+      if (ctx.query === 'unsure-query') return { decision: 'unknown', confidence: 0.9, unsure: true };
+      return { decision: 'pass', confidence: 0.9, unsure: false };
+    },
+    verifyListingDescriptionWithVision: async (input: any) => {
+      visionInputs.push({ ...input });
+      return { decision: 'pass', confidence: 0.78, issues: [], imagesSeen: 0 };
+    },
+  });
+  (context.service as any).fetchPublicPage = async () => '<meta property="og:description" content="Fully working console.">';
+  try {
+    const candidate = {
+      watchId: 'live-watch',
+      listing: liveListing(),
+      typical: 2500,
+      discountPercent: 25,
+      confidence: 0.9,
+      requiresDescriptionVerification: true,
+      query: 'PS5',
+      includedTerms: '',
+      excludedTerms: 'pad',
+    };
+    assert.equal(await (context.service as any).verifyHighPriorityDealOnce(candidate), true);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].query, 'PS5');
+    assert.equal(seen[0].excludedTerms, 'pad');
+    // An unsure Jev judgment escalates to vision with the query attached.
+    const unsure = { ...candidate, listing: liveListing({ listingId: 'live-2', url: 'https://www.olx.pl/d/oferta/live-2' }), query: 'unsure-query' };
+    assert.equal(await (context.service as any).verifyHighPriorityDealOnce(unsure), true);
+    assert.equal(visionInputs.length, 1);
+    assert.equal(visionInputs[0].query, 'unsure-query');
+  } finally {
+    restore();
+    context.close();
+  }
+});

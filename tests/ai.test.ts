@@ -181,7 +181,7 @@ test('conservatively verifies an exceptional listing description through DeepSee
 
   assert.deepEqual(result.decision, 'pass');
   const body = JSON.parse(String(requestInit?.body)) as Record<string, any>;
-  assert.equal(body.session_id, 'scout:listing-description-verification:v2');
+  assert.equal(body.session_id, 'scout:listing-description-verification:v3');
   assert.equal(body.max_tokens, 360);
   assert.deepEqual(body.plugins, [{ id: 'response-healing' }]);
   assert.equal(body.response_format.json_schema.name, 'listing_description_verification');
@@ -222,4 +222,47 @@ test('retries once when verification output is malformed JSON', async () => {
 
   assert.equal(result.decision, 'pass');
   assert.equal(requests, 2);
+});
+
+test('tolerates provider schema drift in verification output instead of failing with invalid shape', async () => {
+  const context = { marketplace: 'OLX' as const, title: 'Steam Deck OLED 512GB', condition: 'Używany', description: 'W pełni sprawny.' };
+  const config = { apiKey: 'sk-or-v1-test', model: 'deepseek-v4-flash' };
+  const fetcherFor = (payload: unknown) => () => Promise.resolve(Response.json({ choices: [{ message: { content: JSON.stringify(payload) } }] }));
+  const base = { decision: 'pass', confidence: 0.9, summary: 'The item works.', issues: [], evidence: ['Works'] };
+
+  // Extra keys are stripped instead of rejected by strict mode.
+  assert.equal((await verifyListingDescriptionWithDeepSeek(context, config, fetcherFor({ ...base, reasoning: 'looks fine' }))).decision, 'pass');
+  // 0–100 and string confidences are scaled/coerced.
+  assert.equal((await verifyListingDescriptionWithDeepSeek(context, config, fetcherFor({ ...base, confidence: 94 }))).confidence, 0.94);
+  assert.equal((await verifyListingDescriptionWithDeepSeek(context, config, fetcherFor({ ...base, confidence: '0.82' }))).confidence, 0.82);
+  // Over-long and empty strings are truncated/dropped, casing normalized.
+  const messy = await verifyListingDescriptionWithDeepSeek(context, config, fetcherFor({
+    decision: 'Pass', confidence: 0.9, summary: `  ${'x'.repeat(300)}  `, issues: ['', 'noisy fan'], evidence: [],
+  }));
+  assert.equal(messy.decision, 'pass');
+  assert.equal(messy.summary.length, 240);
+  assert.deepEqual(messy.issues, ['noisy fan']);
+  // An unrecognizable object degrades to a safe unknown hold instead of throwing.
+  assert.equal((await verifyListingDescriptionWithDeepSeek(context, config, fetcherFor({ foo: 1 }))).decision, 'unknown');
+  // Out-of-range confidence keeps the decision but falls back to 0.5.
+  const badConf = await verifyListingDescriptionWithDeepSeek(context, config, fetcherFor({ ...base, confidence: 1.5 }));
+  assert.equal(badConf.decision, 'pass');
+  assert.equal(badConf.confidence, 0.5);
+});
+
+test('sends the watch query with verification and rejects accessories in the prompt', async () => {
+  let requestInit: RequestInit | undefined;
+  const result = await verifyListingDescriptionWithDeepSeek(
+    { marketplace: 'OLX', title: 'Wentylator Zotac RTX 1660/2060/2070/3050/3060 chłodzenie', condition: 'Używany', description: 'Sprawny wentylator.', query: 'RTX 3060', includedTerms: '', excludedTerms: '' },
+    { apiKey: 'sk-or-v1-test', model: 'deepseek-v4-flash' },
+    (_input, init) => {
+      requestInit = init;
+      return Promise.resolve(Response.json({ choices: [{ message: { content: JSON.stringify({ decision: 'reject', confidence: 0.9, summary: 'Accessory, not the GPU.', issues: ['Accessory listing'], evidence: ['Wentylator'] }) } }] }));
+    },
+  );
+
+  assert.equal(result.decision, 'reject');
+  const body = JSON.parse(String(requestInit?.body)) as Record<string, any>;
+  assert.equal(JSON.parse(body.messages[1].content).query, 'RTX 3060');
+  assert.match(body.messages[0].content, /accessory/i);
 });
