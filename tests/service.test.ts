@@ -1432,6 +1432,72 @@ test('decides relevance live with Jev and never calls DeepSeek', async () => {
   }
 });
 
+test('skips the AI relevance call for listings below the deal-strength gate', async () => {
+  const restore = liveJevEnv();
+  let jevCalls = 0;
+  const context = fixture({
+    classifyListingRelevance: async () => { throw new Error('DeepSeek must not be called in live mode'); },
+    classifyListingRelevanceWithJev: async () => { jevCalls += 1; return { relevant: true, p: 0.92, unsure: false }; },
+    classifyListingRelevanceWithVision: async () => { throw new Error('Vision must not be called'); },
+  });
+  try {
+    const strong = liveListing({ listingId: 'strong-1', url: 'https://www.olx.pl/d/oferta/strong-1' });
+    const weak = liveListing({ listingId: 'weak-1', url: 'https://www.olx.pl/d/oferta/weak-1' });
+    const result = await (context.service as any).filterListingsByAiRelevance(
+      [strong, weak], { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
+      (listing: any) => listing.listingId === 'strong-1',
+    );
+    assert.equal(jevCalls, 1);
+    assert.equal(result.listings.length, 2);
+    assert.equal(result.excluded, 0);
+    assert.equal(result.unknown, 0);
+    assert.equal(result.skipped, 1);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('spends relevance AI only on very strong or qualifying watch-scan listings', async () => {
+  const restore = liveJevEnv();
+  const checked: string[] = [];
+  const context = fixture({
+    classifyListingRelevanceWithJev: async (ctx: any) => {
+      checked.push(ctx.title);
+      return { relevant: true, p: 0.95, unsure: false };
+    },
+    classifyListingRelevanceWithVision: async () => { throw new Error('Vision must not be called'); },
+  });
+  try {
+    seedWatch(context.db, 'gate-watch');
+    const baselineAt = new Date(Date.now() - 8 * 60 * 60_000).toISOString();
+    const insertListing = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+    const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    for (let index = 0; index < 30; index += 1) {
+      insertListing.run('OLX', `gate-baseline-${index}`, `Baseline CPU ${index}`, 1000, `https://www.olx.pl/d/oferta/gate-baseline-${index}`, baselineAt, baselineAt);
+      const listing = context.db.prepare('SELECT id FROM listings WHERE listing_id = ?').get(`gate-baseline-${index}`) as { id: number };
+      insertObservation.run(listing.id, 'gate-watch', 1000, baselineAt);
+    }
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'gate-strong', url: 'https://www.olx.pl/d/oferta/gate-strong', title: 'CPU very strong', created_time: baselineAt, params: [{ key: 'price', value: { value: 700, currency: 'PLN', negotiable: false } }] },
+      { id: 'gate-weak', url: 'https://www.olx.pl/d/oferta/gate-weak', title: 'CPU weak', created_time: baselineAt, params: [{ key: 'price', value: { value: 950, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 2 } } });
+
+    const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('gate-watch');
+    await (context.service as any).runWatch(row);
+
+    assert.deepEqual(checked, ['CPU very strong']);
+    const stored = (context.db.prepare("SELECT l.listing_id, wl.deal_strength FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE l.listing_id IN ('gate-strong', 'gate-weak') ORDER BY l.listing_id").all() as Array<{ listing_id: string; deal_strength: number }>).map((row) => ({ ...row }));
+    assert.deepEqual(stored, [
+      { listing_id: 'gate-strong', deal_strength: 5 },
+      { listing_id: 'gate-weak', deal_strength: 2 },
+    ]);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
 test('escalates unsure live relevance through a bounded detail fetch', async () => {
   const restore = liveJevEnv();
   const detailCalls: Array<[string, string]> = [];
