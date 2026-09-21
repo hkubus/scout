@@ -6,7 +6,6 @@ import {
   Database,
   Info,
   LoaderCircle,
-  MessagesSquare,
   RefreshCw,
   Sparkles,
   Tag,
@@ -299,19 +298,7 @@ export default function AnalyticsPage({
             ) : <div className="analytics-inline-empty">No marketplace scans in this range yet.</div>}
           </section>
 
-          <div className="analytics-detail-grid">
-            <section className="analytics-section analytics-section--card">
-              <div className="analytics-section-heading">
-                <div><span className="drawer-section-kicker">Outreach</span><h3>Negotiation</h3></div>
-                <MessagesSquare size={16} />
-              </div>
-              <div className="analytics-stat-grid analytics-stat-grid--compact">
-                <div className="analytics-stat"><span>Offers sent</span><strong>{formatCount(data.negotiation.offersSent)}</strong><small>manual + automatic</small></div>
-                <div className="analytics-stat"><span>Success rate</span><strong>{formatPercent(data.negotiation.successRate, 0)}</strong><small>delivered messages</small></div>
-                <div className="analytics-stat"><span>Automatic</span><strong>{formatCount(data.negotiation.automatic)}</strong><small>tracked negotiations</small></div>
-                <div className="analytics-stat"><span>Avg discount</span><strong>{formatPercent(data.negotiation.averageDiscountPercent)}</strong><small>automatic offers</small></div>
-              </div>
-            </section>
+          <div className="analytics-detail-grid analytics-detail-grid--single">
             <section className="analytics-section analytics-section--card">
               <div className="analytics-section-heading">
                 <div><span className="drawer-section-kicker">Calibration</span><h3>AI quality</h3></div>

@@ -7,7 +7,7 @@ Performance review of the Scout codebase, completed 2026-09-01 against commit `e
 - The working tree is user-owned. Inspect `git status` before editing.
 - Do **not** restart the user's running Scout process or write to `data/scout.sqlite` — it belongs to a live deployment. For any experiment, copy the database or use a temp `SCOUT_DB_PATH`.
 - Never edit an existing file under `migrations/` — `openDatabase` (`server/db.ts:63-98`) records a SHA-256 checksum per file and refuses to start on mismatch. All schema work goes into a new `migrations/014_<name>.sql` (a `VACUUM INTO` backup is taken automatically before each migration).
-- Preserve fail-closed behavior in connectors and the manual-only AI normalization posture. None of the work below should change what users see, except where a semantic change is explicitly called out in "Needs a product decision".
+- Preserve fail-closed behavior in connectors. None of the work below should change what users see, except where a semantic change is explicitly called out in "Needs a product decision".
 - Verification before declaring done: `npm run typecheck`, `npm test`, `npm run build` (see `NEXT_AGENT.md`). Existing tests live in `tests/` and cover service behavior including triggers — keep them green.
 
 ## Verified baseline (2026-09-01)
@@ -136,7 +136,7 @@ private stmt(sql: string) {
 - `notifyDeal` reads `getSetting('discord_webhook')`, `ntfyConfig()` (AES-GCM decrypt), `dailyDigestConfig()` per candidate (`server/service.ts:3011-3014`); `verifyHighPriorityDealOnce` decrypts again via `deepSeekConfig()` per candidate (`server/service.ts:695`).
 - `runWatch` processes candidates strictly sequentially (`server/service.ts:2326-2330`), and each high-priority verification can cost ~12 s (marketplace fetch) + ~30 s (OpenRouter).
 
-**Fix:** Hoist the config reads once per scan and pass them down (or memoize decrypts with a short TTL). For concurrency, process candidates with a bounded pool of 2–3 — keep it small to stay polite to marketplaces and preserve deterministic alert ordering per listing (the `descriptionVerificationInFlight` map and `messagingInFlight` guards must keep working; they already key per listing).
+**Fix:** Hoist the config reads once per scan and pass them down (or memoize decrypts with a short TTL). For concurrency, process candidates with a bounded pool of 2–3 — keep it small to stay polite to marketplaces and preserve deterministic alert ordering per listing (the `descriptionVerificationInFlight` guard must keep working; it already keys per listing).
 
 **Risk:** Medium. The per-channel alert sequencing (`alertState`, `latestDeliveryForAlert`, `shouldAlert`) has subtle ordering logic — parallelizing candidates must not parallelize two candidates for the **same** listing.
 

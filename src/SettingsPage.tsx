@@ -52,14 +52,6 @@ export default function SettingsPage({
   const [nightInterval, setNightInterval] = useState("30");
   const [aiModel, setAiModel] = useState("");
   const [aiApiKey, setAiApiKey] = useState("");
-  const [autoNegotiationEnabled, setAutoNegotiationEnabled] = useState(false);
-  const [autoNegotiationMaxTotal, setAutoNegotiationMaxTotal] = useState("");
-  const [autoNegotiationShipping, setAutoNegotiationShipping] = useState("0");
-  const [autoNegotiationOtherCosts, setAutoNegotiationOtherCosts] = useState("0");
-  const [autoNegotiationMinimumDiscount, setAutoNegotiationMinimumDiscount] = useState("18");
-  const [autoNegotiationOpeningDiscount, setAutoNegotiationOpeningDiscount] = useState("12");
-  const [autoNegotiationDailyLimit, setAutoNegotiationDailyLimit] = useState("3");
-  const [negotiationUseBand, setNegotiationUseBand] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testingNtfy, setTestingNtfy] = useState(false);
@@ -86,14 +78,6 @@ export default function SettingsPage({
       setIntervalValue(String(result.defaultInterval));
       setNightInterval(String(result.nightInterval));
       setAiModel(result.ai?.model ?? "");
-      setAutoNegotiationEnabled(result.autoNegotiation?.enabled ?? false);
-      setNegotiationUseBand(result.negotiationUseBand ?? false);
-      setAutoNegotiationMaxTotal(result.autoNegotiation?.maxTotalCost === null || result.autoNegotiation?.maxTotalCost === undefined ? "" : String(result.autoNegotiation.maxTotalCost));
-      setAutoNegotiationShipping(String(result.autoNegotiation?.shippingCost ?? 0));
-      setAutoNegotiationOtherCosts(String(result.autoNegotiation?.otherCosts ?? 0));
-      setAutoNegotiationMinimumDiscount(String(result.autoNegotiation?.minimumDiscountPercent ?? 18));
-      setAutoNegotiationOpeningDiscount(String(result.autoNegotiation?.openingDiscountPercent ?? 12));
-      setAutoNegotiationDailyLimit(String(result.autoNegotiation?.dailyLimit ?? 3));
       setDiscordMinimumPriority(result.discordMinimumPriority);
       setDailyDigestEnabled(result.dailyDigest?.enabled ?? false);
       setDailyDigestTime(result.dailyDigest?.time ?? "08:00");
@@ -125,32 +109,6 @@ export default function SettingsPage({
       numericNightInterval > 1440
     ) {
       onToast("Night polling interval must be between 5 and 1440 minutes.", "error");
-      return;
-    }
-    const autoMaxTotal = autoNegotiationMaxTotal.trim() === "" ? null : Number(autoNegotiationMaxTotal);
-    const autoShipping = autoNegotiationShipping.trim() === "" ? 0 : Number(autoNegotiationShipping);
-    const autoOtherCosts = autoNegotiationOtherCosts.trim() === "" ? 0 : Number(autoNegotiationOtherCosts);
-    const autoMinimumDiscount = Number(autoNegotiationMinimumDiscount);
-    const autoOpeningDiscount = Number(autoNegotiationOpeningDiscount);
-    const autoDailyLimit = Number(autoNegotiationDailyLimit);
-    if (autoNegotiationEnabled && (autoMaxTotal === null || !Number.isFinite(autoMaxTotal) || autoMaxTotal <= 0)) {
-      onToast("Set a positive maximum total cost before enabling automatic negotiation.", "error");
-      return;
-    }
-    if (![autoShipping, autoOtherCosts].every((value) => Number.isFinite(value) && value >= 0)) {
-      onToast("Automatic negotiation known costs must be zero or positive.", "error");
-      return;
-    }
-    if (!Number.isFinite(autoMinimumDiscount) || autoMinimumDiscount < 18 || autoMinimumDiscount > 80) {
-      onToast("Minimum deal discount must be between 18% and 80%.", "error");
-      return;
-    }
-    if (!Number.isFinite(autoOpeningDiscount) || autoOpeningDiscount < 1 || autoOpeningDiscount > 50) {
-      onToast("Opening discount must be between 1% and 50%.", "error");
-      return;
-    }
-    if (!Number.isInteger(autoDailyLimit) || autoDailyLimit < 1 || autoDailyLimit > 50) {
-      onToast("Daily attempt limit must be between 1 and 50.", "error");
       return;
     }
     if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(dailyDigestTime)) {
@@ -185,16 +143,6 @@ export default function SettingsPage({
           model: aiModel.trim() || undefined,
           apiKey: aiApiKey.trim() || undefined,
         },
-        negotiationUseBand,
-        autoNegotiation: {
-          enabled: autoNegotiationEnabled,
-          maxTotalCost: autoMaxTotal,
-          shippingCost: autoShipping,
-          otherCosts: autoOtherCosts,
-          minimumDiscountPercent: autoMinimumDiscount,
-          openingDiscountPercent: autoOpeningDiscount,
-          dailyLimit: autoDailyLimit,
-        },
         ntfy: ntfyTouched
           ? {
               serverUrl: ntfyServerUrl.trim() || undefined,
@@ -214,14 +162,6 @@ export default function SettingsPage({
       setDailyDigestTime(result.dailyDigest?.time ?? "08:00");
       setDailyDigestDiscord(result.dailyDigest?.discord ?? true);
       setDailyDigestNtfy(result.dailyDigest?.ntfy ?? false);
-      setAutoNegotiationEnabled(result.autoNegotiation?.enabled ?? false);
-      setNegotiationUseBand(result.negotiationUseBand ?? false);
-      setAutoNegotiationMaxTotal(result.autoNegotiation?.maxTotalCost === null || result.autoNegotiation?.maxTotalCost === undefined ? "" : String(result.autoNegotiation.maxTotalCost));
-      setAutoNegotiationShipping(String(result.autoNegotiation?.shippingCost ?? 0));
-      setAutoNegotiationOtherCosts(String(result.autoNegotiation?.otherCosts ?? 0));
-      setAutoNegotiationMinimumDiscount(String(result.autoNegotiation?.minimumDiscountPercent ?? 18));
-      setAutoNegotiationOpeningDiscount(String(result.autoNegotiation?.openingDiscountPercent ?? 12));
-      setAutoNegotiationDailyLimit(String(result.autoNegotiation?.dailyLimit ?? 3));
       setNtfyTopic("");
       setNtfyToken("");
       setNtfyServerUrl(result.ntfy?.serverUrl ?? "https://ntfy.sh");
@@ -409,9 +349,6 @@ export default function SettingsPage({
   const configured = settings?.webhookConfigured ?? false;
   const ntfyConfigured = settings?.ntfy?.configured ?? false;
   const aiConfigured = settings?.ai?.configured ?? false;
-  const autoNegotiation = settings?.autoNegotiation;
-  const olxSessionConnected = settings?.marketplaceSessions.find((session) => session.marketplace === "OLX")?.connected ?? false;
-  const allegroSessionConnected = settings?.marketplaceSessions.find((session) => session.marketplace === "Allegro Lokalnie")?.connected ?? false;
   const settingsLoaded = settings !== null;
   return (
     <>
@@ -495,7 +432,7 @@ export default function SettingsPage({
             </div>
             <div>
               <h2>AI listing intelligence</h2>
-              <p>Jev filters out accessories, parts, and unrelated matches, with a vision model as fallback when unsure. The model below powers manual listing normalization and negotiation drafts. Listing normalization stays manual and is off by default.</p>
+              <p>Jev filters out accessories, parts, and unrelated matches, with a vision model as fallback when unsure.</p>
             </div>
             <span className={`settings-status ${aiConfigured ? "" : "settings-status--idle"}`}>
               <i />
@@ -527,81 +464,10 @@ export default function SettingsPage({
           </div>
           <div className="settings-actions">
             {settings?.ai?.source === "settings" ? <button className="outline-button danger-outline" disabled={saving} onClick={() => void clearAiApiKey()}><Trash2 size={15} />Remove saved token</button> : null}
-            <span className="settings-inline-note">Normalization is manual from a listing drawer and never runs automatically.</span>
           </div>
           <div className="security-note">
             <ShieldCheck size={17} />
             <span>The token is encrypted with SCOUT_SECRET and never returned to the browser. Headless deployments can use SCOUT_OPENROUTER_API_KEY and SCOUT_OPENROUTER_MODEL instead.</span>
-          </div>
-        </section>
-        <section className={`settings-section settings-section--wide ${autoNegotiationEnabled ? "auto-negotiation-section--active" : ""}`}>
-          <div className="settings-section-heading">
-            <div className="settings-symbol settings-symbol--blue">
-              <Send size={18} />
-            </div>
-            <div>
-              <h2>Automatic marketplace negotiation</h2>
-              <p>Send one AI-written opening message when a saved OLX or Allegro Lokalnie listing becomes a qualifying deal.</p>
-            </div>
-            <span className={`settings-status ${autoNegotiationEnabled ? "" : "settings-status--idle"}`}>
-              <i />
-              {settingsLoaded ? autoNegotiationEnabled ? "Enabled" : "Off" : "Loading…"}
-            </span>
-          </div>
-          <label className="auto-negotiation-toggle">
-            <input type="checkbox" checked={autoNegotiationEnabled} disabled={!settingsLoaded || saving} onChange={(event) => setAutoNegotiationEnabled(event.target.checked)} />
-            <span>
-              <strong>Enable automatic seller messages</strong>
-              <small>Opt in only after checking the budget, session, and message limit below.</small>
-            </span>
-          </label>
-          <label className="auto-negotiation-toggle">
-            <input type="checkbox" checked={negotiationUseBand} disabled={!settingsLoaded || saving} onChange={(event) => setNegotiationUseBand(event.target.checked)} />
-            <span>
-              <strong>Cap offers with a reference series band</strong>
-              <small>When a watch uses a research series as its fallback baseline, probable-sale band highs can only tighten the offer ceiling — including bounded automatic negotiation. It never loosens it.</small>
-            </span>
-          </label>
-          <div className="field-row">
-            <label className="field-label">
-              Maximum total cost <span>required · PLN</span>
-              <input type="number" min="1" step="1" value={autoNegotiationMaxTotal} disabled={!settingsLoaded || saving} onChange={(event) => setAutoNegotiationMaxTotal(event.target.value)} placeholder="e.g. 2100" />
-            </label>
-            <label className="field-label">
-              Delivery and fees <span>optional · PLN</span>
-              <input type="number" min="0" step="1" value={autoNegotiationShipping} disabled={!settingsLoaded || saving} onChange={(event) => setAutoNegotiationShipping(event.target.value)} placeholder="0" />
-            </label>
-          </div>
-          <div className="field-row">
-            <label className="field-label">
-              Other known costs <span>optional · PLN</span>
-              <input type="number" min="0" step="1" value={autoNegotiationOtherCosts} disabled={!settingsLoaded || saving} onChange={(event) => setAutoNegotiationOtherCosts(event.target.value)} placeholder="0" />
-            </label>
-            <label className="field-label">
-              Minimum deal discount <span>18–80% below typical</span>
-              <input type="number" min="18" max="80" step="1" value={autoNegotiationMinimumDiscount} disabled={!settingsLoaded || saving} onChange={(event) => setAutoNegotiationMinimumDiscount(event.target.value)} />
-            </label>
-          </div>
-          <div className="field-row">
-            <label className="field-label">
-              Opening discount <span>1–50% below current ask</span>
-              <input type="number" min="1" max="50" step="1" value={autoNegotiationOpeningDiscount} disabled={!settingsLoaded || saving} onChange={(event) => setAutoNegotiationOpeningDiscount(event.target.value)} />
-            </label>
-            <label className="field-label">
-              Daily attempt limit <span>1–50 listings</span>
-              <input type="number" min="1" max="50" step="1" value={autoNegotiationDailyLimit} disabled={!settingsLoaded || saving} onChange={(event) => setAutoNegotiationDailyLimit(event.target.value)} />
-            </label>
-          </div>
-          <div className="field-help">
-            <Info size={15} />
-            Automatic messages require OpenRouter with a DeepSeek model, an authenticated OLX or Allegro Lokalnie session, an explicit negotiable-price signal, and a qualifying deal. Fixed or unspecified prices are never contacted automatically.
-          </div>
-          <div className="auto-negotiation-status">
-            <span>Today: <strong>{autoNegotiation?.attemptedToday ?? 0}/{autoNegotiation?.dailyLimit ?? autoNegotiationDailyLimit} attempts</strong></span>
-            <span><strong>{autoNegotiation?.sentToday ?? 0}</strong> sent</span>
-            <span className={aiConfigured ? "auto-negotiation-status--ready" : ""}>{aiConfigured ? "OpenRouter ready" : "OpenRouter not configured"}</span>
-            <span className={olxSessionConnected ? "auto-negotiation-status--ready" : ""}>{olxSessionConnected ? "OLX session ready" : "OLX session missing"}</span>
-            <span className={allegroSessionConnected ? "auto-negotiation-status--ready" : ""}>{allegroSessionConnected ? "Allegro Lokalnie session ready" : "Allegro Lokalnie session missing"}</span>
           </div>
         </section>
         <section className="settings-section settings-section--wide">
@@ -691,7 +557,7 @@ export default function SettingsPage({
             </span>
           </div>
         </section>
-        <section className={`settings-section settings-section--wide ${dailyDigestEnabled ? "auto-negotiation-section--active" : ""}`}>
+        <section className={`settings-section settings-section--wide ${dailyDigestEnabled ? "settings-section--active" : ""}`}>
           <div className="settings-section-heading">
             <div className="settings-symbol settings-symbol--blue">
               <Clock3 size={18} />
@@ -705,7 +571,7 @@ export default function SettingsPage({
               {settingsLoaded ? dailyDigestEnabled ? "Enabled" : "Off" : "Loading…"}
             </span>
           </div>
-          <label className="auto-negotiation-toggle">
+          <label className="settings-toggle">
             <input type="checkbox" checked={dailyDigestEnabled} disabled={!settingsLoaded || saving} onChange={(event) => setDailyDigestEnabled(event.target.checked)} />
             <span>
               <strong>Send a daily digest</strong>

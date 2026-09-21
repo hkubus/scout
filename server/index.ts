@@ -52,7 +52,7 @@ app.addHook('onRequest', async (request, reply) => {
   const isEvents = url === '/events';
   if (!isApi && !isEvents) return;
 
-  const expensive = /\/search$|\/scan$|\/scans$|\/negotiate(?:\/draft)?$|\/recommendation$|\/normalize-listing$|\/compare-verification$|\/snapshot$|\/snapshot-images\/|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$/.test(url);
+  const expensive = /\/search$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/snapshot-images\/|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$/.test(url);
   const limit = expensive ? 30 : 240;
   const bucket = rateLimiter.consume(`${request.ip}:${expensive ? 'expensive' : url}`, limit);
   reply.header('X-RateLimit-Limit', String(limit));
@@ -112,57 +112,10 @@ app.get('/api/listing-detail', async (request, reply) => {
   if (!parsed.success) return reply.code(400).send({ error: 'A listing key is required' });
   return service.listingDetail(parsed.data.key, parsed.data.watchId);
 });
-app.post('/api/ai/normalize-listing', async (request, reply) => {
-  const parsed = z.object({ key: z.string().min(3).max(500), force: z.boolean().optional().default(false) }).strict().safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: 'A valid listing key is required' });
-  return service.normalizeListingByKey(parsed.data.key, parsed.data.force);
-});
 app.post('/api/ai/compare-verification', async (request, reply) => {
   const parsed = z.object({ key: z.string().min(3).max(500) }).strict().safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: 'A valid listing key is required' });
   return service.compareVerificationByKey(parsed.data.key);
-});
-app.get('/api/messages', async (request, reply) => {
-  const parsed = z.object({ page: z.coerce.number().int().min(1).optional().default(1), pageSize: z.coerce.number().int().min(1).max(200).optional().default(100) }).strict().safeParse(request.query);
-  if (!parsed.success) return reply.code(400).send({ error: 'Invalid message history pagination' });
-  return service.messagesPage(parsed.data);
-});
-app.post('/api/negotiation/recommendation', async (request, reply) => {
-  const parsed = z.object({
-    key: z.string().min(3).max(500),
-    maxTotalCost: z.number().positive().nullable().optional().default(null),
-    shippingCost: z.number().nonnegative().optional().default(0),
-    otherCosts: z.number().nonnegative().optional().default(0),
-  }).strict().safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: 'A valid listing key, maximum total cost, and non-negative known costs are required' });
-  const { key, maxTotalCost, shippingCost, otherCosts } = parsed.data;
-  return service.recommendNegotiationPriceByKey(key, maxTotalCost, shippingCost, otherCosts);
-});
-const negotiationInput = z.object({
-  key: z.string().min(3).max(500),
-  offerPrice: z.number().positive().nullable().optional().default(null),
-  maxTotalCost: z.number().positive().nullable().optional().default(null),
-  shippingCost: z.number().nonnegative().optional().default(0),
-  otherCosts: z.number().nonnegative().optional().default(0),
-}).strict();
-app.post('/api/ai/negotiate/draft', async (request, reply) => {
-  const parsed = negotiationInput.safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: 'A valid listing key and optional opening offer are required' });
-  const budget = parsed.data.maxTotalCost === null ? undefined : { maxTotalCost: parsed.data.maxTotalCost, shippingCost: parsed.data.shippingCost, otherCosts: parsed.data.otherCosts };
-  return service.draftNegotiationByKey(parsed.data.key, parsed.data.offerPrice, budget);
-});
-app.post('/api/ai/negotiate', async (request, reply) => {
-  const parsed = z.object({
-    key: z.string().min(3).max(500),
-    offerPrice: z.number().positive().nullable().optional().default(null),
-    maxTotalCost: z.number().positive().nullable().optional().default(null),
-    shippingCost: z.number().nonnegative().optional().default(0),
-    otherCosts: z.number().nonnegative().optional().default(0),
-    message: z.string().trim().min(1).max(600).optional(),
-  }).strict().safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: 'A valid listing key and optional opening offer are required' });
-  const budget = parsed.data.maxTotalCost === null ? undefined : { maxTotalCost: parsed.data.maxTotalCost, shippingCost: parsed.data.shippingCost, otherCosts: parsed.data.otherCosts };
-  return reply.code(201).send(await service.negotiateAndSendByKey(parsed.data.key, parsed.data.offerPrice, budget, 'manual', parsed.data.message));
 });
 app.get('/api/listing-actions', async (request, reply) => {
   const parsed = z.object({ key: z.string().min(3).max(500) }).safeParse(request.query);
@@ -519,16 +472,6 @@ const settingsInput = z.object({
     apiKey: z.string().max(512).optional(),
     clearApiKey: z.boolean().optional(),
     model: z.string().trim().max(200).optional(),
-  }).strict().optional(),
-  negotiationUseBand: z.boolean().optional(),
-  autoNegotiation: z.object({
-    enabled: z.boolean().optional(),
-    maxTotalCost: z.number().positive().nullable().optional(),
-    shippingCost: z.number().nonnegative().optional(),
-    otherCosts: z.number().nonnegative().optional(),
-    minimumDiscountPercent: z.number().min(18).max(80).optional(),
-    openingDiscountPercent: z.number().min(1).max(50).optional(),
-    dailyLimit: z.number().int().min(1).max(50).optional(),
   }).strict().optional(),
 }).strict();
 

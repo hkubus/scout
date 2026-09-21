@@ -1,8 +1,8 @@
 # Replacing Playwright scraping with marketplace APIs
 
 **Status:** design / implementation briefing for an agent.
-**Scope:** replace the Chromium/`playwright-core` **runtime scraping** of marketplace listings with HTTP APIs (or plain HTTP where no API exists). Read-only monitoring first.
-**Out of scope (per owner):** seller messaging / auto-negotiation. Do **not** touch `server/olx-messaging.ts`, `server/allegro-messaging.ts`, `sendMarketplaceMessage`, or the messenger-only `marketplace-login.ts` session capture in this effort. (Their Chromium dependency is a separate, later problem.)
+**Scope:** replace the Chromium/`playwright-core` **runtime scraping** of marketplace listings with HTTP APIs (or plain HTTP where no API exists). Read-only monitoring only.
+**Out of scope (per owner):** authenticated session capture. Do **not** touch the `marketplace-login.ts` session capture in this effort. (Its Chromium dependency is a separate, later problem.)
 
 ## Repo facts
 
@@ -16,7 +16,7 @@
 - `fetchPublicPage` (`server/service.ts` ~2162) tries plain `fetch` first, then falls back to `renderPublicPage` (`~2233`) on **403/429** or when a **marketplace session** is imported. `renderPublicPage` is the Chromium path (`chromium.connectOverCDP(SCOUT_BROWSER_WS)` or `chromium.launch(...)`).
 - Parser/normalization code (do not change behavior): `parseSearchPage`, `parseListingAvailability`, `normalizeListing`, `parseOlxCards`/`parseAllegroCards`/`parseVintedCards`, `buildMarketplaceSearchUrl`, normalizers in `server/marketplaces.ts`.
 
-**Key insight (verified):** with no imported session, OLX and Allegro Lokalnie search/detail already work over plain HTTP (no browser). Chromium is only on the hot path for (a) imported sessions, (b) bot-challenge fallback, (c) Vinted SPA rendering, (d) messaging. After this change, OLX no longer needs Chromium for anything.
+**Key insight (verified):** with no imported session, OLX and Allegro Lokalnie search/detail already work over plain HTTP (no browser). Chromium is only on the hot path for (a) imported sessions, (b) bot-challenge fallback, and (c) Vinted SPA rendering. After this change, OLX no longer needs Chromium for anything.
 
 **Update 2026-08-31 (researched, live-tested):** anonymous JSON paths were also found for **Allegro Lokalnie** (undocumented `allegrolokalnie.pl/api/*` + JSON-LD embedded in search HTML) and **Vinted** (`/api/v2/catalog/items` with a one-request anonymous cookie bootstrap). The claims below in "Scope of remaining marketplaces" that said otherwise are outdated — see the two new sections after the OLX one.
 

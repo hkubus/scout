@@ -1,30 +1,9 @@
 export type Theme = 'light' | 'dark' | 'system';
-export type View = 'overview' | 'search' | 'watches' | 'market-research' | 'analytics' | 'listings' | 'messages' | 'connectors' | 'logs' | 'settings';
+export type View = 'overview' | 'search' | 'watches' | 'market-research' | 'analytics' | 'listings' | 'connectors' | 'logs' | 'settings';
 export type Marketplace = 'OLX' | 'Allegro Lokalnie' | 'Vinted';
 export type DealLabel = 'Exceptional' | 'Very strong' | 'Strong' | 'Watch';
 export type NotificationPriority = 'strong' | 'very-strong' | 'exceptional';
 export type ListingDecision = 'buy' | 'watch' | 'pass';
-
-export type ListingNormalizationCondition = 'new' | 'like-new' | 'very-good' | 'good' | 'acceptable' | 'for-parts' | 'unknown';
-
-export interface ListingNormalizationAttribute {
-  name: string;
-  value: string;
-}
-
-export interface ListingNormalization {
-  canonicalTitle: string;
-  category: string;
-  brand: string | null;
-  model: string | null;
-  variant: string | null;
-  attributes: ListingNormalizationAttribute[];
-  condition: ListingNormalizationCondition;
-  conditionNotes: string[];
-  flags: string[];
-  confidence: number;
-  evidence: string[];
-}
 
 export type ListingDescriptionVerificationDecision = 'pass' | 'reject' | 'unknown';
 export type ListingDescriptionVerificationStatus = ListingDescriptionVerificationDecision | 'pending' | 'not-configured' | 'fallback';
@@ -80,9 +59,6 @@ export interface Listing {
   note?: string;
   /** True when the watch's AI relevance filter classified this listing as irrelevant. Shown greyed-out on overview. */
   aiFiltered?: boolean;
-  aiNormalization?: ListingNormalization | null;
-  aiNormalizationAt?: string | null;
-  aiNormalizationError?: string | null;
   aiDescriptionVerification?: ListingDescriptionVerification | null;
   aiDescriptionVerificationAt?: string | null;
   aiDescriptionVerificationStatus?: ListingDescriptionVerificationStatus | null;
@@ -137,53 +113,6 @@ export interface VerificationComparison {
   llmModel: string;
   jev: { ok: true; judgment: { decision: string; confidence: number | null; unsure: boolean }; raw: unknown } | { ok: false; error: string };
   llm: { ok: true; verification: ListingDescriptionVerification; raw: unknown } | { ok: false; error: string };
-}
-
-export type SellerMessageStatus = 'sent' | 'failed';
-export type SellerMessageSource = 'manual' | 'automatic';
-
-export interface SellerMessage {
-  id: number;
-  marketplace: Marketplace;
-  listingId: string;
-  listingTitle: string;
-  listingUrl: string;
-  message: string;
-  offerPrice: number | null;
-  model: string;
-  source: SellerMessageSource;
-  status: SellerMessageStatus;
-  error: string | null;
-  createdAt: string;
-  sentAt: string | null;
-}
-
-export interface NegotiationResult {
-  message: SellerMessage;
-}
-
-export interface NegotiationDraft {
-  message: string;
-  model: string;
-  askingPrice: number;
-  offerPrice: number | null;
-  marketplace: Marketplace;
-  listingId: string;
-  title: string;
-}
-
-export type NegotiationRecommendationStatus = 'ready' | 'budget-required' | 'not-negotiable' | 'manual-review' | 'budget-too-low' | 'no-room';
-
-export interface NegotiationRecommendation {
-  status: NegotiationRecommendationStatus;
-  askingPrice: number;
-  maxTotalCost: number | null;
-  knownCosts: number;
-  ceilingPrice: number | null;
-  openingOffer: number | null;
-  counterOffers: number[];
-  openingDiscountPercent: number | null;
-  rationale: string;
 }
 
 export interface Watch {
@@ -308,13 +237,6 @@ export interface AnalyticsTriage {
   none: number;
 }
 
-export interface AnalyticsNegotiation {
-  offersSent: number;
-  successRate: number | null;
-  automatic: number;
-  averageDiscountPercent: number | null;
-}
-
 export interface AnalyticsAiQuality {
   relevanceJudged: number;
   relevancePassRate: number | null;
@@ -333,7 +255,6 @@ export interface AnalyticsData {
   watchLeaderboard: AnalyticsWatchLeaderboardRow[];
   marketplaceComparison: AnalyticsMarketplaceRow[];
   triage: AnalyticsTriage;
-  negotiation: AnalyticsNegotiation;
   aiQuality: AnalyticsAiQuality;
 }
 
@@ -534,9 +455,6 @@ export interface SettingsData {
   dailyDigest: DailyDigestSettings;
   ntfy: NtfySettings;
   ai: AiSettings;
-  autoNegotiation: AutoNegotiationSettings;
-  /** Cap negotiation ceilings with the reference series' probable-sale band (opt-in). */
-  negotiationUseBand: boolean;
   publicExposureWarning: boolean;
   marketplaceSessions: MarketplaceSession[];
 }
@@ -553,18 +471,6 @@ export interface AiSettings {
   configured: boolean;
   model: string;
   source: 'settings' | 'environment' | 'none';
-}
-
-export interface AutoNegotiationSettings {
-  enabled: boolean;
-  maxTotalCost: number | null;
-  shippingCost: number;
-  otherCosts: number;
-  minimumDiscountPercent: number;
-  openingDiscountPercent: number;
-  dailyLimit: number;
-  sentToday: number;
-  attemptedToday: number;
 }
 
 export interface NtfySettings {

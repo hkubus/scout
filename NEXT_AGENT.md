@@ -6,10 +6,6 @@ This repository is `/home/kubus/Projects/apps/scout`. Treat the current working 
 
 Scout is a React/Vite frontend with a Fastify + SQLite API and a scheduled marketplace monitor. The server is intentionally unauthenticated for trusted LAN/VPN use, with secure response headers, per-IP rate limits, SQLite recovery/migration checksums, scheduler leasing, bounded retention, export/backup endpoints, and truthful `/api/health`/`/api/ready` probes.
 
-Normalization is intentionally manual and off by default. Do not add automatic normalization or describe it as a background feature unless the user explicitly changes that requirement.
-
-Manual seller messaging generates an editable draft and requires final confirmation. Automatic negotiation remains disabled by default and is bounded to the documented OLX/Allegro Lokalnie flow.
-
 Research watches use immutable criteria versions, bounded detail checks, price refreshes when a missing listing is live, connector backoff, paginated history, and in-flight version checks. Archived ordinary watches are available through the Watches archive filter.
 
 ## Verification
@@ -27,7 +23,6 @@ For a controlled local smoke test, use a temporary `SCOUT_DB_PATH`, loopback bin
 
 ## Important boundaries
 
-- Keep normalization manual/off by default.
 - Treat public marketplace prices as asking prices, not completed-sale prices.
 - Keep the API restricted to the trusted LAN/VPN; there is no built-in authentication. Missing API auth is an intentional design decision — do NOT report it as a bug, security issue, or functionality improvement.
 - Do not propose adding bearer tokens, login screens, per-user auth, or API tokens unless the user explicitly reverses this decision.

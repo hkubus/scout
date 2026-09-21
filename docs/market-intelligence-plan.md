@@ -1,13 +1,12 @@
 # Scout — Market Intelligence implementation plan
 
 Handoff plan for an implementing agent. Written 2026-09-01 against the current tree (main @ e1d0113).
-Read `NEXT_AGENT.md` and the README sections on market research, preserved copies, and negotiation before starting.
+Read `NEXT_AGENT.md` and the README sections on market research and preserved copies before starting.
 All line references were verified against the tree at planning time; expect drift — re-grep before editing.
 
 ## Ground rules (non-negotiable)
 
 - **Language boundary:** Scout never claims confirmed/completed-sale prices. Everything derived from disappeared listings is a **"probable sale"** estimate. UI copy, API field names, and docs must say "probable sale" / "estimated band", never "sold price".
-- **Normalization stays manual.** Never auto-trigger `normalizeStoredListing()`; only *read* already-stored `listings.ai_normalization_json`.
 - **One page per source per scan.** Any new search fetches (typo variants) must respect the single-page budget (`fetchSearchPages()`, service.ts:1459-1471) and stay within connector backoff rules.
 - **Deterministic scoring first.** AI output never changes price scoring. Band-based scoring changes are deterministic and gated behind explicit opt-ins (Milestone 5).
 - **Migrations:** files are `migrations/NNN_description.sql`, auto-discovered and checksummed (`openDatabase()`, server/db.ts:10-155; checksum mismatch throws, db.ts:71-76). **Never edit an already-applied migration** — allocate the next number in implementation order and renumber the plan's suggestions accordingly (this plan proposes 014–016 in milestone order 2, 5, 6).
@@ -22,14 +21,13 @@ All line references were verified against the tree at planning time; expect drif
 | Missing-listing verification (3-check threshold) | `marketStatusAfterMiss()` service.ts:118-121; terminal rows get `status='ended'`, `availability_status='terminal'`, `ended_reason` (service.ts:1780) |
 | **Existing median estimate (crude)** | `estimatedMedianPrice` = median of `last_price_pln` of **all** ended listings, no staleness filter — service.ts:1552-1580 (`marketResearchData()`) |
 | Deal scoring | `scoreDeal()` scoring.ts:21-39 (median typical, robust deviation, `qualifies` gate); deal labels service.ts:2738-2739; baseline from `watchBaseline()` service.ts:2689-2717; typical stored in `watch_listings.typical_pln` |
-| Negotiation math (pure) | `recommendNegotiationPrice()` negotiation.ts:65-129, input type negotiation.ts:9-16; call site `recommendNegotiationPriceByKey()` service.ts:1288-1307 |
 | Normalized connector listing | `NormalizedListing` marketplaces.ts:3-16 (marketplace, listingId, title, price, url, imageUrl?, condition?, location?, shippingAvailable?, priceNegotiable?, observedAt); image CDN identity key `imageIdentityKey()` marketplaces.ts:482 |
 | Deal-watch analytics UI (the chart/band reference) | `WatchAnalyticsDialog` + `AnalyticsTrendChart` WatchesPage.tsx:411-549 (SVG, shaded p25–p75 band, median polyline); data from `GET /api/watches/:id/analytics` (index.ts:182) |
 | Drawer sparkline reference | `PriceSparkline` ListingDetailDrawer.tsx:49-76, fed by `detail.history` (`PriceHistoryPoint[]`) |
 | Research UI | `MarketResearchPage.tsx` — cards with Tracked/Ended/Median-estimate metrics (:232-242), saved-listings table (:270-313), snapshot modal (:315-434), `MarketWatchDialog` (:443-511, **no preset mechanism yet**) |
 | Deal-watch prefill mechanism | `WatchPreset` type (Dialogs.tsx:18-28) + SearchPage "Save as watch" → App.tsx:493 `setWatchPreset` → `LazyWatchDialog preset=` (App.tsx:568); dialog state falls back to preset fields (Dialogs.tsx:44-60) |
 | API conventions | Flat `/api/...` in server/index.ts, zod-validated; expensive-route rate-limit regex index.ts:54; SSE via `emit` callback (events incl. `market-watch`, `watch`) |
-| Tests | `node:test` via tsx (`npm test`); pure-math pattern tests/negotiation.test.ts; integration pattern tests/service.test.ts:7-14 (tmpdir + `openDatabase` + `ScoutService` with injectable fakes) |
+| Tests | `node:test` via tsx (`npm test`); integration pattern tests/service.test.ts:7-14 (tmpdir + `openDatabase` + `ScoutService` with injectable fakes) |
 
 ---
 
@@ -38,9 +36,9 @@ All line references were verified against the tree at planning time; expect drif
 **Goal:** one click from any listing to a pre-filled deal watch or research watch.
 
 1. New pure builders in `src/presets.ts`:
-   - `watchPresetFromListing(listing: Listing): WatchPreset` — query from `aiNormalization?.canonicalTitle ?? listing.title` (strip price/location-looking tokens, collapse whitespace); put `brand`/`model` into `terms` when present; `sources: [listing.marketplace]`; `location` from listing; `minPrice/maxPrice` = ±25% around `listing.price` rounded to 5; `shippingOnly: listing.shippingAvailable === true`.
+   - `watchPresetFromListing(listing: Listing): WatchPreset` — query from `listing.title` (strip price/location-looking tokens, collapse whitespace); `sources: [listing.marketplace]`; `location` from listing; `minPrice/maxPrice` = ±25% around `listing.price` rounded to 5; `shippingOnly: listing.shippingAvailable === true`.
    - `marketWatchInputFromListing(listing: MarketTrackedListing): MarketWatchInput` — same shape for research watches.
-   - **Only use stored `aiNormalization`**; never call the API to enrich.
+   - Builders are deterministic and side-effect free; never call the API to enrich.
 2. Deal-watch path: add optional `onCreateWatch?: (preset: WatchPreset) => void` prop to `ListingDetailDrawer` (ListingDetailDrawer.tsx:78-86), render a "Save as watch" action near the triage section; wire in App.tsx:595-603 to the existing `setWatchPreset(preset); setShowWatchDialog(true)` flow (same as App.tsx:493).
 3. Research-watch path: give `MarketWatchDialog` (MarketResearchPage.tsx:443-511) a `preset?: MarketWatchInput | null` prop and fall back to it in form-state init (copy the pattern from Dialogs.tsx:44-60). Add a row action in `MarketResearchTable` and a button in `MarketListingSnapshotModal` footer that opens the dialog with the preset. Keep the dialog's existing "changing criteria starts a new series" copy.
 
@@ -114,9 +112,9 @@ All line references were verified against the tree at planning time; expect drif
 
 ---
 
-## Milestone 5 — Band integration (opt-in): deal ranking + negotiation (migration 015)
+## Milestone 5 — Band integration (opt-in): deal ranking (migration 015)
 
-**Goal:** let the user connect a deal watch to a research series so the probable-sale band seeds ranking before the watch's own history is ready, and optionally caps negotiation. **Everything here is opt-in and off by default.**
+**Goal:** let the user connect a deal watch to a research series so the probable-sale band seeds ranking before the watch's own history is ready. **Everything here is opt-in and off by default.**
 
 1. Migration `015_reference_series.sql`:
    - `ALTER TABLE watches ADD COLUMN reference_market_watch_id TEXT REFERENCES market_watches(id);`
@@ -125,14 +123,11 @@ All line references were verified against the tree at planning time; expect drif
    - Extend `scoreDeal()` options (scoring.ts:21-39) with `typicalOverride?: number` (pure, tested).
    - In `storeListing()` (service.ts:2719-2741): if the watch has a reference series, the band has ≥ 4 eligible samples, and the listing's own observation count is below `BASELINE_MIN_SAMPLES` (30), pass the band median as `typicalOverride` and set `watch_listings.typical_source = 'reference-band'`; once own samples ≥ 30, own history always wins (`typical_source = 'own-history'`).
    - **Recommended (and default) semantics:** the fallback typical improves *ranking/display only* — the `qualifies` readiness gate (30 samples + 6 h, scoring.ts:37) is unchanged, so no new alerts fire earlier than today. Do not loosen the readiness gate without asking the user first.
-3. Negotiation (separate setting, default off — settings key `negotiation_use_band`):
-   - `recommendNegotiationPrice()` (negotiation.ts:65-129): add optional `fairPriceBand?: { low: number; high: number }` to `NegotiationRecommendationInput` (negotiation.ts:9-16); when present, `ceilingPrice = min(existing ceiling, band.high)`. Opening-offer math and counter-offers recompute from the resulting room; rationale string mentions the cap.
-   - Wire from `recommendNegotiationPriceByKey()` (service.ts:1288-1307) when the listing's watch has a reference series and the setting is on. Since the cap only *tightens* the buyer's ceiling, letting it apply to bounded automatic negotiation (`automaticallyNegotiate()` service.ts:1423-1440) is safe when the setting is on — note this in the Settings copy.
-4. API/types/UI: `referenceMarketWatchId` on `Watch` + WatchDialog select ("Use research series as fallback baseline", listing research watches) + PATCH keys; SettingsPage toggle for `negotiation_use_band`; ListingTable/drawer chip "series baseline" when `typicalSource === 'reference-band'` (add to `Listing` types).
+4. API/types/UI: `referenceMarketWatchId` on `Watch` + WatchDialog select ("Use research series as fallback baseline", listing research watches) + PATCH keys; ListingTable/drawer chip "series baseline" when `typicalSource === 'reference-band'` (add to `Listing` types).
 
-**Tests:** `typicalOverride` cases in the scoring test file; negotiation band-cap cases in tests/negotiation.test.ts (ceiling below asking, band above asking → unchanged, opening floor still respected); service test that a fresh listing under a reference-series watch shows `typical_source='reference-band'` and that a 30+ sample listing ignores it.
+**Tests:** `typicalOverride` cases in the scoring test file; service test that a fresh listing under a reference-series watch shows `typical_source='reference-band'` and that a 30+ sample listing ignores it.
 
-**Files:** migrations/015, scoring.ts, negotiation.ts, service.ts, index.ts, src/types.ts, src/api.ts, src/Dialogs.tsx, src/SettingsPage.tsx, src/ListingTable.tsx, src/ListingDetailDrawer.tsx; scoring/negotiation/service tests.
+**Files:** migrations/015, scoring.ts, service.ts, index.ts, src/types.ts, src/api.ts, src/Dialogs.tsx, src/ListingTable.tsx, src/ListingDetailDrawer.tsx; scoring/service tests.
 
 ---
 
@@ -177,5 +172,4 @@ Each milestone is one reviewable unit: branch per milestone, run `npm run typech
 ## Open decisions logged for the user (do not resolve silently)
 
 1. Whether the reference-band fallback may ever loosen the alert readiness gate (plan assumes: no).
-2. Whether the negotiation band cap may apply to bounded automatic negotiation when `negotiation_use_band` is on (plan assumes: yes, it only tightens).
-3. Whether `estimatedMedianPrice` stays exposed alongside `saleBand` or is replaced in the UI (plan: keep field one release, replace UI label with "Probable-sale median").
+2. Whether `estimatedMedianPrice` stays exposed alongside `saleBand` or is replaced in the UI (plan: keep field one release, replace UI label with "Probable-sale median").

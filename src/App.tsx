@@ -9,7 +9,6 @@ import {
   Grid2X2,
   Info,
   LoaderCircle,
-  MessageSquare,
   Menu,
   PanelLeftClose,
   PanelLeftOpen,
@@ -45,13 +44,11 @@ const navItems: Array<{ id: View; label: string; icon: typeof Grid2X2 }> = [
   { id: "market-research", label: "Market research", icon: BarChart3 },
   { id: "analytics", label: "Analytics", icon: TrendingUp },
   { id: "listings", label: "Listings", icon: Tag },
-  { id: "messages", label: "Messages", icon: MessageSquare },
   { id: "connectors", label: "Connectors", icon: PlugZap },
   { id: "logs", label: "Logs", icon: ScrollText },
   { id: "settings", label: "Settings", icon: Settings2 },
 ];
 
-const loadMessagesPage = () => import("./MessagesPage");
 const loadMarketResearchPage = () => import("./MarketResearchPage");
 const loadAnalyticsPage = () => import("./AnalyticsPage");
 const loadSettingsPage = () => import("./SettingsPage");
@@ -59,7 +56,6 @@ const loadConnectorsPage = () => import("./ConnectorsPage");
 const loadLogsPage = () => import("./LogsPage");
 const loadSearchPage = () => import("./SearchPage");
 const loadListingsPage = () => import("./ListingsPage");
-const LazyMessagesPage = lazy(loadMessagesPage);
 const LazyMarketResearchPage = lazy(loadMarketResearchPage);
 const LazyAnalyticsPage = lazy(loadAnalyticsPage);
 const LazySettingsPage = lazy(loadSettingsPage);
@@ -82,7 +78,6 @@ const routeLoaders: Partial<Record<View, () => Promise<unknown>>> = {
   "market-research": loadMarketResearchPage,
   analytics: loadAnalyticsPage,
   listings: loadListingsPage,
-  messages: loadMessagesPage,
   connectors: loadConnectorsPage,
   logs: loadLogsPage,
   settings: loadSettingsPage,
@@ -141,7 +136,6 @@ function App() {
   const [showHistory, setShowHistory] = useState(false);
   const [marketRefreshKey, setMarketRefreshKey] = useState(0);
   const [analyticsRefreshKey, setAnalyticsRefreshKey] = useState(0);
-  const [messagesRefreshKey, setMessagesRefreshKey] = useState(0);
   const [logsRefreshKey, setLogsRefreshKey] = useState(0);
   const [selectedWatchId, setSelectedWatchId] = useState<string | null>(
     null,
@@ -203,10 +197,8 @@ function App() {
     source.addEventListener("watch", refresh);
     source.addEventListener("notification", refresh);
     source.addEventListener("listing-action", refresh);
-    source.addEventListener("ai-normalization", refresh);
     source.addEventListener("ai-description-verification", refresh);
     source.addEventListener("market-watch", () => { setMarketRefreshKey((value) => value + 1); setAnalyticsRefreshKey((value) => value + 1); });
-    source.addEventListener("seller-message", () => { setMessagesRefreshKey((value) => value + 1); setAnalyticsRefreshKey((value) => value + 1); });
     source.addEventListener("log", () => setLogsRefreshKey((value) => value + 1));
     source.onerror = () => setConnection("offline");
     return () => {
@@ -532,11 +524,6 @@ function App() {
               onClearWatch={() => setSelectedWatchId(null)}
               onSelectListing={setSelectedListing}
             />
-          </Suspense>
-        ) : null}
-        {view === "messages" ? (
-          <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading messages…</div>}>
-            <LazyMessagesPage refreshKey={messagesRefreshKey} />
           </Suspense>
         ) : null}
         {view === "connectors" ? (
