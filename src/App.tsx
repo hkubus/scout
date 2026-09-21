@@ -423,14 +423,28 @@ function App() {
       ...previous,
       listings: previous.listings.map((item) =>
         item.id === listing.id
-          ? { ...item, decision: listing.decision, note: listing.note }
+          ? { ...item, decision: listing.decision, note: listing.note, hidden: listing.hidden }
           : item,
       ),
     }));
     setSelectedListing((current) =>
-      current?.id === listing.id ? { ...current, decision: listing.decision, note: listing.note } : current,
+      current?.id === listing.id ? { ...current, decision: listing.decision, note: listing.note, hidden: listing.hidden } : current,
     );
   }, []);
+  const toggleListingHidden = useCallback(async (listing: Listing) => {
+    const nextHidden = !listing.hidden;
+    try {
+      const result = await api.updateListingAction(listing.marketplaceListingKey ?? listing.id, {
+        decision: listing.decision ?? null,
+        note: listing.note ?? "",
+        hidden: nextHidden,
+      });
+      updateListingAction({ ...listing, decision: result.action.decision, note: result.action.note, hidden: result.action.hidden });
+      notify(nextHidden ? "Listing hidden from the overview and alerts." : "Listing unhidden.");
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    }
+  }, [notify, updateListingAction]);
 
   return (
     <div className="app-shell">
@@ -480,6 +494,7 @@ function App() {
           onNavigate={openView}
           onScan={() => requestScan()}
           onSelectListing={setSelectedListing}
+          onToggleHidden={toggleListingHidden}
         />
         ) : null}
         {view === "search" ? (
@@ -523,6 +538,7 @@ function App() {
               selectedWatchId={selectedWatchId}
               onClearWatch={() => setSelectedWatchId(null)}
               onSelectListing={setSelectedListing}
+              onToggleHidden={toggleListingHidden}
             />
           </Suspense>
         ) : null}
@@ -716,6 +732,7 @@ function Overview({
   onNavigate,
   onScan,
   onSelectListing,
+  onToggleHidden,
 }: {
   data: DashboardData;
   isLoading: boolean;
@@ -724,6 +741,7 @@ function Overview({
   onNavigate: (view: View) => void;
   onScan: () => void;
   onSelectListing: (listing: Listing) => void;
+  onToggleHidden: (listing: Listing) => void;
 }) {
   const [marketplace, setMarketplace] = useState<"All" | Marketplace>("All");
   const [strength, setStrength] = useState<"All" | "Strong" | "Exceptional">(
@@ -733,6 +751,7 @@ function Overview({
   const visibleListings = useMemo(
     () =>
       data.listings
+        .filter((listing) => !listing.hidden)
         .filter(
           (listing) =>
             marketplace === "All" || listing.marketplace === marketplace,
@@ -870,6 +889,7 @@ function Overview({
           isLoading={isLoading}
           compact
           onSelect={onSelectListing}
+          onToggleHidden={onToggleHidden}
         />
         <div className="section-footer">
           <button

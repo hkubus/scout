@@ -54,6 +54,10 @@ Daily deal digests can be enabled for Discord, ntfy, or both at a configurable s
 
 Any listing drawer offers a `Save as watch` action that opens the deal-watch dialog pre-filled from the listing's stored data: the search phrase comes from the stored AI canonical title (or the cleaned listing title, with price tokens, sale stopwords, and city names removed), brand/model become included terms, the source is preselected, the price range spans ±25% around the asking price, and the shipping requirement follows the listing. Research listings offer the same from their row actions and the preserved-copy dialog. Prefill never triggers an AI request, and every field stays editable before saving.
 
+## Manually hiding listings
+
+Any listing can be hidden with the eye action on its row or the `Hide listing` button in the detail drawer. Hiding is keyed to the marketplace listing, so it removes the offer from the overview and the default Listings feed across every watch, excludes it from the dashboard counters, and suppresses its alerts (including queued immediate alerts and future daily-digest entries) even when the query, title, and description look correct. Hidden rows are kept in the database — history is retained and they can be reviewed or unhidden from the Listings page via the `Hidden only` / `All listings` visibility filter.
+
 ## Market research availability and history
 
 Research snapshots are separate from deal-watch scoring. A valid empty search page is recorded as an empty snapshot; blocked, unsupported, timed-out, or ambiguous markup fails that source snapshot. A listing that disappears from search is verified at its detail URL with low concurrency. Only explicit terminal responses advance the three-check threshold; live detail pages reset the missing count, while unknown checks leave it unchanged. The UI says “no longer available” and retains the last asking price without claiming a confirmed sale.

@@ -6,6 +6,8 @@ import {
   Check,
   CheckCircle2,
   ExternalLink,
+  Eye,
+  EyeOff,
   Info,
   LoaderCircle,
   Scale,
@@ -60,12 +62,13 @@ export default function ListingDetailDrawer({
   const [detail, setDetail] = useState<ListingDetail>({
     listing,
     history: [],
-    action: { decision: listing.decision ?? null, note: listing.note ?? '', updatedAt: null },
+    action: { decision: listing.decision ?? null, note: listing.note ?? '', hidden: listing.hidden ?? false, updatedAt: null },
     firstSeenAt: listing.observedAt,
     lastSeenAt: listing.observedAt,
   });
   const [decision, setDecision] = useState<ListingDecision | null>(listing.decision ?? null);
   const [note, setNote] = useState(listing.note ?? "");
+  const [hidden, setHidden] = useState(listing.hidden ?? false);
   const [shippingCost, setShippingCost] = useState("");
   const [extraCost, setExtraCost] = useState("");
   const [resalePrice, setResalePrice] = useState(listing.typical === null ? "" : String(listing.typical));
@@ -93,13 +96,14 @@ export default function ListingDetailDrawer({
     const fallback: ListingDetail = {
       listing,
       history: [],
-      action: { decision: listing.decision ?? null, note: listing.note ?? '', updatedAt: null },
+      action: { decision: listing.decision ?? null, note: listing.note ?? '', hidden: listing.hidden ?? false, updatedAt: null },
       firstSeenAt: listing.observedAt,
       lastSeenAt: listing.observedAt,
     };
     setDetail(fallback);
     setDecision(listing.decision ?? null);
     setNote(listing.note ?? "");
+    setHidden(listing.hidden ?? false);
     setResalePrice(listing.typical === null ? "" : String(listing.typical));
     setShippingCost("");
     setExtraCost("");
@@ -115,6 +119,7 @@ export default function ListingDetailDrawer({
         setDetail(result);
         setDecision(result.action.decision);
         setNote(result.action.note);
+        setHidden(result.action.hidden);
         if (result.listing.typical !== null) setResalePrice(String(result.listing.typical));
       })
       .catch(async () => {
@@ -125,6 +130,7 @@ export default function ListingDetailDrawer({
           setDetail((current) => ({ ...current, action }));
           setDecision(action.decision);
           setNote(action.note);
+          setHidden(action.hidden);
         } catch {
           // The listing itself remains useful when the API is offline or the result is not stored.
         }
@@ -145,15 +151,16 @@ export default function ListingDetailDrawer({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose, saving]);
 
-  const saveAction = async (nextDecision = decision) => {
+  const saveAction = async (nextDecision = decision, nextHidden = hidden) => {
     setSaving(true);
     setError(null);
     try {
-      const result = await api.updateListingAction(marketplaceListingKey, { decision: nextDecision, note });
-      const updatedListing = { ...detail.listing, decision: result.action.decision, note: result.action.note };
+      const result = await api.updateListingAction(marketplaceListingKey, { decision: nextDecision, note, hidden: nextHidden });
+      const updatedListing = { ...detail.listing, decision: result.action.decision, note: result.action.note, hidden: result.action.hidden };
       setDetail((current) => ({ ...current, listing: updatedListing, action: result.action }));
       setDecision(result.action.decision);
       setNote(result.action.note);
+      setHidden(result.action.hidden);
       onUpdated(updatedListing);
     } catch (saveError) {
       setError(errorMessage(saveError));
@@ -279,6 +286,7 @@ export default function ListingDetailDrawer({
           <section className="drawer-section drawer-section--decision">
             <div className="drawer-section-heading">
               <div><span className="drawer-section-kicker">Triage</span><h3>What do you want to do?</h3></div>
+              {hidden ? <span className="decision-chip decision-chip--hidden"><EyeOff size={11} />Hidden</span> : null}
               {decision ? <span className={`decision-chip decision-chip--${decision}`}>{decision === "buy" ? "Buy" : decision === "watch" ? "Watch" : "Pass"}</span> : null}
             </div>
             <div className="decision-grid">
@@ -299,6 +307,16 @@ export default function ListingDetailDrawer({
               })}
             </div>
             {decision ? <button className="clear-decision" type="button" disabled={saving} onClick={() => void saveAction(null)}>Clear decision</button> : null}
+            <button
+              className="outline-button drawer-save-note"
+              type="button"
+              disabled={saving}
+              title={hidden ? "Show this listing again in the overview and alerts" : "Remove this listing from the overview and alerts without deleting its history"}
+              onClick={() => void saveAction(decision, !hidden)}
+            >
+              {saving ? <LoaderCircle size={15} className="spin" /> : hidden ? <Eye size={15} /> : <EyeOff size={15} />}
+              {hidden ? "Unhide listing" : "Hide listing"}
+            </button>
             {onCreateWatch ? (
               <button className="outline-button drawer-save-note" type="button" onClick={() => onCreateWatch(watchPresetFromListing(currentListing))}>
                 <Bell size={15} />
