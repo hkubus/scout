@@ -201,6 +201,7 @@ export async function verifyListingDescriptionWithVision(
     session_id: VISION_SESSION_VERIFICATION,
     temperature: 0,
     max_tokens: 256,
+    reasoning: { effort: 'none' },
     provider: { require_parameters: true },
     stream: false,
     messages: [
@@ -259,6 +260,7 @@ export async function classifyListingRelevanceWithVision(
     session_id: VISION_SESSION_RELEVANCE,
     temperature: 0,
     max_tokens: 64,
+    reasoning: { effort: 'none' },
     provider: { require_parameters: true },
     stream: false,
     messages: [

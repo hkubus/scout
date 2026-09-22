@@ -221,6 +221,7 @@ test('escalates verification to vision with gallery photos as image parts', asyn
   assert.equal(body.model, 'openai/gpt-4o-mini');
   assert.equal(body.session_id, 'scout:vision-verification:v1');
   assert.equal(body.response_format.json_schema.strict, true);
+  assert.deepEqual(body.reasoning, { effort: 'none' });
   assert.deepEqual(body.provider, { require_parameters: true });
   const parts = body.messages[1].content as Array<Record<string, any>>;
   assert.equal(parts[0].type, 'text');
@@ -230,14 +231,20 @@ test('escalates verification to vision with gallery photos as image parts', asyn
 });
 
 test('tiebreaks unsure relevance through vision with the thumbnail', async () => {
+  let requestInit: RequestInit | undefined;
   const result = await classifyListingRelevanceWithVision(
     { query: 'q', title: 't', condition: null, imageUrl: 'https://img.example/thumb.jpg' },
     { apiKey: 'sk-or-v1-test' },
-    () => Promise.resolve(Response.json({
-      choices: [{ message: { content: JSON.stringify({ relevant: false, confidence: 0.62 }) } }],
-    })),
+    (_input, init) => {
+      requestInit = init;
+      return Promise.resolve(Response.json({
+        choices: [{ message: { content: JSON.stringify({ relevant: false, confidence: 0.62 }) } }],
+      }));
+    },
   );
   assert.deepEqual(result, { relevant: false, confidence: 0.62, imagesSeen: 1 });
+  const body = JSON.parse(String(requestInit?.body)) as Record<string, any>;
+  assert.deepEqual(body.reasoning, { effort: 'none' });
 });
 
 test('rescues term near-misses only on confident pass', async () => {
