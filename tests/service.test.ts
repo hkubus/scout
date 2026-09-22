@@ -506,6 +506,35 @@ test('returns listing price history and persists Buy/Watch/Pass triage actions',
   } finally { context.close(); }
 });
 
+test('hides and unhides a listing without deleting its history', () => {
+  const context = fixture();
+  try {
+    const firstSeen = new Date(Date.now() - 24 * 60 * 60_000).toISOString();
+    const lastSeen = new Date().toISOString();
+    context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run('hidden-watch', 'Hidden watch', 'brakes', '["OLX"]', 1, lastSeen, firstSeen, lastSeen);
+    context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run('OLX', 'hidden-listing', 'Cheap brake pads', 500, 'https://www.olx.pl/d/oferta/hidden-listing', firstSeen, lastSeen);
+    const listing = context.db.prepare('SELECT id FROM listings WHERE listing_id = ?').get('hidden-listing') as { id: number };
+    context.db.prepare('INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)').run('hidden-watch', listing.id, firstSeen, lastSeen);
+
+    assert.equal(context.service.getListings()[0].hidden, false);
+    assert.equal(context.service.dashboard().stats.newToday, 1);
+
+    const hiddenAction = context.service.updateListingAction('OLX:hidden-listing', null, '', true);
+    assert.equal(hiddenAction.hidden, true);
+    assert.equal(context.service.listingAction('OLX:hidden-listing').hidden, true);
+    assert.equal(context.service.getListings()[0].hidden, true);
+    // Hidden listings are excluded from the dashboard counters.
+    assert.equal(context.service.dashboard().stats.newToday, 0);
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM listing_actions WHERE marketplace = ? AND listing_id = ?').get('OLX', 'hidden-listing') as { count: number }).count, 1);
+
+    context.service.updateListingAction('OLX:hidden-listing', null, '', false);
+    assert.equal(context.service.listingAction('OLX:hidden-listing').hidden, false);
+    assert.equal(context.service.getListings()[0].hidden, false);
+    // Unhiding with no decision or note removes the empty action row.
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM listing_actions WHERE marketplace = ? AND listing_id = ?').get('OLX', 'hidden-listing') as { count: number }).count, 0);
+  } finally { context.close(); }
+});
+
 test('fetches and verifies descriptions for very strong and exceptional deals before alerting', async () => {
   let verificationRequests = 0;
   const context = fixture({
@@ -880,7 +909,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '020_drop_messaging_negotiation']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '020_drop_messaging_negotiation', '021_listing_visibility']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1222,7 +1251,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 20);
+    assert.equal(after.migrations.count, 21);
   } finally { context.close(); }
 });
 

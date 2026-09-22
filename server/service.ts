@@ -1746,6 +1746,7 @@ export class ScoutService {
       listingId: String(row.listing_id),
       decision: parseListingDecision(row.listing_decision),
       note: typeof row.listing_note === 'string' ? row.listing_note : '',
+      hidden: row.listing_hidden === undefined ? undefined : Number(row.listing_hidden) === 1,
       aiFiltered: row.ai_filtered === undefined ? undefined : Number(row.ai_filtered) === 1,
       ...(row.ai_description_verification_json !== undefined ? {
         aiDescriptionVerification: parseStoredListingDescriptionVerification(row.ai_description_verification_json),
@@ -2010,7 +2011,7 @@ export class ScoutService {
     const total = Number((this.stmt(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(500, Math.floor(options.pageSize ?? 200)));
-    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note, CASE WHEN ${aiFilteredPredicate} THEN 1 ELSE 0 END AS ai_filtered
+    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note, a.hidden AS listing_hidden, CASE WHEN ${aiFilteredPredicate} THEN 1 ELSE 0 END AS ai_filtered
       FROM listings l
       JOIN watch_listings wl ON wl.listing_id = l.id
       JOIN watches w ON w.id = wl.watch_id
@@ -2028,7 +2029,7 @@ export class ScoutService {
 
   listingDetail(key: string, watchId?: string | null): ListingDetail {
     const { marketplace, listingId } = parseListingKey(key);
-    const row = this.stmt(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, a.decision AS listing_decision, a.note AS listing_note, a.updated_at AS action_updated_at
+    const row = this.stmt(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, a.decision AS listing_decision, a.note AS listing_note, a.hidden AS listing_hidden, a.updated_at AS action_updated_at
       FROM listings l
       LEFT JOIN watch_listings wl ON wl.listing_id = l.id AND (? IS NULL OR wl.watch_id = ?)
       LEFT JOIN watches w ON w.id = wl.watch_id
@@ -2098,7 +2099,7 @@ export class ScoutService {
     return {
       listing,
       history,
-      action: { decision: listing.decision ?? null, note: listing.note ?? '', updatedAt: row.action_updated_at ?? null },
+      action: { decision: listing.decision ?? null, note: listing.note ?? '', hidden: listing.hidden ?? false, updatedAt: row.action_updated_at ?? null },
       descriptionSnapshot,
       firstSeenAt: row.watch_first_seen_at ?? row.first_seen_at,
       lastSeenAt: row.watch_last_seen_at ?? row.last_seen_at,
@@ -2147,21 +2148,21 @@ export class ScoutService {
 
   listingAction(key: string): ListingAction {
     const { marketplace, listingId } = parseListingKey(key);
-    const row = this.stmt('SELECT decision, note, updated_at FROM listing_actions WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as { decision?: unknown; note?: string; updated_at?: string } | undefined;
-    return { decision: parseListingDecision(row?.decision), note: row?.note ?? '', updatedAt: row?.updated_at ?? null };
+    const row = this.stmt('SELECT decision, note, hidden, updated_at FROM listing_actions WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as { decision?: unknown; note?: string; hidden?: number; updated_at?: string } | undefined;
+    return { decision: parseListingDecision(row?.decision), note: row?.note ?? '', hidden: Number(row?.hidden ?? 0) === 1, updatedAt: row?.updated_at ?? null };
   }
 
-  updateListingAction(key: string, decision: ListingDecision | null, note: string): ListingAction {
+  updateListingAction(key: string, decision: ListingDecision | null, note: string, hidden = false): ListingAction {
     const { marketplace, listingId } = parseListingKey(key);
     const safeNote = note.trim().slice(0, 2000);
     const timestamp = nowIso();
-    if (decision === null && !safeNote) {
+    if (decision === null && !safeNote && !hidden) {
       this.stmt('DELETE FROM listing_actions WHERE marketplace = ? AND listing_id = ?').run(marketplace, listingId);
     } else {
-      this.stmt(`INSERT INTO listing_actions (marketplace, listing_id, decision, note, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(marketplace, listing_id) DO UPDATE SET decision = excluded.decision, note = excluded.note, updated_at = excluded.updated_at`).run(marketplace, listingId, decision, safeNote, timestamp);
+      this.stmt(`INSERT INTO listing_actions (marketplace, listing_id, decision, note, hidden, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(marketplace, listing_id) DO UPDATE SET decision = excluded.decision, note = excluded.note, hidden = excluded.hidden, updated_at = excluded.updated_at`).run(marketplace, listingId, decision, safeNote, hidden ? 1 : 0, timestamp);
     }
-    this.emit('listing-action', { key, decision });
-    return { decision, note: safeNote, updatedAt: safeNote || decision ? timestamp : null };
+    this.emit('listing-action', { key, decision, hidden });
+    return { decision, note: safeNote, hidden, updatedAt: safeNote || decision || hidden ? timestamp : null };
   }
 
   /**
@@ -2834,7 +2835,7 @@ export class ScoutService {
     let newToday = 0;
     let strongDeals = 0;
     for (const listing of listings) {
-      if (listing.aiFiltered) continue;
+      if (listing.aiFiltered || listing.hidden) continue;
       if (Date.parse(listing.observedAt) >= todayTime) newToday += 1;
       if (listing.dealStrength >= 4) strongDeals += 1;
     }
@@ -3759,7 +3760,9 @@ export class ScoutService {
     try {
       const candidates = this.stmt(`SELECT c.*, w.name AS watch_name
         FROM daily_digest_candidates c JOIN watches w ON w.id = c.watch_id
-        WHERE c.digest_date IS NULL ORDER BY c.discount_percent DESC, c.observed_at ASC, c.id ASC`).all() as DigestCandidateRow[];
+        WHERE c.digest_date IS NULL
+          AND NOT EXISTS (SELECT 1 FROM listing_actions a WHERE a.marketplace = c.marketplace AND a.listing_id = c.listing_id AND a.hidden = 1)
+        ORDER BY c.discount_percent DESC, c.observed_at ASC, c.id ASC`).all() as DigestCandidateRow[];
       const planned: Array<{ channel: DigestChannel; eventKey: string; payload: Record<string, any> }> = [];
       this.transaction(() => {
         for (const channel of channels) {
@@ -3787,6 +3790,12 @@ export class ScoutService {
     } finally {
       this.digestRunning = false;
     }
+  }
+
+  /** A manually hidden listing never alerts, regardless of its deterministic or AI score. */
+  private isListingHidden(listing: NormalizedListing) {
+    const row = this.stmt('SELECT hidden FROM listing_actions WHERE marketplace = ? AND listing_id = ?').get(listing.marketplace, listing.listingId) as { hidden?: number } | undefined;
+    return Number(row?.hidden ?? 0) === 1;
   }
 
   private notificationEventKey(watchId: string, listing: NormalizedListing, sequence: number, legacy = false) {
@@ -3917,6 +3926,7 @@ export class ScoutService {
     const discountPercent = legacy ? typicalOrDiscount : discountOrConfidence;
     const confidence = legacy ? discountOrConfidence : maybeConfidence!;
     const priority = priorityFromDiscount(discountPercent);
+    if (this.isListingHidden(listing)) return;
     const encryptedDiscord = context?.encryptedDiscord ?? this.getSetting('discord_webhook');
     const ntfy = context?.ntfy ?? this.ntfyConfig();
     const digest = context?.digest ?? this.dailyDigestConfig();
@@ -4000,6 +4010,8 @@ export class ScoutService {
       }
       const meta = this.notificationMeta(payload);
       if (!meta) continue;
+      // A listing hidden after it was queued should not deliver on retry.
+      if (this.isListingHidden(meta.listing)) continue;
       const claim = this.claimNotificationDelivery(String(row.listing_key), row.channel as 'Discord' | 'ntfy');
       if (!claim) continue;
       await this.deliverClaimedNotification({

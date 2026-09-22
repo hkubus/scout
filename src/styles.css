@@ -135,7 +135,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .select-control select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-soft); }
 .select-control svg { position: absolute; right: 11px; pointer-events: none; color: var(--muted); }
 .listing-table-wrap { width: 100%; overflow-x: auto; }
-.listing-table { min-width: 955px; display: grid; grid-template-columns: minmax(300px, 2.55fr) 1.18fr .95fr 1.02fr 1fr .82fr 1.35fr 34px; align-items: center; column-gap: 16px; padding: 10px 14px; }
+.listing-table { min-width: 955px; display: grid; grid-template-columns: minmax(300px, 2.55fr) 1.18fr .95fr 1.02fr 1fr .82fr 1.35fr 60px; align-items: center; column-gap: 16px; padding: 10px 14px; }
 .listing-table--head { min-height: 34px; padding-top: 0; padding-bottom: 6px; color: var(--muted); font-size: 12px; font-weight: 500; }
 .listing-row { min-height: 64px; border-top: 1px solid var(--line); font-size: 13px; color: var(--text); }
 .listing-row, .research-listing-row { content-visibility: auto; contain-intrinsic-size: auto 72px; }
@@ -173,6 +173,11 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .deal-bars--3 i.is-filled { background: #87a7e8; }
 .external-link { display: inline-grid; place-items: center; color: var(--blue); }
 .external-link:hover { color: var(--blue-deep); }
+.row-actions { display: inline-flex; align-items: center; justify-content: flex-end; gap: 2px; }
+.row-action { width: 28px; height: 28px; }
+.row-action:hover { color: var(--blue); }
+.listing-row--hidden { opacity: .6; }
+.listing-row--hidden .listing-item strong { text-decoration: line-through; text-decoration-color: var(--line-strong); }
 .section-footer { display: flex; align-items: center; gap: 20px; padding: 10px 14px 2px; }
 .table-loading, .empty-state { min-height: 160px; display: grid; place-items: center; align-content: center; gap: 8px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
 .panel-empty, .page-empty { display: grid; place-items: center; align-content: center; gap: 8px; min-height: 112px; color: var(--muted); font-size: 12px; text-align: center; }
@@ -666,13 +671,13 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
   .connector-title span { display: none; }
   .connector-row { grid-template-columns: 1.25fr .85fr .65fr; }
   .listing-table--head { display: none; }
-  .listing-table-wrap--compact .listing-row, .listing-table-wrap:not(.listing-table-wrap--compact) .listing-row { min-width: 0; grid-template-columns: minmax(0, 1fr) auto auto 27px; gap: 7px; padding-top: 11px; padding-bottom: 11px; }
+  .listing-table-wrap--compact .listing-row, .listing-table-wrap:not(.listing-table-wrap--compact) .listing-row { min-width: 0; grid-template-columns: minmax(0, 1fr) auto auto 56px; gap: 7px; padding-top: 11px; padding-bottom: 11px; }
   .listing-row .listing-item { grid-column: 1 / -1; }
   .listing-row .marketplace-cell { grid-column: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
   .listing-row .price-cell { grid-column: 2; font-size: 13px; }
   .listing-row .strength-cell { grid-column: 3; }
   .listing-row .strength-cell > span:last-child { display: none; }
-  .listing-row .external-link { grid-column: 4; }
+  .listing-row .row-actions { grid-column: 4; }
   .listing-row > span:nth-child(4), .listing-row .discount-cell, .listing-row .observed-cell { display: none; }
   .listing-row { padding-left: 7px; padding-right: 7px; }
   .listing-item img { width: 66px; height: 43px; }
@@ -754,6 +759,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .decision-chip--pass { color: var(--orange); background: rgba(241, 90, 53, .1); }
 .decision-chip--reference { color: var(--teal); background: rgba(21, 155, 150, .12); }
 .decision-chip--ai-filtered { color: var(--muted); background: var(--surface-muted); border: 1px dashed var(--line-strong); font-weight: 600; }
+.decision-chip--hidden { display: inline-flex; align-items: center; gap: 3px; color: var(--muted); background: var(--surface-muted); border: 1px solid var(--line-strong); font-weight: 600; }
 .snapshot-price-history { margin-top: 12px; display: grid; gap: 8px; }
 .snapshot-price-history > strong { font-size: 12px; }
 .listing-drawer-backdrop { position: fixed; inset: 0; z-index: 60; display: flex; justify-content: flex-end; background: rgba(12, 17, 26, .48); backdrop-filter: blur(3px); }
