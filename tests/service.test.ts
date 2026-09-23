@@ -506,6 +506,35 @@ test('returns listing price history and persists Buy/Watch/Pass triage actions',
   } finally { context.close(); }
 });
 
+test('hides and unhides a listing without deleting its history', () => {
+  const context = fixture();
+  try {
+    const firstSeen = new Date(Date.now() - 24 * 60 * 60_000).toISOString();
+    const lastSeen = new Date().toISOString();
+    context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run('hidden-watch', 'Hidden watch', 'brakes', '["OLX"]', 1, lastSeen, firstSeen, lastSeen);
+    context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run('OLX', 'hidden-listing', 'Cheap brake pads', 500, 'https://www.olx.pl/d/oferta/hidden-listing', firstSeen, lastSeen);
+    const listing = context.db.prepare('SELECT id FROM listings WHERE listing_id = ?').get('hidden-listing') as { id: number };
+    context.db.prepare('INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)').run('hidden-watch', listing.id, firstSeen, lastSeen);
+
+    assert.equal(context.service.getListings()[0].hidden, false);
+    assert.equal(context.service.dashboard().stats.newToday, 1);
+
+    const hiddenAction = context.service.updateListingAction('OLX:hidden-listing', null, '', true);
+    assert.equal(hiddenAction.hidden, true);
+    assert.equal(context.service.listingAction('OLX:hidden-listing').hidden, true);
+    assert.equal(context.service.getListings()[0].hidden, true);
+    // Hidden listings are excluded from the dashboard counters.
+    assert.equal(context.service.dashboard().stats.newToday, 0);
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM listing_actions WHERE marketplace = ? AND listing_id = ?').get('OLX', 'hidden-listing') as { count: number }).count, 1);
+
+    context.service.updateListingAction('OLX:hidden-listing', null, '', false);
+    assert.equal(context.service.listingAction('OLX:hidden-listing').hidden, false);
+    assert.equal(context.service.getListings()[0].hidden, false);
+    // Unhiding with no decision or note removes the empty action row.
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM listing_actions WHERE marketplace = ? AND listing_id = ?').get('OLX', 'hidden-listing') as { count: number }).count, 0);
+  } finally { context.close(); }
+});
+
 test('fetches and verifies descriptions for very strong and exceptional deals before alerting', async () => {
   let verificationRequests = 0;
   const context = fixture({
@@ -880,7 +909,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '020_drop_messaging_negotiation']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '020_drop_messaging_negotiation', '021_listing_visibility']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1222,7 +1251,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 20);
+    assert.equal(after.migrations.count, 21);
   } finally { context.close(); }
 });
 
@@ -1426,6 +1455,72 @@ test('decides relevance live with Jev and never calls DeepSeek', async () => {
     assert.equal(result.listings.length, 1);
     assert.equal(result.excluded, 0);
     assert.equal(result.unknown, 0);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('skips the AI relevance call for listings below the deal-strength gate', async () => {
+  const restore = liveJevEnv();
+  let jevCalls = 0;
+  const context = fixture({
+    classifyListingRelevance: async () => { throw new Error('DeepSeek must not be called in live mode'); },
+    classifyListingRelevanceWithJev: async () => { jevCalls += 1; return { relevant: true, p: 0.92, unsure: false }; },
+    classifyListingRelevanceWithVision: async () => { throw new Error('Vision must not be called'); },
+  });
+  try {
+    const strong = liveListing({ listingId: 'strong-1', url: 'https://www.olx.pl/d/oferta/strong-1' });
+    const weak = liveListing({ listingId: 'weak-1', url: 'https://www.olx.pl/d/oferta/weak-1' });
+    const result = await (context.service as any).filterListingsByAiRelevance(
+      [strong, weak], { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
+      (listing: any) => listing.listingId === 'strong-1',
+    );
+    assert.equal(jevCalls, 1);
+    assert.equal(result.listings.length, 2);
+    assert.equal(result.excluded, 0);
+    assert.equal(result.unknown, 0);
+    assert.equal(result.skipped, 1);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('spends relevance AI only on very strong or qualifying watch-scan listings', async () => {
+  const restore = liveJevEnv();
+  const checked: string[] = [];
+  const context = fixture({
+    classifyListingRelevanceWithJev: async (ctx: any) => {
+      checked.push(ctx.title);
+      return { relevant: true, p: 0.95, unsure: false };
+    },
+    classifyListingRelevanceWithVision: async () => { throw new Error('Vision must not be called'); },
+  });
+  try {
+    seedWatch(context.db, 'gate-watch');
+    const baselineAt = new Date(Date.now() - 8 * 60 * 60_000).toISOString();
+    const insertListing = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+    const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    for (let index = 0; index < 30; index += 1) {
+      insertListing.run('OLX', `gate-baseline-${index}`, `Baseline CPU ${index}`, 1000, `https://www.olx.pl/d/oferta/gate-baseline-${index}`, baselineAt, baselineAt);
+      const listing = context.db.prepare('SELECT id FROM listings WHERE listing_id = ?').get(`gate-baseline-${index}`) as { id: number };
+      insertObservation.run(listing.id, 'gate-watch', 1000, baselineAt);
+    }
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'gate-strong', url: 'https://www.olx.pl/d/oferta/gate-strong', title: 'CPU very strong', created_time: baselineAt, params: [{ key: 'price', value: { value: 700, currency: 'PLN', negotiable: false } }] },
+      { id: 'gate-weak', url: 'https://www.olx.pl/d/oferta/gate-weak', title: 'CPU weak', created_time: baselineAt, params: [{ key: 'price', value: { value: 950, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 2 } } });
+
+    const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('gate-watch');
+    await (context.service as any).runWatch(row);
+
+    assert.deepEqual(checked, ['CPU very strong']);
+    const stored = (context.db.prepare("SELECT l.listing_id, wl.deal_strength FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE l.listing_id IN ('gate-strong', 'gate-weak') ORDER BY l.listing_id").all() as Array<{ listing_id: string; deal_strength: number }>).map((row) => ({ ...row }));
+    assert.deepEqual(stored, [
+      { listing_id: 'gate-strong', deal_strength: 5 },
+      { listing_id: 'gate-weak', deal_strength: 2 },
+    ]);
   } finally {
     restore();
     context.close();

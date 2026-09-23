@@ -24,6 +24,8 @@ type RelevanceFilterResult = {
   excluded: number;
   failed: number;
   unknown: number;
+  /** Listings kept without an AI call because the deal-strength gate excluded them. */
+  skipped: number;
   notConfigured: boolean;
 };
 
@@ -344,6 +346,21 @@ export function validateDiscordWebhook(value: string) {
     throw new ServiceError('Webhook must be an HTTPS Discord webhook URL');
   }
   return url.toString();
+}
+
+/**
+ * Deal-strength tier from a discount percentage, matching the label mapping
+ * used when storing listings: 5 Exceptional (>=30%), 4 Very strong (>=20%),
+ * 3 Strong (>=12%), 2 Watch (>0%), 1 none. A null discount (no typical yet)
+ * yields null so callers can distinguish "not scoreable" from "no discount".
+ */
+function dealStrengthFromDiscount(discountPercent: number | null): number | null {
+  if (discountPercent === null || !Number.isFinite(discountPercent)) return null;
+  return discountPercent >= 30 ? 5 : discountPercent >= 20 ? 4 : discountPercent >= 12 ? 3 : discountPercent > 0 ? 2 : 1;
+}
+
+function dealLabelFromStrength(strength: number): DealLabel {
+  return strength >= 5 ? 'Exceptional' : strength === 4 ? 'Very strong' : strength === 3 ? 'Strong' : 'Watch';
 }
 
 export class ScoutService {
@@ -989,15 +1006,35 @@ export class ScoutService {
     );
   }
 
+  /**
+   * Human-readable scan note for the AI relevance pass. Mirrors the inline
+   * wording manual search uses, plus the deal-strength skip count.
+   */
+  private relevanceNote(relevance: RelevanceFilterResult, row: WatchRow): string {
+    if (relevance.notConfigured && (row.ai_relevance === undefined || Boolean(row.ai_relevance))) return ' · AI relevance inactive';
+    const parts: string[] = [];
+    if (relevance.unknown) parts.push(`${relevance.unknown} AI checks unknown`);
+    if (relevance.excluded) parts.push(`${relevance.excluded} excluded by AI`);
+    if (relevance.skipped) parts.push(`${relevance.skipped} below AI check threshold`);
+    return parts.length ? ` · ${parts.join(' · ')}` : '';
+  }
+
   private async filterListingsByAiRelevance(
     listings: NormalizedListing[],
     search: ListingRelevanceSearch,
     watchId: string | undefined,
     enabled: boolean,
+    /**
+     * Optional deal-strength gate: when supplied, a listing whose price does
+     * not (yet) clear the bar is kept as `unknown` without spending an AI call.
+     * Cache reads still run first, so a decision made when the listing was
+     * stronger is reused.
+     */
+    gate?: (listing: NormalizedListing) => boolean,
   ): Promise<RelevanceFilterResult> {
-    if (!enabled || !listings.length) return { listings, excluded: 0, failed: 0, unknown: 0, notConfigured: false };
+    if (!enabled || !listings.length) return { listings, excluded: 0, failed: 0, unknown: 0, skipped: 0, notConfigured: false };
     const config = this.deepSeekConfig();
-    if (!config.apiKey) return { listings, excluded: 0, failed: 0, unknown: 0, notConfigured: true };
+    if (!config.apiKey) return { listings, excluded: 0, failed: 0, unknown: 0, skipped: 0, notConfigured: true };
     const apiKey = config.apiKey;
     // Shadow fires only on live DeepSeek calls below: cache hits, cross-listing
     // reuse, and budget-exhausted rows return before the hook by design (nothing
@@ -1011,6 +1048,7 @@ export class ScoutService {
     const AI_RELEVANCE_BUDGET_PER_SCAN = 40;
     const AI_RELEVANCE_DETAIL_BUDGET_PER_SCAN = 8;
     let aiCalls = 0;
+    let skipped = 0;
     const detailBudget = { remaining: AI_RELEVANCE_DETAIL_BUDGET_PER_SCAN };
     const pendingClassifications = new Map<string, Promise<{ relevant: boolean }>>();
     const pendingLive = new Map<string, Promise<{ relevant: boolean; status: 'relevant' | 'irrelevant' | 'unknown'; reason: string; error?: string }>>();
@@ -1054,6 +1092,16 @@ export class ScoutService {
           const status: 'relevant' | 'irrelevant' = reusable.relevance_status === 'irrelevant' || reusable.relevant === 0 ? 'irrelevant' : 'relevant';
           if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: activeModel, relevant: status === 'relevant', status, reason: reusable.reason ?? 'Reused cached relevance decision' });
           return { listing, status };
+        }
+
+        // Deal-strength gate: an uncached listing that is neither a notifiable
+        // deal nor a very strong display candidate is kept (unknown) without
+        // spending an AI call. This is the main lever on Jev/DeepSeek spend —
+        // the check runs after cache reuse so cached decisions still apply.
+        if (gate && !gate(listing)) {
+          skipped += 1;
+          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: activeModel, relevant: true, status: 'unknown', reason: 'AI relevance skipped: deal below the Very strong threshold' });
+          return { listing, status: 'unknown' as const };
         }
 
         // Per-scan budget: uncached listings beyond the budget stay unknown
@@ -1113,8 +1161,9 @@ export class ScoutService {
     return {
       listings: classified.filter((item) => item.status !== 'irrelevant').map((item) => item.listing),
       excluded: classified.filter((item) => item.status === 'irrelevant').length,
-      failed: classified.filter((item) => item.status === 'unknown').length,
-      unknown: classified.filter((item) => item.status === 'unknown').length,
+      failed: classified.filter((item) => item.status === 'unknown').length - skipped,
+      unknown: classified.filter((item) => item.status === 'unknown').length - skipped,
+      skipped,
       notConfigured: false,
     };
   }
@@ -1697,6 +1746,7 @@ export class ScoutService {
       listingId: String(row.listing_id),
       decision: parseListingDecision(row.listing_decision),
       note: typeof row.listing_note === 'string' ? row.listing_note : '',
+      hidden: row.listing_hidden === undefined ? undefined : Number(row.listing_hidden) === 1,
       aiFiltered: row.ai_filtered === undefined ? undefined : Number(row.ai_filtered) === 1,
       ...(row.ai_description_verification_json !== undefined ? {
         aiDescriptionVerification: parseStoredListingDescriptionVerification(row.ai_description_verification_json),
@@ -1961,7 +2011,7 @@ export class ScoutService {
     const total = Number((this.stmt(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(500, Math.floor(options.pageSize ?? 200)));
-    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note, CASE WHEN ${aiFilteredPredicate} THEN 1 ELSE 0 END AS ai_filtered
+    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note, a.hidden AS listing_hidden, CASE WHEN ${aiFilteredPredicate} THEN 1 ELSE 0 END AS ai_filtered
       FROM listings l
       JOIN watch_listings wl ON wl.listing_id = l.id
       JOIN watches w ON w.id = wl.watch_id
@@ -1979,7 +2029,7 @@ export class ScoutService {
 
   listingDetail(key: string, watchId?: string | null): ListingDetail {
     const { marketplace, listingId } = parseListingKey(key);
-    const row = this.stmt(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, a.decision AS listing_decision, a.note AS listing_note, a.updated_at AS action_updated_at
+    const row = this.stmt(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, a.decision AS listing_decision, a.note AS listing_note, a.hidden AS listing_hidden, a.updated_at AS action_updated_at
       FROM listings l
       LEFT JOIN watch_listings wl ON wl.listing_id = l.id AND (? IS NULL OR wl.watch_id = ?)
       LEFT JOIN watches w ON w.id = wl.watch_id
@@ -2049,7 +2099,7 @@ export class ScoutService {
     return {
       listing,
       history,
-      action: { decision: listing.decision ?? null, note: listing.note ?? '', updatedAt: row.action_updated_at ?? null },
+      action: { decision: listing.decision ?? null, note: listing.note ?? '', hidden: listing.hidden ?? false, updatedAt: row.action_updated_at ?? null },
       descriptionSnapshot,
       firstSeenAt: row.watch_first_seen_at ?? row.first_seen_at,
       lastSeenAt: row.watch_last_seen_at ?? row.last_seen_at,
@@ -2098,21 +2148,21 @@ export class ScoutService {
 
   listingAction(key: string): ListingAction {
     const { marketplace, listingId } = parseListingKey(key);
-    const row = this.stmt('SELECT decision, note, updated_at FROM listing_actions WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as { decision?: unknown; note?: string; updated_at?: string } | undefined;
-    return { decision: parseListingDecision(row?.decision), note: row?.note ?? '', updatedAt: row?.updated_at ?? null };
+    const row = this.stmt('SELECT decision, note, hidden, updated_at FROM listing_actions WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as { decision?: unknown; note?: string; hidden?: number; updated_at?: string } | undefined;
+    return { decision: parseListingDecision(row?.decision), note: row?.note ?? '', hidden: Number(row?.hidden ?? 0) === 1, updatedAt: row?.updated_at ?? null };
   }
 
-  updateListingAction(key: string, decision: ListingDecision | null, note: string): ListingAction {
+  updateListingAction(key: string, decision: ListingDecision | null, note: string, hidden = false): ListingAction {
     const { marketplace, listingId } = parseListingKey(key);
     const safeNote = note.trim().slice(0, 2000);
     const timestamp = nowIso();
-    if (decision === null && !safeNote) {
+    if (decision === null && !safeNote && !hidden) {
       this.stmt('DELETE FROM listing_actions WHERE marketplace = ? AND listing_id = ?').run(marketplace, listingId);
     } else {
-      this.stmt(`INSERT INTO listing_actions (marketplace, listing_id, decision, note, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(marketplace, listing_id) DO UPDATE SET decision = excluded.decision, note = excluded.note, updated_at = excluded.updated_at`).run(marketplace, listingId, decision, safeNote, timestamp);
+      this.stmt(`INSERT INTO listing_actions (marketplace, listing_id, decision, note, hidden, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(marketplace, listing_id) DO UPDATE SET decision = excluded.decision, note = excluded.note, hidden = excluded.hidden, updated_at = excluded.updated_at`).run(marketplace, listingId, decision, safeNote, hidden ? 1 : 0, timestamp);
     }
-    this.emit('listing-action', { key, decision });
-    return { decision, note: safeNote, updatedAt: safeNote || decision ? timestamp : null };
+    this.emit('listing-action', { key, decision, hidden });
+    return { decision, note: safeNote, hidden, updatedAt: safeNote || decision || hidden ? timestamp : null };
   }
 
   /**
@@ -2785,7 +2835,7 @@ export class ScoutService {
     let newToday = 0;
     let strongDeals = 0;
     for (const listing of listings) {
-      if (listing.aiFiltered) continue;
+      if (listing.aiFiltered || listing.hidden) continue;
       if (Date.parse(listing.observedAt) >= todayTime) newToday += 1;
       if (listing.dealStrength >= 4) strongDeals += 1;
     }
@@ -3104,35 +3154,36 @@ export class ScoutService {
           } catch {
             // Rescue is recall-only; any failure keeps the deterministic set.
           }
+          // Baseline and first-observation queries are watch-wide and computed
+          // once per scan, before the AI relevance pass: the pass needs the same
+          // scoring to decide which listings are strong enough to justify an AI
+          // call, and storeListing below reuses the result.
+          const baseline = this.watchBaseline(row);
           const relevance = await this.filterListingsByAiRelevance(filtered, {
             query: row.query,
             includedTerms: row.included_terms ?? '',
             excludedTerms: row.excluded_terms ?? '',
-          }, row.id, row.ai_relevance === undefined ? true : Boolean(row.ai_relevance));
+          }, row.id, row.ai_relevance === undefined ? true : Boolean(row.ai_relevance), (listing) => {
+            // Spend AI relevance only where it can matter: listings that would
+            // alert (score.qualifies) or already rank Very strong. Everything
+            // else is kept without an AI call.
+            const { score, dealStrength } = this.dealScore(row, listing.price, baseline, referenceMedian);
+            return score.qualifies || (dealStrength ?? 0) >= 4;
+          });
           const candidates = this.transaction(() => {
-            // The baseline and first-observation queries are watch-wide: running
-            // them once per scan instead of per stored listing keeps the
-            // synchronous SQLite work flat as observation history grows.
-            const baseline = this.watchBaseline(row);
             const pendingCandidates: DealNotificationCandidate[] = [];
             for (const listing of relevance.listings) {
               const candidate = this.storeListing(row, listing, scanId, baseline, referenceMedian);
               if (candidate) pendingCandidates.push(candidate);
             }
             const pending = row.shipping_only ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
-            const relevanceNote = relevance.notConfigured && (row.ai_relevance === undefined || Boolean(row.ai_relevance))
-              ? ' · AI relevance inactive'
-              : relevance.unknown ? ` · ${relevance.unknown} AI checks unknown`
-                : relevance.excluded ? ` · ${relevance.excluded} excluded by AI` : '';
+            const relevanceNote = this.relevanceNote(relevance, row);
             this.completeScan(scanId, row.shipping_only ? `${relevance.listings.length} shipping matches${pending ? ` · ${pending} pending checks` : ''}${relevanceNote}` : `${relevance.listings.length} listings normalized${relevanceNote}`);
             return pendingCandidates;
           });
           await this.processDealCandidates(candidates, () => this.scanNotifyContext());
           const pending = row.shipping_only ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
-          const relevanceNote = relevance.notConfigured && (row.ai_relevance === undefined || Boolean(row.ai_relevance))
-            ? ' · AI relevance inactive'
-            : relevance.unknown ? ` · ${relevance.unknown} AI checks unknown`
-              : relevance.excluded ? ` · ${relevance.excluded} excluded by AI` : '';
+          const relevanceNote = this.relevanceNote(relevance, row);
           this.finishRun(runId, 'ok', row.shipping_only ? `${relevance.listings.length} shipping matches${pending ? ` · ${pending} pending checks` : ''}${relevanceNote}` : `${relevance.listings.length} listings normalized${relevanceNote}`);
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Connector failed';
@@ -3544,8 +3595,26 @@ export class ScoutService {
     return { prices, firstObservedAt: first?.first ?? null };
   }
 
+  /**
+   * Score a listing against the watch baseline. Shared by `storeListing` and
+   * the AI-relevance gate so both make the exact same deal-strength call.
+   */
+  private dealScore(
+    row: WatchRow,
+    price: number,
+    baseline: { prices: number[]; firstObservedAt: string | null },
+    referenceMedian: number | null,
+  ): { score: ReturnType<typeof scoreDeal>; useReference: boolean; dealStrength: number | null } {
+    const observedHours = baseline.firstObservedAt ? Math.max(0, (Date.now() - Date.parse(baseline.firstObservedAt)) / 3_600_000) : 0;
+    // The reference-band fallback seeds ranking/display only: while the watch's
+    // own history is below the sample floor, its median stands in for the
+    // typical. Once own samples reach the floor, own history always wins.
+    const useReference = referenceMedian !== null && baseline.prices.length < BASELINE_MIN_SAMPLES;
+    const score = scoreDeal(baseline.prices, price, { observedHours, sensitivity: Number(row.sensitivity ?? 1), ...(useReference ? { typicalOverride: referenceMedian } : {}) });
+    return { score, useReference, dealStrength: dealStrengthFromDiscount(score.discountPercent) };
+  }
+
   private storeListing(row: WatchRow, listing: NormalizedListing, scanId: number, baseline: { prices: number[]; firstObservedAt: string | null }, referenceMedian: number | null = null): DealNotificationCandidate | null {
-    const existingPrices = baseline.prices;
     const observedAt = nowIso();
     // RETURNING removes the follow-up SELECT for the row id on both the
     // insert and the conflict-update branch of each upsert.
@@ -3557,18 +3626,13 @@ export class ScoutService {
       VALUES (?, ?, ?, ?)
       ON CONFLICT(watch_id, listing_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
       RETURNING id`).get(row.id, stored.id, observedAt, observedAt) as { id: number };
-    const observedHours = baseline.firstObservedAt ? Math.max(0, (Date.now() - Date.parse(baseline.firstObservedAt)) / 3_600_000) : 0;
-    // The reference-band fallback seeds ranking/display only: while the watch's
-    // own history is below the sample floor, its median stands in for the
-    // typical. Once own samples reach the floor, own history always wins.
-    const useReference = referenceMedian !== null && existingPrices.length < BASELINE_MIN_SAMPLES;
-    const score = scoreDeal(existingPrices, listing.price, { observedHours, sensitivity: Number(row.sensitivity ?? 1), ...(useReference ? { typicalOverride: referenceMedian } : {}) });
+    const { score, useReference, dealStrength: scoredStrength } = this.dealScore(row, listing.price, baseline, referenceMedian);
     const observation = this.stmt('INSERT INTO observations (listing_id, watch_id, watch_listing_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?, ?)').run(stored.id, row.id, association.id, scanId, listing.price, observedAt);
     const observationId = Number(observation.lastInsertRowid);
     if (score.isReady && score.typical !== null) {
       const discountPercent = score.discountPercent ?? 0;
-      const dealStrength = discountPercent >= 30 ? 5 : discountPercent >= 20 ? 4 : discountPercent >= 12 ? 3 : discountPercent > 0 ? 2 : 1;
-      const dealLabel: DealLabel = dealStrength >= 5 ? 'Exceptional' : dealStrength === 4 ? 'Very strong' : dealStrength === 3 ? 'Strong' : 'Watch';
+      const dealStrength = scoredStrength ?? 1;
+      const dealLabel = dealLabelFromStrength(dealStrength);
       this.stmt("UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, typical_source = 'own-history', last_seen_at = ? WHERE id = ?").run(score.typical, dealStrength, dealLabel, observedAt, association.id);
       this.stmt('UPDATE observations SET baseline_pln = ?, discount_percent = ?, deal_strength = ?, deal_label = ? WHERE id = ?').run(score.typical, discountPercent, dealStrength, dealLabel, observationId);
       if (score.qualifies) return {
@@ -3586,8 +3650,8 @@ export class ScoutService {
       // Band-seeded display values; the readiness gate is untouched, so no
       // alerts fire earlier than they would without a reference series.
       const discountPercent = score.discountPercent ?? 0;
-      const dealStrength = discountPercent >= 30 ? 5 : discountPercent >= 20 ? 4 : discountPercent >= 12 ? 3 : discountPercent > 0 ? 2 : 1;
-      const dealLabel: DealLabel = dealStrength >= 5 ? 'Exceptional' : dealStrength === 4 ? 'Very strong' : dealStrength === 3 ? 'Strong' : 'Watch';
+      const dealStrength = scoredStrength ?? 1;
+      const dealLabel = dealLabelFromStrength(dealStrength);
       this.stmt("UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, typical_source = 'reference-band', last_seen_at = ? WHERE id = ?").run(score.typical, dealStrength, dealLabel, observedAt, association.id);
     } else {
       this.stmt('UPDATE observations SET baseline_pln = NULL, discount_percent = NULL WHERE id = ?').run(observationId);
@@ -3696,7 +3760,9 @@ export class ScoutService {
     try {
       const candidates = this.stmt(`SELECT c.*, w.name AS watch_name
         FROM daily_digest_candidates c JOIN watches w ON w.id = c.watch_id
-        WHERE c.digest_date IS NULL ORDER BY c.discount_percent DESC, c.observed_at ASC, c.id ASC`).all() as DigestCandidateRow[];
+        WHERE c.digest_date IS NULL
+          AND NOT EXISTS (SELECT 1 FROM listing_actions a WHERE a.marketplace = c.marketplace AND a.listing_id = c.listing_id AND a.hidden = 1)
+        ORDER BY c.discount_percent DESC, c.observed_at ASC, c.id ASC`).all() as DigestCandidateRow[];
       const planned: Array<{ channel: DigestChannel; eventKey: string; payload: Record<string, any> }> = [];
       this.transaction(() => {
         for (const channel of channels) {
@@ -3724,6 +3790,12 @@ export class ScoutService {
     } finally {
       this.digestRunning = false;
     }
+  }
+
+  /** A manually hidden listing never alerts, regardless of its deterministic or AI score. */
+  private isListingHidden(listing: NormalizedListing) {
+    const row = this.stmt('SELECT hidden FROM listing_actions WHERE marketplace = ? AND listing_id = ?').get(listing.marketplace, listing.listingId) as { hidden?: number } | undefined;
+    return Number(row?.hidden ?? 0) === 1;
   }
 
   private notificationEventKey(watchId: string, listing: NormalizedListing, sequence: number, legacy = false) {
@@ -3854,6 +3926,7 @@ export class ScoutService {
     const discountPercent = legacy ? typicalOrDiscount : discountOrConfidence;
     const confidence = legacy ? discountOrConfidence : maybeConfidence!;
     const priority = priorityFromDiscount(discountPercent);
+    if (this.isListingHidden(listing)) return;
     const encryptedDiscord = context?.encryptedDiscord ?? this.getSetting('discord_webhook');
     const ntfy = context?.ntfy ?? this.ntfyConfig();
     const digest = context?.digest ?? this.dailyDigestConfig();
@@ -3937,6 +4010,8 @@ export class ScoutService {
       }
       const meta = this.notificationMeta(payload);
       if (!meta) continue;
+      // A listing hidden after it was queued should not deliver on retry.
+      if (this.isListingHidden(meta.listing)) continue;
       const claim = this.claimNotificationDelivery(String(row.listing_key), row.channel as 'Discord' | 'ntfy');
       if (!claim) continue;
       await this.deliverClaimedNotification({

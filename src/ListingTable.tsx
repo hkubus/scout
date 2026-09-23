@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ExternalLink, RefreshCw, Search, Tag } from "lucide-react";
+import { ExternalLink, Eye, EyeOff, RefreshCw, Search, Tag } from "lucide-react";
 import { marketplaceColors } from "./data";
 import type { Listing } from "./types";
 
@@ -22,11 +22,13 @@ export default function ListingTable({
   compact = false,
   isLoading = false,
   onSelect,
+  onToggleHidden,
 }: {
   listings: Listing[];
   compact?: boolean;
   isLoading?: boolean;
   onSelect?: (listing: Listing) => void;
+  onToggleHidden?: (listing: Listing) => void;
 }) {
   if (isLoading) {
     return (
@@ -59,10 +61,10 @@ export default function ListingTable({
         <span role="columnheader">Below typical</span>
         <span role="columnheader">Observed</span>
         <span role="columnheader">Deal strength</span>
-        <span role="columnheader" aria-label="Open listing" />
+        <span role="columnheader" aria-label="Actions" />
       </div>
       {listings.map((listing) => (
-        <ListingRow key={listing.associationId ?? listing.id} listing={listing} onSelect={onSelect} />
+        <ListingRow key={listing.associationId ?? listing.id} listing={listing} onSelect={onSelect} onToggleHidden={onToggleHidden} />
       ))}
     </div>
   );
@@ -80,10 +82,11 @@ function ListingThumbnail({ listing }: { listing: Listing }) {
   );
 }
 
-function ListingRow({ listing, onSelect }: { listing: Listing; onSelect?: (listing: Listing) => void }) {
+function ListingRow({ listing, onSelect, onToggleHidden }: { listing: Listing; onSelect?: (listing: Listing) => void; onToggleHidden?: (listing: Listing) => void }) {
   const aiFiltered = Boolean(listing.aiFiltered);
+  const hidden = Boolean(listing.hidden);
   return (
-    <div className={`listing-table listing-row${aiFiltered ? " listing-row--ai-filtered" : ""}`} role="row">
+    <div className={`listing-table listing-row${aiFiltered ? " listing-row--ai-filtered" : ""}${hidden ? " listing-row--hidden" : ""}`} role="row">
       <button
         type="button"
         className="listing-item listing-item--button"
@@ -110,6 +113,11 @@ function ListingRow({ listing, onSelect }: { listing: Listing; onSelect?: (listi
               Filtered by AI
             </em>
           ) : null}
+          {hidden ? (
+            <em className="decision-chip decision-chip--hidden" title="Manually hidden from the overview and alerts">
+              <EyeOff size={11} />Hidden
+            </em>
+          ) : null}
         </div>
       </button>
       <div className="marketplace-cell" role="cell">
@@ -126,15 +134,28 @@ function ListingRow({ listing, onSelect }: { listing: Listing; onSelect?: (listi
         <DealBars strength={listing.dealStrength} />
         <span>{listing.typical === null ? "Learning" : listing.dealLabel}</span>
       </div>
-      <a
-        href={listing.url}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="external-link"
-        aria-label={`Open ${listing.title}`}
-      >
-        <ExternalLink size={17} />
-      </a>
+      <div className="row-actions" role="cell">
+        {onToggleHidden ? (
+          <button
+            type="button"
+            className="icon-button row-action"
+            onClick={() => onToggleHidden(listing)}
+            aria-label={hidden ? `Unhide ${listing.title}` : `Hide ${listing.title}`}
+            title={hidden ? "Unhide listing" : "Hide listing from the overview and alerts"}
+          >
+            {hidden ? <Eye size={17} /> : <EyeOff size={17} />}
+          </button>
+        ) : null}
+        <a
+          href={listing.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="external-link"
+          aria-label={`Open ${listing.title}`}
+        >
+          <ExternalLink size={17} />
+        </a>
+      </div>
     </div>
   );
 }

@@ -57,6 +57,8 @@ export interface Listing {
   listingId?: string;
   decision?: ListingDecision | null;
   note?: string;
+  /** True when the listing was manually hidden by the user. Hidden rows stay stored but are removed from the overview and alerting. */
+  hidden?: boolean;
   /** True when the watch's AI relevance filter classified this listing as irrelevant. Shown greyed-out on overview. */
   aiFiltered?: boolean;
   aiDescriptionVerification?: ListingDescriptionVerification | null;
@@ -73,6 +75,7 @@ export interface PriceHistoryPoint {
 export interface ListingAction {
   decision: ListingDecision | null;
   note: string;
+  hidden: boolean;
   updatedAt?: string | null;
 }
 

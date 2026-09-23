@@ -128,11 +128,12 @@ const listingActionInput = z.object({
   key: z.string().min(3).max(500),
   decision: z.enum(['buy', 'watch', 'pass']).nullable(),
   note: z.string().max(2000).default(''),
+  hidden: z.boolean().optional().default(false),
 }).strict();
 app.patch('/api/listing-actions', async (request, reply) => {
   const parsed = listingActionInput.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid listing action', details: parsed.error.flatten() });
-  return { action: service.updateListingAction(parsed.data.key, parsed.data.decision, parsed.data.note) };
+  return { action: service.updateListingAction(parsed.data.key, parsed.data.decision, parsed.data.note, parsed.data.hidden) };
 });
 app.get('/api/watches', async (request, reply) => {
   const strictBoolean = z.union([z.boolean(), z.string().regex(/^(?:true|false)$/i).transform((value) => value.toLowerCase() === 'true')]);

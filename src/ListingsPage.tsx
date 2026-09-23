@@ -31,16 +31,19 @@ export default function ListingsPage({
   selectedWatchId,
   onClearWatch,
   onSelectListing,
+  onToggleHidden,
 }: {
   listings: Listing[];
   selectedWatchId: string | null;
   onClearWatch: () => void;
   onSelectListing: (listing: Listing) => void;
+  onToggleHidden: (listing: Listing) => void;
 }) {
   const [search, setSearch] = useState("");
   const [marketplace, setMarketplace] = useState<"All" | Marketplace>("All");
   const [sort, setSort] = useState<"Newest" | "Strongest" | "Price">("Newest");
   const [decision, setDecision] = useState<"All" | ListingDecision>("All");
+  const [visibility, setVisibility] = useState<"Visible" | "Hidden" | "All">("Visible");
   const [page, setPage] = useState(1);
   const [remoteListings, setRemoteListings] = useState<Listing[] | null>(null);
   const [pagination, setPagination] = useState<{ page: number; pageSize: number; total: number; hasNext: boolean } | null>(null);
@@ -78,6 +81,8 @@ export default function ListingsPage({
       if (marketplace !== "All" && listing.marketplace !== marketplace) continue;
       if (selectedWatchId && listing.watchId !== selectedWatchId) continue;
       if (decision !== "All" && listing.decision !== decision) continue;
+      if (visibility === "Visible" && listing.hidden) continue;
+      if (visibility === "Hidden" && !listing.hidden) continue;
       if (!`${listing.title} ${listing.subtitle} ${listing.condition ?? ""} ${listing.location ?? ""}`.toLowerCase().includes(normalizedSearch)) continue;
       matches.push(listing);
     }
@@ -88,7 +93,7 @@ export default function ListingsPage({
           ? a.price - b.price
           : (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0),
     );
-  }, [pageListings, marketplace, deferredSearch, selectedWatchId, sort, decision]);
+  }, [pageListings, marketplace, deferredSearch, selectedWatchId, sort, decision, visibility]);
 
   return (
     <>
@@ -123,6 +128,11 @@ export default function ListingsPage({
           options={["All decisions", "Buy", "Watch", "Pass"]}
           onChange={(value) => setDecision(value === "Buy" ? "buy" : value === "Watch" ? "watch" : value === "Pass" ? "pass" : "All")}
         />
+        <SelectControl
+          value={visibility === "Visible" ? "Visible listings" : visibility === "Hidden" ? "Hidden only" : "All listings"}
+          options={["Visible listings", "Hidden only", "All listings"]}
+          onChange={(value) => setVisibility(value === "Hidden only" ? "Hidden" : value === "All listings" ? "All" : "Visible")}
+        />
       </div>
       {selectedWatchId ? (
         <div className="active-filter">
@@ -135,7 +145,7 @@ export default function ListingsPage({
           </button>
         </div>
       ) : null}
-      <ListingTable listings={filtered} onSelect={onSelectListing} />
+      <ListingTable listings={filtered} onSelect={onSelectListing} onToggleHidden={onToggleHidden} />
       {pagination && (pagination.page > 1 || pagination.hasNext) ? (
         <div className="research-pagination listings-pagination">
           <button className="outline-button" disabled={page <= 1 || loadingPage} onClick={() => setPage((current) => Math.max(1, current - 1))}>Previous</button>
