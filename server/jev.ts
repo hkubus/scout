@@ -33,12 +33,14 @@ export function resolveJevModel(configured?: string | null): string {
 }
 
 /**
- * Initial unsure-band for the relevance noul judgment, to be calibrated against local
- * shadow data (see jev_shadow_log). Noul carries no separate confidence — the
+ * Unsure band for the relevance noul judgment. Narrow by design: filter-only
+ * relevance follows the Jev lean without vision escalation, so only genuinely
+ * borderline probabilities stay unsure. Calibrated against local shadow data
+ * (see jev_shadow_log). Noul carries no separate confidence — the
  * probability itself is the uncertainty signal.
  */
-export const RELEVANCE_UNSURE_LOW = 0.3;
-export const RELEVANCE_UNSURE_HIGH = 0.7;
+export const RELEVANCE_UNSURE_LOW = 0.4;
+export const RELEVANCE_UNSURE_HIGH = 0.6;
 
 /** Minimum Choice confidence for a verification verdict to stand without escalation. */
 export const VERIFICATION_MIN_CONFIDENCE = 0.6;

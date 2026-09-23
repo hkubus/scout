@@ -67,11 +67,13 @@ test('classifies relevance through Jev Decisions via OpenRouter', async () => {
   assert.match(body.questions.relevant.criteria.false, /in any language/i);
 });
 
-test('marks mid-band relevance probabilities as unsure', () => {
+test('marks borderline relevance probabilities as unsure', () => {
   assert.equal(isRelevanceUnsure(0.1), false);
+  assert.equal(isRelevanceUnsure(0.35), false);
   assert.equal(isRelevanceUnsure(RELEVANCE_UNSURE_LOW), false);
   assert.equal(isRelevanceUnsure(0.5), true);
   assert.equal(isRelevanceUnsure(RELEVANCE_UNSURE_HIGH), false);
+  assert.equal(isRelevanceUnsure(0.65), false);
   assert.equal(isRelevanceUnsure(0.9), false);
 });
 

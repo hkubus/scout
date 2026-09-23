@@ -909,7 +909,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '020_drop_messaging_negotiation', '021_listing_visibility']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1251,7 +1251,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 21);
+    assert.equal(after.migrations.count, 22);
   } finally { context.close(); }
 });
 
@@ -1527,62 +1527,50 @@ test('spends relevance AI only on very strong or qualifying watch-scan listings'
   }
 });
 
-test('escalates unsure live relevance through a bounded detail fetch', async () => {
+test('follows the Jev lean on unsure relevance without detail fetch or vision', async () => {
   const restore = liveJevEnv();
-  const detailCalls: Array<[string, string]> = [];
   const context = fixture({
-    classifyListingRelevanceWithJev: async (ctx: any) => ctx.description
-      ? { relevant: false, p: 0.2, unsure: false }
+    classifyListingRelevanceWithJev: async (ctx: any) => ctx.title.includes('box')
+      ? { relevant: false, p: 0.45, unsure: true }
       : { relevant: true, p: 0.55, unsure: true },
-    fetchListingDetailHtml: async (url: string, marketplace: string) => {
-      detailCalls.push([url, marketplace]);
-      return '<meta property="og:description" content="Only the empty box, console not included.">';
-    },
-    classifyListingRelevanceWithVision: async () => { throw new Error('Vision must not be called after a sure second judgment'); },
+    fetchListingDetailHtml: async () => { throw new Error('Detail fetch must not run for filter-only relevance'); },
+    classifyListingRelevanceWithVision: async () => { throw new Error('Vision must not run for filter-only relevance'); },
   });
   try {
     const result = await (context.service as any).filterListingsByAiRelevance(
-      [liveListing()], { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
+      [
+        liveListing(),
+        liveListing({ listingId: 'live-2', url: 'https://www.olx.pl/d/oferta/live-2', title: 'empty box' }),
+      ],
+      { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
     );
-    assert.equal(result.listings.length, 0);
+    assert.equal(result.listings.length, 1);
     assert.equal(result.excluded, 1);
-    assert.deepEqual(detailCalls, [['https://www.olx.pl/d/oferta/live-1', 'OLX']]);
+    assert.equal(result.unknown, 0);
   } finally {
     restore();
     context.close();
   }
 });
 
-test('uses the vision thumbnail tiebreak when enriched Jev stays unsure, and vision direct on Jev failure', async () => {
+test('leans on unsure Jev relevance and keeps unknown on Jev failure without vision', async () => {
   const restore = liveJevEnv();
-  const seen: Array<{ imageUrl: unknown }> = [];
   const unsure = fixture({
     classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.5, unsure: true }),
-    fetchListingDetailHtml: async () => '<html></html>',
-    classifyListingRelevanceWithVision: async (input: any) => {
-      seen.push({ imageUrl: input.imageUrl });
-      return { relevant: true, confidence: 0.66, imagesSeen: 1 };
-    },
+    classifyListingRelevanceWithVision: async () => { throw new Error('Vision must not run for filter-only relevance'); },
   });
   const failed = fixture({
     classifyListingRelevanceWithJev: async () => { throw new Error('Decisions 520'); },
-    classifyListingRelevanceWithVision: async () => ({ relevant: false, confidence: 0.8, imagesSeen: 1 }),
-  });
-  const bothFailed = fixture({
-    classifyListingRelevanceWithJev: async () => { throw new Error('Decisions 520'); },
-    classifyListingRelevanceWithVision: async () => { throw new Error('Vision 502'); },
+    classifyListingRelevanceWithVision: async () => { throw new Error('Vision must not run for filter-only relevance'); },
   });
   try {
-    const tiebreak = await (unsure.service as any).filterListingsByAiRelevance(
+    const leaned = await (unsure.service as any).filterListingsByAiRelevance(
       [liveListing()], { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
     );
-    assert.equal(tiebreak.listings.length, 1);
-    assert.deepEqual(seen, [{ imageUrl: 'https://img.example/thumb.jpg' }]);
-    const direct = await (failed.service as any).filterListingsByAiRelevance(
-      [liveListing()], { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
-    );
-    assert.equal(direct.excluded, 1);
-    const unknown = await (bothFailed.service as any).filterListingsByAiRelevance(
+    assert.equal(leaned.listings.length, 1);
+    assert.equal(leaned.excluded, 0);
+    assert.equal(leaned.unknown, 0);
+    const unknown = await (failed.service as any).filterListingsByAiRelevance(
       [liveListing()], { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
     );
     assert.equal(unknown.listings.length, 1);
@@ -1591,7 +1579,6 @@ test('uses the vision thumbnail tiebreak when enriched Jev stays unsure, and vis
     restore();
     unsure.close();
     failed.close();
-    bothFailed.close();
   }
 });
 
@@ -1643,20 +1630,18 @@ test('verifies high-priority deals live with Jev and vision escalation', async (
   }
 });
 
-test('evaluates same-title live listings separately per URL and thumbnail', async () => {
+test('evaluates same-title live listings separately per URL with one Jev call each', async () => {
   const restore = liveJevEnv();
-  const detailUrls: string[] = [];
+  let calls = 0;
   const context = fixture({
-    classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.55, unsure: true }),
-    fetchListingDetailHtml: async (url: string) => {
-      detailUrls.push(url);
-      return '<html></html>';
+    classifyListingRelevanceWithJev: async () => {
+      calls += 1;
+      return calls === 1
+        ? { relevant: true, p: 0.9, unsure: false }
+        : { relevant: false, p: 0.1, unsure: false };
     },
-    classifyListingRelevanceWithVision: async (input: any) => ({
-      relevant: String(input.imageUrl).includes('good'),
-      confidence: 0.7,
-      imagesSeen: 1,
-    }),
+    fetchListingDetailHtml: async () => { throw new Error('Detail fetch must not run for filter-only relevance'); },
+    classifyListingRelevanceWithVision: async () => { throw new Error('Vision must not run for filter-only relevance'); },
   });
   try {
     const result = await (context.service as any).filterListingsByAiRelevance(
@@ -1666,10 +1651,10 @@ test('evaluates same-title live listings separately per URL and thumbnail', asyn
       ],
       { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
     );
+    assert.equal(calls, 2);
     assert.equal(result.listings.length, 1);
     assert.equal(result.listings[0].listingId, 'dup-a');
     assert.equal(result.excluded, 1);
-    assert.deepEqual(detailUrls, ['https://www.olx.pl/d/oferta/dup-a', 'https://www.olx.pl/d/oferta/dup-b']);
   } finally {
     restore();
     context.close();
@@ -1900,6 +1885,72 @@ test('caps fuzzy rescue at ten Jev calls per search', async () => {
     }, (context.service as any).jevLiveConfig());
     assert.equal(calls, 10);
     assert.equal(result.rescued.length, 10);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('reuses cached fuzzy rescue verdicts and gates weak listings', async () => {
+  const restore = liveJevEnv();
+  let calls = 0;
+  const context = fixture({
+    classifyTermMatchWithJev: async () => { calls += 1; return { decision: 'pass', confidence: 0.9, unsure: false }; },
+    classifyConditionMatchWithJev: async () => { calls += 1; return { decision: 'match', confidence: 0.9, unsure: false }; },
+  });
+  try {
+    const now = new Date().toISOString();
+    const listings = Array.from({ length: 2 }, (_, index) => ({
+      marketplace: 'OLX', listingId: `cache-miss-${index}`, title: `Ladowarki model ${index} Dell`, price: 100,
+      currency: 'PLN', url: `https://www.olx.pl/d/oferta/cache-miss-${index}`, observedAt: now, condition: 'Nowe', location: 'Warszawa',
+      shippingAvailable: null, priceNegotiable: null,
+    }));
+    const search = { query: 'ladowarka', includedTerms: '', excludedTerms: '', condition: 'Any' };
+    const live = (context.service as any).jevLiveConfig();
+    const first = await (context.service as any).rescueFuzzyMisses(
+      findFuzzyRescueCandidates(listings as any, 'ladowarka', '', '', {}), search, live);
+    assert.equal(calls, 2);
+    assert.equal(first.rescued.length, 2);
+    const second = await (context.service as any).rescueFuzzyMisses(
+      findFuzzyRescueCandidates(listings as any, 'ladowarka', '', '', {}), search, live);
+    assert.equal(calls, 2);
+    assert.equal(second.rescued.length, 2);
+    const gated = await (context.service as any).rescueFuzzyMisses(
+      findFuzzyRescueCandidates(listings as any, 'ladowarka', '', '', {}), search, live, () => false);
+    assert.equal(gated.rescued.length, 0);
+    assert.equal(calls, 2);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('caches confident fixed negotiability and skips upgrade on cached verification', async () => {
+  const restore = liveJevEnv();
+  const now = new Date().toISOString();
+  let jevCalls = 0;
+  const context = fixture({
+    verifyListingDescriptionWithJev: async () => ({ decision: 'pass', confidence: 0.85, unsure: false }),
+    classifyNegotiabilityWithJev: async () => { jevCalls += 1; return { decision: 'fixed', confidence: 0.9, unsure: false }; },
+  });
+  (context.service as any).fetchPublicPage = async () => '<meta property="og:description" content="Fully working console. Fixed price, no negotiation.">';
+  try {
+    context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at, price_negotiable) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+      'OLX', 'fixed-1', 'PS5 console', 2000, 'https://www.olx.pl/d/oferta/fixed-1', now, now, null);
+    const candidate: any = {
+      watchId: 'live-watch', listing: liveListing({ listingId: 'fixed-1', url: 'https://www.olx.pl/d/oferta/fixed-1' }),
+      typical: 2500, discountPercent: 25, confidence: 0.9, requiresDescriptionVerification: true,
+    };
+    assert.equal(await (context.service as any).verifyHighPriorityDealOnce(candidate), true);
+    assert.equal(jevCalls, 1);
+    assert.equal((context.db.prepare('SELECT price_negotiable FROM listings WHERE listing_id = ?').get('fixed-1') as { price_negotiable: number }).price_negotiable, 0);
+    assert.equal(candidate.listing.priceNegotiable, null);
+    const repeat: any = {
+      watchId: 'live-watch', listing: liveListing({ listingId: 'fixed-1', url: 'https://www.olx.pl/d/oferta/fixed-1' }),
+      typical: 2500, discountPercent: 25, confidence: 0.9, requiresDescriptionVerification: true,
+    };
+    assert.equal(await (context.service as any).verifyHighPriorityDealOnce(repeat), true);
+    assert.equal(jevCalls, 1);
   } finally {
     restore();
     context.close();

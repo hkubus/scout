@@ -849,71 +849,32 @@ export class ScoutService {
   }
 
   /**
-   * Live relevance decision (Phase 2): Jev decides; unsure triggers one
-   * bounded detail fetch for a description-enriched second judgment, then the
-   * vision tiebreak over the thumbnail; Jev failure goes straight to vision.
-   * Anything still undecided stays 'unknown' (kept, like the legacy path).
+   * Live relevance decision (Phase 2, spend-controlled): exactly one Jev call
+   * per uncached listing. A confident judgment decides; an unsure judgment
+   * falls back to its lean (cached as a decisive verdict so repeat scans
+   * reuse it); a Jev failure stays 'unknown' (kept, like the legacy path).
+   * Vision escalation is reserved for high-priority description verification,
+   * never for filter-only relevance — the relevance unsure rate (~88% in
+   * production) made every filtered listing cost 2 Jev calls plus vision.
    */
   private async decideRelevanceLive(
-    listing: NormalizedListing,
     context: ListingRelevanceContext,
     inputHash: string,
     live: NonNullable<ReturnType<ScoutService['jevLiveConfig']>>,
-    detailBudget: { remaining: number },
   ): Promise<{ relevant: boolean; status: 'relevant' | 'irrelevant' | 'unknown'; reason: string; error?: string }> {
-    const fromJev = (judgment: JevRelevanceJudgment, source: string): { relevant: boolean; status: 'relevant' | 'irrelevant'; reason: string } => {
+    try {
+      const judgment = await this.jevRelevance(context, { apiKey: live.apiKey, model: live.jevModel });
       const status: 'relevant' | 'irrelevant' = judgment.relevant ? 'relevant' : 'irrelevant';
-      this.logJevLive('relevance', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.p, jevUnsure: false });
-      return { relevant: judgment.relevant, status, reason: `Jev ${source} classified listing as ${status} (p=${judgment.p.toFixed(2)})` };
-    };
-
-    let lastJudgment: JevRelevanceJudgment | null = null;
-    let jevFailed: string | null = null;
-    try {
-      const first = await this.jevRelevance(context, { apiKey: live.apiKey, model: live.jevModel });
-      if (!first.unsure) return fromJev(first, 'classified');
-      lastJudgment = first;
-      if (detailBudget.remaining > 0) {
-        detailBudget.remaining -= 1;
-        try {
-          const html = await this.detailHtml(listing.url, listing.marketplace);
-          const description = parseListingDescription(html, listing.marketplace);
-          if (description) {
-            const second = await this.jevRelevance({ ...context, description }, { apiKey: live.apiKey, model: live.jevModel });
-            lastJudgment = second;
-            if (!second.unsure) return fromJev(second, 'description-enriched');
-          }
-        } catch {
-          // Detail fetch or enriched judgment failed — thumbnail tiebreak below.
-        }
-      }
+      this.logJevLive('relevance', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.p, jevUnsure: judgment.unsure });
+      if (!judgment.unsure) return { relevant: judgment.relevant, status, reason: `Jev classified listing as ${status} (p=${judgment.p.toFixed(2)})` };
+      // Unsure: follow the lean rather than spending a second Jev call plus
+      // vision — an accessory-leaning judgment excludes the listing outright
+      // instead of alerting on it.
+      return { relevant: judgment.relevant, status, reason: `Jev leaned ${status} (p=${judgment.p.toFixed(2)})` };
     } catch (error) {
-      jevFailed = error instanceof Error ? error.message : String(error);
-    }
-
-    try {
-      const vision = await this.visionRelevance(
-        { query: context.query, title: context.title, condition: context.condition, imageUrl: listing.imageUrl ?? null },
-        { apiKey: live.apiKey, model: live.visionModel },
-      );
-      const status: 'relevant' | 'irrelevant' = vision.relevant ? 'relevant' : 'irrelevant';
-      this.logJevLive('relevance', inputHash, live,
-        lastJudgment ? { jevAnswer: lastJudgment, jevConfidence: lastJudgment.p, jevUnsure: true } : { jevError: jevFailed },
-        { visionVerdict: status, visionConfidence: vision.confidence, visionImagesSeen: vision.imagesSeen });
-      return { relevant: vision.relevant, status, reason: `Vision tiebreak classified listing as ${status} (confidence ${vision.confidence.toFixed(2)})` };
-    } catch (error) {
-      const message = (error instanceof Error ? error.message : 'Vision could not classify listing relevance').slice(0, 500);
-      this.logJevLive('relevance', inputHash, live,
-        lastJudgment ? { jevAnswer: lastJudgment, jevConfidence: lastJudgment.p, jevUnsure: true } : { jevError: jevFailed },
-        { visionError: message });
-      // When Jev produced an unsure judgment, fall back to its lean rather
-      // than blindly keeping the listing: an accessory-leaning judgment
-      // excludes the listing outright instead of alerting on it.
-      if (lastJudgment) {
-        const status: 'relevant' | 'irrelevant' = lastJudgment.relevant ? 'relevant' : 'irrelevant';
-        return { relevant: lastJudgment.relevant, status, reason: `Jev leaned ${status} (p=${lastJudgment.p.toFixed(2)}) and vision relevance failed`, error: message };
-      }
-      return { relevant: true, status: 'unknown', reason: 'Jev and vision relevance checks failed', error: message };
+      const message = (error instanceof Error ? error.message : 'Jev could not classify listing relevance').slice(0, 500);
+      this.logJevLive('relevance', inputHash, live, { jevError: message });
+      return { relevant: true, status: 'unknown', reason: 'Jev relevance check failed', error: message };
     }
   }
 
@@ -1046,10 +1007,8 @@ export class ScoutService {
     // re-evaluates them; afterwards Jev rows reuse normally).
     const activeModel = jevLive ? jevLive.jevModel : config.model;
     const AI_RELEVANCE_BUDGET_PER_SCAN = 40;
-    const AI_RELEVANCE_DETAIL_BUDGET_PER_SCAN = 8;
     let aiCalls = 0;
     let skipped = 0;
-    const detailBudget = { remaining: AI_RELEVANCE_DETAIL_BUDGET_PER_SCAN };
     const pendingClassifications = new Map<string, Promise<{ relevant: boolean }>>();
     const pendingLive = new Map<string, Promise<{ relevant: boolean; status: 'relevant' | 'irrelevant' | 'unknown'; reason: string; error?: string }>>();
     // Relevance rows are collected while the batch awaits the AI calls and
@@ -1118,7 +1077,7 @@ export class ScoutService {
             let decision = pendingLive.get(liveKey);
             if (!decision) {
               aiCalls += 1;
-              decision = this.decideRelevanceLive(listing, context, inputHash, jevLive, detailBudget);
+              decision = this.decideRelevanceLive(context, inputHash, jevLive);
               pendingLive.set(liveKey, decision);
             }
             const live = await decision;
@@ -1173,11 +1132,46 @@ export class ScoutService {
    * exactly one fuzzy dimension (terms XOR condition) while passing price,
    * shipping, and location are considered, at most 10 per call, fail-closed
    * (Jev error/unsure keeps the drop). Returns rescued listings to merge.
+   *
+   * Spend-controlled: an optional deal-strength `gate` (same predicate as the
+   * AI-relevance pass) filters candidates before any Jev call, and every
+   * verdict is cached in `jev_fuzzy_cache` by input hash + model so repeat
+   * scans reuse it instead of re-spending on the same near-miss title.
    */
+  private readFuzzyCache(inputHash: string, model: string, task: 'term-match' | 'condition'): { rescued: boolean } | null {
+    try {
+      const row = this.stmt('SELECT rescued FROM jev_fuzzy_cache WHERE input_hash = ? AND model = ? AND task = ?').get(inputHash, model, task) as { rescued?: number } | undefined;
+      if (!row || row.rescued === undefined || row.rescued === null) return null;
+      return { rescued: Number(row.rescued) === 1 };
+    } catch {
+      // Missing table (migration not yet applied) means cache miss.
+      return null;
+    }
+  }
+
+  private writeFuzzyCache(inputHash: string, model: string, task: 'term-match' | 'condition', decision: string, confidence: number | null, rescued: boolean) {
+    try {
+      this.stmt(`INSERT INTO jev_fuzzy_cache (input_hash, model, task, decision, confidence, rescued, checked_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(input_hash, model, task) DO UPDATE SET decision = excluded.decision, confidence = excluded.confidence, rescued = excluded.rescued, checked_at = excluded.checked_at`).run(
+        inputHash, model, task, decision, confidence, rescued ? 1 : 0, nowIso(),
+      );
+    } catch {
+      // Cache writes must never break scans.
+    }
+  }
+
   private async rescueFuzzyMisses(
     candidates: { termCandidates: NormalizedListing[]; conditionCandidates: NormalizedListing[] },
     search: { query: string; includedTerms: string; excludedTerms: string; condition?: string },
     live: NonNullable<ReturnType<ScoutService['jevLiveConfig']>>,
+    /**
+     * Optional deal-strength gate: callers that can score listings (watch
+     * scans) pass the same predicate as the AI-relevance pass so rescue only
+     * spends Jev where an alert or Very-strong display could result. Manual
+     * searches omit it (no baseline to score against) and rely on the cache.
+     */
+    gate?: (listing: NormalizedListing) => boolean,
   ): Promise<{ rescued: NormalizedListing[]; rescuedByTerm: number; rescuedByCondition: number }> {
     const rescued: NormalizedListing[] = [];
     let rescuedByTerm = 0;
@@ -1185,22 +1179,34 @@ export class ScoutService {
     if (!live) return { rescued, rescuedByTerm, rescuedByCondition };
     const FUZZY_RESCUE_BUDGET = 10;
     let budget = FUZZY_RESCUE_BUDGET;
-    const termSlice = candidates.termCandidates.slice(0, FUZZY_RESCUE_BUDGET);
+    const gatedTerm = gate ? candidates.termCandidates.filter(gate) : candidates.termCandidates;
+    const gatedCondition = gate ? candidates.conditionCandidates.filter(gate) : candidates.conditionCandidates;
+    const termSlice = gatedTerm.slice(0, FUZZY_RESCUE_BUDGET);
     budget -= termSlice.length;
-    const conditionSlice = candidates.conditionCandidates.slice(0, Math.max(0, budget));
+    const conditionSlice = gatedCondition.slice(0, Math.max(0, budget));
     for (const listing of termSlice) {
       const inputHash = listingTermMatchInputHash({
         title: listing.title, listingCondition: listing.condition,
         query: search.query,
         includedTerms: search.includedTerms, excludedTerms: search.excludedTerms,
       });
+      const cached = this.readFuzzyCache(inputHash, live.jevModel, 'term-match');
+      if (cached) {
+        if (cached.rescued) {
+          rescued.push(listing);
+          rescuedByTerm += 1;
+        }
+        continue;
+      }
       try {
         const judgment = await this.jevTermMatch({
           query: search.query, includedTerms: search.includedTerms, excludedTerms: search.excludedTerms,
           title: listing.title, condition: listing.condition,
         }, { apiKey: live.apiKey, model: live.jevModel });
         this.logJevLive('term-match', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
-        if (judgment.decision === 'pass' && !judgment.unsure) {
+        const rescuedListing = judgment.decision === 'pass' && !judgment.unsure;
+        this.writeFuzzyCache(inputHash, live.jevModel, 'term-match', judgment.decision, judgment.confidence, rescuedListing);
+        if (rescuedListing) {
           rescued.push(listing);
           rescuedByTerm += 1;
         }
@@ -1212,12 +1218,22 @@ export class ScoutService {
       const inputHash = listingConditionMatchInputHash({
         title: listing.title, listingCondition: listing.condition, requestedCondition: search.condition ?? 'Any',
       });
+      const cached = this.readFuzzyCache(inputHash, live.jevModel, 'condition');
+      if (cached) {
+        if (cached.rescued) {
+          rescued.push(listing);
+          rescuedByCondition += 1;
+        }
+        continue;
+      }
       try {
         const judgment = await this.jevConditionMatch({
           requestedCondition: search.condition ?? 'Any', listingCondition: listing.condition, title: listing.title,
         }, { apiKey: live.apiKey, model: live.jevModel });
         this.logJevLive('condition', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
-        if (judgment.decision === 'match' && !judgment.unsure) {
+        const rescuedListing = judgment.decision === 'match' && !judgment.unsure;
+        this.writeFuzzyCache(inputHash, live.jevModel, 'condition', judgment.decision, judgment.confidence, rescuedListing);
+        if (rescuedListing) {
           rescued.push(listing);
           rescuedByCondition += 1;
         }
@@ -1240,6 +1256,7 @@ export class ScoutService {
     search: { query: string; includedTerms: string; excludedTerms: string; condition?: string },
     finalFilters: { minPrice?: number | null; maxPrice?: number | null; condition?: string; location?: string; shippingOnly: boolean },
     source: Marketplace,
+    gate?: (listing: NormalizedListing) => boolean,
   ): Promise<NormalizedListing[]> {
     const live = this.jevLiveConfig();
     if (!live) return [];
@@ -1253,21 +1270,22 @@ export class ScoutService {
       if (!shippable.length) return [];
       const rechecked = findFuzzyRescueCandidates(shippable, search.query, search.includedTerms, search.excludedTerms, finalFilters);
       // Candidates that no longer qualify (e.g. price/location edge) stay dropped.
-      const rescue = await this.rescueFuzzyMisses(rechecked, search, live);
+      const rescue = await this.rescueFuzzyMisses(rechecked, search, live, gate);
       return rescue.rescued;
     }
     const aligned = findFuzzyRescueCandidates(pool, search.query, search.includedTerms, search.excludedTerms, finalFilters);
-    const rescue = await this.rescueFuzzyMisses(aligned, search, live);
+    const rescue = await this.rescueFuzzyMisses(aligned, search, live, gate);
     return rescue.rescued;
   }
 
   /**
-   * P2: upgrade unknown negotiability to negotiable from description text.
-   * Never overrides an explicit signal: only runs when the in-memory listing
-   * and the stored row are both null/unknown, requires a confident Jev
-   * `negotiable` verdict, and writes with `WHERE price_negotiable IS NULL`.
-   * Mutates candidate.listing.priceNegotiable so same-scan consumers see the
-   * upgrade without a re-scan. Fail-open: any error is a no-op.
+   * P2: resolve unknown negotiability from description text. Never overrides
+   * an explicit signal: only runs when the in-memory listing and the stored
+   * row are both null/unknown, requires a confident Jev verdict, and writes
+   * with `WHERE price_negotiable IS NULL`. Confident `negotiable` upgrades to
+   * 1 (and mutates the candidate so same-scan consumers see it without a
+   * re-scan); confident `fixed` persists as 0 so the listing never re-spends
+   * a call on repeat scans. Fail-open: any error is a no-op.
    */
   private async upgradeNegotiabilityFromDescription(
     candidate: DealNotificationCandidate,
@@ -1292,7 +1310,14 @@ export class ScoutService {
         condition: candidate.listing.condition, description,
       });
       this.logJevLive('negotiability', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
-      if (judgment.decision !== 'negotiable' || judgment.unsure) return false;
+      if (judgment.unsure) return false;
+      if (judgment.decision === 'fixed') {
+        this.stmt('UPDATE listings SET price_negotiable = 0 WHERE marketplace = ? AND listing_id = ? AND price_negotiable IS NULL').run(
+          candidate.listing.marketplace, candidate.listing.listingId,
+        );
+        return false;
+      }
+      if (judgment.decision !== 'negotiable') return false;
       const result = this.stmt('UPDATE listings SET price_negotiable = 1 WHERE marketplace = ? AND listing_id = ? AND price_negotiable IS NULL').run(
         candidate.listing.marketplace, candidate.listing.listingId,
       );
@@ -1437,13 +1462,6 @@ export class ScoutService {
     };
     const inputHash = listingDescriptionVerificationInputHash(context);
     const snapshot = this.captureListingDetailSnapshot(candidate, description);
-    // P2: same description upgrades unknown negotiability (null -> true only,
-    // confident Jev verdict, IS NULL-guarded write). Runs before the
-    // verification cache early-return so previously-verified listings still
-    // get the upgrade. Fail-open no-op.
-    if (jevLive && description) {
-      await this.upgradeNegotiabilityFromDescription(candidate, description, jevLive);
-    }
     const row = this.stmt(`SELECT ai_description_verification_json, ai_description_verification_input_hash,
       ai_description_verification_model, ai_description_verification_at, ai_description_verification_error,
       ai_description_verification_status
@@ -1491,6 +1509,16 @@ export class ScoutService {
       this.updateListingDetailSnapshot(snapshot?.id ?? null, shared.decision, inputHash);
       this.saveDescriptionVerification({ marketplace, listingId, status: shared.decision, verification: shared, inputHash, model: activeModel });
       return shared.decision === 'pass';
+    }
+
+    // P2: same description upgrades unknown negotiability. Runs only on the
+    // fresh-verification path — after every cache early-return above — so an
+    // already-verified listing never re-spends a negotiability call on repeat
+    // scans. Confident `fixed` verdicts are persisted as 0 for the same
+    // reason (previously only `negotiable` was written, so fixed listings
+    // re-fired every scan). Fail-open no-op.
+    if (jevLive && description) {
+      await this.upgradeNegotiabilityFromDescription(candidate, description, jevLive);
     }
 
     try {
@@ -3135,11 +3163,24 @@ export class ScoutService {
           const comparable = filterListings(fetched, row.query, row.included_terms, row.excluded_terms, deterministicFilters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
           let filtered = filterListings(comparable, row.query, row.included_terms, row.excluded_terms, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) });
+          // Baseline and first-observation queries are watch-wide and computed
+          // once per scan, before the AI passes: both the fuzzy rescue and the
+          // relevance pass need the same scoring to decide which listings are
+          // strong enough to justify an AI call, and storeListing below
+          // reuses the result.
+          const baseline = this.watchBaseline(row);
+          // Spend rescue + relevance AI only where it can matter: listings
+          // that would alert (score.qualifies) or already rank Very strong.
+          // Everything else is kept without an AI call.
+          const strongEnough = (listing: NormalizedListing) => {
+            const { score, dealStrength } = this.dealScore(row, listing.price, baseline, referenceMedian);
+            return score.qualifies || (dealStrength ?? 0) >= 4;
+          };
           try {
             if (!matchingExact.length) {
               const rescued = await this.fuzzyRescueForSearch(fetched, {
                 query: row.query, includedTerms: row.included_terms ?? '', excludedTerms: row.excluded_terms ?? '', condition: row.condition,
-              }, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) }, source);
+              }, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) }, source, strongEnough);
               if (rescued.length) {
                 const seen = new Set(filtered.map((listing) => `${listing.marketplace}:${listing.listingId}`));
                 for (const listing of rescued) {
@@ -3155,21 +3196,15 @@ export class ScoutService {
             // Rescue is recall-only; any failure keeps the deterministic set.
           }
           // Baseline and first-observation queries are watch-wide and computed
-          // once per scan, before the AI relevance pass: the pass needs the same
-          // scoring to decide which listings are strong enough to justify an AI
-          // call, and storeListing below reuses the result.
-          const baseline = this.watchBaseline(row);
+          // once per scan above (shared with the fuzzy rescue gate), before
+          // the AI relevance pass: the pass needs the same scoring to decide
+          // which listings are strong enough to justify an AI call, and
+          // storeListing below reuses the result.
           const relevance = await this.filterListingsByAiRelevance(filtered, {
             query: row.query,
             includedTerms: row.included_terms ?? '',
             excludedTerms: row.excluded_terms ?? '',
-          }, row.id, row.ai_relevance === undefined ? true : Boolean(row.ai_relevance), (listing) => {
-            // Spend AI relevance only where it can matter: listings that would
-            // alert (score.qualifies) or already rank Very strong. Everything
-            // else is kept without an AI call.
-            const { score, dealStrength } = this.dealScore(row, listing.price, baseline, referenceMedian);
-            return score.qualifies || (dealStrength ?? 0) >= 4;
-          });
+          }, row.id, row.ai_relevance === undefined ? true : Boolean(row.ai_relevance), strongEnough);
           const candidates = this.transaction(() => {
             const pendingCandidates: DealNotificationCandidate[] = [];
             for (const listing of relevance.listings) {
