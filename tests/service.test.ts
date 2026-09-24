@@ -8,7 +8,7 @@ import { parseMarketplaceStorageState } from '../server/marketplace-sessions';
 import { DeepSeekError } from '../server/ai';
 import { listingDescriptionVerificationInputHash, listingRelevanceInputHash } from '../server/ai';
 import { VisionError } from '../server/vision';
-import { ScoutService, ServiceError, decryptSecret, encryptSecret, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, validateDiscordWebhook, type ScoutServiceDependencies } from '../server/service';
+import { ScoutService, ServiceError, decryptSecret, encryptSecret, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
 
 // Pin the legacy DeepSeek path for pre-existing tests: live Jev is the
 // production default whenever a key is available, but these tests assert
@@ -133,6 +133,71 @@ test('slows normal watch polling overnight without skipping the morning boundary
   assert.equal(nextWatchScanAt(beforeMorning, 5, 30), morning);
   assert.equal(minutesBetween(morning, nextWatchScanAt(morning, 5, 30)), 5);
   assert.equal(minutesBetween(overnight, nextWatchScanAt(overnight, 60, 30)), 60);
+});
+
+test('resolves per-marketplace intervals with a safety floor and default fallback', () => {
+  assert.deepEqual(watchSourceIntervals(['OLX', 'Vinted'], 15, { OLX: 30 }), { OLX: 30, Vinted: 15 });
+  assert.deepEqual(watchSourceIntervals(['OLX', 'Vinted'], 15, { OLX: 3 }), { OLX: 5, Vinted: 15 });
+  assert.deepEqual(watchSourceIntervals(['OLX'], 15, { Vinted: 60 }), { OLX: 15 });
+  assert.deepEqual(normalizeSourceIntervals(['OLX'], { OLX: 30, Vinted: 60 }), { OLX: 30 });
+  assert.deepEqual(normalizeSourceIntervals(['Vinted'], {}), {});
+});
+
+test('scans only the marketplaces whose interval has elapsed', () => {
+  const now = Date.parse('2026-08-23T12:00:00.000Z');
+  const next = {
+    OLX: '2026-08-23T11:55:00.000Z',
+    Vinted: '2026-08-23T12:30:00.000Z',
+    'Allegro Lokalnie': undefined,
+  };
+  assert.deepEqual(dueWatchSources(['OLX', 'Vinted', 'Allegro Lokalnie'], next, now), ['OLX', 'Allegro Lokalnie']);
+  assert.deepEqual(dueWatchSources(['OLX', 'Vinted'], next, now), ['OLX']);
+});
+
+test('advances each scanned marketplace on its own interval and keeps the earliest next scan', () => {
+  const finished = new Date(2026, 7, 23, 12, 0, 0, 0).toISOString();
+  const vintedNext = new Date(2026, 7, 23, 12, 30, 0, 0).toISOString();
+  const { nextBySource, nextScanAt } = nextWatchScanSchedule({
+    sources: ['OLX', 'Vinted'],
+    intervals: { OLX: 10, Vinted: 60 },
+    prior: { Vinted: vintedNext },
+    scanned: ['OLX'],
+    finishedAt: finished,
+    nightIntervalMinutes: 30,
+  });
+  assert.equal((Date.parse(nextBySource.OLX) - Date.parse(finished)) / 60_000, 10);
+  assert.equal(nextBySource.Vinted, vintedNext);
+  assert.equal(nextScanAt, nextBySource.OLX);
+});
+
+test('honors connector backoff when advancing a scanned marketplace', () => {
+  const finished = new Date(2026, 7, 23, 12, 0, 0, 0).toISOString();
+  const backoff = new Date(2026, 7, 23, 12, 45, 0, 0).toISOString();
+  const { nextBySource, nextScanAt } = nextWatchScanSchedule({
+    sources: ['OLX'],
+    intervals: { OLX: 5 },
+    prior: {},
+    scanned: ['OLX'],
+    finishedAt: finished,
+    nightIntervalMinutes: 30,
+    backoff: { OLX: backoff },
+  });
+  assert.equal(nextBySource.OLX, backoff);
+  assert.equal(nextScanAt, backoff);
+});
+
+test('surfaces stored per-marketplace intervals and drops stale sources', () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, source_intervals_json, enabled, next_scan_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`).run('interval-watch', 'Interval watch', 'cpu', '["OLX","Vinted"]', '{"OLX":45,"Vinted":120}', now, now, now);
+    const watch = context.service.getWatches().find((item) => item.id === 'interval-watch');
+    assert.deepEqual(watch?.sourceIntervals, { OLX: 45, Vinted: 120 });
+    context.db.prepare('UPDATE watches SET sources_json = ? WHERE id = ?').run('["OLX"]', 'interval-watch');
+    const narrowed = context.service.getWatches().find((item) => item.id === 'interval-watch');
+    assert.deepEqual(narrowed?.sourceIntervals, { OLX: 45 });
+  } finally { context.close(); }
 });
 
 test('encrypts Discord secrets and validates settings bounds', () => {
@@ -535,6 +600,39 @@ test('hides and unhides a listing without deleting its history', () => {
   } finally { context.close(); }
 });
 
+test('filters and sorts the listings feed server-side across all rows', () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    context.db.prepare('INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run('feed-watch', 'Feed watch', 'gpu', '["OLX"]', 1, now, now, now);
+    const insertListing = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, condition, location, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    const insertLink = context.db.prepare('INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)');
+    const add = (id: string, title: string, price: number, condition: string, location: string) => {
+      insertListing.run('OLX', id, title, price, condition, location, `https://www.olx.pl/d/oferta/${id}`, now, now);
+      const listing = context.db.prepare('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get('OLX', id) as { id: number };
+      insertLink.run('feed-watch', listing.id, now, now);
+    };
+    add('feed-cheap', 'GPU RTX 4070', 1500, 'Używane', 'Warszawa');
+    add('feed-mid', 'GPU RTX 4070 Ti', 2500, 'Nowe', 'Kraków');
+    add('feed-pricey', 'Karta graficzna RTX 4070', 3500, 'Używane', 'Warszawa');
+    context.service.updateListingAction('OLX:feed-mid', 'buy', 'worth it');
+    context.service.updateListingAction('OLX:feed-pricey', null, '', true);
+
+    // `q` covers title, condition, and location, and the total follows the filter.
+    assert.deepEqual(context.service.listingsPage({ q: 'kraków' }).listings.map((listing) => listing.id), ['OLX:feed-mid']);
+    assert.deepEqual(context.service.listingsPage({ q: 'używane' }).listings.map((listing) => listing.id).sort(), ['OLX:feed-cheap', 'OLX:feed-pricey']);
+    assert.equal(context.service.listingsPage({ q: 'używane' }).pagination.total, 2);
+    // Internal callers keep every row; the endpoint opts into visible-only.
+    assert.equal(context.service.listingsPage({}).listings.length, 3);
+    assert.deepEqual(context.service.listingsPage({ visibility: 'visible' }).listings.map((listing) => listing.id).sort(), ['OLX:feed-cheap', 'OLX:feed-mid']);
+    assert.deepEqual(context.service.listingsPage({ visibility: 'hidden' }).listings.map((listing) => listing.id), ['OLX:feed-pricey']);
+    assert.deepEqual(context.service.listingsPage({ decision: 'buy' }).listings.map((listing) => listing.id), ['OLX:feed-mid']);
+    // Sorting happens before the page window, so it covers every matching row.
+    assert.deepEqual(context.service.listingsPage({ sort: 'price' }).listings.map((listing) => listing.id), ['OLX:feed-cheap', 'OLX:feed-mid', 'OLX:feed-pricey']);
+    assert.deepEqual(context.service.listingsPage({ sort: 'price', page: 2, pageSize: 2 }).listings.map((listing) => listing.id), ['OLX:feed-pricey']);
+  } finally { context.close(); }
+});
+
 test('fetches and verifies descriptions for very strong and exceptional deals before alerting', async () => {
   let verificationRequests = 0;
   const context = fixture({
@@ -764,6 +862,35 @@ test('applies the same AI relevance gate to one-off marketplace search', async (
   } finally { context.close(); }
 });
 
+test('streams per-source manual search progress and honors the result page', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'scout-service-'));
+  const db = openDatabase(join(directory, 'scout.sqlite'));
+  const emitted: Array<{ event: string; payload: any }> = [];
+  const service = new ScoutService(db, (event, payload) => emitted.push({ event, payload }));
+  const urls: string[] = [];
+  (service as any).fetchOlxApi = async (url: string) => {
+    urls.push(url);
+    return { status: 200, json: { data: [
+      { id: 'STREAM-1', url: 'https://www.olx.pl/d/oferta/stream-1', title: 'GPU RTX 4070', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 2000, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 1 } } };
+  };
+  try {
+    const result = await service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '', page: 3, searchId: 'stream-1' });
+    assert.equal(result.listings.length, 1);
+    assert.match(urls[0], /offset=100/, 'the requested page maps to a marketplace offset');
+    const progress = emitted.filter((entry) => entry.event === 'search');
+    assert.equal(progress.length, 1);
+    assert.equal(progress[0].payload.searchId, 'stream-1');
+    assert.equal(progress[0].payload.source, 'OLX');
+    assert.equal(progress[0].payload.status.status, 'ok');
+    assert.deepEqual(progress[0].payload.listings.map((listing: any) => listing.id), ['OLX:STREAM-1']);
+
+    emitted.length = 0;
+    await service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
+    assert.equal(emitted.filter((entry) => entry.event === 'search').length, 0, 'no searchId means no streaming events');
+  } finally { db.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('keeps manual search results when AI relevance fails', async () => {
   const context = fixture({
     classifyListingRelevance: async () => { throw new Error('Marketplace timeout'); },
@@ -909,7 +1036,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1251,7 +1378,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 22);
+    assert.equal(after.migrations.count, 24);
   } finally { context.close(); }
 });
 
@@ -1455,6 +1582,37 @@ test('decides relevance live with Jev and never calls DeepSeek', async () => {
     assert.equal(result.listings.length, 1);
     assert.equal(result.excluded, 0);
     assert.equal(result.unknown, 0);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('reuses manual-search relevance decisions instead of re-spending Jev', async () => {
+  const restore = liveJevEnv();
+  let jevCalls = 0;
+  const context = fixture({
+    classifyListingRelevance: async () => { throw new Error('DeepSeek must not be called in live mode'); },
+    classifyListingRelevanceWithJev: async (ctx: any) => { jevCalls += 1; return { relevant: !ctx.title.includes('parts'), p: 0.92, unsure: false }; },
+    classifyListingRelevanceWithVision: async () => { throw new Error('Vision must not be called for sure judgments'); },
+  });
+  try {
+    const keep = liveListing({ listingId: 'manual-cache-1', title: 'PlayStation 5', url: 'https://www.olx.pl/d/oferta/manual-cache-1' });
+    const drop = liveListing({ listingId: 'manual-cache-2', title: 'PS5 parts only', url: 'https://www.olx.pl/d/oferta/manual-cache-2' });
+    const search = { query: 'PS5', includedTerms: '', excludedTerms: '' };
+    const first = await (context.service as any).filterListingsByAiRelevance([keep, drop], search, undefined, true);
+    assert.equal(jevCalls, 2);
+    assert.deepEqual(first.listings.map((item: any) => item.listingId), ['manual-cache-1']);
+    assert.equal(first.excluded, 1);
+
+    const repeat = await (context.service as any).filterListingsByAiRelevance([keep, drop], search, undefined, true);
+    assert.equal(jevCalls, 2, 'a repeated manual search must reuse cached decisions');
+    assert.deepEqual(repeat.listings.map((item: any) => item.listingId), ['manual-cache-1']);
+    assert.equal(repeat.excluded, 1);
+
+    // A different phrase is a different judgment and must not reuse the cache.
+    await (context.service as any).filterListingsByAiRelevance([keep], { query: 'Xbox', includedTerms: '', excludedTerms: '' }, undefined, true);
+    assert.equal(jevCalls, 3);
   } finally {
     restore();
     context.close();

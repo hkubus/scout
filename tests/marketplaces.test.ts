@@ -155,7 +155,11 @@ test('builds OLX offers API URLs from Scout query filters', () => {
   const unfiltered = new URL(buildOlxSearchApiUrl('steam deck'));
   assert.equal(unfiltered.searchParams.has('offset'), false);
   assert.equal(unfiltered.searchParams.has('sort_by'), false);
+  assert.equal(unfiltered.searchParams.has('owner_type'), false);
   assert.equal(unfiltered.searchParams.get('limit'), '50');
+  // Seller type is a structured OLX filter, not a post-filter on the results.
+  assert.equal(new URL(buildOlxSearchApiUrl('iphone 14', { ownerType: 'private' })).searchParams.get('owner_type'), 'private');
+  assert.equal(new URL(buildOlxSearchApiUrl('iphone 14', { ownerType: 'business' })).searchParams.get('owner_type'), 'business');
 });
 
 test('maps OLX offers API payloads onto normalized listings', () => {
@@ -654,6 +658,42 @@ test('uses query tokens as the default comparability filter', () => {
   assert.deepEqual(filterListings(listings, 'i5 8400', '', 'uszkodzony', true).map((listing) => listing.listingId), ['1']);
   listings[0].shippingAvailable = false;
   assert.deepEqual(filterListings(listings, 'i5 8400', '', 'uszkodzony', true), []);
+});
+
+test('matches joined model tokens and unit spellings', () => {
+  const base = { marketplace: 'OLX' as const, price: 100, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/test', observedAt: new Date().toISOString(), shippingAvailable: null as boolean | null };
+  const listings = [
+    { ...base, listingId: '1', title: 'iPhone 13 Pro 128 GB' },
+    { ...base, listingId: '2', title: 'Karta RTX3080 10GB' },
+    { ...base, listingId: '3', title: 'iPhone 13 Pro 128gb' },
+  ];
+  assert.deepEqual(filterListings(listings, '128gb', '', '').map((listing) => listing.listingId), ['1', '3']);
+  assert.deepEqual(filterListings(listings, '128 gb', '', '').map((listing) => listing.listingId), ['1', '3']);
+  assert.deepEqual(filterListings(listings, 'rtx 3080', '', '').map((listing) => listing.listingId), ['2']);
+});
+
+test('drops query stopwords but keeps single-digit models on token boundaries', () => {
+  const base = { marketplace: 'OLX' as const, price: 100, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/test', observedAt: new Date().toISOString(), shippingAvailable: null as boolean | null };
+  const listings = [
+    { ...base, listingId: '1', title: 'Dysk SSD 1TB do laptopa' },
+    { ...base, listingId: '2', title: 'iPhone 5 16GB' },
+    { ...base, listingId: '3', title: 'iPhone 15 128GB' },
+  ];
+  assert.deepEqual(filterListings(listings, 'ssd for laptop', '', '').map((listing) => listing.listingId), ['1']);
+  assert.deepEqual(filterListings(listings, 'iphone 5', '', '').map((listing) => listing.listingId), ['2']);
+});
+
+test('relaxes the implicit query terms only for opt-in manual searches', () => {
+  const base = { marketplace: 'OLX' as const, price: 100, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/test', observedAt: new Date().toISOString(), shippingAvailable: null as boolean | null };
+  const listings = [
+    { ...base, listingId: '1', title: 'iPhone 13 Pro' },
+    { ...base, listingId: '2', title: 'iPhone 13 Pro uszkodzony' },
+  ];
+  assert.deepEqual(filterListings(listings, 'iphone 13 pro max', '', '').map((listing) => listing.listingId), []);
+  assert.deepEqual(filterListings(listings, 'iphone 13 pro max', '', '', { relaxTerms: true }).map((listing) => listing.listingId), ['1', '2']);
+  assert.deepEqual(filterListings(listings, 'iphone 13 pro max', '', 'uszkodzony', { relaxTerms: true }).map((listing) => listing.listingId), ['1']);
+  // Explicit included terms are a hard requirement and never relax.
+  assert.deepEqual(filterListings(listings, 'iphone 13 pro max', 'iphone,13,pro,max', '', { relaxTerms: true }).map((listing) => listing.listingId), []);
 });
 
 test('applies manual and watch price, condition, and location filters', () => {

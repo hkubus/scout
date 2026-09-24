@@ -26,7 +26,15 @@ import {
 import { api } from "./api";
 import { marketplaceColors } from "./data";
 import { AnalyticsTrendChart, formatAnalyticsDate, formatAnalyticsPrice } from "./AnalyticsTrendChart";
-import type { Watch, WatchAnalytics } from "./types";
+import type { Marketplace, Watch, WatchAnalytics } from "./types";
+
+const intervalLabel = (watch: Watch): string => {
+  const overrides = watch.sourceIntervals;
+  if (!overrides || !Object.keys(overrides).length) return `every ${watch.interval} min`;
+  return watch.sources
+    .map((source) => `${source} ${overrides[source] ?? watch.interval}m`)
+    .join(" · ");
+};
 
 const formatPln = (value: number | null) =>
   value === null ? "Learning" : `${value.toLocaleString("pl-PL")} zł`;
@@ -220,7 +228,7 @@ function WatchRow({
           <div className="watch-tags">
             <span>include: {watch.terms || "query terms"}</span>
             <span>exclude: {watch.excluded || "none"}</span>
-            <span>every {watch.interval} min</span>
+            <span>{intervalLabel(watch)}</span>
             {watch.minPrice !== null || watch.maxPrice !== null ? (
               <span>
                 price:{" "}

@@ -133,6 +133,8 @@ export interface Watch {
   readiness: number;
   status: 'Learning' | 'Ready' | 'Paused' | 'Archived';
   interval: number;
+  /** Optional per-marketplace check cadence in minutes; unset sources use interval. */
+  sourceIntervals?: Partial<Record<Marketplace, number>>;
   nextScan: string;
   enabled: boolean;
   exactUrls: string[];
@@ -271,11 +273,18 @@ export interface SearchFilters {
   shippingOnly?: boolean;
   condition?: string;
   location?: string;
+  /** OLX only: private sellers or business accounts. */
+  ownerType?: "private" | "business" | null;
+  /** 1-based marketplace result page; the UI pages past the per-request cap. */
+  page?: number;
+  /** Client-generated id that correlates streamed per-source progress events. */
+  searchId?: string;
 }
 
 export interface SearchSourceStatus {
   source: Marketplace;
-  status: 'ok' | 'error';
+  /** `searching` is a client-side placeholder until the source reports back. */
+  status: "ok" | "error" | "searching";
   count: number;
   pendingShipping: number;
   durationMs: number;

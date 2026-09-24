@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ChevronDown, Database, Search, X } from "lucide-react";
 import { api } from "./api";
 import ListingTable from "./ListingTable";
@@ -40,6 +40,7 @@ export default function ListingsPage({
   onToggleHidden: (listing: Listing) => void;
 }) {
   const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [marketplace, setMarketplace] = useState<"All" | Marketplace>("All");
   const [sort, setSort] = useState<"Newest" | "Strongest" | "Price">("Newest");
   const [decision, setDecision] = useState<"All" | ListingDecision>("All");
@@ -48,16 +49,35 @@ export default function ListingsPage({
   const [remoteListings, setRemoteListings] = useState<Listing[] | null>(null);
   const [pagination, setPagination] = useState<{ page: number; pageSize: number; total: number; hasNext: boolean } | null>(null);
   const [loadingPage, setLoadingPage] = useState(false);
-  const deferredSearch = useDeferredValue(search);
 
+  // Debounce typing so one search fires after the user pauses, not per keystroke.
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedSearch(search.trim()), 300);
+    return () => window.clearTimeout(timer);
+  }, [search]);
+
+  const sortKey = sort === "Strongest" ? "strongest" : sort === "Price" ? "price" : "newest";
+  const visibilityKey = visibility === "Visible" ? "visible" : visibility === "Hidden" ? "hidden" : "all";
+
+  // Every filter is applied by the API across all pages, so a filter change
+  // restarts from page 1 instead of filtering only the loaded page.
   useEffect(() => {
     setPage(1);
-  }, [selectedWatchId]);
+  }, [selectedWatchId, debouncedSearch, marketplace, sort, decision, visibility]);
 
   useEffect(() => {
     const controller = new AbortController();
     setLoadingPage(true);
-    api.listings({ page, pageSize: 500, watchId: selectedWatchId ?? undefined }, controller.signal)
+    api.listings({
+      page,
+      pageSize: 500,
+      watchId: selectedWatchId ?? undefined,
+      q: debouncedSearch || undefined,
+      marketplace: marketplace === "All" ? undefined : marketplace,
+      sort: sortKey,
+      decision: decision === "All" ? undefined : decision,
+      visibility: visibilityKey,
+    }, controller.signal)
       .then((result) => {
         setRemoteListings(result.listings);
         setPagination(result.pagination);
@@ -71,13 +91,15 @@ export default function ListingsPage({
         if (!controller.signal.aborted) setLoadingPage(false);
       });
     return () => controller.abort();
-  }, [page, selectedWatchId]);
+  }, [page, selectedWatchId, debouncedSearch, marketplace, sortKey, decision, visibilityKey]);
 
-  const pageListings = remoteListings ?? listings;
+  // Offline fallback only: an unreachable API filters the dashboard feed in
+  // memory. Server-backed results already cover every page and are pre-sorted.
   const filtered = useMemo(() => {
-    const normalizedSearch = deferredSearch.trim().toLowerCase();
+    if (remoteListings) return remoteListings;
+    const normalizedSearch = debouncedSearch.toLowerCase();
     const matches: Listing[] = [];
-    for (const listing of pageListings) {
+    for (const listing of listings) {
       if (marketplace !== "All" && listing.marketplace !== marketplace) continue;
       if (selectedWatchId && listing.watchId !== selectedWatchId) continue;
       if (decision !== "All" && listing.decision !== decision) continue;
@@ -93,7 +115,7 @@ export default function ListingsPage({
           ? a.price - b.price
           : (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0),
     );
-  }, [pageListings, marketplace, deferredSearch, selectedWatchId, sort, decision, visibility]);
+  }, [remoteListings, listings, marketplace, debouncedSearch, selectedWatchId, sort, decision, visibility]);
 
   return (
     <>
@@ -149,7 +171,7 @@ export default function ListingsPage({
       {pagination && (pagination.page > 1 || pagination.hasNext) ? (
         <div className="research-pagination listings-pagination">
           <button className="outline-button" disabled={page <= 1 || loadingPage} onClick={() => setPage((current) => Math.max(1, current - 1))}>Previous</button>
-          <span>Page {pagination.page} · {pagination.total.toLocaleString("pl-PL")} saved matches</span>
+          <span>Page {pagination.page} · {pagination.total.toLocaleString("pl-PL")} matching listings</span>
           <button className="outline-button" disabled={!pagination.hasNext || loadingPage} onClick={() => setPage((current) => current + 1)}>Next</button>
         </div>
       ) : null}

@@ -47,6 +47,11 @@ export interface MarketplaceSearchFilters {
   location?: string;
   sort?: MarketplaceSearchSort;
   page?: number;
+  /**
+   * OLX only: restrict results to private sellers or business accounts. The
+   * other marketplaces have no equivalent param, so they ignore it.
+   */
+  ownerType?: 'private' | 'business' | null;
 }
 
 const hosts: Record<Marketplace, string[]> = {
@@ -748,6 +753,7 @@ export function buildOlxSearchApiUrl(query: string, filters: MarketplaceSearchFi
   const condition = filters.condition?.trim().toLowerCase();
   if (condition === 'new' || condition === 'used') url.searchParams.set('filter_enum_state[0]', condition);
   if (filters.shippingOnly) url.searchParams.set('courier', 'on');
+  if (filters.ownerType) url.searchParams.set('owner_type', filters.ownerType);
   if (filters.sort === 'newest') url.searchParams.set('sort_by', 'created_at:desc');
   const page = filters.page;
   if (page !== undefined && Number.isInteger(page) && page > 1 && page <= 10) url.searchParams.set('offset', String((page - 1) * OLX_API_PAGE_LIMIT));

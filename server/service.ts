@@ -14,7 +14,7 @@ import { pickVariantBatch, typoVariants } from './typos';
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
-import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -93,6 +93,11 @@ const connectorDefinitions: Array<Pick<Connector, 'name' | 'kind' | 'color'>> = 
 const marketplaces: Marketplace[] = ['OLX', 'Allegro Lokalnie', 'Vinted'];
 export const DEFAULT_NIGHT_INTERVAL_MINUTES = 30;
 const MATCH_VISIBILITY_MS = 12 * 60 * 60_000;
+/**
+ * Rows a single manual-search request keeps per source before truncating. The
+ * client pages past it with `page` instead of losing results silently.
+ */
+const MANUAL_SEARCH_RESULT_CAP = 200;
 const NIGHT_START_HOUR = 22;
 const NIGHT_END_HOUR = 8;
 const MAX_RESEARCH_DETAIL_CHECKS = 100;
@@ -168,6 +173,97 @@ export function nextWatchScanAt(finishedAt: string, dayIntervalMinutes: number, 
   const boundary = nextPollingBoundary(from, night);
   if (next > boundary) return boundary.toISOString();
   return next.toISOString();
+}
+
+/**
+ * Keep only the per-marketplace interval overrides that apply to the selected
+ * sources, clamping each to the 5-minute safety floor and 1440-minute ceiling.
+ * Values that are missing, non-numeric, or for unselected sources are dropped
+ * so a stale stored map can never schedule a source that is no longer used.
+ */
+export function normalizeSourceIntervals(
+  sources: Marketplace[],
+  overrides: Record<string, unknown> = {},
+): Record<string, number> {
+  const normalized: Record<string, number> = {};
+  for (const source of sources) {
+    const raw = overrides?.[source];
+    if (raw === undefined || raw === null) continue;
+    const value = Number(raw);
+    if (!Number.isFinite(value)) continue;
+    normalized[source] = Math.min(1440, Math.max(5, Math.floor(value)));
+  }
+  return normalized;
+}
+
+/**
+ * Resolve the polling cadence for every selected marketplace: an explicit
+ * per-source override when present, otherwise the watch-wide default. This is
+ * the effective schedule the running watch uses, independent of how many
+ * overrides are stored.
+ */
+export function watchSourceIntervals(
+  sources: Marketplace[],
+  defaultMinutes: number,
+  overrides: Record<string, unknown> = {},
+): Record<string, number> {
+  const fallback = Math.max(5, Math.floor(Number(defaultMinutes) || 5));
+  const resolved = normalizeSourceIntervals(sources, overrides);
+  for (const source of sources) {
+    if (resolved[source] === undefined) resolved[source] = fallback;
+  }
+  return resolved;
+}
+
+/**
+ * Pick the sources whose recorded next-check time has arrived. A source with
+ * no recorded time (first run, newly added source, or a legacy watch written
+ * before per-marketplace scheduling) is always due so it can never be starved.
+ */
+export function dueWatchSources(
+  sources: Marketplace[],
+  sourceNext: Record<string, string | undefined> = {},
+  now = Date.now(),
+): Marketplace[] {
+  return sources.filter((source) => {
+    const scheduledAt = sourceNext[source];
+    return !scheduledAt || !Number.isFinite(Date.parse(scheduledAt)) || Date.parse(scheduledAt) <= now;
+  });
+}
+
+/**
+ * Compute the next check time for every selected source after a run. Scanned
+ * sources advance by their own interval (or connector backoff, whichever is
+ * later); sources that were not due keep their existing time. The watch-wide
+ * next_scan_at is the earliest source time, so the scheduler wakes the watch
+ * exactly when its next marketplace is ready.
+ */
+export function nextWatchScanSchedule(options: {
+  sources: Marketplace[];
+  intervals: Record<string, number>;
+  prior: Record<string, string | undefined>;
+  scanned: Iterable<Marketplace>;
+  finishedAt: string;
+  nightIntervalMinutes: number;
+  backoff?: Record<string, string | undefined>;
+}): { nextBySource: Record<string, string>; nextScanAt: string } {
+  const scannedSet = new Set(options.scanned);
+  const nextBySource: Record<string, string> = {};
+  for (const source of options.sources) {
+    const interval = options.intervals[source] ?? 5;
+    if (scannedSet.has(source)) {
+      let next = nextWatchScanAt(options.finishedAt, interval, options.nightIntervalMinutes);
+      const backoffUntil = options.backoff?.[source];
+      if (backoffUntil && Date.parse(backoffUntil) > Date.parse(next)) next = backoffUntil;
+      nextBySource[source] = next;
+    } else if (options.prior[source]) {
+      nextBySource[source] = options.prior[source] as string;
+    } else {
+      nextBySource[source] = nextWatchScanAt(options.finishedAt, interval, options.nightIntervalMinutes);
+    }
+  }
+  const nextScanAt = Object.values(nextBySource).sort()[0] ?? nextWatchScanAt(options.finishedAt, 5, options.nightIntervalMinutes);
+  return { nextBySource, nextScanAt };
 }
 
 const nowIso = () => new Date().toISOString();
@@ -968,6 +1064,46 @@ export class ScoutService {
   }
 
   /**
+   * Manual-search relevance cache. Same input hash + model the watch path uses,
+   * but with no watch row; a hit skips the Jev/DeepSeek call entirely. Reads are
+   * best-effort: a missing table (migration not yet applied) is a miss.
+   */
+  private readManualRelevance(inputHash: string, legacyInputHash: string, model: string): 'relevant' | 'irrelevant' | null {
+    try {
+      const row = (this.stmt('SELECT relevant, relevance_status, error FROM manual_relevance_cache WHERE input_hash = ? AND model = ?').get(inputHash, model)
+        ?? this.stmt('SELECT relevant, relevance_status, error FROM manual_relevance_cache WHERE input_hash = ? AND model = ?').get(legacyInputHash, model)) as
+        { relevant?: number; relevance_status?: string; error?: string | null } | undefined;
+      if (!row || row.error) return null;
+      if (row.relevance_status === 'irrelevant' || row.relevant === 0) return 'irrelevant';
+      if (row.relevance_status === 'relevant' || row.relevant === 1) return 'relevant';
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  private saveManualRelevance(input: {
+    inputHash: string;
+    model: string;
+    relevant: boolean;
+    status: 'relevant' | 'irrelevant';
+    reason: string;
+    error?: string | null;
+  }) {
+    this.stmt(`INSERT INTO manual_relevance_cache (input_hash, model, relevant, relevance_status, reason, error, checked_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(input_hash, model) DO UPDATE SET relevant = excluded.relevant, relevance_status = excluded.relevance_status, reason = excluded.reason, error = excluded.error, checked_at = excluded.checked_at`).run(
+      input.inputHash,
+      input.model,
+      input.relevant ? 1 : 0,
+      input.status,
+      input.reason.slice(0, 240),
+      input.error?.slice(0, 500) ?? null,
+      nowIso(),
+    );
+  }
+
+  /**
    * Human-readable scan note for the AI relevance pass. Mirrors the inline
    * wording manual search uses, plus the deal-strength skip count.
    */
@@ -1015,6 +1151,23 @@ export class ScoutService {
     // flushed in one transaction per batch: a per-row autocommit would mean a
     // commit per listing, and the transaction must never span an await.
     const relevanceWrites: Array<Parameters<ScoutService['saveListingRelevance']>[0]> = [];
+    // Manual searches have no watch row to key `listing_relevance` on, so their
+    // decisions go to a listing-scoped cache keyed by the same input hash. A
+    // repeat of the same search then costs no AI calls and no wait.
+    const manualRelevanceWrites: Array<Parameters<ScoutService['saveManualRelevance']>[0]> = [];
+    const persistRelevance = (
+      listing: NormalizedListing,
+      inputHash: string,
+      model: string,
+      relevant: boolean,
+      status: 'relevant' | 'irrelevant' | 'unknown',
+      reason: string,
+      error: string | null = null,
+    ) => {
+      if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model, relevant, status, reason, error });
+      // Unknown means "not judged" — caching it would suppress a later real check.
+      else if (status !== 'unknown') manualRelevanceWrites.push({ inputHash, model, relevant, status, reason, error });
+    };
 
     const classified: Array<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> = [];
     for (let offset = 0; offset < listings.length; offset += 4) {
@@ -1036,9 +1189,12 @@ export class ScoutService {
             ? cached.relevance_status
             : cached?.error ? 'unknown' : cached?.relevant === 0 ? 'irrelevant' : 'relevant';
           if ((cached?.input_hash === inputHash || cached?.input_hash === legacyInputHash) && cached.model === activeModel && cachedStatus !== 'unknown' && !cached.error) {
-            if (cached.input_hash === legacyInputHash) relevanceWrites.push({ watchId, listing, inputHash, model: activeModel, relevant: cachedStatus === 'relevant', status: cachedStatus, reason: cached.reason ?? 'Reused cached relevance decision' });
+            if (cached.input_hash === legacyInputHash) persistRelevance(listing, inputHash, activeModel, cachedStatus === 'relevant', cachedStatus, cached.reason ?? 'Reused cached relevance decision');
             return { listing, status: cachedStatus };
           }
+        } else {
+          const manual = this.readManualRelevance(inputHash, legacyInputHash, activeModel);
+          if (manual) return { listing, status: manual };
         }
 
         // Cross-listing reuse is keyed by input hash, which omits the per-listing
@@ -1049,7 +1205,7 @@ export class ScoutService {
           ORDER BY checked_at DESC LIMIT 1`).get(inputHash, activeModel) as { relevant?: number; reason?: string; relevance_status?: string } | undefined : undefined;
         if (reusable) {
           const status: 'relevant' | 'irrelevant' = reusable.relevance_status === 'irrelevant' || reusable.relevant === 0 ? 'irrelevant' : 'relevant';
-          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: activeModel, relevant: status === 'relevant', status, reason: reusable.reason ?? 'Reused cached relevance decision' });
+          persistRelevance(listing, inputHash, activeModel, status === 'relevant', status, reusable.reason ?? 'Reused cached relevance decision');
           return { listing, status };
         }
 
@@ -1059,7 +1215,7 @@ export class ScoutService {
         // the check runs after cache reuse so cached decisions still apply.
         if (gate && !gate(listing)) {
           skipped += 1;
-          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: activeModel, relevant: true, status: 'unknown', reason: 'AI relevance skipped: deal below the Very strong threshold' });
+          persistRelevance(listing, inputHash, activeModel, true, 'unknown', 'AI relevance skipped: deal below the Very strong threshold');
           return { listing, status: 'unknown' as const };
         }
 
@@ -1069,7 +1225,7 @@ export class ScoutService {
         // uses each listing's own URL and thumbnail, which the hash omits.
         const liveKey = `${inputHash}|${listing.url}|${listing.imageUrl ?? ''}`;
         if (aiCalls >= AI_RELEVANCE_BUDGET_PER_SCAN && !pendingClassifications.has(inputHash) && !pendingLive.has(liveKey)) {
-          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: activeModel, relevant: true, status: 'unknown', reason: 'AI relevance budget exhausted for this scan' });
+          persistRelevance(listing, inputHash, activeModel, true, 'unknown', 'AI relevance budget exhausted for this scan');
           return { listing, status: 'unknown' as const };
         }
         if (jevLive) {
@@ -1081,11 +1237,11 @@ export class ScoutService {
               pendingLive.set(liveKey, decision);
             }
             const live = await decision;
-            if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: jevLive.jevModel, relevant: live.relevant, status: live.status, reason: live.reason, error: live.error ?? null });
+            persistRelevance(listing, inputHash, jevLive.jevModel, live.relevant, live.status, live.reason, live.error ?? null);
             return { listing, status: live.status };
           } catch (error) {
             const message = (error instanceof Error ? error.message : 'Jev could not classify listing relevance').slice(0, 500);
-            if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: jevLive.jevModel, relevant: true, status: 'unknown', reason: 'Jev relevance check failed unexpectedly', error: message });
+            persistRelevance(listing, inputHash, jevLive.jevModel, true, 'unknown', 'Jev relevance check failed unexpectedly', message);
             return { listing, status: 'unknown' };
           }
         }
@@ -1099,20 +1255,22 @@ export class ScoutService {
           const result = await classification;
           if (jevShadow) this.shadowJevRelevance(context, inputHash, result.relevant, listing.imageUrl, jevShadow);
           const status: 'relevant' | 'irrelevant' = result.relevant ? 'relevant' : 'irrelevant';
-          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: activeModel, relevant: result.relevant, status, reason: result.relevant ? 'AI classified listing as relevant' : 'AI classified listing as irrelevant' });
+          persistRelevance(listing, inputHash, activeModel, result.relevant, status, result.relevant ? 'AI classified listing as relevant' : 'AI classified listing as irrelevant');
           return { listing, status };
         } catch (error) {
           const message = (error instanceof Error ? error.message : 'OpenRouter could not classify listing relevance').slice(0, 500);
-          if (watchId) relevanceWrites.push({ watchId, listing, inputHash, model: activeModel, relevant: true, status: 'unknown', reason: 'AI relevance check failed', error: message });
+          persistRelevance(listing, inputHash, activeModel, true, 'unknown', 'AI relevance check failed', message);
           if (jevShadow) this.shadowJevRelevance(context, inputHash, null, listing.imageUrl, jevShadow);
           return { listing, status: 'unknown' };
         }
       }));
       classified.push(...batch);
-      if (relevanceWrites.length) {
+      if (relevanceWrites.length || manualRelevanceWrites.length) {
         const writes = relevanceWrites.splice(0, relevanceWrites.length);
+        const manualWrites = manualRelevanceWrites.splice(0, manualRelevanceWrites.length);
         this.transaction(() => {
           for (const input of writes) this.saveListingRelevance(input);
+          for (const input of manualWrites) this.saveManualRelevance(input);
         });
       }
     }
@@ -1698,13 +1856,14 @@ export class ScoutService {
     const readiness = Math.round(Math.min(1, samples / BASELINE_MIN_SAMPLES, observationHours / BASELINE_MIN_HOURS) * 100);
     const archived = Boolean(row.archived_at);
     const enabled = Boolean(row.enabled) && !archived;
+    const sources = parseJson<Marketplace[]>(row.sources_json, []);
     return {
       id: row.id,
       name: row.name,
       query: row.query,
       terms: row.included_terms,
       excluded: row.excluded_terms,
-      sources: parseJson<Marketplace[]>(row.sources_json, []),
+      sources,
       location: row.location,
       condition: row.condition,
       samples,
@@ -1713,6 +1872,7 @@ export class ScoutService {
       readiness,
       status: archived ? 'Archived' : enabled ? (readiness >= 100 ? 'Ready' : 'Learning') : 'Paused',
       interval: Number(row.interval_minutes),
+      sourceIntervals: normalizeSourceIntervals(sources, parseJson<Record<string, unknown>>(row.source_intervals_json, {})),
       nextScan: enabled ? relativeTimeFuture(row.next_scan_at) : 'Paused',
       enabled,
       exactUrls: parseJson<string[]>(row.exact_urls_json, []),
@@ -2019,7 +2179,18 @@ export class ScoutService {
     };
   }
 
-  listingsPage(options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string; includeAiFiltered?: boolean } = {}, knownWatches?: Watch[]) {
+  listingsPage(options: {
+    page?: number;
+    pageSize?: number;
+    marketplace?: Marketplace;
+    q?: string;
+    watchId?: string;
+    includeAiFiltered?: boolean;
+    sort?: 'newest' | 'strongest' | 'price';
+    decision?: ListingDecision;
+    /** Defaults to `all` so internal callers (dashboard feed) keep today's rows. */
+    visibility?: 'visible' | 'hidden' | 'all';
+  } = {}, knownWatches?: Watch[]) {
     const freshnessCutoff = new Date(Date.now() - MATCH_VISIBILITY_MS).toISOString();
     const aiFilteredPredicate = 'EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = \'irrelevant\' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)';
     const predicates = [
@@ -2033,10 +2204,21 @@ export class ScoutService {
     const params: unknown[] = [freshnessCutoff];
     if (options.marketplace) { predicates.push('l.marketplace = ?'); params.push(options.marketplace); }
     if (options.watchId) { predicates.push('w.id = ?'); params.push(options.watchId); }
+    if (options.decision) { predicates.push('a.decision = ?'); params.push(options.decision); }
+    if (options.visibility === 'hidden') predicates.push('COALESCE(a.hidden, 0) = 1');
+    else if (options.visibility === 'visible') predicates.push('COALESCE(a.hidden, 0) = 0');
     const query = options.q?.trim().toLowerCase() ?? '';
-    if (query) { predicates.push("lower(COALESCE(l.title, '') || ' ' || COALESCE(l.subtitle, '')) LIKE ? ESCAPE '\\'"); params.push(`%${ScoutService.escapeLike(query)}%`); }
+    if (query) {
+      predicates.push("lower(COALESCE(l.title, '') || ' ' || COALESCE(l.subtitle, '') || ' ' || COALESCE(l.condition, '') || ' ' || COALESCE(l.location, '')) LIKE ? ESCAPE '\\'");
+      params.push(`%${ScoutService.escapeLike(query)}%`);
+    }
     const where = predicates.join(' AND ');
-    const total = Number((this.stmt(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
+    const orderBy = options.sort === 'strongest'
+      ? 'wl.deal_strength DESC, wl.last_seen_at DESC, wl.id DESC'
+      : options.sort === 'price'
+        ? 'l.price_pln ASC, wl.last_seen_at DESC, wl.id DESC'
+        : 'wl.last_seen_at DESC, wl.id DESC';
+    const total = Number((this.stmt(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(500, Math.floor(options.pageSize ?? 200)));
     const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note, a.hidden AS listing_hidden, CASE WHEN ${aiFilteredPredicate} THEN 1 ELSE 0 END AS ai_filtered
@@ -2045,7 +2227,7 @@ export class ScoutService {
       JOIN watches w ON w.id = wl.watch_id
       LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id
       WHERE ${where}
-      ORDER BY wl.last_seen_at DESC, wl.id DESC LIMIT ? OFFSET ?`).all(...params, pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
+      ORDER BY ${orderBy} LIMIT ? OFFSET ?`).all(...params, pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
     const watches = new Map((knownWatches ?? this.getWatches()).map((watch) => [watch.id, watch]));
     const listings = rows.map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100));
     return { listings, pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
@@ -2204,20 +2386,33 @@ export class ScoutService {
     return [...new Map(first.map((listing) => [`${listing.marketplace}:${listing.listingId}`, listing])).values()];
   }
 
+  /**
+   * Stream a finished source to whichever client initiated the search. Only
+   * fires when the client supplied a `searchId`; the HTTP response remains the
+   * authoritative result set.
+   */
+  private emitSearchProgress(searchId: string | undefined, page: number, source: Marketplace, status: SearchSourceStatus, listings: Listing[]) {
+    const id = searchId?.trim();
+    if (!id) return;
+    this.emit('search', { searchId: id, page, source, status, listings });
+  }
+
   async manualSearch(input: SearchFilters): Promise<ManualSearchResponse> {
     if (this.activeManualSearches >= 3) throw new ServiceError('Three manual searches are already running. Try again shortly.', 429);
     this.activeManualSearches += 1;
+    // The client pages through results; marketplaces cap their own page size.
+    const page = Math.min(Math.max(Math.floor(input.page ?? 1), 1), 10);
     try {
       const tasks = input.sources.map(async (source) => {
       const started = Date.now();
       try {
-        const fetched = await this.fetchSearchPages(source, input.query, input);
+        const fetched = await this.fetchSearchPages(source, input.query, { ...input, page });
         const deterministicFilters = { minPrice: input.minPrice, maxPrice: input.maxPrice, condition: input.condition, location: input.location, shippingOnly: false };
         const comparable = filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters);
         // Cache-first like watch scans: only a few cold listings fetch an item
         // page per search; the rest surface as pending delivery checks.
         if (input.shippingOnly) await this.enrichShipping(comparable, source);
-        let filtered = filterListings(comparable, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, shippingOnly: input.shippingOnly });
+        let filtered = filterListings(comparable, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, shippingOnly: input.shippingOnly, relaxTerms: true });
         // P1/P3 near-miss rescue: deterministic substring misses that pass
         // everything else get one bounded Jev judgment each. Fail-closed:
         // any failure keeps the deterministic set.
@@ -2260,23 +2455,35 @@ export class ScoutService {
         }
         // One transaction for the whole batch: each upsert would otherwise be
         // its own implicit commit (an fsync per listing before WAL=NORMAL).
+        const capped = relevant.slice(0, MANUAL_SEARCH_RESULT_CAP);
+        const truncated = relevant.length > capped.length;
         this.transaction(() => {
-          for (const listing of relevant.slice(0, 100)) this.storeManualListing(listing);
+          for (const listing of capped) this.storeManualListing(listing);
         });
         const pendingShipping = input.shippingOnly ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
-        return {
-          listings: relevant.slice(0, 100).map((listing): Listing => ({
-            id: `${listing.marketplace}:${listing.listingId}`, title: listing.title,
-            subtitle: [listing.condition, listing.location].filter(Boolean).join(' · '), marketplace: listing.marketplace,
-            price: listing.price, typical: null, belowTypical: null, observed: 'just now', observedAt: listing.observedAt,
-            dealStrength: 1, dealLabel: 'Watch', image: listing.imageUrl ?? '', url: listing.url, watch: 'Manual search',
-            condition: listing.condition, location: listing.location, shippingAvailable: listing.shippingAvailable ?? null, priceNegotiable: listing.priceNegotiable ?? null,
-          })),
-          status: { source, status: 'ok' as const, count: relevant.length, pendingShipping, durationMs: Date.now() - started, message: relevant.length ? `${relevant.length} matches${relevanceNote}` : 'No matching listings' },
+        const listings = capped.map((listing): Listing => ({
+          id: `${listing.marketplace}:${listing.listingId}`, title: listing.title,
+          subtitle: [listing.condition, listing.location].filter(Boolean).join(' · '), marketplace: listing.marketplace,
+          price: listing.price, typical: null, belowTypical: null, observed: 'just now', observedAt: listing.observedAt,
+          dealStrength: 1, dealLabel: 'Watch', image: listing.imageUrl ?? '', url: listing.url, watch: 'Manual search',
+          condition: listing.condition, location: listing.location, shippingAvailable: listing.shippingAvailable ?? null, priceNegotiable: listing.priceNegotiable ?? null,
+        }));
+        const status: SearchSourceStatus = {
+          source, status: 'ok', count: relevant.length, pendingShipping, durationMs: Date.now() - started,
+          message: relevant.length
+            ? `${relevant.length} matches${relevanceNote}${truncated ? ` · showing the first ${MANUAL_SEARCH_RESULT_CAP}` : ''}`
+            : 'No matching listings',
         };
+        // Stream this source to the originating client so a fast marketplace is
+        // visible while a slow one is still fetching. The HTTP response below
+        // stays authoritative and reconciles anything the stream missed.
+        this.emitSearchProgress(input.searchId, page, source, status, listings);
+        return { listings, status };
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Search failed';
-        return { listings: [] as Listing[], status: { source, status: 'error' as const, count: 0, pendingShipping: 0, durationMs: Date.now() - started, message } };
+        const status: SearchSourceStatus = { source, status: 'error', count: 0, pendingShipping: 0, durationMs: Date.now() - started, message };
+        this.emitSearchProgress(input.searchId, page, source, status, []);
+        return { listings: [] as Listing[], status };
       }
       });
       const results = await Promise.all(tasks);
@@ -3100,7 +3307,8 @@ export class ScoutService {
       ? this.stmt('SELECT * FROM watches WHERE id = ? AND enabled = 1').all(watchId) as WatchRow[]
       : this.stmt('SELECT * FROM watches WHERE enabled = 1').all() as WatchRow[];
     if (!rows.length) throw new ServiceError(watchId ? 'Enabled watch not found' : 'There are no enabled watches to scan', 404);
-    for (const row of rows) void this.runWatch(row);
+    // A manual scan ignores the per-marketplace schedule and checks every source.
+    for (const row of rows) void this.runWatch(row, { forceAll: true });
     return { queued: true, message: `Queued ${rows.length} ${rows.length === 1 ? 'watch' : 'watches'}` };
   }
 
@@ -3114,22 +3322,32 @@ export class ScoutService {
     for (const row of marketRows) void this.runMarketWatch(row);
   }
 
-  private async runWatch(row: WatchRow) {
+  private async runWatch(row: WatchRow, options: { forceAll?: boolean } = {}) {
     if (this.running.has(row.id)) return;
     this.running.add(row.id);
     const sources = parseJson<Marketplace[]>(row.sources_json, []);
     const exactUrls = parseJson<string[]>(row.exact_urls_json, []);
+    // Each marketplace keeps its own next-check time so a slow source can be
+    // left alone while a fast one is polled. A source with no recorded time
+    // (first run, newly added) is always due; "Scan now" forces every source.
+    const storedSourceNext = parseJson<Record<string, string>>(row.source_next_scan_json, {});
+    const dueSources = options.forceAll ? sources : dueWatchSources(sources, storedSourceNext);
     // Reference-series fallback is computed once per scan, like the baseline.
     const referenceMedian = row.reference_market_watch_id ? this.referenceBandMedian(String(row.reference_market_watch_id)) : null;
-    let latestBackoffUntil: string | null = null;
+    const backoffBySource = new Map<string, string>();
     try {
-      await Promise.all(sources.map(async (source) => {
+      if (!dueSources.length) {
+        const pending = sources.map((source) => storedSourceNext[source]).filter((value): value is string => Boolean(value)).sort();
+        if (pending.length) this.stmt('UPDATE watches SET next_scan_at = ?, updated_at = ? WHERE id = ?').run(pending[0], nowIso(), row.id);
+        return;
+      }
+      await Promise.all(dueSources.map(async (source) => {
         const paths: string[] = [];
         const onPath: ConnectorPathReporter = (path) => { if (!paths.includes(path)) paths.push(path); };
         const latest = this.stmt('SELECT backoff_until FROM connector_runs WHERE source = ? ORDER BY started_at DESC LIMIT 1').get(source) as { backoff_until?: string } | undefined;
         const started = nowIso();
         const backoffUntil = latest?.backoff_until && Date.parse(latest.backoff_until) > Date.now() ? latest.backoff_until : null;
-        if (backoffUntil && (!latestBackoffUntil || Date.parse(backoffUntil) > Date.parse(latestBackoffUntil))) latestBackoffUntil = backoffUntil;
+        if (backoffUntil) backoffBySource.set(source, backoffUntil);
         const runId = this.recordRun(source, backoffUntil ? 'skipped' : 'running', backoffUntil ? `Skipped ${row.name}; connector backoff is active` : `Scanning ${row.name}`, started, backoffUntil ? started : null);
         const scanId = this.createScan(String(row.id), 'watch', source, started);
         if (backoffUntil) {
@@ -3231,9 +3449,18 @@ export class ScoutService {
         }
       }));
       const finished = nowIso();
-      const scheduled = nextWatchScanAt(finished, Number(row.interval_minutes), Number(this.getSetting('night_interval') ?? DEFAULT_NIGHT_INTERVAL_MINUTES));
-      const next = latestBackoffUntil && Date.parse(latestBackoffUntil) > Date.parse(scheduled) ? latestBackoffUntil : scheduled;
-      this.stmt('UPDATE watches SET next_scan_at = ?, updated_at = ? WHERE id = ?').run(next, finished, row.id);
+      const nightInterval = Number(this.getSetting('night_interval') ?? DEFAULT_NIGHT_INTERVAL_MINUTES);
+      const intervals = watchSourceIntervals(sources, Number(row.interval_minutes), parseJson<Record<string, unknown>>(row.source_intervals_json, {}));
+      const { nextBySource, nextScanAt } = nextWatchScanSchedule({
+        sources,
+        intervals,
+        prior: storedSourceNext,
+        scanned: dueSources,
+        finishedAt: finished,
+        nightIntervalMinutes: nightInterval,
+        backoff: Object.fromEntries(backoffBySource),
+      });
+      this.stmt('UPDATE watches SET next_scan_at = ?, source_next_scan_json = ?, updated_at = ? WHERE id = ?').run(nextScanAt, JSON.stringify(nextBySource), finished, row.id);
       this.setSetting('last_scan', JSON.stringify({ at: finished }));
       this.emit('scan', { refresh: true, watchId: row.id });
     } finally {
@@ -3511,6 +3738,7 @@ export class ScoutService {
     this.stmt('DELETE FROM listing_detail_snapshots WHERE captured_at < ?').run(cutoff);
     this.stmt('DELETE FROM market_price_observations WHERE observed_at < ?').run(cutoff);
     this.stmt('DELETE FROM listing_relevance WHERE checked_at < ?').run(cutoff);
+    this.stmt('DELETE FROM manual_relevance_cache WHERE checked_at < ?').run(cutoff);
     this.stmt('DELETE FROM connector_runs WHERE started_at < ?').run(cutoff);
     this.stmt('DELETE FROM scans WHERE started_at < ?').run(cutoff);
     this.stmt('DELETE FROM notification_deliveries WHERE created_at < ?').run(cutoff);
@@ -4086,18 +4314,69 @@ function relativeTimeFuture(value?: string | null) {
   return minutes < 60 ? `in ${minutes}m` : `in ${Math.ceil(minutes / 60)}h`;
 }
 
-export type ListingFilters = { shippingOnly?: boolean; minPrice?: number | null; maxPrice?: number | null; condition?: string; location?: string };
+export type ListingFilters = {
+  shippingOnly?: boolean;
+  minPrice?: number | null;
+  maxPrice?: number | null;
+  condition?: string;
+  location?: string;
+  /**
+   * Manual search only: when the strict all-terms match returns nothing, accept
+   * listings that match a majority of the implicit query tokens instead of
+   * dropping the whole page. Never relaxes user-typed included/excluded terms.
+   */
+  relaxTerms?: boolean;
+};
 
 function normalizeFilterText(value: string) {
   return value.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
+/** Query filler that carries no product signal on its own (Polish + English). */
+const QUERY_STOPWORDS = new Set([
+  'do', 'na', 'w', 'we', 'z', 'ze', 'i', 'oraz', 'dla', 'od', 'po', 'za', 'o', 'a', 'u',
+  'the', 'for', 'with', 'and', 'to', 'of', 'in', 'on', 'at', 'by',
+]);
+
+/**
+ * Implicit query tokens. Single-character digits are kept (so "iphone 5" still
+ * constrains the model) while single letters and stopwords are dropped — but
+ * only while at least one meaningful token survives, so a query that is all
+ * stopwords still filters on what the user typed.
+ */
+function queryTokens(query: string) {
+  const tokens = normalizeFilterText(query).split(/\s+/).filter(Boolean);
+  const meaningful = tokens.filter((term) => (term.length > 1 || /\d/.test(term)) && !QUERY_STOPWORDS.has(term));
+  return meaningful.length ? meaningful : tokens;
+}
+
 function parseIncludedExcluded(query: string, includedRaw: string, excludedRaw: string) {
-  const included = includedRaw.trim()
+  const explicitTerms = Boolean(includedRaw.trim());
+  const included = explicitTerms
     ? includedRaw.split(',').map(normalizeFilterText).filter(Boolean)
-    : normalizeFilterText(query).split(/\s+/).filter((term) => term.length > 1);
+    : queryTokens(query);
   const excluded = excludedRaw.split(',').map(normalizeFilterText).filter(Boolean);
-  return { included, excluded };
+  return { included, excluded, explicitTerms };
+}
+
+/**
+ * One term against one normalized title. Plain substring matching is preserved,
+ * but alphanumeric model tokens ("128gb", "rtx3080", "s23ultra") also match the
+ * title with its spaces removed, so "128 GB" and "128gb" describe the same
+ * offer. The digit requirement keeps the glued form from colliding across word
+ * boundaries on ordinary words ("onpro" inside "iphone13pro"). Pure numeric
+ * terms must land on a whole token so "5" cannot match "15".
+ */
+function termMatches(titleSpaced: string, titleGlued: string, term: string) {
+  if (!term) return false;
+  // Pure numeric terms must land on a digit run boundaried by letters or the
+  // token start, so "5" cannot match "15" but does match "5g" and "rtx3080".
+  if (/^\d+$/.test(term)) {
+    return titleSpaced.split(' ').some((token) => token.split(/[a-z]+/).includes(term));
+  }
+  if (titleSpaced.includes(term)) return true;
+  const compact = term.replace(/ /g, '');
+  return /\d/.test(compact) && compact.length >= 3 && titleGlued.includes(compact);
 }
 
 const CONDITION_ALIASES: Record<string, string[]> = {
@@ -4124,8 +4403,15 @@ function evaluateDeterministic(
   requestedCondition: string,
   requestedLocation: string,
   options: ListingFilters,
+  relaxed = false,
 ) {
-  const termOk = included.every((term) => title.includes(term)) && !excluded.some((term) => title.includes(term));
+  const titleGlued = title.replace(/ /g, '');
+  const excludedHit = excluded.some((term) => termMatches(title, titleGlued, term));
+  const matchedTerms = included.filter((term) => termMatches(title, titleGlued, term)).length;
+  let termOk = matchedTerms === included.length && !excludedHit;
+  // Relaxed pass (manual search fallback only): keep offers that match a
+  // majority of the query tokens rather than returning an empty page.
+  if (!termOk && relaxed && !excludedHit && included.length > 1 && matchedTerms >= Math.ceil(included.length / 2)) termOk = true;
   const conditionOk = matchesRequestedCondition(requestedCondition, condition);
   const locationOk = !requestedLocation || requestedLocation === 'polska' || location.includes(requestedLocation);
   const priceOk = (options.minPrice === null || options.minPrice === undefined || listing.price >= options.minPrice)
@@ -4136,18 +4422,23 @@ function evaluateDeterministic(
 
 export function filterListings(listings: NormalizedListing[], query: string, includedRaw: string, excludedRaw: string, filters: ListingFilters | boolean = {}) {
   const options = typeof filters === 'boolean' ? { shippingOnly: filters } : filters;
-  const { included, excluded } = parseIncludedExcluded(query, includedRaw, excludedRaw);
+  const { included, excluded, explicitTerms } = parseIncludedExcluded(query, includedRaw, excludedRaw);
   // Request-level values are identical for every listing: normalize them and
   // the alias table once instead of per filter pass.
   const requestedLocation = normalizeFilterText(options.location ?? '');
   const requestedCondition = normalizeFilterText(options.condition ?? '');
-  return listings.filter((listing) => {
+  const evaluate = (relaxed: boolean) => listings.filter((listing) => {
     const title = normalizeFilterText(listing.title);
     const condition = normalizeFilterText(listing.condition ?? '');
     const location = normalizeFilterText(listing.location ?? '');
-    const evaluated = evaluateDeterministic(listing, title, condition, location, included, excluded, requestedCondition, requestedLocation, options);
+    const evaluated = evaluateDeterministic(listing, title, condition, location, included, excluded, requestedCondition, requestedLocation, options, relaxed);
     return evaluated.termOk && evaluated.conditionOk && evaluated.locationOk && evaluated.priceOk && evaluated.shippingOk;
   });
+  const strict = evaluate(false);
+  // Only manual search opts into the relaxed retry, and never when the user
+  // typed explicit included terms (those are a hard requirement).
+  if (strict.length || !options.relaxTerms || explicitTerms) return strict;
+  return evaluate(true);
 }
 
 /**

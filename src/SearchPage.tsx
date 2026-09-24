@@ -1,15 +1,29 @@
-import { useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { AlertTriangle, Bell, Check, ExternalLink, ListFilter, LoaderCircle, Search, Tag } from "lucide-react";
 import { api } from "./api";
 import { marketplaceColors } from "./data";
+import { subscribe } from "./events";
 import type { WatchPreset } from "./presets";
-import type { Listing, Marketplace, SearchSourceStatus } from "./types";
+import type { Listing, Marketplace, SearchFilters, SearchSourceStatus } from "./types";
 
 const formatPln = (value: number | null) =>
   value === null ? "Learning" : `${value.toLocaleString("pl-PL")} zł`;
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
+
+/** Stable id without depending on a secure context (`crypto.randomUUID`). */
+function makeSearchId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+/** Merge streamed or paged results into the current list, cheapest first. */
+function mergeListings(current: Listing[], incoming: Listing[]) {
+  const byId = new Map(current.map((listing) => [listing.id, listing]));
+  for (const listing of incoming) byId.set(listing.id, listing);
+  return [...byId.values()].sort((a, b) => a.price - b.price);
+}
 
 function safeImageUrl(value: string | null | undefined) {
   if (!value) return null;
@@ -46,6 +60,7 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
   const [minPrice, setMinPrice] = useState("");
   const [maxPrice, setMaxPrice] = useState("");
   const [condition, setCondition] = useState("Any");
+  const [ownerType, setOwnerType] = useState("Any");
   const [location, setLocation] = useState("");
   const [shippingOnly, setShippingOnly] = useState(false);
   const [sources, setSources] = useState<Marketplace[]>([
@@ -58,22 +73,53 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
     [],
   );
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [exhausted, setExhausted] = useState(false);
+  const [page, setPage] = useState(1);
   const [searched, setSearched] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const searchSequence = useRef(0);
   const searchController = useRef<AbortController | null>(null);
+  const searchIdRef = useRef("");
   const numericMin = minPrice === "" ? null : Number(minPrice);
   const numericMax = maxPrice === "" ? null : Number(maxPrice);
   const validPrices =
     (numericMin === null || (Number.isFinite(numericMin) && numericMin >= 0)) &&
     (numericMax === null || (Number.isFinite(numericMax) && numericMax > 0)) &&
     (numericMin === null || numericMax === null || numericMin <= numericMax);
+  const buildFilters = (targetPage: number): SearchFilters => ({
+    query: query.trim(),
+    terms: terms.trim(),
+    excluded: excluded.trim(),
+    sources,
+    minPrice: numericMin,
+    maxPrice: numericMax,
+    shippingOnly,
+    condition,
+    location: location.trim() || "Polska",
+    ownerType: ownerType === "Any" ? null : ownerType.toLowerCase() as "private" | "business",
+    page: targetPage,
+  });
   const toggleSource = (source: Marketplace) =>
     setSources((current) =>
       current.includes(source)
         ? current.filter((item) => item !== source)
         : [...current, source],
     );
+
+  // Per-source progress arrives over SSE while the request is still running, so
+  // a fast marketplace renders before a slow one finishes. Events are keyed by
+  // the search id and merged best-effort; the HTTP response reconciles.
+  useEffect(() => {
+    const unsubscribe = subscribe("search", (payload) => {
+      const event = payload as { searchId?: string; status?: SearchSourceStatus; listings?: Listing[] } | null;
+      if (!event || event.searchId !== searchIdRef.current || !event.status) return;
+      setSourceStatuses((current) => [...current.filter((item) => item.source !== event.status!.source), event.status!]);
+      if (event.listings?.length) setListings((current) => mergeListings(current, event.listings!));
+    });
+    return unsubscribe;
+  }, []);
+
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!query.trim() || !sources.length || !validPrices) return;
@@ -81,31 +127,50 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
     const controller = new AbortController();
     searchController.current = controller;
     const sequence = ++searchSequence.current;
+    const searchId = makeSearchId();
+    searchIdRef.current = searchId;
     setLoading(true);
+    setLoadingMore(false);
     setError(null);
     setSearched(true);
     setListings([]);
-    setSourceStatuses([]);
+    setPage(1);
+    setExhausted(false);
+    setSourceStatuses(sources.map((source): SearchSourceStatus => ({ source, status: "searching", count: 0, pendingShipping: 0, durationMs: 0, message: "Searching…" })));
     try {
-      const result = await api.search({
-        query: query.trim(),
-        terms: terms.trim(),
-        excluded: excluded.trim(),
-        sources,
-        minPrice: numericMin,
-        maxPrice: numericMax,
-        shippingOnly,
-        condition,
-        location: location.trim() || "Polska",
-      }, controller.signal);
+      const result = await api.search({ ...buildFilters(1), searchId }, controller.signal);
       if (sequence !== searchSequence.current || controller.signal.aborted) return;
       setListings(result.listings);
       setSourceStatuses(result.sources);
+      setExhausted(result.listings.length === 0);
     } catch (searchError) {
       if (sequence !== searchSequence.current || controller.signal.aborted) return;
       setError(errorMessage(searchError));
     } finally {
       if (sequence === searchSequence.current) setLoading(false);
+    }
+  };
+
+  // Pages past the per-request cap instead of dropping results silently.
+  const loadMore = async () => {
+    if (loading || loadingMore || exhausted || page >= 10) return;
+    const nextPage = page + 1;
+    setLoadingMore(true);
+    setError(null);
+    try {
+      const result = await api.search(buildFilters(nextPage));
+      setListings((current) => mergeListings(current, result.listings));
+      // Keep the first page's per-source counts; only surface new failures.
+      setSourceStatuses((current) => current.map((item) => {
+        const updated = result.sources.find((status) => status.source === item.source);
+        return updated?.status === "error" ? updated : item;
+      }));
+      setPage(nextPage);
+      if (!result.listings.length) setExhausted(true);
+    } catch (loadError) {
+      setError(errorMessage(loadError));
+    } finally {
+      setLoadingMore(false);
     }
   };
   return (
@@ -170,6 +235,17 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
               <option>Any</option>
               <option>New</option>
               <option>Used</option>
+            </select>
+          </label>
+          <label className="field-label">
+            Seller <span>OLX only</span>
+            <select
+              value={ownerType}
+              onChange={(event) => setOwnerType(event.target.value)}
+            >
+              <option>Any</option>
+              <option>Private</option>
+              <option>Business</option>
             </select>
           </label>
           <label className="field-label">
@@ -259,7 +335,11 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
                     : ""}
                 </span>
               </div>
-              <small>{(status.durationMs / 1000).toFixed(1)}s</small>
+              <small>
+                {status.status === "searching"
+                  ? "…"
+                  : `${(status.durationMs / 1000).toFixed(1)}s`}
+              </small>
             </div>
           ))}
         </div>
@@ -274,20 +354,29 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
         <div className="section-heading-row">
           <h2>
             {searched
-              ? `${listings.length} ${listings.length === 1 ? "result" : "results"}`
+              ? `${listings.length} ${listings.length === 1 ? "result" : "results"}${loading ? " so far…" : ""}`
               : "Results"}
           </h2>
           {searched && !loading ? (
-            <div className="search-results-actions"><span className="toolbar-meta">Sorted by lowest price</span><button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, location: location.trim() || "Polska", condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly })}><Bell size={15} />Save as watch</button></div>
+            <div className="search-results-actions">
+              <span className="toolbar-meta">Sorted by lowest price</span>
+              {listings.length && !exhausted && page < 10 ? (
+                <button className="outline-button" type="button" disabled={loadingMore} onClick={loadMore}>
+                  {loadingMore ? <LoaderCircle size={15} className="spin" /> : null}
+                  {loadingMore ? "Loading…" : "Load more"}
+                </button>
+              ) : null}
+              <button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, location: location.trim() || "Polska", condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly })}><Bell size={15} />Save as watch</button>
+            </div>
           ) : null}
         </div>
-        {loading ? (
+        {listings.length ? (
+          <SearchResultsTable listings={listings} onSelect={onSelectListing} />
+        ) : loading ? (
           <div className="table-loading">
             <LoaderCircle size={20} className="spin" />
             Searching public marketplace pages…
           </div>
-        ) : listings.length ? (
-          <SearchResultsTable listings={listings} onSelect={onSelectListing} />
         ) : (
           <div className="empty-state">
             <ListFilter size={25} />

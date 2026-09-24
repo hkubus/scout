@@ -50,6 +50,14 @@ Settings supports Discord webhooks and ntfy topics. Each channel has its own min
 
 Daily deal digests can be enabled for Discord, ntfy, or both at a configurable server-local time. On digest-enabled channels, Strong and Very strong deals are bundled into one ranked daily summary while Exceptional deals remain immediate. Empty digests are suppressed, unchanged listings are not repeated, and meaningful price drops or priority increases can appear in a later digest. Digest creation and per-channel delivery are durable and use the same capped retry behavior as immediate alerts.
 
+## Manual search
+
+The Search page queries OLX, Allegro Lokalnie, and Vinted live and applies the same deterministic and AI relevance filters as watch scans. Term matching folds unit spellings and joined model numbers (`128gb` matches “128 GB”, `rtx 3080` matches “RTX3080”), ignores query stopwords, and keeps single-digit models bound to whole tokens so `iphone 5` does not match “iPhone 15”. When the strict all-terms match finds nothing, a manual search falls back to matching a majority of the query tokens; user-typed Included/Excluded terms always stay strict.
+
+Each source streams its finished page over the existing SSE channel, so a fast marketplace renders while a slow one is still fetching; the HTTP response remains authoritative and reconciles anything the stream missed. `Load more` pages past the per-request cap instead of truncating silently, and AI relevance decisions are cached by query, listing input, and model, so repeating a search reuses them instead of re-spending Jev calls. OLX searches can additionally restrict results to private sellers or business accounts (`owner_type`), a structured marketplace filter rather than a post-filter.
+
+The Listings feed applies its text search, marketplace, decision, visibility, and sort filters in SQL across every page, and its match total reflects the active filters.
+
 ## Watch prefill from listings
 
 Any listing drawer offers a `Save as watch` action that opens the deal-watch dialog pre-filled from the listing's stored data: the search phrase comes from the stored AI canonical title (or the cleaned listing title, with price tokens, sale stopwords, and city names removed), brand/model become included terms, the source is preselected, the price range spans ±25% around the asking price, and the shipping requirement follows the listing. Research listings offer the same from their row actions and the preserved-copy dialog. Prefill never triggers an AI request, and every field stays editable before saving.

@@ -285,6 +285,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .search-source-status span { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
 .search-source-status small { color: var(--muted); font-size: 10px; }
 .search-source-status--error { border-color: rgba(241, 90, 53, .32); background: rgba(241, 90, 53, .05); }
+.search-source-status--searching { border-style: dashed; }
 .search-error { display: flex; align-items: center; gap: 9px; margin-top: 15px; padding: 12px 14px; border: 1px solid rgba(241, 90, 53, .35); border-radius: 8px; color: var(--orange); font-size: 12px; }
 .search-results { margin-top: 26px; }
 .search-table-wrap { width: 100%; overflow-x: auto; border-top: 1px solid var(--line); }
@@ -491,6 +492,14 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .source-option i { width: 8px; height: 8px; border-radius: 50%; }
 .source-option svg { margin-left: 2px; color: var(--blue); }
 .source-option--selected { border-color: var(--blue); background: var(--blue-soft); color: var(--text); }
+.source-intervals { display: grid; gap: 6px; margin-top: 10px; }
+.source-intervals-hint { color: var(--muted); font-size: 10px; font-weight: 400; }
+.source-interval-row { display: grid; grid-template-columns: 1fr 108px auto; align-items: center; gap: 8px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-muted); color: var(--text); font-size: 12px; font-weight: 500; }
+.source-interval-name { display: inline-flex; align-items: center; gap: 7px; }
+.source-interval-name i { width: 8px; height: 8px; border-radius: 50%; }
+.source-interval-row input { width: 100%; min-height: 30px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); color: var(--text); font-size: 12px; font-weight: 400; }
+.source-interval-row input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-soft); outline: 0; }
+.source-interval-row em { color: var(--muted); font-style: normal; font-size: 10px; font-weight: 400; }
 .modal-note { display: flex; align-items: flex-start; gap: 8px; margin-top: 20px; padding: 11px 12px; border-radius: 7px; background: var(--blue-soft); color: var(--muted); font-size: 11px; line-height: 1.5; }
 .modal-note svg { flex: 0 0 auto; color: var(--blue); margin-top: 1px; }
 .modal-footer { display: flex; justify-content: flex-end; gap: 10px; padding: 14px 24px 18px; border-top: 1px solid var(--line); }

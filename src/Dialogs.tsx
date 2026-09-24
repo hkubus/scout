@@ -37,6 +37,13 @@ export function WatchDialog({
   const [location, setLocation] = useState(initialWatch?.location?.trim() || preset?.location?.trim() || "Polska");
   const [condition, setCondition] = useState(initialWatch?.condition ?? preset?.condition ?? "Any");
   const [interval, setIntervalValue] = useState(String(initialWatch?.interval ?? 5));
+  const [sourceIntervals, setSourceIntervals] = useState<Record<string, string>>(() => {
+    const initial: Record<string, string> = {};
+    for (const [marketplace, minutes] of Object.entries(initialWatch?.sourceIntervals ?? {})) {
+      if (typeof minutes === "number" && Number.isFinite(minutes)) initial[marketplace] = String(minutes);
+    }
+    return initial;
+  });
   const [sensitivity, setSensitivity] = useState(String(initialWatch?.sensitivity ?? 1));
   const [exactUrls, setExactUrls] = useState(initialWatch?.exactUrls.join("\n") ?? "");
   const [sources, setSources] = useState<Marketplace[]>(initialWatch?.sources ?? preset?.sources ?? [
@@ -60,6 +67,11 @@ export function WatchDialog({
     (numericMin === null || numericMin >= 0) &&
     (numericMax === null || numericMax > 0) &&
     (numericMin === null || numericMax === null || numericMin <= numericMax);
+  const validSourceIntervals = Object.entries(sourceIntervals).every(([, raw]) => {
+    if (raw === "") return true;
+    const minutes = Number(raw);
+    return Number.isInteger(minutes) && minutes >= 5 && minutes <= 1440;
+  });
   const canSubmit = Boolean(
     name.trim() &&
       query.trim() &&
@@ -67,7 +79,8 @@ export function WatchDialog({
       Number.isInteger(numericInterval) &&
       numericInterval >= 5 &&
       numericInterval <= 1440 &&
-      validPrices,
+      validPrices &&
+      validSourceIntervals,
   );
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -89,6 +102,14 @@ export function WatchDialog({
     setError(null);
     const rawSensitivity = Number(sensitivity);
     const safeSensitivity = Number.isFinite(rawSensitivity) && rawSensitivity >= 0.6 && rawSensitivity <= 1.6 ? rawSensitivity : 1;
+    const parsedSourceIntervals: Partial<Record<Marketplace, number>> = {};
+    for (const [source, raw] of Object.entries(sourceIntervals)) {
+      if (raw === "") continue;
+      const minutes = Number(raw);
+      if (!Number.isInteger(minutes) || minutes < 5 || minutes > 1440) continue;
+      if (!sources.includes(source as Marketplace)) continue;
+      parsedSourceIntervals[source as Marketplace] = minutes;
+    }
     try {
       await onSubmit({
         ...(initialWatch?.id ? { id: initialWatch.id } : {}),
@@ -105,6 +126,7 @@ export function WatchDialog({
         readiness: initialWatch?.readiness ?? 0,
         status: initialWatch?.status ?? "Learning",
         interval: numericInterval,
+        sourceIntervals: parsedSourceIntervals,
         nextScan: "due now",
         enabled: initialWatch?.enabled ?? true,
         exactUrls: exactUrls
@@ -130,6 +152,8 @@ export function WatchDialog({
         ? current.filter((item) => item !== source)
         : [...current, source],
     );
+  const setSourceInterval = (source: Marketplace, value: string) =>
+    setSourceIntervals((current) => ({ ...current, [source]: value }));
   return (
     <div
       className="modal-backdrop"
@@ -232,7 +256,7 @@ export function WatchDialog({
           </div>
           <div className="field-row">
             <label className="field-label">
-              Polling interval <span>5–1440 min</span>
+              Default polling interval <span>5–1440 min</span>
               <input
                 type="number"
                 min="5"
@@ -272,6 +296,32 @@ export function WatchDialog({
                 ),
               )}
             </div>
+            {sources.length ? (
+              <div className="source-intervals">
+                <small className="source-intervals-hint">
+                  Optional per-marketplace check interval. Leave blank to follow the default.
+                </small>
+                {sources.map((source) => (
+                  <label className="source-interval-row" key={source}>
+                    <span className="source-interval-name">
+                      <i style={{ background: marketplaceColors[source] }} />
+                      {source}
+                    </span>
+                    <input
+                      type="number"
+                      min="5"
+                      max="1440"
+                      inputMode="numeric"
+                      aria-label={`${source} polling interval in minutes`}
+                      placeholder={`Default · ${interval || 5}`}
+                      value={sourceIntervals[source] ?? ""}
+                      onChange={(event) => setSourceInterval(source, event.target.value)}
+                    />
+                    <em>min</em>
+                  </label>
+                ))}
+              </div>
+            ) : null}
           </div>
           <label className="check-option check-option--modal">
             <input type="checkbox" checked={shippingOnly} onChange={(event) => setShippingOnly(event.target.checked)} />
@@ -318,6 +368,7 @@ export function WatchDialog({
             </div>
           ) : null}
           {!validPrices ? <div className="form-error" role="alert"><AlertTriangle size={15} />Minimum price cannot exceed maximum price.</div> : null}
+          {!validSourceIntervals ? <div className="form-error" role="alert"><AlertTriangle size={15} />Per-marketplace intervals must be whole minutes between 5 and 1440.</div> : null}
           <div className="modal-note">
             <Zap size={16} />
             <span>

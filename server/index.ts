@@ -13,7 +13,7 @@ import { validateSearchUrl } from './marketplaces';
 import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
 import { isPubliclyBoundHost, RateLimiter, securityHeaders } from './security';
-import { ScoutService, ServiceError } from './service';
+import { normalizeSourceIntervals, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 
 const port = Number(process.env.PORT ?? 3001);
@@ -103,10 +103,28 @@ app.get('/api/ready', async (_request, reply) => {
 });
 app.get('/api/dashboard', async () => service.dashboard());
 app.get('/api/listings', async (request, reply) => {
-  const parsed = z.object({ marketplace: marketplaceParam.optional(), q: z.string().max(240).optional(), watchId: z.string().trim().min(1).max(160).optional(), page: z.coerce.number().int().min(1).optional().default(1), pageSize: z.coerce.number().int().min(1).max(500).optional().default(200) }).strict().safeParse(request.query);
+  const parsed = z.object({
+    marketplace: marketplaceParam.optional(),
+    q: z.string().max(240).optional(),
+    watchId: z.string().trim().min(1).max(160).optional(),
+    page: z.coerce.number().int().min(1).optional().default(1),
+    pageSize: z.coerce.number().int().min(1).max(500).optional().default(200),
+    sort: z.enum(['newest', 'strongest', 'price']).optional().default('newest'),
+    decision: z.enum(['buy', 'watch', 'pass']).optional(),
+    visibility: z.enum(['visible', 'hidden', 'all']).optional().default('visible'),
+  }).strict().safeParse(request.query);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid listing filters' });
   const query = parsed.data;
-  const page = service.listingsPage({ marketplace: query.marketplace, q: query.q, watchId: query.watchId, page: query.page, pageSize: query.pageSize });
+  const page = service.listingsPage({
+    marketplace: query.marketplace,
+    q: query.q,
+    watchId: query.watchId,
+    page: query.page,
+    pageSize: query.pageSize,
+    sort: query.sort,
+    decision: query.decision,
+    visibility: query.visibility,
+  });
   return { listings: page.listings, pagination: page.pagination };
 });
 app.get('/api/listing-detail', async (request, reply) => {
@@ -198,6 +216,7 @@ const watchInput = z.object({
   location: z.string().max(120).optional().default('Polska'),
   condition: z.string().max(80).optional().default('Any'),
   interval: z.number().int().min(5).max(24 * 60).optional().default(5),
+  sourceIntervals: z.record(z.string(), z.number().int().min(5).max(1440)).optional().default({}),
   exactUrls: z.array(z.string().url()).max(20).optional().default([]),
   sensitivity: z.number().min(0.6).max(1.6).optional().default(1),
   shippingOnly: z.boolean().optional().default(false),
@@ -221,8 +240,9 @@ app.post('/api/watches', async (request, reply) => {
   }
   const id = value.id ?? `watch-${randomUUID()}`;
   const now = nowIso();
+  const sourceIntervals = normalizeSourceIntervals(value.sources, value.sourceIntervals);
   try {
-    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, sensitivity, shipping_only, typo_variants, ai_relevance, reference_market_watch_id, min_price_pln, max_price_pln, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, 1, now, now, now);
+    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, source_intervals_json, sensitivity, shipping_only, typo_variants, ai_relevance, reference_market_watch_id, min_price_pln, max_price_pln, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, JSON.stringify(sourceIntervals), value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, 1, now, now, now);
   } catch (error) {
     if (error instanceof Error && /UNIQUE|PRIMARY KEY|constraint/i.test(error.message)) {
       return reply.code(409).send({ error: 'A watch with this id already exists' });
@@ -242,7 +262,8 @@ app.patch('/api/watches/:id', async (request, reply) => {
     terms: z.string().max(240).optional(), excluded: z.string().max(240).optional(), sources: marketplaceSources.optional(),
     location: z.string().max(120).optional(), condition: z.string().max(80).optional(), exactUrls: z.array(z.string().url()).max(20).optional(),
     sensitivity: z.number().min(0.6).max(1.6).optional(),
-    enabled: z.boolean().optional(), interval: z.number().int().min(5).max(1440).optional(), shippingOnly: z.boolean().optional(),
+    enabled: z.boolean().optional(), interval: z.number().int().min(5).max(1440).optional(),
+    sourceIntervals: z.record(z.string(), z.number().int().min(5).max(1440)).optional(), shippingOnly: z.boolean().optional(),
     aiRelevance: z.boolean().optional(),
     typoVariants: z.boolean().optional(),
     referenceMarketWatchId: z.string().trim().max(160).nullable().optional(),
@@ -276,6 +297,7 @@ app.patch('/api/watches/:id', async (request, reply) => {
   if (body.sensitivity !== undefined) { fields.push('sensitivity = ?'); values.push(body.sensitivity); }
   if (typeof body.enabled === 'boolean') { fields.push('enabled = ?'); values.push(body.enabled ? 1 : 0); }
   if (body.interval !== undefined) { fields.push('interval_minutes = ?'); values.push(body.interval); }
+  if (body.sourceIntervals !== undefined) { fields.push('source_intervals_json = ?'); values.push(JSON.stringify(normalizeSourceIntervals(sources, body.sourceIntervals))); }
   if (typeof body.shippingOnly === 'boolean') { fields.push('shipping_only = ?'); values.push(body.shippingOnly ? 1 : 0); }
   if (typeof body.aiRelevance === 'boolean') { fields.push('ai_relevance = ?'); values.push(body.aiRelevance ? 1 : 0); }
   if (typeof body.typoVariants === 'boolean') { fields.push('typo_variants = ?'); values.push(body.typoVariants ? 1 : 0); }
@@ -314,6 +336,9 @@ const searchInput = z.object({
   shippingOnly: z.boolean().optional().default(false),
   condition: z.string().max(80).optional().default('Any'),
   location: z.string().max(120).optional().default(''),
+  ownerType: z.enum(['private', 'business']).nullable().optional().default(null),
+  page: z.number().int().min(1).max(10).optional().default(1),
+  searchId: z.string().trim().min(1).max(80).optional(),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
 
 app.post('/api/search', async (request, reply) => {
