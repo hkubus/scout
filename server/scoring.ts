@@ -41,7 +41,14 @@ export function scoreDeal(prices: number[], price: number, options: { minSamples
   const rawSensitivity = options.sensitivity ?? 1;
   const sensitivity = Number.isFinite(rawSensitivity) && rawSensitivity >= 0.6 && rawSensitivity <= 1.6 ? rawSensitivity : 1;
   const isReady = usablePrices.length >= minSamples && (options.observedHours ?? 0) >= minHours;
-  const qualifies = isReady && deviation >= 3.1 / sensitivity && discountPercent >= 18;
+  // A "Very strong" discount (the same >= 20% tier the feed labels) alerts even
+  // when the watch's price spread is too wide to clear the robust z-score. A
+  // heterogeneous watch can otherwise hold every genuine discount forever:
+  // MAD/robustScale grows with the spread, so a 20-40% discount can sit below
+  // the 3.1 deviation bar. Strong (18-20%) still has to clear it, and the
+  // readiness floor plus the high-priority description verification still apply.
+  const veryStrong = discountPercent >= 20;
+  const qualifies = isReady && discountPercent >= 18 && (veryStrong || deviation >= 3.1 / sensitivity);
   return { typical, mad, deviation, discountPercent, confidence, isReady, qualifies };
 }
 
