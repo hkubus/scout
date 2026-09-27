@@ -145,6 +145,7 @@ export function WatchDialog({
         aiRelevance,
         variantGroups: cleanVariantGroups,
         variants: initialWatch?.variants ?? [],
+        dealCounts: initialWatch?.dealCounts ?? { exceptional: 0, veryStrong: 0, strong: 0 },
         referenceMarketWatchId: referenceMarketWatchId.trim() ? referenceMarketWatchId.trim() : null,
         minPrice: numericMin,
         maxPrice: numericMax,

@@ -146,6 +146,18 @@ export interface VerificationComparison {
   llm: { ok: true; verification: ListingDescriptionVerification; raw: unknown } | { ok: false; error: string };
 }
 
+/**
+ * Current visible Strong+ findings for one watch, split by deal tier. Counts
+ * are listings still seen within the feed freshness window, excluding rows the
+ * watch filters out and any the user marked as hidden. All zeros means the
+ * watch has no qualifying findings right now (or is still learning).
+ */
+export interface WatchDealCounts {
+  exceptional: number;
+  veryStrong: number;
+  strong: number;
+}
+
 export interface Watch {
   id: string;
   name: string;
@@ -173,6 +185,8 @@ export interface Watch {
   variantGroups: VariantGroup[];
   /** Per-model sample/readiness/typical breakdown; empty without configured groups. */
   variants: WatchVariantStat[];
+  /** How many Exceptional/Very strong/Strong findings this watch currently has. */
+  dealCounts: WatchDealCounts;
   referenceMarketWatchId: string | null;
   minPrice: number | null;
   maxPrice: number | null;

@@ -478,6 +478,35 @@ test('keeps provisional baselines and deal labels hidden during cold start', () 
   } finally { context.close(); }
 });
 
+test('summarizes current Exceptional/Very strong/Strong findings per watch', () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    const stale = new Date(Date.now() - 13 * 60 * 60_000).toISOString();
+    seedWatch(context.db, 'deal-counts-watch');
+    const insertListing = context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, typical_pln, shipping_available, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    const setDeal = context.db.prepare('UPDATE watch_listings SET deal_strength = ?, deal_label = ?, last_seen_at = ? WHERE watch_id = ? AND listing_id = ?');
+    const deals: Array<[string, number, string, string]> = [
+      ['deal-5', 5, 'Exceptional', now],
+      ['deal-4', 4, 'Very strong', now],
+      ['deal-3', 3, 'Strong', now],
+      ['deal-2', 2, 'Watch', now],
+      ['deal-stale', 5, 'Exceptional', stale],
+      ['deal-hidden', 5, 'Exceptional', now],
+    ];
+    for (const [listingId, strength, label, seenAt] of deals) {
+      insertListing.run('OLX', listingId, listingId, 100, 500, 1, `https://www.olx.pl/d/oferta/${listingId}`, now, now);
+      const listing = context.db.prepare('SELECT id FROM listings WHERE listing_id = ?').get(listingId) as { id: number };
+      insertObservation.run(listing.id, 'deal-counts-watch', 100, seenAt);
+      setDeal.run(strength, label, seenAt, 'deal-counts-watch', listing.id);
+    }
+    context.db.prepare('INSERT INTO listing_actions (marketplace, listing_id, decision, note, hidden, updated_at) VALUES (?, ?, NULL, ?, 1, ?)').run('OLX', 'deal-hidden', '', now);
+    const [watch] = context.service.getWatches();
+    assert.deepEqual(watch.dealCounts, { exceptional: 1, veryStrong: 1, strong: 1 });
+  } finally { context.close(); }
+});
+
 test('marks a baseline ready after 30 comparable listings and six hours', () => {
   const context = fixture();
   try {

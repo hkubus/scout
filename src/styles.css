@@ -240,6 +240,17 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .watch-copy p span { padding: 0 5px; color: var(--soft); }
 .watch-tags { display: flex; flex-wrap: wrap; gap: 6px; }
 .watch-tags span { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); font-size: 10px; }
+/* Strong+ findings summary on each watch card, colour-matched to the listing deal bars. */
+.watch-deals { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.deal-count { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface-muted); color: var(--muted); font-size: 10px; }
+.deal-count i { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--soft); }
+.deal-count strong { color: var(--text-strong); font-size: 11px; font-weight: 700; }
+.deal-count--exceptional { border-color: rgba(241, 90, 53, .35); background: rgba(241, 90, 53, .09); }
+.deal-count--exceptional i { background: var(--orange); }
+.deal-count--very-strong { border-color: rgba(244, 183, 52, .45); background: rgba(244, 183, 52, .14); }
+.deal-count--very-strong i { background: var(--amber); }
+.deal-count--strong { border-color: rgba(135, 167, 232, .5); background: rgba(135, 167, 232, .14); }
+.deal-count--strong i { background: #87a7e8; }
 .watch-progress { min-width: 0; }
 .watch-progress > div { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 11px; }
 .watch-progress strong { color: var(--text); font-weight: 600; }

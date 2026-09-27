@@ -16,7 +16,7 @@ import { OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assignVariant, parseVariantGrou
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
-import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchVariantStat } from '../src/types';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat } from '../src/types';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -1899,6 +1899,7 @@ export class ScoutService {
     row: WatchRow,
     stats: { samples: number; first_observed: string | null } = { samples: 0, first_observed: null },
     variantStats: Map<string, { samples: number; first_observed: string | null; typical: number | null }> = new Map(),
+    dealCounts: WatchDealCounts = { exceptional: 0, veryStrong: 0, strong: 0 },
   ): Watch {
     const samples = Number(stats?.samples ?? 0);
     const observationHours = stats?.first_observed ? Math.max(0, Math.floor((Date.now() - Date.parse(stats.first_observed)) / 3_600_000)) : 0;
@@ -1955,6 +1956,7 @@ export class ScoutService {
       referenceMarketWatchId: row.reference_market_watch_id ?? null,
       variantGroups,
       variants,
+      dealCounts,
       minPrice: row.min_price_pln === null ? null : Number(row.min_price_pln),
       maxPrice: row.max_price_pln === null ? null : Number(row.max_price_pln),
       archivedAt: row.archived_at ?? null,
@@ -2076,7 +2078,35 @@ export class ScoutService {
     for (const row of typicalRows) {
       variantEntry(row.watch_id, row.variant_key ?? OTHER_VARIANT_KEY).typical = Number(row.typical);
     }
-    return rows.map((row) => this.watchFromRow(row, statsByWatch.get(row.id), variantsByWatch.get(row.id) ?? new Map()));
+    // Current Strong+ findings per watch, bucketed by tier. The predicates
+    // mirror listingsPage (fresh association, not AI-filtered irrelevant, the
+    // watch's shipping/price filters) and additionally skip rows the user hid,
+    // so the card's counts always match the feed it links to.
+    const freshnessCutoff = new Date(Date.now() - MATCH_VISIBILITY_MS).toISOString();
+    const dealRows = this.stmt(`SELECT wl.watch_id AS watch_id, COALESCE(wl.deal_strength, 0) AS deal_strength, COUNT(*) AS count
+      FROM watch_listings wl
+      JOIN listings l ON l.id = wl.listing_id
+      JOIN watches w ON w.id = wl.watch_id
+      LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id
+      WHERE wl.last_seen_at > ?
+        AND (? = 1 OR w.archived_at IS NULL)
+        AND COALESCE(a.hidden, 0) = 0
+        AND (w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
+        AND (w.min_price_pln IS NULL OR l.price_pln >= w.min_price_pln)
+        AND (w.max_price_pln IS NULL OR l.price_pln <= w.max_price_pln)
+        AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)
+      GROUP BY wl.watch_id, COALESCE(wl.deal_strength, 0)`).all(freshnessCutoff, includeArchived ? 1 : 0) as Array<{ watch_id: string; deal_strength: number; count: number }>;
+    const dealCountsByWatch = new Map<string, WatchDealCounts>();
+    for (const row of dealRows) {
+      const counts = dealCountsByWatch.get(row.watch_id) ?? { exceptional: 0, veryStrong: 0, strong: 0 };
+      const strength = Number(row.deal_strength ?? 0);
+      const count = Number(row.count ?? 0);
+      if (strength >= 5) counts.exceptional += count;
+      else if (strength === 4) counts.veryStrong += count;
+      else if (strength === 3) counts.strong += count;
+      dealCountsByWatch.set(row.watch_id, counts);
+    }
+    return rows.map((row) => this.watchFromRow(row, statsByWatch.get(row.id), variantsByWatch.get(row.id) ?? new Map(), dealCountsByWatch.get(row.id) ?? { exceptional: 0, veryStrong: 0, strong: 0 }));
   }
 
   getWatches() {

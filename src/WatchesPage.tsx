@@ -251,6 +251,23 @@ function WatchRow({
               </span>
             ) : null}
           </div>
+          <div className="watch-deals" role="group" aria-label={`Strong findings for ${watch.name}`}>
+            <span className="deal-count deal-count--exceptional" title="Exceptional findings — 30%+ below baseline">
+              <i aria-hidden="true" />
+              <strong>{watch.dealCounts.exceptional}</strong>
+              Exceptional
+            </span>
+            <span className="deal-count deal-count--very-strong" title="Very strong findings — 20%+ below baseline">
+              <i aria-hidden="true" />
+              <strong>{watch.dealCounts.veryStrong}</strong>
+              Very strong
+            </span>
+            <span className="deal-count deal-count--strong" title="Strong findings — 12%+ below baseline">
+              <i aria-hidden="true" />
+              <strong>{watch.dealCounts.strong}</strong>
+              Strong
+            </span>
+          </div>
         </div>
       </div>
       <div className="watch-progress">
