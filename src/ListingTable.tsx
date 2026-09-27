@@ -103,6 +103,11 @@ function ListingRow({ listing, onSelect, onToggleHidden }: { listing: Listing; o
               {listing.decision === "buy" ? "Buy" : listing.decision === "watch" ? "Watch" : "Pass"}
             </em>
           ) : null}
+          {listing.variantLabel ? (
+            <em className="decision-chip decision-chip--variant" title={`Scored against the “${listing.variantLabel}” model baseline, not the watch-wide blend`}>
+              {listing.variantLabel}
+            </em>
+          ) : null}
           {listing.typicalSource === "reference-band" ? (
             <em className="decision-chip decision-chip--reference" title="Typical shown from the watch's reference research series while its own baseline is learning">
               series baseline

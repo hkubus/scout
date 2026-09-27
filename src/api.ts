@@ -88,7 +88,7 @@ export const api = {
     return request<AnalyticsData>(`/api/analytics?${params}`, { signal });
   },
   createWatch: (watch: Omit<Watch, 'id'> & { id?: string }) => request<{ watch: Watch }>('/api/watches', json('POST', watch)),
-  updateWatch: (id: string, patch: Partial<Pick<Watch, 'name' | 'query' | 'terms' | 'excluded' | 'sources' | 'location' | 'condition' | 'interval' | 'sourceIntervals' | 'exactUrls' | 'sensitivity' | 'shippingOnly' | 'aiRelevance' | 'typoVariants' | 'referenceMarketWatchId' | 'minPrice' | 'maxPrice' | 'enabled'>> & { archived?: boolean }) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
+  updateWatch: (id: string, patch: Partial<Pick<Watch, 'name' | 'query' | 'terms' | 'excluded' | 'sources' | 'location' | 'condition' | 'interval' | 'sourceIntervals' | 'exactUrls' | 'sensitivity' | 'shippingOnly' | 'aiRelevance' | 'typoVariants' | 'variantGroups' | 'referenceMarketWatchId' | 'minPrice' | 'maxPrice' | 'enabled'>> & { archived?: boolean }) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
   search: (filters: SearchFilters, signal?: AbortSignal) => request<ManualSearchResponse>('/api/search', { ...json('POST', filters), signal }, 90_000),
   marketResearch: (options: { page?: number; pageSize?: number; watchId?: string; status?: 'active' | 'ended' | 'superseded' } = {}, signal?: AbortSignal) => {
     const params = new URLSearchParams();

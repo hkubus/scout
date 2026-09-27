@@ -11,10 +11,12 @@ import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, 
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, median, scoreDeal } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
+import { normalizeFilterText } from './text';
+import { OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assignVariant, parseVariantGroups, variantLabelFor, type VariantGroup } from './variants';
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
-import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource } from '../src/types';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchVariantStat } from '../src/types';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -40,7 +42,20 @@ type DealNotificationCandidate = {
   query?: string;
   includedTerms?: string;
   excludedTerms?: string;
+  /** Model-variant bucket this listing was scored against, when the watch groups variants. */
+  variantKey?: string | null;
+  variantLabel?: string | null;
 };
+
+/**
+ * Per-variant price history for one scan. The window query returns the latest
+ * observation per listing with its assigned variant_key; the buckets split them
+ * so each model scores against its own median/readiness instead of a blend.
+ * With no configured groups every row lands in the single OTHER bucket, which
+ * reproduces the legacy watch-wide baseline exactly.
+ */
+type WatchVariantBucket = { prices: number[]; firstObservedAt: string | null };
+type WatchBaselines = { groups: VariantGroup[]; buckets: Map<string, WatchVariantBucket> };
 
 /**
  * Notification/verification configuration snapshotted once per scan: reading
@@ -122,6 +137,20 @@ const SNAPSHOT_MAX_ATTEMPTS = 3;
 const MARKETPLACE_API_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 /** Scan-path log entries kept in memory for the Logs tab; pure diagnostics, never persisted. */
 const LOG_BUFFER_LIMIT = 500;
+
+/**
+ * Jev relevance and fuzzy-rescue judgments are independent network round trips,
+ * so a search runs a bounded pool of them at once instead of waiting on each
+ * one in turn. Six hides most of the round-trip latency while staying polite to
+ * OpenRouter; raise (or lower) per deployment with SCOUT_JEV_CONCURRENCY.
+ */
+const DEFAULT_JEV_CHECK_CONCURRENCY = 6;
+const MAX_JEV_CHECK_CONCURRENCY = 16;
+function jevCheckConcurrency() {
+  const configured = Number.parseInt(process.env.SCOUT_JEV_CONCURRENCY ?? '', 10);
+  if (!Number.isFinite(configured) || configured < 1) return DEFAULT_JEV_CHECK_CONCURRENCY;
+  return Math.min(configured, MAX_JEV_CHECK_CONCURRENCY);
+}
 
 export class ServiceError extends Error {
   status: number;
@@ -1170,8 +1199,12 @@ export class ScoutService {
     };
 
     const classified: Array<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> = [];
-    for (let offset = 0; offset < listings.length; offset += 4) {
-      const batch = await Promise.all(listings.slice(offset, offset + 4).map(async (listing): Promise<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> => {
+    // Jev relevance calls are network round trips and independent per listing:
+    // a wider pool overlaps more of them than the old fixed batch of four,
+    // while the per-batch flush below still persists results incrementally.
+    const relevanceConcurrency = jevCheckConcurrency();
+    for (let offset = 0; offset < listings.length; offset += relevanceConcurrency) {
+      const batch = await Promise.all(listings.slice(offset, offset + relevanceConcurrency).map(async (listing): Promise<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> => {
         const context: ListingRelevanceContext = {
           marketplace: listing.marketplace,
           title: listing.title,
@@ -1342,62 +1375,74 @@ export class ScoutService {
     const termSlice = gatedTerm.slice(0, FUZZY_RESCUE_BUDGET);
     budget -= termSlice.length;
     const conditionSlice = gatedCondition.slice(0, Math.max(0, budget));
-    for (const listing of termSlice) {
-      const inputHash = listingTermMatchInputHash({
-        title: listing.title, listingCondition: listing.condition,
-        query: search.query,
-        includedTerms: search.includedTerms, excludedTerms: search.excludedTerms,
-      });
-      const cached = this.readFuzzyCache(inputHash, live.jevModel, 'term-match');
-      if (cached) {
-        if (cached.rescued) {
-          rescued.push(listing);
-          rescuedByTerm += 1;
+    // Each candidate is an independent Jev round trip, so run a bounded pool
+    // concurrently and replay the outcomes in candidate order: `rescued` keeps
+    // the old term-then-condition ordering regardless of completion order.
+    // Verdicts still round-trip through `jev_fuzzy_cache`, so repeating a scan
+    // reuses them instead of re-spending.
+    type RescueTask = { listing: NormalizedListing; run: () => Promise<boolean> };
+    const termTasks: RescueTask[] = termSlice.map((listing) => ({
+      listing,
+      run: async () => {
+        const inputHash = listingTermMatchInputHash({
+          title: listing.title, listingCondition: listing.condition,
+          query: search.query,
+          includedTerms: search.includedTerms, excludedTerms: search.excludedTerms,
+        });
+        const cached = this.readFuzzyCache(inputHash, live.jevModel, 'term-match');
+        if (cached) return cached.rescued;
+        try {
+          const judgment = await this.jevTermMatch({
+            query: search.query, includedTerms: search.includedTerms, excludedTerms: search.excludedTerms,
+            title: listing.title, condition: listing.condition,
+          }, { apiKey: live.apiKey, model: live.jevModel });
+          this.logJevLive('term-match', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
+          const rescuedListing = judgment.decision === 'pass' && !judgment.unsure;
+          this.writeFuzzyCache(inputHash, live.jevModel, 'term-match', judgment.decision, judgment.confidence, rescuedListing);
+          return rescuedListing;
+        } catch (error) {
+          this.logJevLive('term-match', inputHash, live, { jevError: error instanceof Error ? error.message : String(error) });
+          return false;
         }
-        continue;
-      }
-      try {
-        const judgment = await this.jevTermMatch({
-          query: search.query, includedTerms: search.includedTerms, excludedTerms: search.excludedTerms,
-          title: listing.title, condition: listing.condition,
-        }, { apiKey: live.apiKey, model: live.jevModel });
-        this.logJevLive('term-match', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
-        const rescuedListing = judgment.decision === 'pass' && !judgment.unsure;
-        this.writeFuzzyCache(inputHash, live.jevModel, 'term-match', judgment.decision, judgment.confidence, rescuedListing);
-        if (rescuedListing) {
-          rescued.push(listing);
-          rescuedByTerm += 1;
+      },
+    }));
+    const conditionTasks: RescueTask[] = conditionSlice.map((listing) => ({
+      listing,
+      run: async () => {
+        const inputHash = listingConditionMatchInputHash({
+          title: listing.title, listingCondition: listing.condition, requestedCondition: search.condition ?? 'Any',
+        });
+        const cached = this.readFuzzyCache(inputHash, live.jevModel, 'condition');
+        if (cached) return cached.rescued;
+        try {
+          const judgment = await this.jevConditionMatch({
+            requestedCondition: search.condition ?? 'Any', listingCondition: listing.condition, title: listing.title,
+          }, { apiKey: live.apiKey, model: live.jevModel });
+          this.logJevLive('condition', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
+          const rescuedListing = judgment.decision === 'match' && !judgment.unsure;
+          this.writeFuzzyCache(inputHash, live.jevModel, 'condition', judgment.decision, judgment.confidence, rescuedListing);
+          return rescuedListing;
+        } catch (error) {
+          this.logJevLive('condition', inputHash, live, { jevError: error instanceof Error ? error.message : String(error) });
+          return false;
         }
-      } catch (error) {
-        this.logJevLive('term-match', inputHash, live, { jevError: error instanceof Error ? error.message : String(error) });
+      },
+    }));
+    const tasks = [...termTasks, ...conditionTasks];
+    const outcomes = new Array<boolean>(tasks.length).fill(false);
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < tasks.length) {
+        const index = cursor++;
+        outcomes[index] = await tasks[index].run();
       }
-    }
-    for (const listing of conditionSlice) {
-      const inputHash = listingConditionMatchInputHash({
-        title: listing.title, listingCondition: listing.condition, requestedCondition: search.condition ?? 'Any',
-      });
-      const cached = this.readFuzzyCache(inputHash, live.jevModel, 'condition');
-      if (cached) {
-        if (cached.rescued) {
-          rescued.push(listing);
-          rescuedByCondition += 1;
-        }
-        continue;
-      }
-      try {
-        const judgment = await this.jevConditionMatch({
-          requestedCondition: search.condition ?? 'Any', listingCondition: listing.condition, title: listing.title,
-        }, { apiKey: live.apiKey, model: live.jevModel });
-        this.logJevLive('condition', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
-        const rescuedListing = judgment.decision === 'match' && !judgment.unsure;
-        this.writeFuzzyCache(inputHash, live.jevModel, 'condition', judgment.decision, judgment.confidence, rescuedListing);
-        if (rescuedListing) {
-          rescued.push(listing);
-          rescuedByCondition += 1;
-        }
-      } catch (error) {
-        this.logJevLive('condition', inputHash, live, { jevError: error instanceof Error ? error.message : String(error) });
-      }
+    };
+    await Promise.all(Array.from({ length: Math.min(jevCheckConcurrency(), tasks.length) }, worker));
+    for (let index = 0; index < tasks.length; index += 1) {
+      if (!outcomes[index]) continue;
+      rescued.push(tasks[index].listing);
+      if (index < termTasks.length) rescuedByTerm += 1;
+      else rescuedByCondition += 1;
     }
     return { rescued, rescuedByTerm, rescuedByCondition };
   }
@@ -1750,7 +1795,7 @@ export class ScoutService {
         const group = queue[cursor++];
         for (const candidate of group) {
           if (candidate.requiresDescriptionVerification && !await this.verifyHighPriorityDeal(candidate, context)) continue;
-          await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence, context);
+          await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence, context, candidate.variantLabel ?? null);
         }
       }
     };
@@ -1850,13 +1895,40 @@ export class ScoutService {
     return this.settings();
   }
 
-  private watchFromRow(row: WatchRow, stats: { samples: number; first_observed: string | null } = { samples: 0, first_observed: null }): Watch {
+  private watchFromRow(
+    row: WatchRow,
+    stats: { samples: number; first_observed: string | null } = { samples: 0, first_observed: null },
+    variantStats: Map<string, { samples: number; first_observed: string | null; typical: number | null }> = new Map(),
+  ): Watch {
     const samples = Number(stats?.samples ?? 0);
     const observationHours = stats?.first_observed ? Math.max(0, Math.floor((Date.now() - Date.parse(stats.first_observed)) / 3_600_000)) : 0;
     const readiness = Math.round(Math.min(1, samples / BASELINE_MIN_SAMPLES, observationHours / BASELINE_MIN_HOURS) * 100);
     const archived = Boolean(row.archived_at);
     const enabled = Boolean(row.enabled) && !archived;
     const sources = parseJson<Marketplace[]>(row.sources_json, []);
+    const variantGroups = parseVariantGroups(row.variant_groups_json);
+    const variantStatFor = (key: string, label: string): WatchVariantStat => {
+      const entry = variantStats.get(key);
+      const entrySamples = Number(entry?.samples ?? 0);
+      const entryHours = entry?.first_observed ? Math.max(0, Math.floor((Date.now() - Date.parse(entry.first_observed)) / 3_600_000)) : 0;
+      return {
+        key,
+        label,
+        samples: entrySamples,
+        targetSamples: BASELINE_MIN_SAMPLES,
+        observationHours: entryHours,
+        readiness: Math.round(Math.min(1, entrySamples / BASELINE_MIN_SAMPLES, entryHours / BASELINE_MIN_HOURS) * 100),
+        typical: entry?.typical ?? null,
+      };
+    };
+    // Only surface the breakdown once the user configured groups; a legacy
+    // watch keeps its single watch-wide progress bar.
+    const variants: WatchVariantStat[] = variantGroups.length
+      ? [
+          ...variantGroups.map((group) => variantStatFor(group.id, group.label)),
+          ...(variantStats.has(OTHER_VARIANT_KEY) ? [variantStatFor(OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL)] : []),
+        ]
+      : [];
     return {
       id: row.id,
       name: row.name,
@@ -1881,18 +1953,23 @@ export class ScoutService {
       typoVariants: Boolean(row.typo_variants),
       aiRelevance: row.ai_relevance === undefined ? true : Boolean(row.ai_relevance),
       referenceMarketWatchId: row.reference_market_watch_id ?? null,
+      variantGroups,
+      variants,
       minPrice: row.min_price_pln === null ? null : Number(row.min_price_pln),
       maxPrice: row.max_price_pln === null ? null : Number(row.max_price_pln),
       archivedAt: row.archived_at ?? null,
     };
   }
 
-  private listingFromRow(row: Record<string, any>, baselineReady: boolean): Listing {
+  private listingFromRow(row: Record<string, any>, baselineReady: boolean, variantGroups: VariantGroup[] = []): Listing {
     const typicalSource = row.typical_source === 'reference-band' || row.typical_source === 'own-history' ? row.typical_source : null;
     const associationTypical = row.watch_typical_pln ?? row.typical_pln;
-    // A band-seeded typical is display-only, so it shows even while the watch
-    // is still learning its own baseline.
-    const showTypical = baselineReady || typicalSource === 'reference-band';
+    // An own-history typical is only written once the listing's own variant is
+    // ready, so it can be shown per variant; a band-seeded typical is
+    // display-only and shows while any baseline is still learning. The
+    // watch-wide readiness flag remains the fallback for legacy rows that
+    // predate typical_source.
+    const showTypical = typicalSource === 'own-history' || typicalSource === 'reference-band' || baselineReady;
     const typical = showTypical && associationTypical !== null && associationTypical !== undefined ? Number(associationTypical) : null;
     const price = Number(row.price_pln);
     const belowTypical = typical && typical > 0 ? -Math.max(0, ((typical - price) / typical) * 100) : null;
@@ -1919,6 +1996,8 @@ export class ScoutService {
       price,
       typical,
       typicalSource,
+      variantKey: row.variant_key ?? null,
+      variantLabel: row.variant_key ? variantLabelFor(String(row.variant_key), variantGroups) : null,
       belowTypical,
       observed: relativeTime(row.watch_last_seen_at ?? row.last_seen_at),
       observedAt: row.watch_last_seen_at ?? row.last_seen_at,
@@ -1929,7 +2008,7 @@ export class ScoutService {
       watch: row.watch_name || 'Unassigned',
       condition: row.condition || undefined,
       location: row.location || undefined,
-      shippingAvailable: row.shipping_available === null ? null : Boolean(row.shipping_available),
+      shippingAvailable: row.marketplace === 'Vinted' ? true : row.shipping_available === null ? null : Boolean(row.shipping_available),
       priceNegotiable: row.price_negotiable === null || row.price_negotiable === undefined ? null : Boolean(row.price_negotiable),
       listingId: String(row.listing_id),
       decision: parseListingDecision(row.listing_decision),
@@ -1955,18 +2034,49 @@ export class ScoutService {
   private watches(includeArchived: boolean) {
     const rows = this.stmt(`SELECT * FROM watches ${includeArchived ? '' : 'WHERE archived_at IS NULL '}ORDER BY created_at DESC`).all() as WatchRow[];
     if (!rows.length) return [];
-    const statsRows = this.stmt(`SELECT o.watch_id, COUNT(DISTINCT o.listing_id) AS samples, MIN(o.observed_at) AS first_observed
+    const statsRows = this.stmt(`SELECT o.watch_id, COALESCE(wl.variant_key, ?) AS variant_key, COUNT(DISTINCT o.listing_id) AS samples, MIN(o.observed_at) AS first_observed
       FROM observations o
       JOIN listings l ON l.id = o.listing_id
       JOIN watches w ON w.id = o.watch_id
+      LEFT JOIN watch_listings wl ON wl.id = o.watch_listing_id
       WHERE (? = 1 OR w.archived_at IS NULL)
         AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)
-        AND (w.shipping_only = 0 OR l.shipping_available = 1)
+        AND (w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
         AND (w.min_price_pln IS NULL OR o.price_pln >= w.min_price_pln)
         AND (w.max_price_pln IS NULL OR o.price_pln <= w.max_price_pln)
-      GROUP BY o.watch_id`).all(includeArchived ? 1 : 0) as Array<{ watch_id: string; samples: number; first_observed: string | null }>;
-    const statsByWatch = new Map(statsRows.map((stats) => [stats.watch_id, stats]));
-    return rows.map((row) => this.watchFromRow(row, statsByWatch.get(row.id)));
+      GROUP BY o.watch_id, COALESCE(wl.variant_key, ?)`).all(OTHER_VARIANT_KEY, includeArchived ? 1 : 0, OTHER_VARIANT_KEY) as Array<{ watch_id: string; variant_key: string; samples: number; first_observed: string | null }>;
+    // Latest stored typical per variant. Every association in a variant shares
+    // the value written by the most recent scan; MAX(last_seen_at) picks that
+    // row so a stale pre-regroup value cannot win.
+    const typicalRows = this.stmt(`SELECT wl.watch_id, COALESCE(wl.variant_key, ?) AS variant_key, wl.typical_pln AS typical, MAX(wl.last_seen_at) AS last_seen_at
+      FROM watch_listings wl
+      JOIN watches w ON w.id = wl.watch_id
+      WHERE wl.typical_pln IS NOT NULL${includeArchived ? '' : ' AND w.archived_at IS NULL'}
+      GROUP BY wl.watch_id, COALESCE(wl.variant_key, ?)`).all(OTHER_VARIANT_KEY, OTHER_VARIANT_KEY) as Array<{ watch_id: string; variant_key: string; typical: number }>;
+    const statsByWatch = new Map<string, { samples: number; first_observed: string | null }>();
+    const variantsByWatch = new Map<string, Map<string, { samples: number; first_observed: string | null; typical: number | null }>>();
+    const variantEntry = (watchId: string, key: string) => {
+      let byVariant = variantsByWatch.get(watchId);
+      if (!byVariant) { byVariant = new Map(); variantsByWatch.set(watchId, byVariant); }
+      let entry = byVariant.get(key);
+      if (!entry) { entry = { samples: 0, first_observed: null, typical: null }; byVariant.set(key, entry); }
+      return entry;
+    };
+    for (const stats of statsRows) {
+      const entry = variantEntry(stats.watch_id, stats.variant_key ?? OTHER_VARIANT_KEY);
+      entry.samples = Number(stats.samples);
+      entry.first_observed = stats.first_observed;
+      // A listing belongs to exactly one variant, so summing the per-variant
+      // distinct counts reproduces the watch-wide distinct count.
+      const aggregate = statsByWatch.get(stats.watch_id) ?? { samples: 0, first_observed: null };
+      aggregate.samples += entry.samples;
+      if (stats.first_observed && (!aggregate.first_observed || stats.first_observed < aggregate.first_observed)) aggregate.first_observed = stats.first_observed;
+      statsByWatch.set(stats.watch_id, aggregate);
+    }
+    for (const row of typicalRows) {
+      variantEntry(row.watch_id, row.variant_key ?? OTHER_VARIANT_KEY).typical = Number(row.typical);
+    }
+    return rows.map((row) => this.watchFromRow(row, statsByWatch.get(row.id), variantsByWatch.get(row.id) ?? new Map()));
   }
 
   getWatches() {
@@ -1975,6 +2085,26 @@ export class ScoutService {
 
   allWatches() {
     return this.watches(true);
+  }
+
+  /**
+   * Re-derive every saved listing association's variant_key from the watch's
+   * current groups. Called after a group edit so history is repartitioned
+   * immediately instead of converging one listing per scan. Deterministic and
+   * idempotent; with no groups every key is cleared back to NULL.
+   */
+  retagWatchVariants(watchId: string) {
+    const row = this.stmt('SELECT variant_groups_json FROM watches WHERE id = ?').get(watchId) as { variant_groups_json?: string } | undefined;
+    if (!row) return;
+    const groups = parseVariantGroups(row.variant_groups_json);
+    const associations = this.stmt('SELECT wl.id AS association_id, l.title AS title FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE wl.watch_id = ?').all(watchId) as Array<{ association_id: number; title: string }>;
+    if (!associations.length) return;
+    this.transaction(() => {
+      const update = this.stmt('UPDATE watch_listings SET variant_key = ? WHERE id = ?');
+      for (const association of associations) {
+        update.run(groups.length ? assignVariant(association.title, groups) : null, association.association_id);
+      }
+    });
   }
 
   watchAnalytics(id: string, rangeDays = 30): WatchAnalytics {
@@ -1990,7 +2120,7 @@ export class ScoutService {
       WHERE o.watch_id = ?
         AND o.observed_at >= ?
         AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND EXISTS (SELECT 1 FROM watches rw WHERE rw.id = r.watch_id AND rw.ai_relevance = 1))
-        AND (? = 0 OR l.shipping_available = 1)
+        AND (? = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
         AND (? IS NULL OR o.price_pln >= ?)
         AND (? IS NULL OR o.price_pln <= ?)`;
     const filterParams = [id, cutoff, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln] as unknown[];
@@ -2078,7 +2208,7 @@ export class ScoutService {
       'w.archived_at IS NULL',
       'o.observed_at >= ?',
       "NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)",
-      '(w.shipping_only = 0 OR l.shipping_available = 1)',
+      "(w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))",
       '(w.min_price_pln IS NULL OR o.price_pln >= w.min_price_pln)',
       '(w.max_price_pln IS NULL OR o.price_pln <= w.max_price_pln)',
     ];
@@ -2197,7 +2327,7 @@ export class ScoutService {
       'w.archived_at IS NULL',
       'wl.last_seen_at > ?',
       ...(options.includeAiFiltered ? [] : [`NOT (${aiFilteredPredicate})`]),
-      '(w.shipping_only = 0 OR l.shipping_available = 1)',
+      "(w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))",
       '(w.min_price_pln IS NULL OR l.price_pln >= w.min_price_pln)',
       '(w.max_price_pln IS NULL OR l.price_pln <= w.max_price_pln)',
     ];
@@ -2221,7 +2351,7 @@ export class ScoutService {
     const total = Number((this.stmt(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(500, Math.floor(options.pageSize ?? 200)));
-    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note, a.hidden AS listing_hidden, CASE WHEN ${aiFilteredPredicate} THEN 1 ELSE 0 END AS ai_filtered
+    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.variant_key AS variant_key, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note, a.hidden AS listing_hidden, CASE WHEN ${aiFilteredPredicate} THEN 1 ELSE 0 END AS ai_filtered
       FROM listings l
       JOIN watch_listings wl ON wl.listing_id = l.id
       JOIN watches w ON w.id = wl.watch_id
@@ -2229,7 +2359,7 @@ export class ScoutService {
       WHERE ${where}
       ORDER BY ${orderBy} LIMIT ? OFFSET ?`).all(...params, pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
     const watches = new Map((knownWatches ?? this.getWatches()).map((watch) => [watch.id, watch]));
-    const listings = rows.map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100));
+    const listings = rows.map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100, watches.get(row.watch_id)?.variantGroups ?? []));
     return { listings, pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
   }
 
@@ -2239,7 +2369,7 @@ export class ScoutService {
 
   listingDetail(key: string, watchId?: string | null): ListingDetail {
     const { marketplace, listingId } = parseListingKey(key);
-    const row = this.stmt(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, a.decision AS listing_decision, a.note AS listing_note, a.hidden AS listing_hidden, a.updated_at AS action_updated_at
+    const row = this.stmt(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.variant_key AS variant_key, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, a.decision AS listing_decision, a.note AS listing_note, a.hidden AS listing_hidden, a.updated_at AS action_updated_at
       FROM listings l
       LEFT JOIN watch_listings wl ON wl.listing_id = l.id AND (? IS NULL OR wl.watch_id = ?)
       LEFT JOIN watches w ON w.id = wl.watch_id
@@ -2248,7 +2378,7 @@ export class ScoutService {
       ORDER BY CASE WHEN wl.id IS NOT NULL THEN 0 ELSE 1 END, wl.last_seen_at DESC LIMIT 1`).get(watchId ?? null, watchId ?? null, marketplace, listingId, watchId ?? null, watchId ?? null) as Record<string, any> | undefined;
     if (!row) throw new ServiceError('Listing detail is not available yet', 404);
     const watches = new Map(this.allWatches().map((watch) => [watch.id, watch]));
-    const listing = this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100);
+    const listing = this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100, watches.get(row.watch_id)?.variantGroups ?? []);
     const history = (this.stmt('SELECT price_pln, observed_at FROM observations WHERE listing_id = ? AND (? IS NULL OR watch_id = ?) ORDER BY observed_at DESC, id DESC LIMIT 120').all(row.id, row.watch_id ?? watchId ?? null, row.watch_id ?? watchId ?? null) as Array<{ price_pln: number; observed_at: string }>).reverse().map((point): PriceHistoryPoint => ({ price: Number(point.price_pln), observedAt: point.observed_at }));
     const snapshotRow = this.stmt(`SELECT title, price_pln, condition, location, url, description, captured_at, verification_status
       FROM listing_detail_snapshots WHERE listing_id = ? ORDER BY captured_at DESC, id DESC LIMIT 1`).get(row.id) as Record<string, any> | undefined;
@@ -2433,10 +2563,12 @@ export class ScoutService {
         } catch {
           // Rescue is recall-only; any failure keeps the deterministic set.
         }
-        // Same AI relevance gate as watch scans (Jev live, DeepSeek legacy):
-        // fail-open, so unknown/not-configured keeps the deterministic set.
-        // An unexpected throw (e.g. cache/transaction failure) must not turn
-        // a good deterministic result into a user-visible search error.
+        // Same AI relevance gate as watch scans (Jev live, DeepSeek legacy),
+        // but the search form can opt out per search (aiRelevance: false) to
+        // skip the Jev round trips entirely. Fail-open, so unknown/
+        // not-configured keeps the deterministic set. An unexpected throw
+        // (e.g. cache/transaction failure) must not turn a good deterministic
+        // result into a user-visible search error.
         let relevant = filtered;
         let relevanceNote = '';
         try {
@@ -2444,7 +2576,7 @@ export class ScoutService {
             query: input.query,
             includedTerms: input.terms ?? '',
             excludedTerms: input.excluded ?? '',
-          }, undefined, true);
+          }, undefined, input.aiRelevance !== false);
           relevant = relevance.listings;
           relevanceNote = relevance.notConfigured
             ? ''
@@ -3381,17 +3513,22 @@ export class ScoutService {
           const comparable = filterListings(fetched, row.query, row.included_terms, row.excluded_terms, deterministicFilters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
           let filtered = filterListings(comparable, row.query, row.included_terms, row.excluded_terms, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) });
-          // Baseline and first-observation queries are watch-wide and computed
+          // Per-variant baselines and first-observation queries are computed
           // once per scan, before the AI passes: both the fuzzy rescue and the
           // relevance pass need the same scoring to decide which listings are
           // strong enough to justify an AI call, and storeListing below
-          // reuses the result.
-          const baseline = this.watchBaseline(row);
+          // reuses the result. A listing's bucket comes from its title, so the
+          // gate scores it against the model it will actually be stored under.
+          const baselines = this.watchBaselines(row);
+          const baselineFor = (listing: NormalizedListing) =>
+            baselines.buckets.get(
+              baselines.groups.length ? assignVariant(listing.title, baselines.groups) : OTHER_VARIANT_KEY,
+            ) ?? { prices: [], firstObservedAt: null };
           // Spend rescue + relevance AI only where it can matter: listings
           // that would alert (score.qualifies) or already rank Very strong.
           // Everything else is kept without an AI call.
           const strongEnough = (listing: NormalizedListing) => {
-            const { score, dealStrength } = this.dealScore(row, listing.price, baseline, referenceMedian);
+            const { score, dealStrength } = this.dealScore(row, listing.price, baselineFor(listing), referenceMedian);
             return score.qualifies || (dealStrength ?? 0) >= 4;
           };
           try {
@@ -3413,11 +3550,11 @@ export class ScoutService {
           } catch {
             // Rescue is recall-only; any failure keeps the deterministic set.
           }
-          // Baseline and first-observation queries are watch-wide and computed
-          // once per scan above (shared with the fuzzy rescue gate), before
-          // the AI relevance pass: the pass needs the same scoring to decide
-          // which listings are strong enough to justify an AI call, and
-          // storeListing below reuses the result.
+          // Per-variant baselines are computed once per scan above (shared
+          // with the fuzzy rescue gate), before the AI relevance pass: the
+          // pass needs the same scoring to decide which listings are strong
+          // enough to justify an AI call, and storeListing below reuses the
+          // result.
           const relevance = await this.filterListingsByAiRelevance(filtered, {
             query: row.query,
             includedTerms: row.included_terms ?? '',
@@ -3426,7 +3563,7 @@ export class ScoutService {
           const candidates = this.transaction(() => {
             const pendingCandidates: DealNotificationCandidate[] = [];
             for (const listing of relevance.listings) {
-              const candidate = this.storeListing(row, listing, scanId, baseline, referenceMedian);
+              const candidate = this.storeListing(row, listing, scanId, baselines, referenceMedian);
               if (candidate) pendingCandidates.push(candidate);
             }
             const pending = row.shipping_only ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
@@ -3782,7 +3919,9 @@ export class ScoutService {
       const cached = lookup.get(listing.marketplace, listing.listingId) as { shipping_available: number | null } | undefined;
       if (cached?.shipping_available !== null && cached?.shipping_available !== undefined) listing.shippingAvailable = Boolean(cached.shipping_available);
     }
-    if (marketplace === 'OLX') return;
+    // OLX detail pages carry the shipping signal elsewhere; Vinted shipping is
+    // assumed available on every listing, so neither marketplace is checked.
+    if (marketplace === 'OLX' || marketplace === 'Vinted') return;
     const unknown = listings.filter((listing) => listing.shippingAvailable === null).slice(0, Math.max(0, options.limit ?? 8));
     // Shipping rows found by the parallel page fetches are cached in one
     // commit after the loop instead of one implicit commit per listing.
@@ -3824,22 +3963,27 @@ export class ScoutService {
   }
 
   /**
-   * Watch-wide inputs every listing in a scan scores against: the latest
-   * observed price per listing (the baseline distribution) and the watch's
-   * first qualifying observation. Both depend only on watch-level filters, so
-   * they are computed once per scan. The baseline uses a window function over
-   * the (watch_id, listing_id, observed_at, id) index — one linear pass —
-   * instead of a newest-first anti-join that degrades on recurring listings.
-   * INDEXED BY pins that covering index: without it the planner sometimes
-   * picked observations_watch_time and re-sorted the watch's full history
-   * (temp b-tree) on every scan.
+   * Per-variant inputs every listing in a scan scores against: the latest
+   * observed price per listing (the baseline distribution) bucketed by the
+   * listing's assigned variant_key, plus each variant's first server-observed
+   * timestamp. Computed once per scan. The window function walks the
+   * (watch_id, listing_id, observed_at, id) index in one linear pass; INDEXED
+   * BY pins that covering index because the planner otherwise sometimes picked
+   * observations_watch_time and re-sorted the watch's full history.
+   *
+   * With no configured groups every row lands in the single OTHER bucket, so
+   * the legacy watch-wide baseline is reproduced unchanged. Each bucket keeps
+   * its own newest 400 listings, so one dominant model can no longer crowd out
+   * another model's samples.
    */
-  private watchBaseline(row: WatchRow): { prices: number[]; firstObservedAt: string | null } {
+  private watchBaselines(row: WatchRow): WatchBaselines {
+    const groups = parseVariantGroups(row.variant_groups_json);
     const baselineFilters = `
       JOIN listings l ON l.id = o.listing_id
+      LEFT JOIN watch_listings wl ON wl.id = o.watch_listing_id
       WHERE o.watch_id = ?
         AND (? = 0 OR NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))))
-        AND (? = 0 OR l.shipping_available = 1)
+        AND (? = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
         AND (? IS NULL OR o.price_pln >= ?)
         AND (? IS NULL OR o.price_pln <= ?)`;
     const baselineParams = [
@@ -3848,14 +3992,29 @@ export class ScoutService {
       row.shipping_only ? 1 : 0,
       row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln,
     ] as unknown[];
-    const prices = (this.stmt(`SELECT price_pln FROM (
-        SELECT o.price_pln, o.observed_at, o.id, ROW_NUMBER() OVER (PARTITION BY o.listing_id ORDER BY o.observed_at DESC, o.id DESC) AS rank
+    const latest = this.stmt(`SELECT price_pln, variant_key FROM (
+        SELECT o.price_pln, o.observed_at, o.id, COALESCE(wl.variant_key, ?) AS variant_key, ROW_NUMBER() OVER (PARTITION BY o.listing_id ORDER BY o.observed_at DESC, o.id DESC) AS rank
         FROM observations o INDEXED BY observations_watch_listing ${baselineFilters}
-      ) WHERE rank <= 1 ORDER BY observed_at DESC, id DESC LIMIT 400`).all(...baselineParams) as Array<{ price_pln: number }>)
-      .map((item) => Number(item.price_pln))
-      .filter((price) => Number.isFinite(price) && price > 0);
-    const first = this.stmt(`SELECT MIN(o.observed_at) AS first FROM observations o INDEXED BY observations_watch_listing ${baselineFilters}`).get(...baselineParams) as { first: string | null };
-    return { prices, firstObservedAt: first?.first ?? null };
+      ) WHERE rank <= 1 ORDER BY observed_at DESC, id DESC`).all(OTHER_VARIANT_KEY, ...baselineParams) as Array<{ price_pln: number; variant_key: string }>;
+    const firstByVariant = this.stmt(`SELECT COALESCE(wl.variant_key, ?) AS variant_key, MIN(o.observed_at) AS first
+      FROM observations o INDEXED BY observations_watch_listing ${baselineFilters}
+      GROUP BY COALESCE(wl.variant_key, ?)`).all(OTHER_VARIANT_KEY, ...baselineParams, OTHER_VARIANT_KEY) as Array<{ variant_key: string; first: string | null }>;
+    const buckets = new Map<string, WatchVariantBucket>();
+    const bucketFor = (key: string) => {
+      let bucket = buckets.get(key);
+      if (!bucket) { bucket = { prices: [], firstObservedAt: null }; buckets.set(key, bucket); }
+      return bucket;
+    };
+    for (const item of latest) {
+      const price = Number(item.price_pln);
+      if (!Number.isFinite(price) || price <= 0) continue;
+      const bucket = bucketFor(item.variant_key ?? OTHER_VARIANT_KEY);
+      // Rows arrive newest-first; 400 preserves the per-model ceiling the
+      // watch-wide query used to apply globally.
+      if (bucket.prices.length < 400) bucket.prices.push(price);
+    }
+    for (const item of firstByVariant) bucketFor(item.variant_key ?? OTHER_VARIANT_KEY).firstObservedAt = item.first ?? null;
+    return { groups, buckets };
   }
 
   /**
@@ -3877,7 +4036,14 @@ export class ScoutService {
     return { score, useReference, dealStrength: dealStrengthFromDiscount(score.discountPercent) };
   }
 
-  private storeListing(row: WatchRow, listing: NormalizedListing, scanId: number, baseline: { prices: number[]; firstObservedAt: string | null }, referenceMedian: number | null = null): DealNotificationCandidate | null {
+  private storeListing(row: WatchRow, listing: NormalizedListing, scanId: number, baselines: WatchBaselines, referenceMedian: number | null = null): DealNotificationCandidate | null {
+    const groups = baselines.groups;
+    // Assignment is deterministic from the title, so a listing can move model
+    // buckets if the marketplace retitles it; the new bucket's history is the
+    // correct one from that point on.
+    const variantKey = groups.length ? assignVariant(listing.title, groups) : null;
+    const variantLabel = variantKey ? variantLabelFor(variantKey, groups) : null;
+    const baseline = baselines.buckets.get(variantKey ?? OTHER_VARIANT_KEY) ?? { prices: [], firstObservedAt: null };
     const observedAt = nowIso();
     // RETURNING removes the follow-up SELECT for the row id on both the
     // insert and the conflict-update branch of each upsert.
@@ -3885,10 +4051,10 @@ export class ScoutService {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, ?)
       ON CONFLICT(marketplace, listing_id) DO UPDATE SET title = excluded.title, price_pln = excluded.price_pln, url = excluded.url, image_url = COALESCE(excluded.image_url, listings.image_url), condition = COALESCE(excluded.condition, listings.condition), location = COALESCE(excluded.location, listings.location), shipping_available = COALESCE(excluded.shipping_available, listings.shipping_available), price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), availability_status = 'live', ended_reason = NULL, last_verified_at = excluded.last_verified_at, last_seen_at = excluded.last_seen_at
       RETURNING id`).get(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable === null ? null : listing.shippingAvailable ? 1 : 0, listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0, observedAt, observedAt, observedAt) as { id: number };
-    const association = this.stmt(`INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(watch_id, listing_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
-      RETURNING id`).get(row.id, stored.id, observedAt, observedAt) as { id: number };
+    const association = this.stmt(`INSERT INTO watch_listings (watch_id, listing_id, variant_key, first_seen_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(watch_id, listing_id) DO UPDATE SET last_seen_at = excluded.last_seen_at, variant_key = excluded.variant_key
+      RETURNING id`).get(row.id, stored.id, variantKey, observedAt, observedAt) as { id: number };
     const { score, useReference, dealStrength: scoredStrength } = this.dealScore(row, listing.price, baseline, referenceMedian);
     const observation = this.stmt('INSERT INTO observations (listing_id, watch_id, watch_listing_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?, ?)').run(stored.id, row.id, association.id, scanId, listing.price, observedAt);
     const observationId = Number(observation.lastInsertRowid);
@@ -3908,6 +4074,8 @@ export class ScoutService {
         query: String(row.query ?? ''),
         includedTerms: String(row.included_terms ?? ''),
         excludedTerms: String(row.excluded_terms ?? ''),
+        variantKey,
+        variantLabel,
       };
     } else if (useReference && score.typical !== null) {
       // Band-seeded display values; the readiness gate is untouched, so no
@@ -4078,6 +4246,7 @@ export class ScoutService {
       confidence: number;
       priority: NotificationPriority;
       sequence: number;
+      variantLabel?: string | null;
     } | undefined;
   }
 
@@ -4131,18 +4300,19 @@ export class ScoutService {
     attemptCount: number;
     encryptedDiscord?: string;
     ntfy: NtfyConfig | null;
+    variantLabel?: string | null;
     legacy?: boolean;
   }) {
     const started = nowIso();
     try {
       if (input.channel === 'Discord') {
         if (!input.encryptedDiscord) throw new Error('Discord webhook is not configured');
-        const response = await fetch(validateDiscordWebhook(decryptSecret(input.encryptedDiscord)), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(buildDiscordEmbed({ listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence })), signal: AbortSignal.timeout(12_000) });
+        const response = await fetch(validateDiscordWebhook(decryptSecret(input.encryptedDiscord)), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(buildDiscordEmbed({ listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence, variantLabel: input.variantLabel })), signal: AbortSignal.timeout(12_000) });
         discardResponse(response, 'discord-webhook');
         if (!response.ok) throw new Error(`Discord returned ${response.status}`);
       } else {
         if (!input.ntfy) throw new Error('ntfy is not configured');
-        await publishNtfy(input.ntfy, buildNtfyPayload({ listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence }, input.ntfy.topic, input.priority));
+        await publishNtfy(input.ntfy, buildNtfyPayload({ listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence, variantLabel: input.variantLabel }, input.ntfy.topic, input.priority));
       }
       const finished = nowIso();
       this.transaction(() => {
@@ -4181,6 +4351,7 @@ export class ScoutService {
     discountOrConfidence: number,
     maybeConfidence?: number,
     context?: ScanNotifyContext,
+    variantLabel?: string | null,
   ) {
     const legacy = typeof watchIdOrListing !== 'string';
     const watchId = legacy ? '__legacy__' : watchIdOrListing;
@@ -4224,7 +4395,7 @@ export class ScoutService {
         eventKey = this.notificationEventKey(watchId, listing, sequence);
         deliveryKey = this.notificationDeliveryKey(eventKey, channel);
       }
-      const payload = { ...buildDiscordEmbed({ listing, typical, discountPercent, confidence }), _scout: { watchId, listing, typical, discountPercent, confidence, priority, sequence } };
+      const payload = { ...buildDiscordEmbed({ listing, typical, discountPercent, confidence, variantLabel }), _scout: { watchId, listing, typical, discountPercent, confidence, priority, sequence, variantLabel } };
       this.stmt('INSERT OR IGNORE INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(eventKey, JSON.stringify(payload), 'pending', nowIso());
       const claim = this.claimNotificationDelivery(deliveryKey, channel);
       if (claim) planned.push({ channel, eventKey, deliveryKey, sequence: legacy ? undefined : sequence, claim, legacy });
@@ -4244,6 +4415,7 @@ export class ScoutService {
       attemptCount: item.claim.attemptCount,
       encryptedDiscord: encryptedDiscord ?? undefined,
       ntfy,
+      variantLabel,
       legacy: item.legacy,
     })));
   }
@@ -4291,6 +4463,7 @@ export class ScoutService {
         attemptCount: claim.attemptCount,
         encryptedDiscord: this.getSetting('discord_webhook') ?? undefined,
         ntfy: this.ntfyConfig(),
+        variantLabel: meta.variantLabel,
         legacy: meta.watchId === '__legacy__',
       });
     }
@@ -4327,10 +4500,6 @@ export type ListingFilters = {
    */
   relaxTerms?: boolean;
 };
-
-function normalizeFilterText(value: string) {
-  return value.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
-}
 
 /** Query filler that carries no product signal on its own (Polish + English). */
 const QUERY_STOPWORDS = new Set([
@@ -4416,7 +4585,7 @@ function evaluateDeterministic(
   const locationOk = !requestedLocation || requestedLocation === 'polska' || location.includes(requestedLocation);
   const priceOk = (options.minPrice === null || options.minPrice === undefined || listing.price >= options.minPrice)
     && (options.maxPrice === null || options.maxPrice === undefined || listing.price <= options.maxPrice);
-  const shippingOk = !options.shippingOnly || listing.shippingAvailable === true;
+  const shippingOk = !options.shippingOnly || listing.marketplace === 'Vinted' || listing.shippingAvailable === true;
   return { termOk, conditionOk, locationOk, priceOk, shippingOk };
 }
 

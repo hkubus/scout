@@ -201,7 +201,11 @@ export function normalizeListing(input: Omit<Partial<NormalizedListing>, 'market
     imageUrl,
     condition: input.condition?.trim(),
     location: input.location?.trim(),
-    shippingAvailable: input.shippingAvailable ?? null,
+    // Vinted is assumed to support shipping on every listing (search results
+    // included), so Scout never spends a detail-page fetch on a Vinted
+    // shipping check and never drops a Vinted listing from a shipping-only
+    // filter — even when a stored row still carries an old null/0 signal.
+    shippingAvailable: input.marketplace === 'Vinted' ? true : input.shippingAvailable ?? null,
     priceNegotiable: input.priceNegotiable ?? null,
     observedAt: input.observedAt ?? new Date().toISOString(),
   };
@@ -496,12 +500,9 @@ export function parseListingDescription(html: string, marketplace: Marketplace):
 
 /** Read shipping availability from a marketplace detail page when the search card omits it. */
 export function parseShippingAvailability(html: string, marketplace: Marketplace): boolean | null {
-  if (marketplace === 'Vinted') {
-    if (/data-testid=["']item-shipping-banner["']/i.test(html)) return true;
-    if (/tylko odbiór osobisty|brak opcji wysyłki/i.test(visiblePageText(html))) return false;
-    const transactionMatch = html.match(/transaction_permitted(?:\\)?["']?\s*:\s*(true|false)/i);
-    return transactionMatch ? transactionMatch[1].toLowerCase() === 'true' : null;
-  }
+  // Vinted shipping is assumed available on every listing (see
+  // `normalizeListing`), so there is no detail-page shipping signal to read.
+  if (marketplace === 'Vinted') return null;
 
   if (marketplace === 'Allegro Lokalnie') {
     const deliveryOptions = [...html.matchAll(/<div[^>]*class=["'][^"']*mlc-delivery-options__name[^"']*["'][^>]*>([\s\S]*?)<\/div>/gi)]
@@ -1098,7 +1099,7 @@ function parseVintedCatalogItem(item: unknown): NormalizedListing | null {
   const photo = isRecord(item.photo) ? item.photo : undefined;
   const imageUrl = typeof photo?.url === 'string' ? photo.url : undefined;
   const condition = typeof item.status === 'string' && item.status.trim() ? item.status.trim() : undefined;
-  return normalizeListing({ marketplace: 'Vinted', listingId, title, price, url, imageUrl, condition, shippingAvailable: null, priceNegotiable: null });
+  return normalizeListing({ marketplace: 'Vinted', listingId, title, price, url, imageUrl, condition, priceNegotiable: null });
 }
 
 /**

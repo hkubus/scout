@@ -14,10 +14,15 @@ import {
 import { api } from "./api";
 import { marketplaceColors } from "./data";
 import type { WatchPreset } from "./presets";
-import type { Marketplace, MarketWatch, NotificationRecord, Watch } from "./types";
+import type { Marketplace, MarketWatch, NotificationRecord, VariantGroup, Watch } from "./types";
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
+
+// crypto.randomUUID() needs a secure context, which a plain-HTTP LAN origin
+// is not; this id only has to be unique within one watch.
+const newVariantId = () =>
+  `variant-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
 export function WatchDialog({
   initialWatch = null,
@@ -55,7 +60,8 @@ export function WatchDialog({
   const [maxPrice, setMaxPrice] = useState(initialWatch?.maxPrice === null || initialWatch?.maxPrice === undefined ? preset?.maxPrice === null || preset?.maxPrice === undefined ? "" : String(preset.maxPrice) : String(initialWatch.maxPrice));
   const [shippingOnly, setShippingOnly] = useState(initialWatch?.shippingOnly ?? preset?.shippingOnly ?? false);
   const [typoVariants, setTypoVariants] = useState(initialWatch?.typoVariants ?? false);
-  const [aiRelevance, setAiRelevance] = useState(initialWatch?.aiRelevance ?? true);
+  const [aiRelevance, setAiRelevance] = useState(initialWatch?.aiRelevance ?? preset?.aiRelevance ?? true);
+  const [variantGroups, setVariantGroups] = useState<VariantGroup[]>(initialWatch?.variantGroups ?? []);
   const [referenceOptions, setReferenceOptions] = useState<MarketWatch[]>([]);
   const [referenceMarketWatchId, setReferenceMarketWatchId] = useState(initialWatch?.referenceMarketWatchId ?? "");
   const [submitting, setSubmitting] = useState(false);
@@ -137,6 +143,8 @@ export function WatchDialog({
         shippingOnly,
         typoVariants,
         aiRelevance,
+        variantGroups: cleanVariantGroups,
+        variants: initialWatch?.variants ?? [],
         referenceMarketWatchId: referenceMarketWatchId.trim() ? referenceMarketWatchId.trim() : null,
         minPrice: numericMin,
         maxPrice: numericMax,
@@ -154,6 +162,21 @@ export function WatchDialog({
     );
   const setSourceInterval = (source: Marketplace, value: string) =>
     setSourceIntervals((current) => ({ ...current, [source]: value }));
+  const addVariant = () =>
+    setVariantGroups((current) =>
+      current.length >= 12
+        ? current
+        : [...current, { id: newVariantId(), label: "", terms: "" }],
+    );
+  const updateVariant = (index: number, patch: Partial<VariantGroup>) =>
+    setVariantGroups((current) =>
+      current.map((group, position) => (position === index ? { ...group, ...patch } : group)),
+    );
+  const removeVariant = (index: number) =>
+    setVariantGroups((current) => current.filter((_, position) => position !== index));
+  const cleanVariantGroups = variantGroups
+    .map((group) => ({ ...group, label: group.label.trim(), terms: group.terms.trim() }))
+    .filter((group) => group.label && group.terms);
   return (
     <div
       className="modal-backdrop"
@@ -335,6 +358,40 @@ export function WatchDialog({
             <input type="checkbox" checked={aiRelevance} onChange={(event) => setAiRelevance(event.target.checked)} />
             <span><strong>Use AI relevance filtering</strong><small>Exclude accessories, replacement parts, services, and unrelated listings when OpenRouter is configured</small></span>
           </label>
+          <div className="field-label">
+            <span>Model variants <span>optional · split a broad search by model</span></span>
+            <div className="variant-editor">
+              {variantGroups.map((group, index) => (
+                <div className="variant-row" key={group.id}>
+                  <input
+                    value={group.label}
+                    onChange={(event) => updateVariant(index, { label: event.target.value })}
+                    placeholder="Label, e.g. 1660 Super"
+                  />
+                  <input
+                    value={group.terms}
+                    onChange={(event) => updateVariant(index, { terms: event.target.value })}
+                    placeholder="Match terms, e.g. 1660 super"
+                  />
+                  <button
+                    type="button"
+                    className="icon-button"
+                    onClick={() => removeVariant(index)}
+                    aria-label={`Remove ${group.label || "variant"}`}
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+              ))}
+              <button type="button" className="ghost-button" disabled={variantGroups.length >= 12} onClick={addVariant}>
+                <Plus size={15} />
+                Add variant
+              </button>
+              <small className="field-hint">
+                The most specific match wins, so “1660 super” and “1660 ti” take precedence over “1660”. Listings that match no group share an “Other” baseline. Each variant learns its own typical price and alerts separately.
+              </small>
+            </div>
+          </div>
           <label className="field-label">
             Fallback baseline <span>optional · research series</span>
             <select value={referenceMarketWatchId} onChange={(event) => setReferenceMarketWatchId(event.target.value)}>

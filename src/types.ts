@@ -5,6 +5,31 @@ export type DealLabel = 'Exceptional' | 'Very strong' | 'Strong' | 'Watch';
 export type NotificationPriority = 'strong' | 'very-strong' | 'exceptional';
 export type ListingDecision = 'buy' | 'watch' | 'pass';
 
+/**
+ * One model bucket inside a watch. A watch searches broadly (e.g. "1660") and
+ * these groups split the matches into separately scored products (1660,
+ * 1660 Super, 1660 Ti), each with its own learned baseline and readiness.
+ */
+export interface VariantGroup {
+  /** Stable identity; renaming the label must not reset the learned baseline. */
+  id: string;
+  label: string;
+  /** Comma-separated terms; every term must be present in the listing title. */
+  terms: string;
+  /** Optional comma-separated terms that veto a match. */
+  exclude?: string;
+}
+
+/** Per-model progress shown on the watch card once variant groups exist. */
+export interface WatchVariantStat {
+  key: string;
+  label: string;
+  samples: number;
+  targetSamples: number;
+  observationHours: number;
+  readiness: number;
+  typical: number | null;
+}
 export type ListingDescriptionVerificationDecision = 'pass' | 'reject' | 'unknown';
 export type ListingDescriptionVerificationStatus = ListingDescriptionVerificationDecision | 'pending' | 'not-configured' | 'fallback';
 
@@ -42,6 +67,9 @@ export interface Listing {
   typical: number | null;
   /** Where the displayed typical comes from: the watch's own history or a reference research series band. */
   typicalSource?: 'own-history' | 'reference-band' | null;
+  /** Model-variant bucket this listing scored against, when the watch groups variants. */
+  variantKey?: string | null;
+  variantLabel?: string | null;
   belowTypical: number | null;
   observed: string;
   observedAt: string;
@@ -142,6 +170,9 @@ export interface Watch {
   shippingOnly: boolean;
   typoVariants: boolean;
   aiRelevance: boolean;
+  variantGroups: VariantGroup[];
+  /** Per-model sample/readiness/typical breakdown; empty without configured groups. */
+  variants: WatchVariantStat[];
   referenceMarketWatchId: string | null;
   minPrice: number | null;
   maxPrice: number | null;
@@ -279,6 +310,8 @@ export interface SearchFilters {
   page?: number;
   /** Client-generated id that correlates streamed per-source progress events. */
   searchId?: string;
+  /** Run the Jev/LLM relevance filter for this search; default true when omitted. */
+  aiRelevance?: boolean;
 }
 
 export interface SearchSourceStatus {

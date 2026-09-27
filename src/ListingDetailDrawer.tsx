@@ -212,6 +212,7 @@ export default function ListingDetailDrawer({
               <strong className="drawer-price">{formatPln(currentListing.price)}</strong>
               <span>{currentListing.typical === null ? "Baseline is still learning" : `${Math.abs(currentListing.belowTypical ?? 0).toFixed(1)}% below typical`}{currentListing.typicalSource === "reference-band" ? " · series baseline" : ""}</span>
               <small>{currentListing.condition || "Condition not specified"}{currentListing.location ? ` · ${currentListing.location}` : ""}</small>
+              {currentListing.variantLabel ? <em className="decision-chip decision-chip--variant" title="Model variant this listing is scored against, not the watch-wide blend">{currentListing.variantLabel}</em> : null}
             </div>
           </div>
 

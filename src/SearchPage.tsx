@@ -63,6 +63,11 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
   const [ownerType, setOwnerType] = useState("Any");
   const [location, setLocation] = useState("");
   const [shippingOnly, setShippingOnly] = useState(false);
+  // Persisted across searches: once a user turns the Jev relevance filter off,
+  // their next searches stay fast until they re-enable it here.
+  const [aiRelevance, setAiRelevance] = useState(
+    () => localStorage.getItem("scout-search-ai-relevance") !== "0",
+  );
   const [sources, setSources] = useState<Marketplace[]>([
     "OLX",
     "Allegro Lokalnie",
@@ -99,6 +104,7 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
     location: location.trim() || "Polska",
     ownerType: ownerType === "Any" ? null : ownerType.toLowerCase() as "private" | "business",
     page: targetPage,
+    aiRelevance,
   });
   const toggleSource = (source: Marketplace) =>
     setSources((current) =>
@@ -307,6 +313,23 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
               <small>Hide pickup-only and unknown delivery results</small>
             </span>
           </label>
+          <label className="check-option">
+            <input
+              type="checkbox"
+              checked={aiRelevance}
+              onChange={(event) => {
+                setAiRelevance(event.target.checked);
+                localStorage.setItem(
+                  "scout-search-ai-relevance",
+                  event.target.checked ? "1" : "0",
+                );
+              }}
+            />
+            <span>
+              <strong>AI relevance filtering</strong>
+              <small>Hide accessories, parts, and unrelated matches; off is faster</small>
+            </span>
+          </label>
         </div>
         {!validPrices ? (
           <div className="form-error" role="alert">
@@ -366,7 +389,7 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
                   {loadingMore ? "Loading…" : "Load more"}
                 </button>
               ) : null}
-              <button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, location: location.trim() || "Polska", condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly })}><Bell size={15} />Save as watch</button>
+              <button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, location: location.trim() || "Polska", condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly, aiRelevance })}><Bell size={15} />Save as watch</button>
             </div>
           ) : null}
         </div>

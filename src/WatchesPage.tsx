@@ -267,6 +267,23 @@ function WatchRow({
           {watch.observationHours}h observed · {Number.isFinite(watch.readiness) ? Math.min(100, Math.max(0, watch.readiness)) : 0}% ready
         </small>
       </div>
+      {watch.variants?.length ? (
+        <div className="watch-variants" aria-label="Model variants">
+          {watch.variants.map((variant) => {
+            const ready = variant.readiness >= 100;
+            return (
+              <span
+                key={variant.key}
+                className={`variant-chip ${ready ? "variant-chip--ready" : "variant-chip--learning"}`}
+                title={`${variant.samples} / ${variant.targetSamples} samples · ${variant.observationHours}h observed`}
+              >
+                <strong>{variant.label}</strong>
+                <small>{ready ? formatPln(variant.typical) : `${variant.samples}/${variant.targetSamples} samples`}</small>
+              </span>
+            );
+          })}
+        </div>
+      ) : null}
       <div className="watch-actions">
         <span className="next-scan">
           <Clock3 size={15} />
