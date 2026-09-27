@@ -234,6 +234,14 @@ app.delete('/api/marketplace-sessions/:marketplace', async (request) => {
   return service.deleteMarketplaceSession(params.data.marketplace);
 });
 
+const variantGroupInput = z.object({
+  id: z.string().trim().min(1).max(64).regex(/^[a-z0-9][a-z0-9_-]*$/i),
+  label: z.string().trim().min(1).max(80),
+  terms: z.string().trim().min(1).max(240),
+  exclude: z.string().trim().max(240).optional(),
+}).strict();
+const variantGroupsInput = z.array(variantGroupInput).max(12);
+
 const watchInput = z.object({
   id: z.string().trim().min(1).max(160).optional(),
   name: z.string().trim().min(1).max(120),
@@ -249,6 +257,7 @@ const watchInput = z.object({
   shippingOnly: z.boolean().optional().default(false),
   typoVariants: z.boolean().optional().default(false),
   aiRelevance: z.boolean().optional().default(true),
+  variantGroups: variantGroupsInput.optional().default([]),
   referenceMarketWatchId: z.string().trim().max(160).nullable().optional().default(null),
   minPrice: z.number().nonnegative().nullable().optional().default(null),
   maxPrice: z.number().positive().nullable().optional().default(null),
@@ -268,7 +277,7 @@ app.post('/api/watches', async (request, reply) => {
   const id = value.id ?? `watch-${randomUUID()}`;
   const now = nowIso();
   try {
-    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, sensitivity, shipping_only, typo_variants, ai_relevance, reference_market_watch_id, min_price_pln, max_price_pln, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, 1, now, now, now);
+    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, sensitivity, shipping_only, typo_variants, ai_relevance, variant_groups_json, reference_market_watch_id, min_price_pln, max_price_pln, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, JSON.stringify(value.variantGroups), value.referenceMarketWatchId, value.minPrice, value.maxPrice, 1, now, now, now);
   } catch (error) {
     if (error instanceof Error && /UNIQUE|PRIMARY KEY|constraint/i.test(error.message)) {
       return reply.code(409).send({ error: 'A watch with this id already exists' });
@@ -291,6 +300,7 @@ app.patch('/api/watches/:id', async (request, reply) => {
     enabled: z.boolean().optional(), interval: z.number().int().min(5).max(1440).optional(), shippingOnly: z.boolean().optional(),
     aiRelevance: z.boolean().optional(),
     typoVariants: z.boolean().optional(),
+    variantGroups: variantGroupsInput.optional(),
     referenceMarketWatchId: z.string().trim().max(160).nullable().optional(),
     archived: z.boolean().optional(),
     minPrice: z.number().nonnegative().nullable().optional(), maxPrice: z.number().positive().nullable().optional(),
@@ -325,6 +335,7 @@ app.patch('/api/watches/:id', async (request, reply) => {
   if (typeof body.shippingOnly === 'boolean') { fields.push('shipping_only = ?'); values.push(body.shippingOnly ? 1 : 0); }
   if (typeof body.aiRelevance === 'boolean') { fields.push('ai_relevance = ?'); values.push(body.aiRelevance ? 1 : 0); }
   if (typeof body.typoVariants === 'boolean') { fields.push('typo_variants = ?'); values.push(body.typoVariants ? 1 : 0); }
+  if (body.variantGroups !== undefined) { fields.push('variant_groups_json = ?'); values.push(JSON.stringify(body.variantGroups)); }
   if (body.referenceMarketWatchId !== undefined) {
     if (body.referenceMarketWatchId && !db.prepare('SELECT 1 FROM market_watches WHERE id = ?').get(body.referenceMarketWatchId)) {
       return reply.code(400).send({ error: 'Reference research watch not found' });
@@ -346,6 +357,9 @@ app.patch('/api/watches/:id', async (request, reply) => {
   values.push(nowIso(), params.data.id);
   const result = db.prepare(`UPDATE watches SET ${fields.join(', ')}, updated_at = ? WHERE id = ?`).run(...(values as any[]));
   if (!result.changes) return reply.code(404).send({ error: 'Watch not found' });
+  // Repartition the watch's saved listings immediately when the model groups
+  // change; otherwise the new keys would only converge one scan at a time.
+  if (body.variantGroups !== undefined) service.retagWatchVariants(params.data.id);
   emit('watch', { id: params.data.id, archived: body.archived });
   return { ok: true };
 });
@@ -360,6 +374,7 @@ const searchInput = z.object({
   shippingOnly: z.boolean().optional().default(false),
   condition: z.string().max(80).optional().default('Any'),
   location: z.string().max(120).optional().default(''),
+  aiRelevance: z.boolean().optional().default(true),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
 
 app.post('/api/search', async (request, reply) => {

@@ -119,6 +119,8 @@ export interface DealNotificationInput {
   discountPercent: number;
   confidence: number;
   observedAt?: string;
+  /** Model variant the typical describes, when the watch groups variants. */
+  variantLabel?: string | null;
 }
 
 export function buildNtfyPayload(input: DealNotificationInput, topic: string, priority = priorityFromDiscount(input.discountPercent)): NtfyPayload {
@@ -129,6 +131,7 @@ export function buildNtfyPayload(input: DealNotificationInput, topic: string, pr
     title: `${notificationPriorityLabel(priority)} deal · ${listing.marketplace}`,
     message: [
       listing.title,
+      ...(input.variantLabel ? [`Variant: ${input.variantLabel}`] : []),
       `${listing.price.toLocaleString('pl-PL')} zł · ${input.discountPercent.toFixed(1)}% below typical · ${input.confidence}% confidence`,
       listing.url,
     ].join('\n'),
@@ -167,6 +170,7 @@ export function buildDiscordEmbed(input: DealNotificationInput) {
       thumbnail: safeImageUrl ? { url: safeImageUrl } : undefined,
       fields: [
         { name: 'Marketplace', value: listing.marketplace, inline: true },
+        ...(input.variantLabel ? [{ name: 'Variant', value: input.variantLabel, inline: true }] : []),
         { name: 'Price', value: `${listing.price.toLocaleString('pl-PL')} zł`, inline: true },
         { name: 'Typical price', value: `${input.typical.toLocaleString('pl-PL')} zł`, inline: true },
         { name: 'Below typical', value: `${input.discountPercent.toFixed(1)}%`, inline: true },

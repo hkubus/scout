@@ -940,3 +940,23 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
   .drawer-meta-grid div:last-child { grid-column: 1 / -1; }
   .listing-drawer-footer { padding-left: 16px; padding-right: 16px; }
 }
+
+/* Model variant groups: a broad watch split into separately scored models. */
+.variant-editor { display: grid; gap: 8px; }
+.variant-row { display: grid; grid-template-columns: 1fr 1.4fr auto; gap: 8px; align-items: center; }
+.variant-row input { min-height: 38px; }
+.field-hint { color: var(--muted); font-size: 10px; font-weight: 400; line-height: 1.5; }
+.ghost-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; justify-self: start; padding: 7px 11px; border: 1px dashed var(--line-strong); border-radius: 7px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; }
+.ghost-button:hover:not(:disabled) { border-color: var(--blue); color: var(--blue); }
+.ghost-button:disabled { opacity: .5; cursor: not-allowed; }
+.watch-variants { display: flex; flex-wrap: wrap; gap: 6px; padding-left: 49px; }
+.variant-chip { display: inline-flex; align-items: baseline; gap: 6px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-muted); font-size: 10px; }
+.variant-chip strong { color: var(--text); font-weight: 600; }
+.variant-chip small { color: var(--muted); }
+.variant-chip--ready { border-color: rgba(21, 155, 150, .35); background: rgba(21, 155, 150, .10); }
+.variant-chip--ready small { color: var(--teal); }
+.decision-chip--variant { color: var(--violet, #6b5bd2); background: rgba(107, 91, 210, .12); }
+@media (max-width: 720px) {
+  .variant-row { grid-template-columns: 1fr; }
+  .watch-variants { padding-left: 0; }
+}

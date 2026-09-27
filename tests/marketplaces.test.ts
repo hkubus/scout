@@ -281,7 +281,7 @@ test('maps Vinted catalog API payloads onto normalized listings', () => {
   assert.equal(listing.currency, 'PLN');
   assert.equal(listing.condition, 'Bardzo dobry');
   assert.equal(listing.priceNegotiable, null);
-  assert.equal(listing.shippingAvailable, null);
+  assert.equal(listing.shippingAvailable, true);
   assert.equal(listing.url, 'https://www.vinted.pl/items/40203315928-lego-technic-porsche-911-rsr');
   assert.equal(listing.imageUrl, 'https://images1.vinted.net/t/03_0266a_9f08b2cb1_800x800.jpeg?s=s1');
   assert.ok(listing.observedAt);
@@ -569,13 +569,25 @@ test('excludes Allegro Lokalnie auctions that otherwise leak through the JSON-LD
   assert.deepEqual(listings.map((listing) => listing.url), ['https://allegrolokalnie.pl/oferta/steam-deck-buy']);
 });
 
-test('reads shipping state from Vinted and marketplace detail-page signals', () => {
-    assert.equal(parseShippingAvailability('<div data-testid="item-shipping-banner"><h3>Wysyłka</h3></div>', 'Vinted'), true);
-    assert.equal(parseShippingAvailability('<main><p>Tylko odbiór osobisty</p></main>', 'Vinted'), false);
-    assert.equal(parseShippingAvailability('<script>window.item={"transaction_permitted":false}</script>', 'Vinted'), false);
-    assert.equal(parseShippingAvailability('<div class="mlc-delivery-options__name">Allegro Paczkomaty InPost</div>', 'Allegro Lokalnie'), true);
+test('reads shipping state from marketplace detail-page signals', () => {
+  assert.equal(parseShippingAvailability('<div class="mlc-delivery-options__name">Allegro Paczkomaty InPost</div>', 'Allegro Lokalnie'), true);
   assert.equal(parseShippingAvailability('<main><p>Odbiór osobisty</p></main>', 'Allegro Lokalnie'), false);
-  assert.equal(parseShippingAvailability('<html><body>challenge</body></html>', 'Vinted'), null);
+  assert.equal(parseShippingAvailability('<html><body>challenge</body></html>', 'Allegro Lokalnie'), null);
+});
+
+test('assumes shipping is available on every Vinted listing, including search', () => {
+  // Vinted is never shipping-checked on a detail page...
+  assert.equal(parseShippingAvailability('<div data-testid="item-shipping-banner"><h3>Wysyłka</h3></div>', 'Vinted'), null);
+  assert.equal(parseShippingAvailability('<main><p>Tylko odbiór osobisty</p></main>', 'Vinted'), null);
+  assert.equal(parseShippingAvailability('<script>window.item={"transaction_permitted":false}</script>', 'Vinted'), null);
+  // ...and every Vinted normalization path, even an explicit false, is shippable.
+  const normalized = normalizeListing({ marketplace: 'Vinted', listingId: '1', title: 'Deal', price: 10, url: 'https://www.vinted.pl/items/1-deal', shippingAvailable: false });
+  assert.equal(normalized.shippingAvailable, true);
+  const [card] = parseVintedCards('<div><a href="/items/9728935135-procesor" data-testid="product-item-id-9728935135--overlay-link" title="Procesor i5-8400, Stan: Dobry, 80.00 zł"></a></div>');
+  assert.equal(card.shippingAvailable, true);
+  // Other marketplaces keep their real shipping signal.
+  const olx = normalizeListing({ marketplace: 'OLX', listingId: '2', title: 'Pickup only', price: 10, url: 'https://www.olx.pl/d/oferta/2', shippingAvailable: false });
+  assert.equal(olx.shippingAvailable, false);
 });
 
 test('parses Vinted public card labels and uses item price rather than total price', () => {

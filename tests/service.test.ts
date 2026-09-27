@@ -982,6 +982,25 @@ test('shipping-only watches hide pickup-only history and count only shippable sa
   } finally { context.close(); }
 });
 
+test('treats every Vinted listing as shippable even with legacy stored flags', () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    context.db.prepare('INSERT INTO watches (id, name, query, sources_json, shipping_only, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run('vinted-shipping-watch', 'Vinted shipping watch', 'cpu', '["Vinted"]', 1, 1, now, now, now);
+    const insert = context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, shipping_available, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    insert.run('Vinted', 'vinted-flagged-pickup', 'Vinted CPU flagged pickup', 100, 0, 'https://www.vinted.pl/items/vinted-flagged-pickup', now, now);
+    insert.run('Vinted', 'vinted-unknown', 'Vinted CPU unknown', 120, null, 'https://www.vinted.pl/items/vinted-unknown', now, now);
+    insert.run('OLX', 'olx-pickup', 'OLX pickup CPU', 90, 0, 'https://www.olx.pl/d/oferta/olx-pickup', now, now);
+    const observe = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    for (const row of context.db.prepare('SELECT id, price_pln FROM listings').all() as Array<{ id: number; price_pln: number }>) observe.run(row.id, 'vinted-shipping-watch', row.price_pln, now);
+    assert.equal(context.service.getWatches()[0].samples, 2);
+    const listings = context.service.getListings();
+    assert.deepEqual(listings.map((listing) => listing.id).sort(), ['Vinted:vinted-flagged-pickup', 'Vinted:vinted-unknown']);
+    // The UI must not report "Pickup only" for a Vinted row with a stale flag.
+    assert.deepEqual(listings.map((listing) => listing.shippingAvailable), [true, true]);
+  } finally { context.close(); }
+});
+
 test('price-filtered watches scope history and baseline samples to their range', () => {
   const context = fixture();
   try {
@@ -1005,8 +1024,10 @@ test('market research filters match terms, price, condition, location, and shipp
     { marketplace: 'OLX' as const, listingId: 'pickup', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/pickup', condition: 'New', location: 'Warszawa', shippingAvailable: false, observedAt: new Date().toISOString() },
     { marketplace: 'OLX' as const, listingId: 'wrong-city', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/wrong-city', condition: 'New', location: 'Kraków', shippingAvailable: true, observedAt: new Date().toISOString() },
     { marketplace: 'OLX' as const, listingId: 'excluded', title: 'RTX 4070 12GB parts only', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/excluded', condition: 'New', location: 'Warszawa', shippingAvailable: true, observedAt: new Date().toISOString() },
+    // Vinted's stale pickup flag must not exclude it from a shipping-only filter.
+    { marketplace: 'Vinted' as const, listingId: 'vinted-ships', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.vinted.pl/items/vinted-ships', condition: 'New', location: 'Warszawa', shippingAvailable: false, observedAt: new Date().toISOString() },
   ];
-  assert.deepEqual(filterListings(listings, 'rtx 4070', '12gb', 'parts', { minPrice: 1000, maxPrice: 2000, condition: 'New', location: 'Warszawa', shippingOnly: true }).map((listing) => listing.listingId), ['match']);
+  assert.deepEqual(filterListings(listings, 'rtx 4070', '12gb', 'parts', { minPrice: 1000, maxPrice: 2000, condition: 'New', location: 'Warszawa', shippingOnly: true }).map((listing) => listing.listingId), ['match', 'vinted-ships']);
 });
 
 test('keeps market research separate and reports ended-listing price estimates', () => {
@@ -1077,7 +1098,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_watch_variants']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1209,6 +1230,29 @@ test('does not fetch listing details for shipping when manual search does not re
     assert.match(fetchedUrls[0], /api\/v2\/catalog\/items/);
     assert.equal(result.listings[0].id, 'Vinted:123');
     assert.equal(result.sources[0].pendingShipping, 0);
+  } finally { context.close(); }
+});
+
+test('assumes Vinted shipping for a shipping-only search without a detail fetch', async () => {
+  const context = fixture();
+  const publicFetches: string[] = [];
+  try {
+    (context.service as any).fetchVintedApi = async () => ({ status: 200, json: { items: [
+      { id: 123, title: 'CPU', price: { amount: '150', currency_code: 'PLN' }, url: 'https://www.vinted.pl/items/123-cpu', status: 'Bardzo dobry' },
+    ], pagination: { current_page: 1, total_pages: 1, total_entries: 1, per_page: 20 }, code: 0 } });
+    // The catalog page is primary; force the JSON path and make any shipping
+    // detail fetch fail loudly so this test proves none happens.
+    (context.service as any).fetchVintedItemPage = async () => ({ status: 403, body: '' });
+    (context.service as any).fetchPublicPage = async (url: string) => {
+      publicFetches.push(url);
+      throw new Error(`unexpected public page fetch: ${url}`);
+    };
+    const result = await context.service.manualSearch({ query: 'cpu', sources: ['Vinted'], minPrice: null, maxPrice: null, terms: '', excluded: '', shippingOnly: true, condition: 'Any', location: '' });
+    assert.equal(result.sources[0].status, 'ok');
+    assert.equal(result.listings[0].id, 'Vinted:123');
+    assert.equal(result.listings[0].shippingAvailable, true);
+    assert.equal(result.sources[0].pendingShipping, 0);
+    assert.deepEqual(publicFetches, []);
   } finally { context.close(); }
 });
 
@@ -1419,7 +1463,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 18);
+    assert.equal(after.migrations.count, 19);
   } finally { context.close(); }
 });
 
@@ -2003,6 +2047,102 @@ test('caps fuzzy rescue at ten Jev calls per search', async () => {
     assert.equal(calls, 10);
     assert.equal(result.rescued.length, 10);
   } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('lets a manual search opt out of the AI relevance gate', async () => {
+  const restore = liveJevEnv();
+  let relevanceCalls = 0;
+  const context = fixture({
+    classifyListingRelevanceWithJev: async () => { relevanceCalls += 1; return { relevant: false, p: 0.1, unsure: false }; },
+    classifyListingRelevance: async () => { throw new Error('DeepSeek must not be called in live mode'); },
+  });
+  try {
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'OPT-1', url: 'https://www.olx.pl/d/oferta/opt-1', title: 'Ladowarka Dell 65W', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 100, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 1 } } });
+    const skipped = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '', aiRelevance: false });
+    assert.equal(relevanceCalls, 0);
+    assert.deepEqual(skipped.listings.map((listing) => listing.title), ['Ladowarka Dell 65W']);
+    // Omitted means default-on, matching the watch-scan default.
+    const filtered = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
+    assert.equal(relevanceCalls, 1);
+    assert.equal(filtered.listings.length, 0);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('runs live relevance checks with bounded concurrency', async () => {
+  const restore = liveJevEnv();
+  const previousConcurrency = process.env.SCOUT_JEV_CONCURRENCY;
+  process.env.SCOUT_JEV_CONCURRENCY = '3';
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const context = fixture({
+    classifyListingRelevanceWithJev: async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight -= 1;
+      return { relevant: true, p: 0.9, unsure: false };
+    },
+  });
+  try {
+    const listings = Array.from({ length: 9 }, (_, index) => liveListing({
+      listingId: `concurrent-${index}`,
+      url: `https://www.olx.pl/d/oferta/concurrent-${index}`,
+      title: `PS5 console ${index}`,
+    }));
+    const result = await (context.service as any).filterListingsByAiRelevance(
+      listings, { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
+    );
+    assert.equal(result.listings.length, 9);
+    assert.equal(maxInFlight, 3);
+  } finally {
+    if (previousConcurrency === undefined) delete process.env.SCOUT_JEV_CONCURRENCY;
+    else process.env.SCOUT_JEV_CONCURRENCY = previousConcurrency;
+    restore();
+    context.close();
+  }
+});
+
+test('runs fuzzy rescue checks with bounded concurrency', async () => {
+  const restore = liveJevEnv();
+  const previousConcurrency = process.env.SCOUT_JEV_CONCURRENCY;
+  process.env.SCOUT_JEV_CONCURRENCY = '4';
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const track = async () => {
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    inFlight -= 1;
+  };
+  const context = fixture({
+    classifyTermMatchWithJev: async () => { await track(); return { decision: 'pass' as const, confidence: 0.9, unsure: false }; },
+    classifyConditionMatchWithJev: async () => { await track(); return { decision: 'match' as const, confidence: 0.9, unsure: false }; },
+  });
+  try {
+    const now = new Date().toISOString();
+    const listings = Array.from({ length: 8 }, (_, index) => ({
+      marketplace: 'OLX', listingId: `pool-${index}`, title: `Ladowarki model ${index} Dell`, price: 100,
+      currency: 'PLN', url: `https://www.olx.pl/d/oferta/pool-${index}`, observedAt: now, condition: 'Nowe', location: 'Warszawa',
+      shippingAvailable: null, priceNegotiable: null,
+    }));
+    const candidates = findFuzzyRescueCandidates(listings as any, 'ladowarka', '', '', {});
+    const result = await (context.service as any).rescueFuzzyMisses(candidates, {
+      query: 'ladowarka', includedTerms: '', excludedTerms: '', condition: 'Any',
+    }, (context.service as any).jevLiveConfig());
+    assert.equal(result.rescued.length, 8);
+    assert.equal(result.rescuedByTerm, 8);
+    assert.equal(maxInFlight, 4);
+  } finally {
+    if (previousConcurrency === undefined) delete process.env.SCOUT_JEV_CONCURRENCY;
+    else process.env.SCOUT_JEV_CONCURRENCY = previousConcurrency;
     restore();
     context.close();
   }

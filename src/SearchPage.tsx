@@ -48,6 +48,11 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
   const [condition, setCondition] = useState("Any");
   const [location, setLocation] = useState("");
   const [shippingOnly, setShippingOnly] = useState(false);
+  // Persisted across searches: once a user turns the Jev relevance filter off,
+  // their next searches stay fast until they re-enable it here.
+  const [aiRelevance, setAiRelevance] = useState(
+    () => localStorage.getItem("scout-search-ai-relevance") !== "0",
+  );
   const [sources, setSources] = useState<Marketplace[]>([
     "OLX",
     "Allegro Lokalnie",
@@ -97,6 +102,7 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
         shippingOnly,
         condition,
         location: location.trim() || "Polska",
+        aiRelevance,
       }, controller.signal);
       if (sequence !== searchSequence.current || controller.signal.aborted) return;
       setListings(result.listings);
@@ -231,6 +237,23 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
               <small>Hide pickup-only and unknown delivery results</small>
             </span>
           </label>
+          <label className="check-option">
+            <input
+              type="checkbox"
+              checked={aiRelevance}
+              onChange={(event) => {
+                setAiRelevance(event.target.checked);
+                localStorage.setItem(
+                  "scout-search-ai-relevance",
+                  event.target.checked ? "1" : "0",
+                );
+              }}
+            />
+            <span>
+              <strong>AI relevance filtering</strong>
+              <small>Hide accessories, parts, and unrelated matches; off is faster</small>
+            </span>
+          </label>
         </div>
         {!validPrices ? (
           <div className="form-error" role="alert">
@@ -278,7 +301,7 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
               : "Results"}
           </h2>
           {searched && !loading ? (
-            <div className="search-results-actions"><span className="toolbar-meta">Sorted by lowest price</span><button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, location: location.trim() || "Polska", condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly })}><Bell size={15} />Save as watch</button></div>
+            <div className="search-results-actions"><span className="toolbar-meta">Sorted by lowest price</span><button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, location: location.trim() || "Polska", condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly, aiRelevance })}><Bell size={15} />Save as watch</button></div>
           ) : null}
         </div>
         {loading ? (
