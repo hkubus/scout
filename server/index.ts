@@ -4,7 +4,7 @@ import fastifyStatic from '@fastify/static';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { createReadStream, existsSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
@@ -12,6 +12,7 @@ import { listings as seedListings, watches as seedWatches } from '../src/data';
 import type { Marketplace } from '../src/types';
 import { validateSearchUrl } from './marketplaces';
 import { createScoutMcpServer } from './mcp';
+import { debugApiEnabled, ScoutDebug } from './debug';
 import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
 import { isPubliclyBoundHost, RateLimiter, securityHeaders } from './security';
@@ -85,6 +86,7 @@ function emit(event: string, payload: unknown) {
   }
 }
 const service = new ScoutService(db, emit, { publicExposureWarning });
+const debug = debugApiEnabled() ? new ScoutDebug(db, service) : null;
 const marketplaceParam = z.enum(['OLX', 'Allegro Lokalnie', 'Vinted']);
 const marketplaceSources = z.array(marketplaceParam).min(1).max(3).refine((sources) => new Set(sources).size === sources.length, { message: 'Marketplace sources must be unique' });
 const resourceIdParams = z.object({ id: z.string().trim().min(1).max(160) });
@@ -580,6 +582,45 @@ app.post('/api/notifications/preview', async (request, reply) => {
   return buildDiscordEmbed({ listing: { marketplace: body.marketplace, listingId: body.listingId, title: body.title, price: body.price, currency: 'PLN', url: validatedUrl.url, observedAt: nowIso() }, typical: body.typical, discountPercent: discount, confidence: 92 });
 });
 
+// Read-only debug access to the live database for development and agent
+// troubleshooting (see README "Debug API"). Queries use a separate read-only
+// connection and encrypted credentials are redacted. Disable with
+// SCOUT_DEBUG_API=false.
+if (debug) {
+  app.get('/api/debug/schema', async () => debug.schema());
+  app.get('/api/debug/runtime', async () => debug.runtime());
+  app.get('/api/debug/tables/:table', async (request, reply) => {
+    const params = z.object({ table: z.string().trim().min(1).max(120) }).safeParse(request.params);
+    const query = z.object({
+      limit: z.coerce.number().int().min(1).max(1000).optional(),
+      offset: z.coerce.number().int().min(0).optional(),
+      orderBy: z.string().trim().min(1).max(120).optional(),
+      direction: z.enum(['asc', 'desc']).optional(),
+    }).safeParse(request.query);
+    if (!params.success || !query.success) return reply.code(400).send({ error: 'Invalid table request' });
+    return debug.tableRows(params.data.table, query.data);
+  });
+  app.post('/api/debug/query', async (request, reply) => {
+    const body = z.object({
+      sql: z.string().trim().min(1).max(20_000),
+      params: z.union([z.array(z.union([z.string(), z.number(), z.null()])).max(100), z.record(z.union([z.string(), z.number(), z.null()]))]).optional(),
+      maxRows: z.number().int().min(1).max(5000).optional(),
+    }).safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: body.error.issues[0]?.message ?? 'Invalid query request' });
+    return debug.query(body.data.sql, body.data.params ?? [], body.data.maxRows);
+  });
+  app.get('/api/debug/snapshot', async (_request, reply) => {
+    const snapshot = debug.snapshot();
+    const stream = createReadStream(snapshot.path);
+    stream.on('close', snapshot.cleanup);
+    return reply
+      .header('Content-Disposition', `attachment; filename="${snapshot.filename}"`)
+      .header('Content-Length', String(snapshot.bytes))
+      .type('application/vnd.sqlite3')
+      .send(stream);
+  });
+}
+
 app.get('/events', async (request, reply) => {
   if (clients.size >= 50) return reply.code(429).send({ error: 'Too many live connections. Try again later.' });
   reply.hijack();
@@ -598,7 +639,7 @@ app.get('/events', async (request, reply) => {
 // unauthenticated by design — keep it on a trusted LAN/VPN.
 app.post('/mcp', async (request, reply) => {
   reply.hijack();
-  const mcpServer = createScoutMcpServer(service);
+  const mcpServer = createScoutMcpServer(service, debug);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   reply.raw.on('close', () => {
     transport.close().catch(() => {});
@@ -649,7 +690,7 @@ const diagnosticsInterval = setInterval(() => {
   service.logDiagnostic(formatMemoryLine());
 }, 30 * 60_000);
 
-app.addHook('onClose', async () => { clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); for (const client of clients) client.end(); try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ } db.close(); });
+app.addHook('onClose', async () => { debug?.close(); clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); for (const client of clients) client.end(); try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ } db.close(); });
 let shuttingDown = false;
 const shutdown = async (signal: string) => {
   if (shuttingDown) return;

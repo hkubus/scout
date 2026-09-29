@@ -1,5 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import type { ScoutDebug } from './debug';
 import type { ScoutService } from './service';
 import { ServiceError } from './service';
 
@@ -29,6 +30,13 @@ export const SCOUT_MCP_TOOL_NAMES = [
   'scout_search',
   'scout_queue_scan',
   'scout_connectors',
+] as const;
+
+export const SCOUT_MCP_DEBUG_TOOL_NAMES = [
+  'scout_debug_schema',
+  'scout_debug_table',
+  'scout_debug_query',
+  'scout_debug_runtime',
 ] as const;
 
 /**
@@ -171,12 +179,59 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
   });
 }
 
+/**
+ * Read-only database introspection for development: schema, raw table rows,
+ * arbitrary read-only SQL, and runtime state. Mirrors /api/debug/*.
+ */
+export function registerScoutDebugMcpTools(server: McpServer, debug: ScoutDebug) {
+  server.registerTool('scout_debug_schema', {
+    description: 'Debug: every SQLite table and view with columns, indexes, and row counts, plus database file size and applied migrations. Start here before writing scout_debug_query SQL.',
+    annotations: { readOnlyHint: true },
+  }, async () => {
+    try { return text(debug.schema()); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_debug_table', {
+    description: 'Debug: raw rows from one table, newest first by rowid unless orderBy is given. Encrypted credentials are redacted and BLOBs are summarized by size.',
+    inputSchema: {
+      table: z.string().min(1).max(120),
+      limit: z.number().int().min(1).max(1000).optional().default(50),
+      offset: z.number().int().min(0).optional().default(0),
+      orderBy: z.string().min(1).max(120).optional(),
+      direction: z.enum(['asc', 'desc']).optional().default('desc'),
+    },
+    annotations: { readOnlyHint: true },
+  }, async ({ table, ...options }) => {
+    try { return text(debug.tableRows(table, options)); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_debug_query', {
+    description: 'Debug: run one read-only SQL statement (SELECT, WITH, VALUES, EXPLAIN, or PRAGMA) against the live SQLite database on a read-only connection. Use ? placeholders with params.',
+    inputSchema: {
+      sql: z.string().min(1).max(20_000),
+      params: z.array(z.union([z.string(), z.number(), z.null()])).max(100).optional().default([]),
+      maxRows: z.number().int().min(1).max(5000).optional().default(200),
+    },
+    annotations: { readOnlyHint: true },
+  }, async ({ sql, params, maxRows }) => {
+    try { return text(debug.query(sql, params, maxRows)); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_debug_runtime', {
+    description: 'Debug: process uptime, memory, Node version, non-secret environment configuration, readiness, settings, and the in-memory log buffer.',
+    annotations: { readOnlyHint: true },
+  }, async () => {
+    try { return text(debug.runtime()); } catch (error) { return toolError(error); }
+  });
+}
+
 /** Build a fresh per-request MCP server bound to the given service. */
-export function createScoutMcpServer(service: ScoutService) {
+export function createScoutMcpServer(service: ScoutService, debug: ScoutDebug | null = null) {
   const server = new McpServer(
     { name: 'scout-deal-monitor', version: process.env.SCOUT_VERSION ?? '1.0.0' },
     { capabilities: { tools: {} } },
   );
   registerScoutMcpTools(server, service);
+  if (debug) registerScoutDebugMcpTools(server, debug);
   return server;
 }

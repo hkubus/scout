@@ -1,7 +1,7 @@
 # Scout — Market Intelligence implementation plan
 
 Handoff plan for an implementing agent. Written 2026-09-01 against the current tree (main @ e1d0113).
-Read `NEXT_AGENT.md` and the README sections on market research and preserved copies before starting.
+Read `CLAUDE.md` and the README sections on market research and preserved copies before starting.
 All line references were verified against the tree at planning time; expect drift — re-grep before editing.
 
 ## Ground rules (non-negotiable)
@@ -10,7 +10,7 @@ All line references were verified against the tree at planning time; expect drif
 - **One page per source per scan.** Any new search fetches (typo variants) must respect the single-page budget (`fetchSearchPages()`, service.ts:1459-1471) and stay within connector backoff rules.
 - **Deterministic scoring first.** AI output never changes price scoring. Band-based scoring changes are deterministic and gated behind explicit opt-ins (Milestone 5).
 - **Migrations:** files are `migrations/NNN_description.sql`, auto-discovered and checksummed (`openDatabase()`, server/db.ts:10-155; checksum mismatch throws, db.ts:71-76). **Never edit an already-applied migration** — allocate the next number in implementation order and renumber the plan's suggestions accordingly (this plan proposes 014–016 in milestone order 2, 5, 6).
-- **Verification for every milestone:** `npm run typecheck && npm test && npm run build`. Never restart the user's persistent Scout process or touch `data/scout.sqlite`; if you need a live smoke test, use a temp `SCOUT_DB_PATH`, loopback bind, and temp `SCOUT_SECRET` as NEXT_AGENT.md prescribes.
+- **Verification for every milestone:** `npm run typecheck && npm test && npm run build`. Never restart the user's persistent Scout process or touch `data/scout.sqlite`; if you need a live smoke test, use a temp `SCOUT_DB_PATH`, loopback bind, and temp `SCOUT_SECRET` as CLAUDE.md prescribes.
 
 ## What exists today (the parts this plan builds on)
 
