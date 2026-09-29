@@ -136,6 +136,7 @@ function App() {
   const [showHistory, setShowHistory] = useState(false);
   const [marketRefreshKey, setMarketRefreshKey] = useState(0);
   const [analyticsRefreshKey, setAnalyticsRefreshKey] = useState(0);
+  const [listingsRefreshKey, setListingsRefreshKey] = useState(0);
   const [logsRefreshKey, setLogsRefreshKey] = useState(0);
   const [selectedWatchId, setSelectedWatchId] = useState<string | null>(
     null,
@@ -190,6 +191,7 @@ function App() {
       refreshTimer = window.setTimeout(() => {
         refreshTimer = null;
         void refreshData(false);
+        setListingsRefreshKey((value) => value + 1);
       }, 100);
     };
     source.addEventListener("ready", () => setConnection("online"));
@@ -373,7 +375,7 @@ function App() {
     const fullWatch = watch as Watch;
     return withBusyWatch(fullWatch, async () => {
       try {
-        await api.updateWatch(fullWatch.id, { name: fullWatch.name, query: fullWatch.query, terms: fullWatch.terms, excluded: fullWatch.excluded, sources: fullWatch.sources, location: fullWatch.location, condition: fullWatch.condition, interval: fullWatch.interval, exactUrls: fullWatch.exactUrls, sensitivity: fullWatch.sensitivity, shippingOnly: fullWatch.shippingOnly, typoVariants: fullWatch.typoVariants, aiRelevance: fullWatch.aiRelevance, referenceMarketWatchId: fullWatch.referenceMarketWatchId, minPrice: fullWatch.minPrice, maxPrice: fullWatch.maxPrice, enabled: fullWatch.enabled });
+        await api.updateWatch(fullWatch.id, { name: fullWatch.name, query: fullWatch.query, terms: fullWatch.terms, excluded: fullWatch.excluded, sources: fullWatch.sources, location: fullWatch.location, condition: fullWatch.condition, interval: fullWatch.interval, exactUrls: fullWatch.exactUrls, sensitivity: fullWatch.sensitivity, shippingOnly: fullWatch.shippingOnly, typoVariants: fullWatch.typoVariants, aiRelevance: fullWatch.aiRelevance, referenceMarketWatchId: fullWatch.referenceMarketWatchId, minPrice: fullWatch.minPrice, maxPrice: fullWatch.maxPrice, enabled: fullWatch.enabled, groups: fullWatch.groups });
         await refreshData(false);
         setEditingFullWatch(null);
         setAllWatches(null);
@@ -535,6 +537,7 @@ function App() {
           <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading listings…</div>}>
             <LazyListingsPage
               listings={data.listings}
+              refreshKey={listingsRefreshKey}
               selectedWatchId={selectedWatchId}
               onClearWatch={() => setSelectedWatchId(null)}
               onSelectListing={setSelectedListing}

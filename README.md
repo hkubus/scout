@@ -83,6 +83,12 @@ Each research watch card offers a price-trend dialog (`GET /api/market-watches/:
 
 A deal watch can point at a research watch (`referenceMarketWatchId`). While the watch's own baseline is below 30 comparable samples and the reference series has at least 4 eligible probable sales, new listings display a **series baseline**: the reference band's median stands in for the learned typical price, clearly chipped as "series baseline" in the table and drawer. This improves ranking and display only — the alert readiness gate (30 samples and 6 hours) is unchanged, so no alerts fire earlier than they would without a reference series. Once the watch's own history reaches the sample floor, own history always wins and new rows are marked `own-history`.
 
+### Model groups
+
+A deal watch can split its results into model groups — for example `13 mini`, `13`, `13 Pro`, and `13 Pro Max` under one "iPhone 13" search — so each listing is scored only against its own model instead of the whole watch's mixed price range. A mixed range inflates the robust spread so much that broad watches could otherwise never alert.
+
+Each group has comma-separated terms that must all appear in the title as whole words (`|` separates alternatives, e.g. `pro max|promax`) plus optional excluded terms. The most specific matching group wins, so `iPhone 13 Pro Max` lands in `13 Pro Max` without the base group needing exclusions. When no rule places a listing (e.g. `13Pro` written without a space) and OpenRouter is configured, Jev picks a group — but only for listings that would be a deal in at least one group, at most 10 per scan, with answers cached against the group definitions; only a confident pick assigns, and the pick lands before the AI relevance pass so it gets the same relevance check. Anything still unassigned is kept but never scored. The listing drawer can also move a listing to a group manually; manual picks win over rules and Jev until switched back to automatic or until their group is removed. A group's typical price is its own median once it has 10 listings, while the spread is pooled across all groups, and alerts still require 30 pooled samples and 6 hours. Editing groups re-sorts the watch's stored listings immediately, so existing history carries over. A grouped watch does not use the reference-series fallback, whose band describes the whole search.
+
 ## Preserved listing copies
 
 Research listings are preserved for market research: when a listing first appears in a research watch, Scout fetches its detail page once (bounded per scan, with a small retry budget on later scans), stores the description, and downloads the gallery images into the Scout database so the listing stays viewable after it is sold or removed. Captures are deduplicated by listing state, capped at 12 images of up to 4 MB each, and served only from Scout's own image endpoint. Use the eye action on a Saved listings row to view the preserved copy, or the save action to capture or refresh a copy on demand — including for listings that already ended. Copies live and die with their research listing row, so the daily 180-day retention cleanup also prunes them; deleting a research watch deletes its copies.
@@ -114,6 +120,33 @@ Searches can also use the AI relevance filter. It runs after Scout's determinist
 Very strong and exceptional deals receive an additional conservative safeguard when OpenRouter is configured. Scout fetches the approved marketplace detail page, extracts the listing description, saves a deduplicated snapshot of the listing state, and asks Jev for a structured `pass`, `reject`, or `unknown` condition check; unsure judgments and Jev outages escalate to a vision model over the listing photos. Only `pass` continues to immediate alerts; explicit damage, parts-only, repair, missing-essential-component, account-lock, or similar signals—and unavailable or ambiguous descriptions—hold the high-priority alert until a later scan. Results are cached by listing description and model, and the saved snapshots can be reviewed later from the listing drawer. Without an OpenRouter key the existing deterministic alert behavior remains active. Set `SCOUT_JEV_MODE=legacy` to use the DeepSeek model for verification instead.
 
 Jev and vision requests retry transient OpenRouter provider failures with backoff. The legacy DeepSeek verification path uses OpenRouter response healing and retries once on malformed JSON. If a technical OpenRouter failure remains, Scout records a `fallback` status and sends the deterministic alert while showing the error; explicit `reject` and `unknown` decisions still hold the alert.
+
+## Agent access (MCP)
+
+Scout ships a [Model Context Protocol](https://modelcontextprotocol.io) server so an MCP-capable agent (Claude Desktop, opencode, Cursor, etc.) can read and, optionally, manage Scout through typed tools instead of raw HTTP.
+
+```bash
+npm run mcp:dev        # stdio MCP server via tsx (development)
+npm run build && npm run mcp   # compiled stdio MCP server
+```
+
+The server talks to the Scout API at `SCOUT_API_URL` (default `http://127.0.0.1:3001`) and speaks MCP over stdio, so it must run where it can reach the API. Read tools cover status, dashboard, listings and listing detail, live search, watches and analytics, market research and trends, notifications, connectors, logs, and (secret-masked) settings. Mutating tools — creating, updating, and deleting watches and research watches, queueing scans, recording listing decisions, hiding listings, moving listings between a watch's model groups, and capturing research snapshots — are only registered when `SCOUT_MCP_ALLOW_WRITES=true`. Without that flag the server is read-only. Two resources, `scout://status` and `scout://dashboard`, expose the readiness report and dashboard.
+
+Example client configuration (run from the Scout checkout so `dist-mcp` exists):
+
+```json
+{
+  "mcpServers": {
+    "scout": {
+      "command": "node",
+      "args": ["/opt/scout/dist-mcp/mcp.js"],
+      "env": { "SCOUT_API_URL": "http://127.0.0.1:3001" }
+    }
+  }
+}
+```
+
+The MCP server inherits Scout's trust model: it holds no credentials of its own and is exactly as powerful as the unauthenticated Scout API it points at, so keep it on the trusted LAN/VPN. Write tools are gated rather than authenticated, and deleting a watch via MCP is permanent.
 
 ## Optional marketplace sessions
 

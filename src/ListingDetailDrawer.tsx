@@ -9,6 +9,7 @@ import {
   Eye,
   EyeOff,
   Info,
+  Layers,
   LoaderCircle,
   Scale,
   ShieldCheck,
@@ -169,6 +170,22 @@ export default function ListingDetailDrawer({
     }
   };
 
+  const changeGroup = async (groupKey: string | null) => {
+    if (!currentListing.watchId) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const result = await api.setListingGroup(marketplaceListingKey, currentListing.watchId, groupKey);
+      setDetail(result);
+      if (result.listing.typical !== null) setResalePrice(String(result.listing.typical));
+      onUpdated(result.listing);
+    } catch (groupError) {
+      setError(errorMessage(groupError));
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const compareJevVsLlm = async () => {
     if (!storedListing || comparing) return;
     setComparing(true);
@@ -196,7 +213,7 @@ export default function ListingDetailDrawer({
       <aside className="listing-drawer" role="dialog" aria-modal="true" aria-labelledby="listing-detail-title">
         <div className="listing-drawer-header">
           <div>
-            <span className="drawer-kicker">{currentListing.marketplace} · {currentListing.watch}</span>
+            <span className="drawer-kicker">{currentListing.marketplace} · {currentListing.watch}{currentListing.group ? ` · ${currentListing.group}` : currentListing.group === null ? " · no model group" : ""}</span>
             <h2 id="listing-detail-title">{currentListing.title}</h2>
           </div>
           <button className="icon-button" onClick={onClose} aria-label="Close listing details">
@@ -210,10 +227,37 @@ export default function ListingDetailDrawer({
             </div>
             <div className="drawer-hero-copy">
               <strong className="drawer-price">{formatPln(currentListing.price)}</strong>
-              <span>{currentListing.typical === null ? "Baseline is still learning" : `${Math.abs(currentListing.belowTypical ?? 0).toFixed(1)}% below typical`}{currentListing.typicalSource === "reference-band" ? " · series baseline" : ""}</span>
+              <span>{currentListing.typical === null ? currentListing.group === null ? "Matches no model group — not scored" : "Baseline is still learning" : `${Math.abs(currentListing.belowTypical ?? 0).toFixed(1)}% below typical`}{currentListing.typicalSource === "reference-band" ? " · series baseline" : ""}</span>
               <small>{currentListing.condition || "Condition not specified"}{currentListing.location ? ` · ${currentListing.location}` : ""}</small>
             </div>
           </div>
+
+          {detail.groups?.length && currentListing.watchId ? <section className="drawer-section">
+            <div className="drawer-section-heading">
+              <div><span className="drawer-section-kicker">Scored within</span><h3>Model group</h3></div>
+              <Layers size={17} />
+            </div>
+            <label className="field-label">
+              Group
+              <select
+                value={currentListing.groupSource === "manual" ? currentListing.groupKey ?? "" : ""}
+                disabled={saving}
+                onChange={(event) => void changeGroup(event.target.value || null)}
+              >
+                <option value="">Automatic{currentListing.groupSource !== "manual" ? ` — ${currentListing.group ?? "no match"}` : ""}</option>
+                {detail.groups.map((group) => <option key={group.key} value={group.key}>{group.name}</option>)}
+              </select>
+            </label>
+            <p className="drawer-section-copy">
+              {currentListing.groupSource === "manual"
+                ? "Set manually — scans keep this group until you switch back to automatic."
+                : currentListing.groupSource === "jev"
+                  ? "Placed by AI because no group's terms matched the title."
+                  : currentListing.groupSource === "rule"
+                    ? "Matched by the group's terms."
+                    : "No group's terms matched, so this listing is not scored. Pick a group to score it."}
+            </p>
+          </section> : null}
 
           {showDescriptionSafeguard ? <section className="drawer-section drawer-section--verification">
             <div className="drawer-section-heading">

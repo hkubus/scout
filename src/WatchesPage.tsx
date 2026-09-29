@@ -234,6 +234,7 @@ function WatchRow({
                 zł
               </span>
             ) : null}
+            {watch.groups.length ? <span>{watch.groups.length} model group{watch.groups.length === 1 ? "" : "s"}</span> : null}
             {watch.shippingOnly ? <span>shipping only</span> : null}
             {watch.aiRelevance ? <span>AI relevance</span> : null}
             {watch.exactUrls.length ? (
@@ -247,7 +248,7 @@ function WatchRow({
       </div>
       <div className="watch-progress">
         <div>
-          <span>Learning baseline</span>
+          <span>{watch.groupStats ? "Pooled baseline" : "Learning baseline"}</span>
           <strong>
             {watch.samples} / {watch.targetSamples} samples
           </strong>
@@ -257,6 +258,7 @@ function WatchRow({
         </b>
         <small>
           {watch.observationHours}h observed · {Number.isFinite(watch.readiness) ? Math.min(100, Math.max(0, watch.readiness)) : 0}% ready
+          {watch.unassignedSamples ? ` · ${watch.unassignedSamples} unmatched` : ""}
         </small>
       </div>
       <div className="watch-actions">
@@ -392,6 +394,21 @@ function WatchRow({
           ) : null}
         </div>
       </div>
+      {watch.groupStats?.length ? (
+        <ul className="watch-groups" aria-label={`Model groups for ${watch.name}`}>
+          {watch.groupStats.map((group) => (
+            <li
+              key={group.key}
+              className={group.ready ? "watch-group watch-group--ready" : "watch-group"}
+              title={group.ready ? "Scored and able to alert" : `Learning: needs ${group.targetSamples} listings in this group and ${watch.targetSamples} across the watch`}
+            >
+              <strong>{group.name}</strong>
+              <span>{group.samples < group.targetSamples ? `${group.samples}/${group.targetSamples}` : `${group.samples} listings`}</span>
+              {group.typical !== null ? <span>{formatPln(Math.round(group.typical))}</span> : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </article>
   );
 }

@@ -15,6 +15,7 @@ import { buildDiscordEmbed } from './notifications';
 import { isPubliclyBoundHost, RateLimiter, securityHeaders } from './security';
 import { ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
+import { normalizeWatchGroups, watchGroupsInputSchema } from './watchGroups';
 
 const port = Number(process.env.PORT ?? 3001);
 if (!Number.isInteger(port) || port < 1 || port > 65_535) {
@@ -135,6 +136,15 @@ app.patch('/api/listing-actions', async (request, reply) => {
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid listing action', details: parsed.error.flatten() });
   return { action: service.updateListingAction(parsed.data.key, parsed.data.decision, parsed.data.note, parsed.data.hidden) };
 });
+app.put('/api/listing-group', async (request, reply) => {
+  const parsed = z.object({
+    key: z.string().min(3).max(500),
+    watchId: z.string().trim().min(1).max(160),
+    groupKey: z.string().trim().min(1).max(60).nullable(),
+  }).strict().safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid listing group', details: parsed.error.flatten() });
+  return service.setListingGroup(parsed.data.watchId, parsed.data.key, parsed.data.groupKey);
+});
 app.get('/api/watches', async (request, reply) => {
   const strictBoolean = z.union([z.boolean(), z.string().regex(/^(?:true|false)$/i).transform((value) => value.toLowerCase() === 'true')]);
   const parsed = z.object({ includeArchived: strictBoolean.optional().default(false) }).strict().safeParse(request.query);
@@ -188,6 +198,15 @@ app.delete('/api/marketplace-sessions/:marketplace', async (request) => {
   return service.deleteMarketplaceSession(params.data.marketplace);
 });
 
+/** Normalized groups as stored JSON, or an error message for a 400. */
+function watchGroupsJson(groups: z.infer<typeof watchGroupsInputSchema>): { json: string } | { error: string } {
+  try {
+    return { json: JSON.stringify(normalizeWatchGroups(groups)) };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : 'Invalid groups' };
+  }
+}
+
 const watchInput = z.object({
   id: z.string().trim().min(1).max(160).optional(),
   name: z.string().trim().min(1).max(120),
@@ -206,6 +225,7 @@ const watchInput = z.object({
   referenceMarketWatchId: z.string().trim().max(160).nullable().optional().default(null),
   minPrice: z.number().nonnegative().nullable().optional().default(null),
   maxPrice: z.number().positive().nullable().optional().default(null),
+  groups: watchGroupsInputSchema.optional().default([]),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
 
 app.post('/api/watches', async (request, reply) => {
@@ -219,10 +239,12 @@ app.post('/api/watches', async (request, reply) => {
   if (value.referenceMarketWatchId && !db.prepare('SELECT 1 FROM market_watches WHERE id = ?').get(value.referenceMarketWatchId)) {
     return reply.code(400).send({ error: 'Reference research watch not found' });
   }
+  const groups = watchGroupsJson(value.groups);
+  if ('error' in groups) return reply.code(400).send({ error: groups.error });
   const id = value.id ?? `watch-${randomUUID()}`;
   const now = nowIso();
   try {
-    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, sensitivity, shipping_only, typo_variants, ai_relevance, reference_market_watch_id, min_price_pln, max_price_pln, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, 1, now, now, now);
+    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, sensitivity, shipping_only, typo_variants, ai_relevance, reference_market_watch_id, min_price_pln, max_price_pln, groups_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, groups.json, 1, now, now, now);
   } catch (error) {
     if (error instanceof Error && /UNIQUE|PRIMARY KEY|constraint/i.test(error.message)) {
       return reply.code(409).send({ error: 'A watch with this id already exists' });
@@ -248,6 +270,7 @@ app.patch('/api/watches/:id', async (request, reply) => {
     referenceMarketWatchId: z.string().trim().max(160).nullable().optional(),
     archived: z.boolean().optional(),
     minPrice: z.number().nonnegative().nullable().optional(), maxPrice: z.number().positive().nullable().optional(),
+    groups: watchGroupsInputSchema.optional(),
   }).strict().safeParse(request.body);
   if (!patchInput.success) return reply.code(400).send({ error: 'Invalid watch update', details: patchInput.error.flatten() });
   const body = patchInput.data;
@@ -288,6 +311,12 @@ app.patch('/api/watches/:id', async (request, reply) => {
   }
   if (body.minPrice !== undefined) { fields.push('min_price_pln = ?'); values.push(body.minPrice); }
   if (body.maxPrice !== undefined) { fields.push('max_price_pln = ?'); values.push(body.maxPrice); }
+  if (body.groups !== undefined) {
+    const groups = watchGroupsJson(body.groups);
+    if ('error' in groups) return reply.code(400).send({ error: groups.error });
+    fields.push('groups_json = ?');
+    values.push(groups.json);
+  }
   if (body.archived !== undefined) {
     fields.push('archived_at = ?');
     values.push(body.archived ? nowIso() : null);
@@ -300,6 +329,7 @@ app.patch('/api/watches/:id', async (request, reply) => {
   values.push(nowIso(), params.data.id);
   const result = db.prepare(`UPDATE watches SET ${fields.join(', ')}, updated_at = ? WHERE id = ?`).run(...(values as any[]));
   if (!result.changes) return reply.code(404).send({ error: 'Watch not found' });
+  if (body.groups !== undefined) service.reassignWatchGroups(params.data.id);
   emit('watch', { id: params.data.id, archived: body.archived });
   return { ok: true };
 });

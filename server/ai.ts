@@ -10,6 +10,7 @@ const LISTING_DESCRIPTION_VERIFICATION_CACHE_VERSION = 'v3';
 const LISTING_CONDITION_MATCH_CACHE_VERSION = 'v1';
 const LISTING_TERM_MATCH_CACHE_VERSION = 'v1';
 const LISTING_NEGOTIABILITY_CACHE_VERSION = 'v1';
+const LISTING_GROUP_CACHE_VERSION = 'v1';
 export const LISTING_DESCRIPTION_MAX_CHARS = 6_000;
 
 const responseHealingPlugins = [{ id: 'response-healing' }] as const;
@@ -236,6 +237,19 @@ export function listingNegotiabilityInputHash(context: { marketplace: string; ti
       title: normalizeCacheText(context.title),
       condition: normalizeCacheText(context.condition),
       description: normalizeCacheText(context.description)?.slice(0, LISTING_DESCRIPTION_MAX_CHARS) ?? null,
+    }))
+    .digest('hex');
+}
+
+/** Keyed on the full group definitions: editing any group re-asks instead of reusing a stale pick. */
+export function listingGroupInputHash(context: { query: string; title: string; condition?: string | null; groups: Array<{ key: string; name: string; terms: string; excluded: string }> }) {
+  return createHash('sha256')
+    .update(JSON.stringify({
+      version: LISTING_GROUP_CACHE_VERSION,
+      title: normalizeCacheText(context.title),
+      condition: normalizeCacheText(context.condition),
+      query: normalizeCacheText(context.query),
+      groups: context.groups.map((group) => [group.key, normalizeCacheText(group.name), normalizeCacheTerms(group.terms), normalizeCacheTerms(group.excluded)]),
     }))
     .digest('hex');
 }

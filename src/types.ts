@@ -50,6 +50,11 @@ export interface Listing {
   image: string;
   url: string;
   watch: string;
+  /** Model group the listing is scored in; null when its grouped watch matched no group, absent for ungrouped watches. */
+  group?: string | null;
+  groupKey?: string | null;
+  /** How the group was chosen: the watch's rules, a Jev fallback pick, or a manual override. */
+  groupSource?: 'rule' | 'jev' | 'manual' | null;
   condition?: string;
   location?: string;
   shippingAvailable: boolean | null;
@@ -89,6 +94,8 @@ export interface ListingDetail {
   verificationTrace?: VerificationTraceEntry[] | null;
   verificationInputHash?: string | null;
   verificationModel?: string | null;
+  /** The owning watch's model groups, for reassigning the listing; absent for ungrouped watches. */
+  groups?: WatchGroup[];
 }
 
 export interface VerificationTraceEntry {
@@ -144,6 +151,36 @@ export interface Watch {
   minPrice: number | null;
   maxPrice: number | null;
   archivedAt?: string | null;
+  /** Model groups; when present each listing is scored against its own group's typical price. */
+  groups: WatchGroup[];
+  /** Per-group baseline progress, present only for grouped watches. */
+  groupStats?: WatchGroupStats[];
+  /** Grouped watches only: comparable listings that matched no group and are not scored. */
+  unassignedSamples?: number;
+}
+
+export interface WatchGroupStats {
+  key: string;
+  name: string;
+  samples: number;
+  targetSamples: number;
+  /** Group median, shown once the group has its own sample floor. */
+  typical: number | null;
+  /** Scored and able to alert: group floor, pooled floor, and observation window all met. */
+  ready: boolean;
+}
+
+/**
+ * One model group of a watch. `terms` are comma-separated and must all appear
+ * in the title as whole words; `|` separates alternatives within a term
+ * (e.g. `pro max|promax`). `excluded` uses the same syntax. The most specific
+ * matching group wins.
+ */
+export interface WatchGroup {
+  key: string;
+  name: string;
+  terms: string;
+  excluded: string;
 }
 
 export interface WatchAnalyticsPoint {

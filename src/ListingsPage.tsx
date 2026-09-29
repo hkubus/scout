@@ -28,12 +28,15 @@ function SelectControl({
 
 export default function ListingsPage({
   listings,
+  refreshKey,
   selectedWatchId,
   onClearWatch,
   onSelectListing,
   onToggleHidden,
 }: {
   listings: Listing[];
+  /** Bumped on server events (scans, listing actions) so the fetched page stays current. */
+  refreshKey: number;
   selectedWatchId: string | null;
   onClearWatch: () => void;
   onSelectListing: (listing: Listing) => void;
@@ -71,7 +74,7 @@ export default function ListingsPage({
         if (!controller.signal.aborted) setLoadingPage(false);
       });
     return () => controller.abort();
-  }, [page, selectedWatchId]);
+  }, [page, selectedWatchId, refreshKey]);
 
   const pageListings = remoteListings ?? listings;
   const filtered = useMemo(() => {

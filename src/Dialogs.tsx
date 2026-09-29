@@ -8,16 +8,22 @@ import {
   LoaderCircle,
   Plus,
   Send,
+  Trash2,
   X,
   Zap,
 } from "lucide-react";
 import { api } from "./api";
 import { marketplaceColors } from "./data";
 import type { WatchPreset } from "./presets";
-import type { Marketplace, MarketWatch, NotificationRecord, Watch } from "./types";
+import type { Marketplace, MarketWatch, NotificationRecord, Watch, WatchGroup } from "./types";
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
+
+/** Editable group row; `rowId` keeps React identity stable while `key` (empty for new rows) is assigned by the server. */
+type GroupDraft = WatchGroup & { rowId: number };
+let nextGroupRowId = 0;
+const groupDraft = (group?: WatchGroup): GroupDraft => ({ key: group?.key ?? "", name: group?.name ?? "", terms: group?.terms ?? "", excluded: group?.excluded ?? "", rowId: nextGroupRowId++ });
 
 export function WatchDialog({
   initialWatch = null,
@@ -51,6 +57,7 @@ export function WatchDialog({
   const [aiRelevance, setAiRelevance] = useState(initialWatch?.aiRelevance ?? true);
   const [referenceOptions, setReferenceOptions] = useState<MarketWatch[]>([]);
   const [referenceMarketWatchId, setReferenceMarketWatchId] = useState(initialWatch?.referenceMarketWatchId ?? "");
+  const [groups, setGroups] = useState<GroupDraft[]>(() => (initialWatch?.groups ?? []).map(groupDraft));
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const numericInterval = Number(interval);
@@ -60,6 +67,11 @@ export function WatchDialog({
     (numericMin === null || numericMin >= 0) &&
     (numericMax === null || numericMax > 0) &&
     (numericMin === null || numericMax === null || numericMin <= numericMax);
+  // Fully blank rows are dropped on save; half-filled rows block it.
+  const filledGroups = groups.filter((group) => group.name.trim() || group.terms.trim() || group.excluded.trim());
+  const validGroups = filledGroups.every((group) => group.name.trim() && group.terms.trim());
+  const updateGroup = (rowId: number, patch: Partial<WatchGroup>) =>
+    setGroups((current) => current.map((group) => (group.rowId === rowId ? { ...group, ...patch } : group)));
   const canSubmit = Boolean(
     name.trim() &&
       query.trim() &&
@@ -67,7 +79,8 @@ export function WatchDialog({
       Number.isInteger(numericInterval) &&
       numericInterval >= 5 &&
       numericInterval <= 1440 &&
-      validPrices,
+      validPrices &&
+      validGroups,
   );
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -118,6 +131,7 @@ export function WatchDialog({
         referenceMarketWatchId: referenceMarketWatchId.trim() ? referenceMarketWatchId.trim() : null,
         minPrice: numericMin,
         maxPrice: numericMax,
+        groups: filledGroups.map((group) => ({ key: group.key, name: group.name.trim(), terms: group.terms.trim(), excluded: group.excluded.trim() })),
       });
     } catch (submitError) {
       setError(errorMessage(submitError));
@@ -300,6 +314,38 @@ export function WatchDialog({
               </span>
             </div>
           ) : null}
+          <div className="field-label">
+            <span>Model groups <span>optional · score each model separately</span></span>
+            {groups.length ? (
+              <div className="group-editor">
+                <div className="group-editor-row group-editor-row--head" aria-hidden="true">
+                  <span>Name</span><span>Terms</span><span>Excluded</span><span />
+                </div>
+                {groups.map((group, index) => (
+                  <div className="group-editor-row" key={group.rowId}>
+                    <input aria-label={`Group ${index + 1} name`} value={group.name} onChange={(event) => updateGroup(group.rowId, { name: event.target.value })} placeholder="13 Pro" />
+                    <input aria-label={`Group ${index + 1} terms`} value={group.terms} onChange={(event) => updateGroup(group.rowId, { terms: event.target.value })} placeholder="13, pro" />
+                    <input aria-label={`Group ${index + 1} excluded terms`} value={group.excluded} onChange={(event) => updateGroup(group.rowId, { excluded: event.target.value })} placeholder="optional" />
+                    <button type="button" className="icon-button" onClick={() => setGroups((current) => current.filter((item) => item.rowId !== group.rowId))} aria-label={`Remove group ${group.name || index + 1}`}>
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            <button type="button" className="outline-button group-editor-add" disabled={groups.length >= 20} onClick={() => setGroups((current) => [...current, groupDraft()])}>
+              <Plus size={15} />Add group
+            </button>
+          </div>
+          {groups.length ? (
+            <div className="modal-note">
+              <Info size={16} />
+              <span>
+                Each listing is scored only against its own group, so a cheap 13 mini never looks like a cheap 13 Pro. Terms are comma-separated whole words that must all appear in the title; use | for alternatives (pro max|promax). The most specific match wins, so a base group needs no exclusions. Listings matching no group are kept but not scored. Groups need 10 listings each and 30 across the watch before alerting.
+              </span>
+            </div>
+          ) : null}
+          {!validGroups ? <div className="form-error" role="alert"><AlertTriangle size={15} />Every group needs a name and at least one term.</div> : null}
           <label className="field-label">
             Exact search URLs <span>optional · one per line</span>
             <textarea

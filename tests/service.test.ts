@@ -909,7 +909,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_watch_groups']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1251,7 +1251,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 22);
+    assert.equal(after.migrations.count, 23);
   } finally { context.close(); }
 });
 
@@ -2024,4 +2024,230 @@ test('passes the watch query into description verification', async () => {
     restore();
     context.close();
   }
+});
+
+const iphoneGroups = [
+  { key: 'mini', name: '13 mini', terms: '13, mini', excluded: '' },
+  { key: 'base', name: '13', terms: '13', excluded: '' },
+  { key: 'pro', name: '13 Pro', terms: '13, pro', excluded: '' },
+];
+
+/**
+ * An iPhone 13 watch with 8h of history: 12 listings each of mini (median
+ * 1500), base (2000), and Pro (2600), plus a 50 zł case titled "iPhone 13".
+ * Groups are stored but listings are not yet assigned.
+ */
+function seedGroupedWatch(db: any, watchId: string) {
+  seedWatch(db, watchId, { query: 'iphone 13' });
+  const firstObserved = new Date(Date.now() - 8 * 3_600_000).toISOString();
+  const insertListing = db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+  const insertObservation = db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+  const shape = [0.95, 0.97, 0.98, 0.99, 1, 1, 1, 1, 1.01, 1.02, 1.03, 1.05];
+  const models = [['iPhone 13 mini', 1500], ['iPhone 13', 2000], ['iPhone 13 Pro', 2600]] as const;
+  for (const [title, center] of models) {
+    shape.forEach((ratio, index) => {
+      const listingId = `${title}-${index}`.replace(/\s+/g, '-');
+      insertListing.run('OLX', listingId, `${title} 128GB`, center * ratio, `https://www.olx.pl/d/oferta/${listingId}`, firstObserved, firstObserved);
+      const stored = db.prepare('SELECT id FROM listings WHERE listing_id = ?').get(listingId) as { id: number };
+      insertObservation.run(stored.id, watchId, center * ratio, firstObserved);
+    });
+  }
+  insertListing.run('OLX', 'iphone-12', 'iPhone 13 case for iPhone 12', 50, 'https://www.olx.pl/d/oferta/iphone-12', firstObserved, firstObserved);
+  insertObservation.run((db.prepare("SELECT id FROM listings WHERE listing_id = 'iphone-12'").get() as { id: number }).id, watchId, 50, firstObserved);
+  db.prepare('UPDATE watches SET groups_json = ? WHERE id = ?').run(JSON.stringify(iphoneGroups), watchId);
+}
+
+function olxListings(listings: Array<{ id: string; title: string; price: number }>) {
+  return async () => ({ status: 200, json: { data: listings.map((listing) => ({
+    id: listing.id, url: `https://www.olx.pl/d/oferta/${listing.id}`, title: listing.title, created_time: new Date().toISOString(),
+    params: [{ key: 'price', value: { value: listing.price, currency: 'PLN', negotiable: false } }],
+  })), metadata: { visible_total_count: listings.length } } });
+}
+
+test('scores grouped watches against their own model group and re-assigns stored history', async () => {
+  const context = fixture();
+  try {
+    seedGroupedWatch(context.db, 'grouped-watch');
+    const groups = iphoneGroups;
+    // The accessory title contains "13" and lands in the base group by rule;
+    // relevance filtering (not grouping) is what removes accessories.
+    assert.deepEqual(context.service.reassignWatchGroups('grouped-watch'), { assigned: 37, unassigned: 0 });
+    const counts = context.db.prepare("SELECT group_key, COUNT(*) AS count FROM watch_listings WHERE watch_id = 'grouped-watch' GROUP BY group_key ORDER BY group_key").all() as Array<{ group_key: string; count: number }>;
+    assert.deepEqual(counts.map((row) => [row.group_key, row.count]), [['base', 13], ['mini', 12], ['pro', 12]]);
+    assert.deepEqual(context.service.getWatches().find((watch) => watch.id === 'grouped-watch')?.groups, groups);
+
+    const captured: Array<{ listing: { listingId: string }; typical: number; discountPercent: number }> = [];
+    (context.service as any).processDealCandidates = async (candidates: typeof captured) => { captured.push(...candidates); };
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'cheap-pro', url: 'https://www.olx.pl/d/oferta/cheap-pro', title: 'iPhone 13 Pro 128GB', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 1950, currency: 'PLN', negotiable: false } }] },
+      { id: 'fair-mini', url: 'https://www.olx.pl/d/oferta/fair-mini', title: 'iPhone 13 mini 128GB', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 1500, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 2 } } });
+    const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('grouped-watch');
+    await (context.service as any).runWatch(row);
+
+    const scored = context.db.prepare(`SELECT l.listing_id, wl.group_key, wl.typical_pln, wl.deal_label FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id
+      WHERE wl.watch_id = 'grouped-watch' AND l.listing_id IN ('cheap-pro', 'fair-mini') ORDER BY l.listing_id`).all() as Array<Record<string, unknown>>;
+    assert.deepEqual(scored.map((item) => ({ ...item })), [
+      { listing_id: 'cheap-pro', group_key: 'pro', typical_pln: 2600, deal_label: 'Very strong' },
+      { listing_id: 'fair-mini', group_key: 'mini', typical_pln: 1500, deal_label: 'Watch' },
+    ]);
+    assert.deepEqual(captured.map((candidate) => [candidate.listing.listingId, candidate.typical, Math.round(candidate.discountPercent)]), [['cheap-pro', 2600, 25]]);
+
+    // The watch reports readiness the way scoring counts it, per group.
+    const grouped = context.service.getWatches().find((watch) => watch.id === 'grouped-watch')!;
+    assert.equal(grouped.samples, 39);
+    assert.equal(grouped.status, 'Ready');
+    assert.equal(grouped.unassignedSamples, 0);
+    assert.deepEqual(grouped.groupStats, [
+      { key: 'mini', name: '13 mini', samples: 13, targetSamples: 10, typical: 1500, ready: true },
+      { key: 'base', name: '13', samples: 13, targetSamples: 10, typical: 2000, ready: true },
+      { key: 'pro', name: '13 Pro', samples: 13, targetSamples: 10, typical: 2600, ready: true },
+    ]);
+    const feedGroups = new Map(context.service.getListings().filter((listing) => listing.watchId === 'grouped-watch').map((listing) => [listing.listingId, listing.group]));
+    assert.equal(feedGroups.get('cheap-pro'), '13 Pro');
+    assert.equal(feedGroups.get('fair-mini'), '13 mini');
+    assert.equal(context.service.listingDetail('OLX:cheap-pro', 'grouped-watch').listing.group, '13 Pro');
+
+    // Removing the groups clears assignments and the per-group deal labels.
+    context.db.prepare("UPDATE watches SET groups_json = '[]' WHERE id = ?").run('grouped-watch');
+    assert.deepEqual(context.service.reassignWatchGroups('grouped-watch'), { assigned: 0, unassigned: 39 });
+    const cleared = context.db.prepare("SELECT COUNT(*) AS count FROM watch_listings WHERE watch_id = 'grouped-watch' AND (group_key IS NOT NULL OR typical_pln IS NOT NULL)").get() as { count: number };
+    assert.equal(cleared.count, 0);
+    const ungrouped = context.service.getWatches().find((watch) => watch.id === 'grouped-watch')!;
+    assert.equal(ungrouped.groupStats, undefined);
+    assert.equal(context.service.getListings().find((listing) => listing.listingId === 'cheap-pro')?.group, undefined, 'ungrouped watches carry no group field');
+  } finally { context.close(); }
+});
+
+test('asks Jev to place unmatched potential deals before the relevance pass, and reuses the pick', async () => {
+  const restore = liveJevEnv();
+  const asked: string[] = [];
+  const relevanceChecked: string[] = [];
+  const context = fixture({
+    classifyWatchGroupWithJev: async (ctx: any) => {
+      asked.push(ctx.title);
+      return { groupKey: 'pro', decision: 'group', confidence: 0.9, unsure: false };
+    },
+    classifyListingRelevanceWithJev: async (ctx: any) => {
+      relevanceChecked.push(ctx.title);
+      return { relevant: true, p: 0.95, unsure: false };
+    },
+    classifyListingRelevanceWithVision: async () => { throw new Error('Vision must not be called'); },
+  });
+  try {
+    seedGroupedWatch(context.db, 'jev-group-watch');
+    context.service.reassignWatchGroups('jev-group-watch');
+    const captured: Array<{ listing: { listingId: string }; typical: number }> = [];
+    (context.service as any).processDealCandidates = async (candidates: typeof captured) => { captured.push(...candidates); };
+    // "13Pro" defeats the whole-word rules; the 3300 zł listing cannot be a
+    // deal in any group, so it is never sent to Jev.
+    (context.service as any).fetchOlxApi = olxListings([
+      { id: 'glued-pro', title: 'iPhone 13Pro 128GB', price: 1950 },
+      { id: 'glued-max', title: 'iPhone 13ProMax 256GB', price: 3300 },
+    ]);
+    const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('jev-group-watch');
+    await (context.service as any).runWatch(row);
+
+    assert.deepEqual(asked, ['iPhone 13Pro 128GB']);
+    assert.deepEqual(relevanceChecked, ['iPhone 13Pro 128GB'], 'the Jev-placed deal still gets its relevance check');
+    const stored = (context.db.prepare(`SELECT l.listing_id, wl.group_key, wl.group_source, wl.typical_pln FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id
+      WHERE l.listing_id IN ('glued-pro', 'glued-max') ORDER BY l.listing_id`).all() as Array<Record<string, unknown>>).map((item) => ({ ...item }));
+    assert.deepEqual(stored, [
+      { listing_id: 'glued-max', group_key: null, group_source: null, typical_pln: null },
+      { listing_id: 'glued-pro', group_key: 'pro', group_source: 'jev', typical_pln: 2600 },
+    ]);
+    assert.deepEqual(captured.map((candidate) => [candidate.listing.listingId, candidate.typical]), [['glued-pro', 2600]]);
+    const logged = context.db.prepare("SELECT COUNT(*) AS count FROM jev_shadow_log WHERE task = 'group'").get() as { count: number };
+    assert.equal(logged.count, 1);
+
+    // The stored pick is reused on the next scan without another Jev call.
+    await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('jev-group-watch'));
+    assert.equal(asked.length, 1);
+    const kept = context.db.prepare("SELECT wl.group_key, wl.group_source FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE l.listing_id = 'glued-pro'").get() as Record<string, unknown>;
+    assert.deepEqual({ ...kept }, { group_key: 'pro', group_source: 'jev' });
+
+    // Editing groups drops Jev picks (they were made against the old definitions).
+    context.service.reassignWatchGroups('jev-group-watch');
+    const dropped = context.db.prepare("SELECT wl.group_key, wl.group_source FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE l.listing_id = 'glued-pro'").get() as Record<string, unknown>;
+    assert.deepEqual({ ...dropped }, { group_key: null, group_source: null });
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('keeps unsure or failed Jev group answers unscored, caching answers but retrying failures', async () => {
+  const restore = liveJevEnv();
+  let calls = 0;
+  const context = fixture({
+    classifyWatchGroupWithJev: async (ctx: any) => {
+      calls += 1;
+      if (ctx.title.includes('broken')) throw new Error('provider down');
+      return ctx.title.includes('maybe')
+        ? { groupKey: 'pro', decision: 'group', confidence: 0.5, unsure: true }
+        : { groupKey: null, decision: 'none', confidence: 0.9, unsure: false };
+    },
+    classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.95, unsure: false }),
+  });
+  try {
+    seedGroupedWatch(context.db, 'unsure-group-watch');
+    context.service.reassignWatchGroups('unsure-group-watch');
+    (context.service as any).processDealCandidates = async () => {};
+    (context.service as any).fetchOlxApi = olxListings([
+      { id: 'maybe', title: 'iPhone 13Pro maybe', price: 1500 },
+      { id: 'other', title: 'iPhone 13XR other', price: 1500 },
+      { id: 'broken', title: 'iPhone 13Pro broken', price: 1500 },
+    ]);
+    const row = () => context.db.prepare('SELECT * FROM watches WHERE id = ?').get('unsure-group-watch');
+    await (context.service as any).runWatch(row());
+    assert.equal(calls, 3);
+    const grouped = context.db.prepare("SELECT COUNT(*) AS count FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE l.listing_id IN ('maybe', 'other', 'broken') AND wl.group_key IS NOT NULL").get() as { count: number };
+    assert.equal(grouped.count, 0);
+    // Answers are cached (including the unsure one); only the failed call is retried.
+    await (context.service as any).runWatch(row());
+    assert.equal(calls, 4);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('moves a listing to a group manually, re-scores it, and keeps the pick across scans and edits', async () => {
+  const context = fixture();
+  try {
+    seedGroupedWatch(context.db, 'manual-group-watch');
+    context.service.reassignWatchGroups('manual-group-watch');
+    const key = 'OLX:iPhone-13-0';
+
+    const moved = context.service.setListingGroup('manual-group-watch', key, 'pro');
+    assert.equal(moved.listing.group, '13 Pro');
+    assert.equal(moved.listing.groupSource, 'manual');
+    assert.equal(moved.listing.typical, 2600);
+    assert.equal(moved.listing.dealLabel, 'Very strong');
+    assert.deepEqual(moved.groups?.map((group) => group.key), ['mini', 'base', 'pro']);
+
+    // A scan that sees the listing again, and a groups edit, both keep the manual pick.
+    (context.service as any).processDealCandidates = async () => {};
+    (context.service as any).fetchOlxApi = olxListings([{ id: 'iPhone-13-0', title: 'iPhone 13 128GB', price: 1900 }]);
+    await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('manual-group-watch'));
+    context.service.reassignWatchGroups('manual-group-watch');
+    const afterScan = context.service.listingDetail(key, 'manual-group-watch').listing;
+    assert.deepEqual([afterScan.groupKey, afterScan.groupSource], ['pro', 'manual']);
+
+    // Back to automatic: the rules put it in the base group again.
+    const automatic = context.service.setListingGroup('manual-group-watch', key, null);
+    assert.deepEqual([automatic.listing.groupKey, automatic.listing.groupSource, automatic.listing.typical], ['base', 'rule', 2000]);
+
+    // A manual pick whose group is removed falls back to the rules.
+    context.service.setListingGroup('manual-group-watch', key, 'pro');
+    context.db.prepare('UPDATE watches SET groups_json = ? WHERE id = ?').run(JSON.stringify(iphoneGroups.filter((group) => group.key !== 'pro')), 'manual-group-watch');
+    context.service.reassignWatchGroups('manual-group-watch');
+    const removed = context.service.listingDetail(key, 'manual-group-watch').listing;
+    assert.deepEqual([removed.groupKey, removed.groupSource], ['base', 'rule']);
+
+    assert.throws(() => context.service.setListingGroup('manual-group-watch', key, 'pro'), /Unknown group/);
+    assert.throws(() => context.service.setListingGroup('manual-group-watch', 'OLX:not-here', 'base'), /not part of this watch/);
+    seedWatch(context.db, 'plain-watch');
+    assert.throws(() => context.service.setListingGroup('plain-watch', key, 'base'), /no model groups/);
+  } finally { context.close(); }
 });
