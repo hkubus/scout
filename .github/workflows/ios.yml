@@ -1,0 +1,109 @@
+# Builds the iOS app on GitHub's macOS runners (the Forgejo repo push-mirrors
+# here) and publishes the unsigned IPA plus a SideStore source to GitHub Pages.
+# Forgejo Actions ignores this directory because .forgejo/workflows exists.
+name: ios
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Test ScoutKit
+        working-directory: ios/ScoutKit
+        run: swift test
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Compute version
+        id: version
+        run: |
+          build=$(git rev-list --count HEAD)
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "version=0.1.$build" >> "$GITHUB_OUTPUT"
+
+      - name: Build unsigned IPA
+        working-directory: ios
+        run: |
+          xcodebuild -project Scout.xcodeproj -scheme Scout -configuration Release \
+            -destination 'generic/platform=iOS' -derivedDataPath build/device \
+            MARKETING_VERSION=${{ steps.version.outputs.version }} \
+            CURRENT_PROJECT_VERSION=${{ steps.version.outputs.build }} \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            -quiet build
+          mkdir -p out/Payload
+          cp -R build/device/Build/Products/Release-iphoneos/Scout.app out/Payload/
+          (cd out && zip -qry Scout.ipa Payload)
+          ls -lh out/Scout.ipa
+
+      - name: Simulator screenshots
+        working-directory: ios
+        run: bash scripts/screenshots.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Scout-${{ steps.version.outputs.version }}
+          path: |
+            ios/out/Scout.ipa
+            ios/out/screenshots
+
+      - name: Build SideStore site
+        if: github.ref == 'refs/heads/main'
+        run: |
+          python3 ios/scripts/sidestore_site.py \
+            --version "${{ steps.version.outputs.version }}" \
+            --build "${{ steps.version.outputs.build }}" \
+            --notes "$(git log -1 --format=%s)" \
+            --ipa ios/out/Scout.ipa \
+            --icon ios/Scout/Assets.xcassets/AppIcon.appiconset/AppIcon.png \
+            --screenshots ios/out/screenshots \
+            --base-url "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}" \
+            --out site
+
+      - uses: actions/upload-pages-artifact@v3
+        if: github.ref == 'refs/heads/main'
+        with:
+          path: site
+
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
