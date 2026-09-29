@@ -144,7 +144,27 @@ curl -s -X POST http://127.0.0.1:3001/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-It is stateless (one fresh server per request, no session ids) and offers twelve tools: `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail`, `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_queue_scan`, and `scout_connectors`. `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. Like the REST API it has no built-in authentication — keep it on a trusted LAN/VPN and never expose it directly to the public internet.
+It is stateless (one fresh server per request, no session ids) and offers twelve tools (plus the four read-only `scout_debug_*` tools from the [Debug API](#debug-api) unless `SCOUT_DEBUG_API=false`): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail`, `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_queue_scan`, and `scout_connectors`. `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. Like the REST API it has no built-in authentication — keep it on a trusted LAN/VPN and never expose it directly to the public internet.
+
+## Debug API
+
+For development and troubleshooting, Scout exposes read-only access to the live database under `/api/debug/*` (enabled by default; set `SCOUT_DEBUG_API=false` to disable it):
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /api/debug/schema` | Every table and view with columns, indexes, and row counts, plus database/WAL size and applied migrations. |
+| `GET /api/debug/tables/:table?limit=&offset=&orderBy=&direction=` | Raw rows from one table, newest first by rowid (max 1000 per page). |
+| `POST /api/debug/query` | One read-only SQL statement: `{"sql": "SELECT ... WHERE id = ?", "params": [1], "maxRows": 500}` (max 5000 rows; `truncated` reports a cut). |
+| `GET /api/debug/runtime` | Uptime, memory, Node version, non-secret environment configuration, readiness, settings, and the in-memory log buffer. |
+| `GET /api/debug/snapshot` | A consistent `VACUUM INTO` copy of the whole SQLite database for local analysis (`curl -o scout.sqlite ...`). |
+
+```bash
+curl -s -X POST http://127.0.0.1:3001/api/debug/query \
+  -H 'Content-Type: application/json' \
+  -d '{"sql":"SELECT marketplace, COUNT(*) AS n FROM listings GROUP BY marketplace"}'
+```
+
+Queries run on a separate read-only SQLite connection with `query_only` set, and only `SELECT`, `WITH`, `VALUES`, `EXPLAIN`, and `PRAGMA` statements are accepted, so the debug API cannot modify data. Values in the encrypted-credential format are replaced with `[redacted: encrypted secret]` and BLOBs are summarized by size; the snapshot blanks encrypted settings and marketplace browser sessions before download. Queries are synchronous, so avoid unbounded scans on large tables while scans are running. The same surface is available to MCP clients as `scout_debug_schema`, `scout_debug_table`, `scout_debug_query`, and `scout_debug_runtime`. Like the rest of the API there is no authentication — the debug API exposes the full listing and notification history, so keep Scout on a trusted LAN/VPN.
 
 ## Optional marketplace sessions
 
