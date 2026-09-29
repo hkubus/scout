@@ -375,7 +375,7 @@ function App() {
     const fullWatch = watch as Watch;
     return withBusyWatch(fullWatch, async () => {
       try {
-        await api.updateWatch(fullWatch.id, { name: fullWatch.name, query: fullWatch.query, terms: fullWatch.terms, excluded: fullWatch.excluded, sources: fullWatch.sources, location: fullWatch.location, condition: fullWatch.condition, interval: fullWatch.interval, sourceIntervals: fullWatch.sourceIntervals, exactUrls: fullWatch.exactUrls, sensitivity: fullWatch.sensitivity, shippingOnly: fullWatch.shippingOnly, typoVariants: fullWatch.typoVariants, aiRelevance: fullWatch.aiRelevance, referenceMarketWatchId: fullWatch.referenceMarketWatchId, minPrice: fullWatch.minPrice, maxPrice: fullWatch.maxPrice, enabled: fullWatch.enabled });
+        await api.updateWatch(fullWatch.id, { name: fullWatch.name, query: fullWatch.query, terms: fullWatch.terms, excluded: fullWatch.excluded, sources: fullWatch.sources, location: fullWatch.location, condition: fullWatch.condition, interval: fullWatch.interval, sourceIntervals: fullWatch.sourceIntervals, exactUrls: fullWatch.exactUrls, sensitivity: fullWatch.sensitivity, shippingOnly: fullWatch.shippingOnly, typoVariants: fullWatch.typoVariants, variantGroups: fullWatch.variantGroups, aiRelevance: fullWatch.aiRelevance, referenceMarketWatchId: fullWatch.referenceMarketWatchId, minPrice: fullWatch.minPrice, maxPrice: fullWatch.maxPrice, enabled: fullWatch.enabled });
         await refreshData(false);
         setEditingFullWatch(null);
         setAllWatches(null);

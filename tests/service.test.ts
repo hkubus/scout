@@ -1257,6 +1257,125 @@ test('records failed scans and does not persist partial normal-watch data', asyn
   } finally { context.close(); }
 });
 
+test('keeps connector backoff active across skipped runs and escalates it on the next failure', async () => {
+  const context = fixture();
+  try {
+    seedWatch(context.db, 'backoff-scan');
+    let fetches = 0;
+    (context.service as any).fetchOlxApi = async () => { fetches += 1; return { status: 403, json: null }; };
+    const row = () => context.db.prepare('SELECT * FROM watches WHERE id = ?').get('backoff-scan');
+    const latestError = () => context.db.prepare("SELECT id, finished_at, backoff_until FROM connector_runs WHERE source = 'OLX' AND status = 'error' ORDER BY id DESC LIMIT 1").get() as { id: number; finished_at: string; backoff_until: string };
+    await (context.service as any).runWatch(row(), { forceAll: true });
+    assert.equal(fetches, 1);
+    // Two forced scans inside the window are skipped; the first skip row must
+    // not clear the backoff for the second.
+    await (context.service as any).runWatch(row(), { forceAll: true });
+    await (context.service as any).runWatch(row(), { forceAll: true });
+    assert.equal(fetches, 1);
+    assert.equal((context.db.prepare("SELECT COUNT(*) AS count FROM connector_runs WHERE source = 'OLX' AND status = 'skipped'").get() as { count: number }).count, 2);
+    assert.equal(context.service.getConnectors().find((connector) => connector.name === 'OLX')?.status, 'Degraded');
+    // Once the window lapses, the next failure doubles the delay: skipped rows
+    // between the two failures do not reset the streak.
+    const first = latestError();
+    const firstDelay = Date.parse(first.backoff_until) - Date.parse(first.finished_at);
+    context.db.prepare('UPDATE connector_runs SET backoff_until = ? WHERE id = ?').run(new Date(Date.now() - 1_000).toISOString(), first.id);
+    await (context.service as any).runWatch(row(), { forceAll: true });
+    assert.equal(fetches, 2);
+    const second = latestError();
+    const secondDelay = Date.parse(second.backoff_until) - Date.parse(second.finished_at);
+    assert.ok(secondDelay >= firstDelay * 2 - 1_000, `expected ${secondDelay}ms to double ${firstDelay}ms`);
+  } finally { context.close(); }
+});
+
+test('logs a failing scheduler tick instead of throwing and reports the scheduler unhealthy', () => {
+  const context = fixture();
+  try {
+    (context.service as any).queueDue = () => { throw new Error('disk I/O error'); };
+    assert.doesNotThrow(() => context.service.schedulerTick());
+    assert.match(context.service.logs()[0].message, /Scheduler tick failed: disk I\/O error/);
+    assert.equal(context.service.readiness().scheduler.healthy, false);
+  } finally { context.close(); }
+});
+
+test('releases a watch and logs the error when a scan fails before reaching a marketplace', async () => {
+  const context = fixture();
+  try {
+    seedWatch(context.db, 'early-failure');
+    const now = new Date().toISOString();
+    context.db.prepare(`INSERT INTO market_watches (id, name, query, sources_json, interval_hours, enabled, next_scan_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('reference', 'Reference', 'cpu', '["OLX"]', 24, 0, now, now, now);
+    context.db.prepare("UPDATE watches SET reference_market_watch_id = 'reference' WHERE id = ?").run('early-failure');
+    (context.service as any).referenceBandMedian = () => { throw new Error('database is locked'); };
+    context.service.queueScan('early-failure');
+    const deadline = Date.now() + 2_000;
+    while (!context.service.logs().length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.match(context.service.logs()[0].message, /Scan early-failure name failed: database is locked/);
+    assert.equal((context.service as any).running.has('early-failure'), false);
+  } finally { context.close(); }
+});
+
+test('caps in-flight requests per marketplace without blocking other marketplaces', async () => {
+  const context = fixture();
+  try {
+    const active = new Map<string, number>();
+    const peak = new Map<string, number>();
+    (context.service as any).requestPublicPage = async (_url: string, marketplace: string) => {
+      active.set(marketplace, (active.get(marketplace) ?? 0) + 1);
+      peak.set(marketplace, Math.max(peak.get(marketplace) ?? 0, active.get(marketplace)!));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      active.set(marketplace, active.get(marketplace)! - 1);
+      return '<html></html>';
+    };
+    const service = context.service as any;
+    await Promise.all([
+      ...[1, 2, 3, 4, 5].map((id) => service.fetchPublicPage(`https://www.olx.pl/d/oferta/x-ID${id}.html`, 'OLX')),
+      ...[1, 2, 3].map((id) => service.fetchPublicPage(`https://www.vinted.pl/items/${id}`, 'Vinted')),
+    ]);
+    assert.equal(peak.get('OLX'), 2);
+    assert.equal(peak.get('Vinted'), 2);
+  } finally { context.close(); }
+});
+
+test('records one observation per price run per day instead of one per scan', () => {
+  const context = fixture();
+  try {
+    seedWatch(context.db, 'dedupe-watch');
+    const service = context.service as any;
+    const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('dedupe-watch');
+    const listing = (price: number) => ({ marketplace: 'OLX', listingId: '777', title: 'CPU', price, currency: 'PLN', url: 'https://www.olx.pl/d/oferta/cpu-ID777.html', observedAt: new Date().toISOString() });
+    const store = (price: number) => {
+      const scanId = service.createScan('dedupe-watch', 'watch', 'OLX');
+      service.storeListing(row, listing(price), scanId, service.watchBaselines(row));
+      return scanId;
+    };
+    const rows = () => context.db.prepare('SELECT id, price_pln, observed_at, scan_id FROM observations WHERE watch_id = ? ORDER BY observed_at, id').all('dedupe-watch') as Array<{ id: number; price_pln: number; observed_at: string; scan_id: number }>;
+    store(100);
+    store(100);
+    const first = rows()[0];
+    store(100);
+    const lastScan = store(100);
+    // Four same-price scans: the run's first row stays put and one trailing row tracks the latest scan.
+    assert.equal(rows().length, 2);
+    assert.deepEqual(rows()[0], first);
+    assert.equal(rows()[1].scan_id, lastScan);
+    store(90);
+    store(90);
+    assert.deepEqual(rows().map((item) => item.price_pln), [100, 100, 90, 90]);
+    // A returning price starts a new run rather than extending an older one.
+    store(100);
+    assert.deepEqual(rows().map((item) => item.price_pln), [100, 100, 90, 90, 100]);
+    // A new UTC day always starts a new row, so daily analytics keep one point per day.
+    const yesterday = new Date(Date.now() - 24 * 60 * 60_000).toISOString();
+    context.db.prepare('UPDATE observations SET observed_at = ? WHERE watch_id = ?').run(yesterday, 'dedupe-watch');
+    store(100);
+    store(100);
+    store(100);
+    assert.equal(rows().length, 7);
+    const todays = rows().filter((item) => item.observed_at.slice(0, 10) !== yesterday.slice(0, 10));
+    assert.equal(todays.length, 2);
+  } finally { context.close(); }
+});
+
 test('verifies missing research listings before ending them and leaves transient failures as unknown', async () => {
   const context = fixture();
   try {
@@ -1288,6 +1407,11 @@ test('verifies missing research listings before ending them and leaves transient
     const transient = context.db.prepare("SELECT status, missing_scans FROM market_listings WHERE listing_id = '1002'").get() as { status: string; missing_scans: number };
     assert.equal(transient.status, 'active');
     assert.equal(transient.missing_scans, 2);
+    // A research failure backs the marketplace off like a watch failure; let
+    // the window lapse so the next scan reaches the connector.
+    const failedRun = context.db.prepare("SELECT id, backoff_until FROM connector_runs WHERE source = 'OLX' AND status = 'error' ORDER BY id DESC LIMIT 1").get() as { id: number; backoff_until: string | null };
+    assert.ok(failedRun.backoff_until && Date.parse(failedRun.backoff_until) > Date.now());
+    context.db.prepare('UPDATE connector_runs SET backoff_until = ? WHERE id = ?').run(new Date(Date.now() - 1_000).toISOString(), failedRun.id);
     mode = 'live';
     await (context.service as any).runMarketWatch(row);
     const live = context.db.prepare("SELECT status, missing_scans, availability_status FROM market_listings WHERE listing_id = '1003'").get() as { status: string; missing_scans: number; availability_status: string };
