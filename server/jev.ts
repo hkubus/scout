@@ -24,7 +24,7 @@ const JEV_VERIFICATION_SESSION_ID = 'scout:jev-verification:v1';
 const JEV_TERM_MATCH_SESSION_ID = 'scout:jev-term-match:v1';
 const JEV_NEGOTIABILITY_SESSION_ID = 'scout:jev-negotiability:v1';
 const JEV_CONDITION_SESSION_ID = 'scout:jev-condition:v1';
-const JEV_GROUP_SESSION_ID = 'scout:jev-group:v1';
+const JEV_VARIANT_SESSION_ID = 'scout:jev-variant:v1';
 
 /** Model is configurable: explicit config wins, then env, then the alias. */
 export function resolveJevModel(configured?: string | null): string {
@@ -174,17 +174,17 @@ export interface JevConditionMatchJudgment {
   unsure: boolean;
 }
 
-export interface JevGroupContext {
+export interface JevVariantContext {
   query: string;
   title: string;
   condition?: string | null;
-  groups: Array<{ key: string; name: string; terms: string }>;
+  variants: Array<{ id: string; label: string; terms: string }>;
 }
 
-export interface JevGroupJudgment {
-  /** The chosen group's key, or null for `none`/`unknown`. */
-  groupKey: string | null;
-  decision: 'group' | 'none' | 'unknown';
+export interface JevVariantJudgment {
+  /** The chosen variant's id, or null for `none`/`unknown`. */
+  variantId: string | null;
+  decision: 'variant' | 'none' | 'unknown';
   confidence: number | null;
   unsure: boolean;
 }
@@ -437,52 +437,52 @@ export async function classifyConditionMatchWithJev(
 }
 
 /**
- * Model-group fallback for watch listings no group rule matched (or that
- * matched several equally). Group keys are user-defined, so choices use
- * positional ids (`g1`, `g2`, …) mapped back here. Only a confident pick
- * assigns a group; `none` and `unknown` keep the listing unscored.
+ * Model-variant fallback for watch listings no variant rule matched (they
+ * would otherwise land in Other / unclassified). Variant ids are user-defined,
+ * so choices use positional ids (`v1`, `v2`, …) mapped back here. Only a
+ * confident pick assigns a variant; `none` and `unknown` keep it in Other.
  */
-export async function classifyWatchGroupWithJev(
-  context: JevGroupContext,
+export async function classifyWatchVariantWithJev(
+  context: JevVariantContext,
   config: { apiKey: string; model?: string | null },
   fetcher: typeof fetch = fetch,
-): Promise<JevGroupJudgment> {
-  const choiceIds = context.groups.map((_, index) => `g${index + 1}`);
+): Promise<JevVariantJudgment> {
+  const choiceIds = context.variants.map((_, index) => `v${index + 1}`);
   const criteria: Record<string, string> = {};
-  context.groups.forEach((group, index) => {
-    criteria[choiceIds[index]] = `The listing is the "${group.name}" model (its titles usually contain: ${group.terms}).`;
+  context.variants.forEach((variant, index) => {
+    criteria[choiceIds[index]] = `The listing is the "${variant.label}" model (its titles usually contain: ${variant.terms}).`;
   });
   criteria.none = 'The listing is a model not in the list, a bundle of several models, an accessory, or a part.';
   criteria.unknown = 'The title is too short or ambiguous to tell which model it is. Do not guess from price.';
   const answers = await postDecisions({
     model: resolveJevModel(config.model),
-    session_id: JEV_GROUP_SESSION_ID,
+    session_id: JEV_VARIANT_SESSION_ID,
     state: {
       query: context.query,
-      groups: context.groups.map((group, index) => ({ id: choiceIds[index], name: group.name, terms: group.terms })),
+      variants: context.variants.map((variant, index) => ({ id: choiceIds[index], label: variant.label, terms: variant.terms })),
       listing: {
         title: context.title,
         condition: context.condition ?? null,
       },
     },
     questions: {
-      group: {
+      variant: {
         type: 'choice',
-        instructions: 'Given `query` (the watch search), `groups` (the models this watch tells apart), and `listing.title`, which single group is the listing for? Match on model identity, accepting abbreviations, Polish inflections, missing spaces, and word-order variants (e.g. `13pro`, `trzynastka pro`). Pick the most specific group that fits; choose `none` for another model, a bundle, or an accessory.',
+        instructions: 'Given `query` (the watch search), `variants` (the models this watch tells apart), and `listing.title`, which single variant is the listing for? Match on model identity, accepting abbreviations, Polish inflections, missing spaces, and word-order variants (e.g. `13pro`, `trzynastka pro`). Pick the most specific variant that fits; choose `none` for another model, a bundle, or an accessory.',
         criteria,
       },
     },
-  }, config.apiKey, 'listing group', fetcher);
+  }, config.apiKey, 'listing variant', fetcher);
 
-  const parsed = choiceAnswerSchema.safeParse(answers.group);
-  if (!parsed.success) throw new JevError('OpenRouter Decisions returned listing group with an invalid shape', 502, 'format');
+  const parsed = choiceAnswerSchema.safeParse(answers.variant);
+  if (!parsed.success) throw new JevError('OpenRouter Decisions returned listing variant with an invalid shape', 502, 'format');
   const index = choiceIds.indexOf(parsed.data.choice);
-  const decision = index >= 0 ? 'group' : parsed.data.choice === 'none' ? 'none' : 'unknown';
+  const decision = index >= 0 ? 'variant' : parsed.data.choice === 'none' ? 'none' : 'unknown';
   const confidence = typeof parsed.data.confidence === 'number' && Number.isFinite(parsed.data.confidence)
     ? parsed.data.confidence
     : null;
   return {
-    groupKey: index >= 0 ? context.groups[index].key : null,
+    variantId: index >= 0 ? context.variants[index].id : null,
     decision,
     confidence,
     unsure: isFuzzyMatchUnsure(decision, confidence),

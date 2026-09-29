@@ -85,8 +85,6 @@ function ListingThumbnail({ listing }: { listing: Listing }) {
 function ListingRow({ listing, onSelect, onToggleHidden }: { listing: Listing; onSelect?: (listing: Listing) => void; onToggleHidden?: (listing: Listing) => void }) {
   const aiFiltered = Boolean(listing.aiFiltered);
   const hidden = Boolean(listing.hidden);
-  // A grouped watch never scores a listing that matched none of its groups.
-  const unscored = listing.group === null;
   return (
     <div className={`listing-table listing-row${aiFiltered ? " listing-row--ai-filtered" : ""}${hidden ? " listing-row--hidden" : ""}`} role="row">
       <button
@@ -105,13 +103,9 @@ function ListingRow({ listing, onSelect, onToggleHidden }: { listing: Listing; o
               {listing.decision === "buy" ? "Buy" : listing.decision === "watch" ? "Watch" : "Pass"}
             </em>
           ) : null}
-          {listing.group ? (
-            <em className="decision-chip decision-chip--group" title={`Scored against this model group's typical price${listing.groupSource === "jev" ? " · placed by AI" : listing.groupSource === "manual" ? " · set manually" : ""}`}>
-              {listing.group}
-            </em>
-          ) : listing.group === null ? (
-            <em className="decision-chip decision-chip--no-group" title="Matched none of the watch's model groups, so it is not scored">
-              no group
+          {listing.variantLabel ? (
+            <em className="decision-chip decision-chip--variant" title={`Scored against the “${listing.variantLabel}” model baseline, not the watch-wide blend${listing.variantSource === "jev" ? " · placed by AI" : listing.variantSource === "manual" ? " · set manually" : ""}`}>
+              {listing.variantLabel}
             </em>
           ) : null}
           {listing.typicalSource === "reference-band" ? (
@@ -136,14 +130,14 @@ function ListingRow({ listing, onSelect, onToggleHidden }: { listing: Listing; o
         {listing.marketplace}
       </div>
       <strong className="price-cell" role="cell">{formatPln(listing.price)}</strong>
-      <span role="cell">{unscored ? "Not scored" : formatPln(listing.typical)}</span>
+      <span role="cell">{formatPln(listing.typical)}</span>
       <strong className="discount-cell" role="cell">
         {listing.belowTypical === null ? "—" : `${listing.belowTypical.toFixed(1)}%`}
       </strong>
       <span className="observed-cell" role="cell">{listing.observed}</span>
       <div className="strength-cell" role="cell">
         <DealBars strength={listing.dealStrength} />
-        <span>{unscored ? "Not scored" : listing.typical === null ? "Learning" : listing.dealLabel}</span>
+        <span>{listing.typical === null ? "Learning" : listing.dealLabel}</span>
       </div>
       <div className="row-actions" role="cell">
         {onToggleHidden ? (

@@ -48,11 +48,33 @@ npm run build
 
 Settings supports Discord webhooks and ntfy topics. Each channel has its own minimum deal priority (`Strong`, `Very strong`, or `Exceptional`), so ntfy can be limited to only the most important alerts while Discord receives the broader stream. ntfy uses the standard JSON publish API and can optionally send a bearer access token; credentials are encrypted with `SCOUT_SECRET`. Alerts are owned by the watch that produced them, are suppressed for unchanged qualifying observations, and retry failed or interrupted deliveries with capped backoff from the scheduler.
 
+An alert needs a ready baseline (30 comparable samples and 6 hours of watch history), an 18%+ discount below the learned median, and — for discounts between 18% and 20% — a robust price-deviation score of at least 3.1 (scaled by watch sensitivity). A **Very strong** discount (20%+ below the median) alerts as soon as the watch is ready even when the watch's own price spread fails that deviation test, so a heterogeneous search cannot keep silencing genuine discounts forever. Higher-priority deals are still subject to the description-verification safeguard below.
+
 Daily deal digests can be enabled for Discord, ntfy, or both at a configurable server-local time. On digest-enabled channels, Strong and Very strong deals are bundled into one ranked daily summary while Exceptional deals remain immediate. Empty digests are suppressed, unchanged listings are not repeated, and meaningful price drops or priority increases can appear in a later digest. Digest creation and per-channel delivery are durable and use the same capped retry behavior as immediate alerts.
+
+## Manual search
+
+The Search page queries OLX, Allegro Lokalnie, and Vinted live and applies the same deterministic and AI relevance filters as watch scans. Term matching folds unit spellings and joined model numbers (`128gb` matches “128 GB”, `rtx 3080` matches “RTX3080”), ignores query stopwords, and keeps single-digit models bound to whole tokens so `iphone 5` does not match “iPhone 15”. When the strict all-terms match finds nothing, a manual search falls back to matching a majority of the query tokens; user-typed Included/Excluded terms always stay strict.
+
+Each source streams its finished page over the existing SSE channel, so a fast marketplace renders while a slow one is still fetching; the HTTP response remains authoritative and reconciles anything the stream missed. `Load more` pages past the per-request cap instead of truncating silently, and AI relevance decisions are cached by query, listing input, and model, so repeating a search reuses them instead of re-spending Jev calls. OLX searches can additionally restrict results to private sellers or business accounts (`owner_type`), a structured marketplace filter rather than a post-filter.
+
+The Listings feed applies its text search, marketplace, decision, visibility, and sort filters in SQL across every page, and its match total reflects the active filters.
 
 ## Watch prefill from listings
 
 Any listing drawer offers a `Save as watch` action that opens the deal-watch dialog pre-filled from the listing's stored data: the search phrase comes from the stored AI canonical title (or the cleaned listing title, with price tokens, sale stopwords, and city names removed), brand/model become included terms, the source is preselected, the price range spans ±25% around the asking price, and the shipping requirement follows the listing. Research listings offer the same from their row actions and the preserved-copy dialog. Prefill never triggers an AI request, and every field stays editable before saving.
+
+## Model variants inside one watch
+
+A broad search such as `gtx 1660` matches the 1660, 1660 Super, and 1660 Ti, which are different products with different price levels. Pooling them into one baseline makes a normal-priced Ti look expensive and an average 1660 look like a deal. The watch dialog's **Model variants** section lets one watch split its matches into separately scored models instead of creating three near-identical watches.
+
+Each group is a label plus comma-separated match terms (all terms must appear in the normalized title; an optional exclude list vetoes a match). Matching is most-specific-first — the number of words across the required terms decides, with the declared order breaking ties — so `1660 super` and `1660 ti` take precedence over `1660` without reordering. Titles that match no group share an **Other / unclassified** bucket so misfiled listings stay visible.
+
+Every variant learns its own typical price, sample count, and readiness, and alerts are scored, gated, and labelled per model: `GTX 1660 Ti · 22% below typical`. The watch card shows a per-variant progress chip and the listings feed and drawer label each row with its variant. A watch with no groups keeps the original watch-wide baseline exactly. Editing a watch's groups re-tags its saved listings immediately; variant identity is stored per listing association, so a listing that is retitled on the marketplace can move models on its next scan.
+
+Named variants share their statistics so each one doesn't have to learn alone: a variant's typical price is its own median once it has 10 listings, while the spread used for the z-score is pooled across all named variants (each price taken relative to its own variant's median), and alerts still need 30 samples across the named variants plus 6 hours. Other / unclassified is a mix by definition, so it keeps its own spread and the full 30-sample floor.
+
+When no rule places a listing (slang, a missing space, an unusual title) and OpenRouter is configured, Jev picks a variant — but only for listings that would be a deal in at least one named variant, at most 10 per scan, with answers cached against the variant definitions. Only a confident pick moves a listing out of Other, and the pick lands before the AI relevance pass so it gets the same relevance check. The listing drawer's **Model variant** selector can also move a listing by hand; manual picks win over rules and Jev until switched back to automatic or until their variant is removed, while Jev picks are re-derived whenever the groups are edited.
 
 ## Manually hiding listings
 
@@ -83,12 +105,6 @@ Each research watch card offers a price-trend dialog (`GET /api/market-watches/:
 
 A deal watch can point at a research watch (`referenceMarketWatchId`). While the watch's own baseline is below 30 comparable samples and the reference series has at least 4 eligible probable sales, new listings display a **series baseline**: the reference band's median stands in for the learned typical price, clearly chipped as "series baseline" in the table and drawer. This improves ranking and display only — the alert readiness gate (30 samples and 6 hours) is unchanged, so no alerts fire earlier than they would without a reference series. Once the watch's own history reaches the sample floor, own history always wins and new rows are marked `own-history`.
 
-### Model groups
-
-A deal watch can split its results into model groups — for example `13 mini`, `13`, `13 Pro`, and `13 Pro Max` under one "iPhone 13" search — so each listing is scored only against its own model instead of the whole watch's mixed price range. A mixed range inflates the robust spread so much that broad watches could otherwise never alert.
-
-Each group has comma-separated terms that must all appear in the title as whole words (`|` separates alternatives, e.g. `pro max|promax`) plus optional excluded terms. The most specific matching group wins, so `iPhone 13 Pro Max` lands in `13 Pro Max` without the base group needing exclusions. When no rule places a listing (e.g. `13Pro` written without a space) and OpenRouter is configured, Jev picks a group — but only for listings that would be a deal in at least one group, at most 10 per scan, with answers cached against the group definitions; only a confident pick assigns, and the pick lands before the AI relevance pass so it gets the same relevance check. Anything still unassigned is kept but never scored. The listing drawer can also move a listing to a group manually; manual picks win over rules and Jev until switched back to automatic or until their group is removed. A group's typical price is its own median once it has 10 listings, while the spread is pooled across all groups, and alerts still require 30 pooled samples and 6 hours. Editing groups re-sorts the watch's stored listings immediately, so existing history carries over. A grouped watch does not use the reference-series fallback, whose band describes the whole search.
-
 ## Preserved listing copies
 
 Research listings are preserved for market research: when a listing first appears in a research watch, Scout fetches its detail page once (bounded per scan, with a small retry budget on later scans), stores the description, and downloads the gallery images into the Scout database so the listing stays viewable after it is sold or removed. Captures are deduplicated by listing state, capped at 12 images of up to 4 MB each, and served only from Scout's own image endpoint. Use the eye action on a Saved listings row to view the preserved copy, or the save action to capture or refresh a copy on demand — including for listings that already ended. Copies live and die with their research listing row, so the daily 180-day retention cleanup also prunes them; deleting a research watch deletes its copies.
@@ -115,38 +131,44 @@ export SCOUT_OPENROUTER_MODEL='deepseek/deepseek-v4-flash'
 
 The API token entered in Settings is encrypted with `SCOUT_SECRET` and is never returned to the browser. Scout sends OpenAI-compatible chat-completion requests to OpenRouter and validates every JSON response before storing it. See the [OpenRouter chat-completions docs](https://openrouter.ai/docs/api/api-reference/chat/create-a-chat-completion) for endpoint and authentication details.
 
-Searches can also use the AI relevance filter. It runs after Scout's deterministic filters and excludes listings where the requested item is only mentioned as an accessory, replacement part, compatible component, repair service, or unrelated context—for example, a GPU fan when searching for a GPU. Jev judges relevance from the title, price, location, and query; unsure cases fetch the detail page for a second description-enriched judgment, then fall back to a vision-model tiebreak over the thumbnail. Relevance decisions are cached per watch, listing, query, and model. The filter is enabled by default for new watches and can be disabled per watch; without an OpenRouter key, Scout falls back to deterministic filtering. Set `SCOUT_JEV_MODE=legacy` to use the DeepSeek model for relevance instead.
+Searches can also use the AI relevance filter. It runs after Scout's deterministic filters and excludes listings where the requested item is only mentioned as an accessory, replacement part, compatible component, repair service, or unrelated context—for example, a GPU fan when searching for a GPU. Jev judges relevance from the title, price, location, and query; unsure cases fetch the detail page for a second description-enriched judgment, then fall back to a vision-model tiebreak over the thumbnail. Relevance decisions are cached per watch, listing, query, and model. The filter is enabled by default for new watches and can be disabled per watch; without an OpenRouter key, Scout falls back to deterministic filtering. Relevance checks and the bounded near-miss rescue run several Jev round trips at once instead of one at a time (default 6, tune with `SCOUT_JEV_CONCURRENCY`), which shortens cold searches without changing any decision. Manual searches carry the same choice as a watch: the **AI relevance filtering** checkbox on the search form (remembered in the browser) can skip the Jev relevance and rescue calls entirely for deterministic-only results, and saving a search as a watch carries that choice over. Set `SCOUT_JEV_MODE=legacy` to use the DeepSeek model for relevance instead.
 
 Very strong and exceptional deals receive an additional conservative safeguard when OpenRouter is configured. Scout fetches the approved marketplace detail page, extracts the listing description, saves a deduplicated snapshot of the listing state, and asks Jev for a structured `pass`, `reject`, or `unknown` condition check; unsure judgments and Jev outages escalate to a vision model over the listing photos. Only `pass` continues to immediate alerts; explicit damage, parts-only, repair, missing-essential-component, account-lock, or similar signals—and unavailable or ambiguous descriptions—hold the high-priority alert until a later scan. Results are cached by listing description and model, and the saved snapshots can be reviewed later from the listing drawer. Without an OpenRouter key the existing deterministic alert behavior remains active. Set `SCOUT_JEV_MODE=legacy` to use the DeepSeek model for verification instead.
 
 Jev and vision requests retry transient OpenRouter provider failures with backoff. The legacy DeepSeek verification path uses OpenRouter response healing and retries once on malformed JSON. If a technical OpenRouter failure remains, Scout records a `fallback` status and sends the deterministic alert while showing the error; explicit `reject` and `unknown` decisions still hold the alert.
 
-## Agent access (MCP)
+## MCP server (Streamable HTTP)
 
-Scout ships a [Model Context Protocol](https://modelcontextprotocol.io) server so an MCP-capable agent (Claude Desktop, opencode, Cursor, etc.) can read and, optionally, manage Scout through typed tools instead of raw HTTP.
+Scout exposes a Model Context Protocol server over Streamable HTTP at `POST /mcp` (same host/port as the API), so AI assistants connect over HTTP instead of stdio:
 
 ```bash
-npm run mcp:dev        # stdio MCP server via tsx (development)
-npm run build && npm run mcp   # compiled stdio MCP server
+curl -s -X POST http://127.0.0.1:3001/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-The server talks to the Scout API at `SCOUT_API_URL` (default `http://127.0.0.1:3001`) and speaks MCP over stdio, so it must run where it can reach the API. Read tools cover status, dashboard, listings and listing detail, live search, watches and analytics, market research and trends, notifications, connectors, logs, and (secret-masked) settings. Mutating tools — creating, updating, and deleting watches and research watches, queueing scans, recording listing decisions, hiding listings, moving listings between a watch's model groups, and capturing research snapshots — are only registered when `SCOUT_MCP_ALLOW_WRITES=true`. Without that flag the server is read-only. Two resources, `scout://status` and `scout://dashboard`, expose the readiness report and dashboard.
+It is stateless (one fresh server per request, no session ids) and offers twelve tools (plus the four read-only `scout_debug_*` tools from the [Debug API](#debug-api) unless `SCOUT_DEBUG_API=false`): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail`, `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_queue_scan`, and `scout_connectors`. `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. Like the REST API it has no built-in authentication — keep it on a trusted LAN/VPN and never expose it directly to the public internet.
 
-Example client configuration (run from the Scout checkout so `dist-mcp` exists):
+## Debug API
 
-```json
-{
-  "mcpServers": {
-    "scout": {
-      "command": "node",
-      "args": ["/opt/scout/dist-mcp/mcp.js"],
-      "env": { "SCOUT_API_URL": "http://127.0.0.1:3001" }
-    }
-  }
-}
+For development and troubleshooting, Scout exposes read-only access to the live database under `/api/debug/*` (enabled by default; set `SCOUT_DEBUG_API=false` to disable it):
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /api/debug/schema` | Every table and view with columns, indexes, and row counts, plus database/WAL size and applied migrations. |
+| `GET /api/debug/tables/:table?limit=&offset=&orderBy=&direction=` | Raw rows from one table, newest first by rowid (max 1000 per page). |
+| `POST /api/debug/query` | One read-only SQL statement: `{"sql": "SELECT ... WHERE id = ?", "params": [1], "maxRows": 500}` (max 5000 rows; `truncated` reports a cut). |
+| `GET /api/debug/runtime` | Uptime, memory, Node version, non-secret environment configuration, readiness, settings, and the in-memory log buffer. |
+| `GET /api/debug/snapshot` | A consistent `VACUUM INTO` copy of the whole SQLite database for local analysis (`curl -o scout.sqlite ...`). |
+
+```bash
+curl -s -X POST http://127.0.0.1:3001/api/debug/query \
+  -H 'Content-Type: application/json' \
+  -d '{"sql":"SELECT marketplace, COUNT(*) AS n FROM listings GROUP BY marketplace"}'
 ```
 
-The MCP server inherits Scout's trust model: it holds no credentials of its own and is exactly as powerful as the unauthenticated Scout API it points at, so keep it on the trusted LAN/VPN. Write tools are gated rather than authenticated, and deleting a watch via MCP is permanent.
+Queries run on a separate read-only SQLite connection with `query_only` set, and only `SELECT`, `WITH`, `VALUES`, `EXPLAIN`, and `PRAGMA` statements are accepted, so the debug API cannot modify data. Values in the encrypted-credential format are replaced with `[redacted: encrypted secret]` and BLOBs are summarized by size; the snapshot blanks encrypted settings and marketplace browser sessions before download. Queries are synchronous, so avoid unbounded scans on large tables while scans are running. The same surface is available to MCP clients as `scout_debug_schema`, `scout_debug_table`, `scout_debug_query`, and `scout_debug_runtime`. Like the rest of the API there is no authentication — the debug API exposes the full listing and notification history, so keep Scout on a trusted LAN/VPN.
 
 ## Optional marketplace sessions
 

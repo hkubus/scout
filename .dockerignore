@@ -15,7 +15,7 @@ coverage
 *.before-restore-*
 *.restore-*.tmp
 *.storage-state.json
-NEXT_AGENT.md
+CLAUDE.md
 OPTIMIZATION_HANDOFF.md
 docs
 README.md

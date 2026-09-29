@@ -10,6 +10,8 @@ export type WatchPreset = {
   minPrice: number | null;
   maxPrice: number | null;
   shippingOnly: boolean;
+  /** Carry the search's AI-relevance choice into the new watch. */
+  aiRelevance?: boolean;
 };
 
 /** Polish cities commonly appended to marketplace titles; stripped from prefilled queries. */

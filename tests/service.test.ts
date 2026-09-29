@@ -8,7 +8,7 @@ import { parseMarketplaceStorageState } from '../server/marketplace-sessions';
 import { DeepSeekError } from '../server/ai';
 import { listingDescriptionVerificationInputHash, listingRelevanceInputHash } from '../server/ai';
 import { VisionError } from '../server/vision';
-import { ScoutService, ServiceError, decryptSecret, encryptSecret, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, validateDiscordWebhook, type ScoutServiceDependencies } from '../server/service';
+import { ScoutService, ServiceError, decryptSecret, encryptSecret, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
 
 // Pin the legacy DeepSeek path for pre-existing tests: live Jev is the
 // production default whenever a key is available, but these tests assert
@@ -133,6 +133,71 @@ test('slows normal watch polling overnight without skipping the morning boundary
   assert.equal(nextWatchScanAt(beforeMorning, 5, 30), morning);
   assert.equal(minutesBetween(morning, nextWatchScanAt(morning, 5, 30)), 5);
   assert.equal(minutesBetween(overnight, nextWatchScanAt(overnight, 60, 30)), 60);
+});
+
+test('resolves per-marketplace intervals with a safety floor and default fallback', () => {
+  assert.deepEqual(watchSourceIntervals(['OLX', 'Vinted'], 15, { OLX: 30 }), { OLX: 30, Vinted: 15 });
+  assert.deepEqual(watchSourceIntervals(['OLX', 'Vinted'], 15, { OLX: 3 }), { OLX: 5, Vinted: 15 });
+  assert.deepEqual(watchSourceIntervals(['OLX'], 15, { Vinted: 60 }), { OLX: 15 });
+  assert.deepEqual(normalizeSourceIntervals(['OLX'], { OLX: 30, Vinted: 60 }), { OLX: 30 });
+  assert.deepEqual(normalizeSourceIntervals(['Vinted'], {}), {});
+});
+
+test('scans only the marketplaces whose interval has elapsed', () => {
+  const now = Date.parse('2026-08-23T12:00:00.000Z');
+  const next = {
+    OLX: '2026-08-23T11:55:00.000Z',
+    Vinted: '2026-08-23T12:30:00.000Z',
+    'Allegro Lokalnie': undefined,
+  };
+  assert.deepEqual(dueWatchSources(['OLX', 'Vinted', 'Allegro Lokalnie'], next, now), ['OLX', 'Allegro Lokalnie']);
+  assert.deepEqual(dueWatchSources(['OLX', 'Vinted'], next, now), ['OLX']);
+});
+
+test('advances each scanned marketplace on its own interval and keeps the earliest next scan', () => {
+  const finished = new Date(2026, 7, 23, 12, 0, 0, 0).toISOString();
+  const vintedNext = new Date(2026, 7, 23, 12, 30, 0, 0).toISOString();
+  const { nextBySource, nextScanAt } = nextWatchScanSchedule({
+    sources: ['OLX', 'Vinted'],
+    intervals: { OLX: 10, Vinted: 60 },
+    prior: { Vinted: vintedNext },
+    scanned: ['OLX'],
+    finishedAt: finished,
+    nightIntervalMinutes: 30,
+  });
+  assert.equal((Date.parse(nextBySource.OLX) - Date.parse(finished)) / 60_000, 10);
+  assert.equal(nextBySource.Vinted, vintedNext);
+  assert.equal(nextScanAt, nextBySource.OLX);
+});
+
+test('honors connector backoff when advancing a scanned marketplace', () => {
+  const finished = new Date(2026, 7, 23, 12, 0, 0, 0).toISOString();
+  const backoff = new Date(2026, 7, 23, 12, 45, 0, 0).toISOString();
+  const { nextBySource, nextScanAt } = nextWatchScanSchedule({
+    sources: ['OLX'],
+    intervals: { OLX: 5 },
+    prior: {},
+    scanned: ['OLX'],
+    finishedAt: finished,
+    nightIntervalMinutes: 30,
+    backoff: { OLX: backoff },
+  });
+  assert.equal(nextBySource.OLX, backoff);
+  assert.equal(nextScanAt, backoff);
+});
+
+test('surfaces stored per-marketplace intervals and drops stale sources', () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, source_intervals_json, enabled, next_scan_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`).run('interval-watch', 'Interval watch', 'cpu', '["OLX","Vinted"]', '{"OLX":45,"Vinted":120}', now, now, now);
+    const watch = context.service.getWatches().find((item) => item.id === 'interval-watch');
+    assert.deepEqual(watch?.sourceIntervals, { OLX: 45, Vinted: 120 });
+    context.db.prepare('UPDATE watches SET sources_json = ? WHERE id = ?').run('["OLX"]', 'interval-watch');
+    const narrowed = context.service.getWatches().find((item) => item.id === 'interval-watch');
+    assert.deepEqual(narrowed?.sourceIntervals, { OLX: 45 });
+  } finally { context.close(); }
 });
 
 test('encrypts Discord secrets and validates settings bounds', () => {
@@ -413,6 +478,35 @@ test('keeps provisional baselines and deal labels hidden during cold start', () 
   } finally { context.close(); }
 });
 
+test('summarizes current Exceptional/Very strong/Strong findings per watch', () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    const stale = new Date(Date.now() - 13 * 60 * 60_000).toISOString();
+    seedWatch(context.db, 'deal-counts-watch');
+    const insertListing = context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, typical_pln, shipping_available, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    const setDeal = context.db.prepare('UPDATE watch_listings SET deal_strength = ?, deal_label = ?, last_seen_at = ? WHERE watch_id = ? AND listing_id = ?');
+    const deals: Array<[string, number, string, string]> = [
+      ['deal-5', 5, 'Exceptional', now],
+      ['deal-4', 4, 'Very strong', now],
+      ['deal-3', 3, 'Strong', now],
+      ['deal-2', 2, 'Watch', now],
+      ['deal-stale', 5, 'Exceptional', stale],
+      ['deal-hidden', 5, 'Exceptional', now],
+    ];
+    for (const [listingId, strength, label, seenAt] of deals) {
+      insertListing.run('OLX', listingId, listingId, 100, 500, 1, `https://www.olx.pl/d/oferta/${listingId}`, now, now);
+      const listing = context.db.prepare('SELECT id FROM listings WHERE listing_id = ?').get(listingId) as { id: number };
+      insertObservation.run(listing.id, 'deal-counts-watch', 100, seenAt);
+      setDeal.run(strength, label, seenAt, 'deal-counts-watch', listing.id);
+    }
+    context.db.prepare('INSERT INTO listing_actions (marketplace, listing_id, decision, note, hidden, updated_at) VALUES (?, ?, NULL, ?, 1, ?)').run('OLX', 'deal-hidden', '', now);
+    const [watch] = context.service.getWatches();
+    assert.deepEqual(watch.dealCounts, { exceptional: 1, veryStrong: 1, strong: 1 });
+  } finally { context.close(); }
+});
+
 test('marks a baseline ready after 30 comparable listings and six hours', () => {
   const context = fixture();
   try {
@@ -532,6 +626,39 @@ test('hides and unhides a listing without deleting its history', () => {
     assert.equal(context.service.getListings()[0].hidden, false);
     // Unhiding with no decision or note removes the empty action row.
     assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM listing_actions WHERE marketplace = ? AND listing_id = ?').get('OLX', 'hidden-listing') as { count: number }).count, 0);
+  } finally { context.close(); }
+});
+
+test('filters and sorts the listings feed server-side across all rows', () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    context.db.prepare('INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run('feed-watch', 'Feed watch', 'gpu', '["OLX"]', 1, now, now, now);
+    const insertListing = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, condition, location, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    const insertLink = context.db.prepare('INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)');
+    const add = (id: string, title: string, price: number, condition: string, location: string) => {
+      insertListing.run('OLX', id, title, price, condition, location, `https://www.olx.pl/d/oferta/${id}`, now, now);
+      const listing = context.db.prepare('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get('OLX', id) as { id: number };
+      insertLink.run('feed-watch', listing.id, now, now);
+    };
+    add('feed-cheap', 'GPU RTX 4070', 1500, 'Używane', 'Warszawa');
+    add('feed-mid', 'GPU RTX 4070 Ti', 2500, 'Nowe', 'Kraków');
+    add('feed-pricey', 'Karta graficzna RTX 4070', 3500, 'Używane', 'Warszawa');
+    context.service.updateListingAction('OLX:feed-mid', 'buy', 'worth it');
+    context.service.updateListingAction('OLX:feed-pricey', null, '', true);
+
+    // `q` covers title, condition, and location, and the total follows the filter.
+    assert.deepEqual(context.service.listingsPage({ q: 'kraków' }).listings.map((listing) => listing.id), ['OLX:feed-mid']);
+    assert.deepEqual(context.service.listingsPage({ q: 'używane' }).listings.map((listing) => listing.id).sort(), ['OLX:feed-cheap', 'OLX:feed-pricey']);
+    assert.equal(context.service.listingsPage({ q: 'używane' }).pagination.total, 2);
+    // Internal callers keep every row; the endpoint opts into visible-only.
+    assert.equal(context.service.listingsPage({}).listings.length, 3);
+    assert.deepEqual(context.service.listingsPage({ visibility: 'visible' }).listings.map((listing) => listing.id).sort(), ['OLX:feed-cheap', 'OLX:feed-mid']);
+    assert.deepEqual(context.service.listingsPage({ visibility: 'hidden' }).listings.map((listing) => listing.id), ['OLX:feed-pricey']);
+    assert.deepEqual(context.service.listingsPage({ decision: 'buy' }).listings.map((listing) => listing.id), ['OLX:feed-mid']);
+    // Sorting happens before the page window, so it covers every matching row.
+    assert.deepEqual(context.service.listingsPage({ sort: 'price' }).listings.map((listing) => listing.id), ['OLX:feed-cheap', 'OLX:feed-mid', 'OLX:feed-pricey']);
+    assert.deepEqual(context.service.listingsPage({ sort: 'price', page: 2, pageSize: 2 }).listings.map((listing) => listing.id), ['OLX:feed-pricey']);
   } finally { context.close(); }
 });
 
@@ -764,6 +891,35 @@ test('applies the same AI relevance gate to one-off marketplace search', async (
   } finally { context.close(); }
 });
 
+test('streams per-source manual search progress and honors the result page', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'scout-service-'));
+  const db = openDatabase(join(directory, 'scout.sqlite'));
+  const emitted: Array<{ event: string; payload: any }> = [];
+  const service = new ScoutService(db, (event, payload) => emitted.push({ event, payload }));
+  const urls: string[] = [];
+  (service as any).fetchOlxApi = async (url: string) => {
+    urls.push(url);
+    return { status: 200, json: { data: [
+      { id: 'STREAM-1', url: 'https://www.olx.pl/d/oferta/stream-1', title: 'GPU RTX 4070', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 2000, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 1 } } };
+  };
+  try {
+    const result = await service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '', page: 3, searchId: 'stream-1' });
+    assert.equal(result.listings.length, 1);
+    assert.match(urls[0], /offset=100/, 'the requested page maps to a marketplace offset');
+    const progress = emitted.filter((entry) => entry.event === 'search');
+    assert.equal(progress.length, 1);
+    assert.equal(progress[0].payload.searchId, 'stream-1');
+    assert.equal(progress[0].payload.source, 'OLX');
+    assert.equal(progress[0].payload.status.status, 'ok');
+    assert.deepEqual(progress[0].payload.listings.map((listing: any) => listing.id), ['OLX:STREAM-1']);
+
+    emitted.length = 0;
+    await service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
+    assert.equal(emitted.filter((entry) => entry.event === 'search').length, 0, 'no searchId means no streaming events');
+  } finally { db.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('keeps manual search results when AI relevance fails', async () => {
   const context = fixture({
     classifyListingRelevance: async () => { throw new Error('Marketplace timeout'); },
@@ -814,6 +970,25 @@ test('shipping-only watches hide pickup-only history and count only shippable sa
   } finally { context.close(); }
 });
 
+test('treats every Vinted listing as shippable even with legacy stored flags', () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    context.db.prepare('INSERT INTO watches (id, name, query, sources_json, shipping_only, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run('vinted-shipping-watch', 'Vinted shipping watch', 'cpu', '["Vinted"]', 1, 1, now, now, now);
+    const insert = context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, shipping_available, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    insert.run('Vinted', 'vinted-flagged-pickup', 'Vinted CPU flagged pickup', 100, 0, 'https://www.vinted.pl/items/vinted-flagged-pickup', now, now);
+    insert.run('Vinted', 'vinted-unknown', 'Vinted CPU unknown', 120, null, 'https://www.vinted.pl/items/vinted-unknown', now, now);
+    insert.run('OLX', 'olx-pickup', 'OLX pickup CPU', 90, 0, 'https://www.olx.pl/d/oferta/olx-pickup', now, now);
+    const observe = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    for (const row of context.db.prepare('SELECT id, price_pln FROM listings').all() as Array<{ id: number; price_pln: number }>) observe.run(row.id, 'vinted-shipping-watch', row.price_pln, now);
+    assert.equal(context.service.getWatches()[0].samples, 2);
+    const listings = context.service.getListings();
+    assert.deepEqual(listings.map((listing) => listing.id).sort(), ['Vinted:vinted-flagged-pickup', 'Vinted:vinted-unknown']);
+    // The UI must not report "Pickup only" for a Vinted row with a stale flag.
+    assert.deepEqual(listings.map((listing) => listing.shippingAvailable), [true, true]);
+  } finally { context.close(); }
+});
+
 test('price-filtered watches scope history and baseline samples to their range', () => {
   const context = fixture();
   try {
@@ -837,8 +1012,10 @@ test('market research filters match terms, price, condition, location, and shipp
     { marketplace: 'OLX' as const, listingId: 'pickup', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/pickup', condition: 'New', location: 'Warszawa', shippingAvailable: false, observedAt: new Date().toISOString() },
     { marketplace: 'OLX' as const, listingId: 'wrong-city', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/wrong-city', condition: 'New', location: 'Kraków', shippingAvailable: true, observedAt: new Date().toISOString() },
     { marketplace: 'OLX' as const, listingId: 'excluded', title: 'RTX 4070 12GB parts only', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/excluded', condition: 'New', location: 'Warszawa', shippingAvailable: true, observedAt: new Date().toISOString() },
+    // Vinted's stale pickup flag must not exclude it from a shipping-only filter.
+    { marketplace: 'Vinted' as const, listingId: 'vinted-ships', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.vinted.pl/items/vinted-ships', condition: 'New', location: 'Warszawa', shippingAvailable: false, observedAt: new Date().toISOString() },
   ];
-  assert.deepEqual(filterListings(listings, 'rtx 4070', '12gb', 'parts', { minPrice: 1000, maxPrice: 2000, condition: 'New', location: 'Warszawa', shippingOnly: true }).map((listing) => listing.listingId), ['match']);
+  assert.deepEqual(filterListings(listings, 'rtx 4070', '12gb', 'parts', { minPrice: 1000, maxPrice: 2000, condition: 'New', location: 'Warszawa', shippingOnly: true }).map((listing) => listing.listingId), ['match', 'vinted-ships']);
 });
 
 test('keeps market research separate and reports ended-listing price estimates', () => {
@@ -909,7 +1086,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_watch_groups']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1041,6 +1218,29 @@ test('does not fetch listing details for shipping when manual search does not re
     assert.match(fetchedUrls[0], /api\/v2\/catalog\/items/);
     assert.equal(result.listings[0].id, 'Vinted:123');
     assert.equal(result.sources[0].pendingShipping, 0);
+  } finally { context.close(); }
+});
+
+test('assumes Vinted shipping for a shipping-only search without a detail fetch', async () => {
+  const context = fixture();
+  const publicFetches: string[] = [];
+  try {
+    (context.service as any).fetchVintedApi = async () => ({ status: 200, json: { items: [
+      { id: 123, title: 'CPU', price: { amount: '150', currency_code: 'PLN' }, url: 'https://www.vinted.pl/items/123-cpu', status: 'Bardzo dobry' },
+    ], pagination: { current_page: 1, total_pages: 1, total_entries: 1, per_page: 20 }, code: 0 } });
+    // The catalog page is primary; force the JSON path and make any shipping
+    // detail fetch fail loudly so this test proves none happens.
+    (context.service as any).fetchVintedItemPage = async () => ({ status: 403, body: '' });
+    (context.service as any).fetchPublicPage = async (url: string) => {
+      publicFetches.push(url);
+      throw new Error(`unexpected public page fetch: ${url}`);
+    };
+    const result = await context.service.manualSearch({ query: 'cpu', sources: ['Vinted'], minPrice: null, maxPrice: null, terms: '', excluded: '', shippingOnly: true, condition: 'Any', location: '' });
+    assert.equal(result.sources[0].status, 'ok');
+    assert.equal(result.listings[0].id, 'Vinted:123');
+    assert.equal(result.listings[0].shippingAvailable, true);
+    assert.equal(result.sources[0].pendingShipping, 0);
+    assert.deepEqual(publicFetches, []);
   } finally { context.close(); }
 });
 
@@ -1251,7 +1451,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 23);
+    assert.equal(after.migrations.count, 26);
   } finally { context.close(); }
 });
 
@@ -1455,6 +1655,37 @@ test('decides relevance live with Jev and never calls DeepSeek', async () => {
     assert.equal(result.listings.length, 1);
     assert.equal(result.excluded, 0);
     assert.equal(result.unknown, 0);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('reuses manual-search relevance decisions instead of re-spending Jev', async () => {
+  const restore = liveJevEnv();
+  let jevCalls = 0;
+  const context = fixture({
+    classifyListingRelevance: async () => { throw new Error('DeepSeek must not be called in live mode'); },
+    classifyListingRelevanceWithJev: async (ctx: any) => { jevCalls += 1; return { relevant: !ctx.title.includes('parts'), p: 0.92, unsure: false }; },
+    classifyListingRelevanceWithVision: async () => { throw new Error('Vision must not be called for sure judgments'); },
+  });
+  try {
+    const keep = liveListing({ listingId: 'manual-cache-1', title: 'PlayStation 5', url: 'https://www.olx.pl/d/oferta/manual-cache-1' });
+    const drop = liveListing({ listingId: 'manual-cache-2', title: 'PS5 parts only', url: 'https://www.olx.pl/d/oferta/manual-cache-2' });
+    const search = { query: 'PS5', includedTerms: '', excludedTerms: '' };
+    const first = await (context.service as any).filterListingsByAiRelevance([keep, drop], search, undefined, true);
+    assert.equal(jevCalls, 2);
+    assert.deepEqual(first.listings.map((item: any) => item.listingId), ['manual-cache-1']);
+    assert.equal(first.excluded, 1);
+
+    const repeat = await (context.service as any).filterListingsByAiRelevance([keep, drop], search, undefined, true);
+    assert.equal(jevCalls, 2, 'a repeated manual search must reuse cached decisions');
+    assert.deepEqual(repeat.listings.map((item: any) => item.listingId), ['manual-cache-1']);
+    assert.equal(repeat.excluded, 1);
+
+    // A different phrase is a different judgment and must not reuse the cache.
+    await (context.service as any).filterListingsByAiRelevance([keep], { query: 'Xbox', includedTerms: '', excludedTerms: '' }, undefined, true);
+    assert.equal(jevCalls, 3);
   } finally {
     restore();
     context.close();
@@ -1957,6 +2188,102 @@ test('caches confident fixed negotiability and skips upgrade on cached verificat
   }
 });
 
+test('lets a manual search opt out of the AI relevance gate', async () => {
+  const restore = liveJevEnv();
+  let relevanceCalls = 0;
+  const context = fixture({
+    classifyListingRelevanceWithJev: async () => { relevanceCalls += 1; return { relevant: false, p: 0.1, unsure: false }; },
+    classifyListingRelevance: async () => { throw new Error('DeepSeek must not be called in live mode'); },
+  });
+  try {
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'OPT-1', url: 'https://www.olx.pl/d/oferta/opt-1', title: 'Ladowarka Dell 65W', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 100, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 1 } } });
+    const skipped = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '', aiRelevance: false });
+    assert.equal(relevanceCalls, 0);
+    assert.deepEqual(skipped.listings.map((listing) => listing.title), ['Ladowarka Dell 65W']);
+    // Omitted means default-on, matching the watch-scan default.
+    const filtered = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
+    assert.equal(relevanceCalls, 1);
+    assert.equal(filtered.listings.length, 0);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('runs live relevance checks with bounded concurrency', async () => {
+  const restore = liveJevEnv();
+  const previousConcurrency = process.env.SCOUT_JEV_CONCURRENCY;
+  process.env.SCOUT_JEV_CONCURRENCY = '3';
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const context = fixture({
+    classifyListingRelevanceWithJev: async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight -= 1;
+      return { relevant: true, p: 0.9, unsure: false };
+    },
+  });
+  try {
+    const listings = Array.from({ length: 9 }, (_, index) => liveListing({
+      listingId: `concurrent-${index}`,
+      url: `https://www.olx.pl/d/oferta/concurrent-${index}`,
+      title: `PS5 console ${index}`,
+    }));
+    const result = await (context.service as any).filterListingsByAiRelevance(
+      listings, { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
+    );
+    assert.equal(result.listings.length, 9);
+    assert.equal(maxInFlight, 3);
+  } finally {
+    if (previousConcurrency === undefined) delete process.env.SCOUT_JEV_CONCURRENCY;
+    else process.env.SCOUT_JEV_CONCURRENCY = previousConcurrency;
+    restore();
+    context.close();
+  }
+});
+
+test('runs fuzzy rescue checks with bounded concurrency', async () => {
+  const restore = liveJevEnv();
+  const previousConcurrency = process.env.SCOUT_JEV_CONCURRENCY;
+  process.env.SCOUT_JEV_CONCURRENCY = '4';
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const track = async () => {
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    inFlight -= 1;
+  };
+  const context = fixture({
+    classifyTermMatchWithJev: async () => { await track(); return { decision: 'pass' as const, confidence: 0.9, unsure: false }; },
+    classifyConditionMatchWithJev: async () => { await track(); return { decision: 'match' as const, confidence: 0.9, unsure: false }; },
+  });
+  try {
+    const now = new Date().toISOString();
+    const listings = Array.from({ length: 8 }, (_, index) => ({
+      marketplace: 'OLX', listingId: `pool-${index}`, title: `Ladowarki model ${index} Dell`, price: 100,
+      currency: 'PLN', url: `https://www.olx.pl/d/oferta/pool-${index}`, observedAt: now, condition: 'Nowe', location: 'Warszawa',
+      shippingAvailable: null, priceNegotiable: null,
+    }));
+    const candidates = findFuzzyRescueCandidates(listings as any, 'ladowarka', '', '', {});
+    const result = await (context.service as any).rescueFuzzyMisses(candidates, {
+      query: 'ladowarka', includedTerms: '', excludedTerms: '', condition: 'Any',
+    }, (context.service as any).jevLiveConfig());
+    assert.equal(result.rescued.length, 8);
+    assert.equal(result.rescuedByTerm, 8);
+    assert.equal(maxInFlight, 4);
+  } finally {
+    if (previousConcurrency === undefined) delete process.env.SCOUT_JEV_CONCURRENCY;
+    else process.env.SCOUT_JEV_CONCURRENCY = previousConcurrency;
+    restore();
+    context.close();
+  }
+});
+
 test('skips negotiability upgrade for Vinted listings', async () => {
   const restore = liveJevEnv();
   const now = new Date().toISOString();
@@ -2026,25 +2353,23 @@ test('passes the watch query into description verification', async () => {
   }
 });
 
-const iphoneGroups = [
-  { key: 'mini', name: '13 mini', terms: '13, mini', excluded: '' },
-  { key: 'base', name: '13', terms: '13', excluded: '' },
-  { key: 'pro', name: '13 Pro', terms: '13, pro', excluded: '' },
+const iphoneVariants = [
+  { id: 'mini', label: '13 mini', terms: '13, mini' },
+  { id: 'base', label: '13', terms: '13' },
+  { id: 'pro', label: '13 Pro', terms: '13, pro' },
 ];
 
 /**
- * An iPhone 13 watch with 8h of history: 12 listings each of mini (median
- * 1500), base (2000), and Pro (2600), plus a 50 zł case titled "iPhone 13".
- * Groups are stored but listings are not yet assigned.
+ * A watch with 8h of history: 12 listings each of iPhone 13 mini (median
+ * 1500), 13 (2000), and 13 Pro (2600). Variants are stored and retagged.
  */
-function seedGroupedWatch(db: any, watchId: string) {
-  seedWatch(db, watchId, { query: 'iphone 13' });
+function seedVariantWatch(db: any, service: ScoutService, watchId: string, query = 'iphone 13') {
+  seedWatch(db, watchId, { query });
   const firstObserved = new Date(Date.now() - 8 * 3_600_000).toISOString();
   const insertListing = db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
   const insertObservation = db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
   const shape = [0.95, 0.97, 0.98, 0.99, 1, 1, 1, 1, 1.01, 1.02, 1.03, 1.05];
-  const models = [['iPhone 13 mini', 1500], ['iPhone 13', 2000], ['iPhone 13 Pro', 2600]] as const;
-  for (const [title, center] of models) {
+  for (const [title, center] of [['iPhone 13 mini', 1500], ['iPhone 13', 2000], ['iPhone 13 Pro', 2600]] as const) {
     shape.forEach((ratio, index) => {
       const listingId = `${title}-${index}`.replace(/\s+/g, '-');
       insertListing.run('OLX', listingId, `${title} 128GB`, center * ratio, `https://www.olx.pl/d/oferta/${listingId}`, firstObserved, firstObserved);
@@ -2052,9 +2377,10 @@ function seedGroupedWatch(db: any, watchId: string) {
       insertObservation.run(stored.id, watchId, center * ratio, firstObserved);
     });
   }
-  insertListing.run('OLX', 'iphone-12', 'iPhone 13 case for iPhone 12', 50, 'https://www.olx.pl/d/oferta/iphone-12', firstObserved, firstObserved);
-  insertObservation.run((db.prepare("SELECT id FROM listings WHERE listing_id = 'iphone-12'").get() as { id: number }).id, watchId, 50, firstObserved);
-  db.prepare('UPDATE watches SET groups_json = ? WHERE id = ?').run(JSON.stringify(iphoneGroups), watchId);
+  db.prepare('UPDATE watches SET variant_groups_json = ? WHERE id = ?').run(JSON.stringify(iphoneVariants), watchId);
+  // Directly inserted observations predate the association link; point them at it.
+  db.prepare('UPDATE observations SET watch_listing_id = (SELECT wl.id FROM watch_listings wl WHERE wl.watch_id = observations.watch_id AND wl.listing_id = observations.listing_id) WHERE watch_id = ?').run(watchId);
+  service.retagWatchVariants(watchId);
 }
 
 function olxListings(listings: Array<{ id: string; title: string; price: number }>) {
@@ -2064,69 +2390,35 @@ function olxListings(listings: Array<{ id: string; title: string; price: number 
   })), metadata: { visible_total_count: listings.length } } });
 }
 
-test('scores grouped watches against their own model group and re-assigns stored history', async () => {
+test('named variants become ready at 10 own samples with the spread pooled across variants', async () => {
   const context = fixture();
   try {
-    seedGroupedWatch(context.db, 'grouped-watch');
-    const groups = iphoneGroups;
-    // The accessory title contains "13" and lands in the base group by rule;
-    // relevance filtering (not grouping) is what removes accessories.
-    assert.deepEqual(context.service.reassignWatchGroups('grouped-watch'), { assigned: 37, unassigned: 0 });
-    const counts = context.db.prepare("SELECT group_key, COUNT(*) AS count FROM watch_listings WHERE watch_id = 'grouped-watch' GROUP BY group_key ORDER BY group_key").all() as Array<{ group_key: string; count: number }>;
-    assert.deepEqual(counts.map((row) => [row.group_key, row.count]), [['base', 13], ['mini', 12], ['pro', 12]]);
-    assert.deepEqual(context.service.getWatches().find((watch) => watch.id === 'grouped-watch')?.groups, groups);
+    seedVariantWatch(context.db, context.service, 'pooled-watch');
+    const watch = context.service.getWatches().find((item) => item.id === 'pooled-watch')!;
+    assert.deepEqual(watch.variants.map((variant) => [variant.key, variant.samples, variant.targetSamples, variant.readiness]), [
+      ['mini', 12, 10, 100], ['base', 12, 10, 100], ['pro', 12, 10, 100],
+    ]);
 
     const captured: Array<{ listing: { listingId: string }; typical: number; discountPercent: number }> = [];
     (context.service as any).processDealCandidates = async (candidates: typeof captured) => { captured.push(...candidates); };
-    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
-      { id: 'cheap-pro', url: 'https://www.olx.pl/d/oferta/cheap-pro', title: 'iPhone 13 Pro 128GB', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 1950, currency: 'PLN', negotiable: false } }] },
-      { id: 'fair-mini', url: 'https://www.olx.pl/d/oferta/fair-mini', title: 'iPhone 13 mini 128GB', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 1500, currency: 'PLN', negotiable: false } }] },
-    ], metadata: { visible_total_count: 2 } } });
-    const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('grouped-watch');
-    await (context.service as any).runWatch(row);
-
-    const scored = context.db.prepare(`SELECT l.listing_id, wl.group_key, wl.typical_pln, wl.deal_label FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id
-      WHERE wl.watch_id = 'grouped-watch' AND l.listing_id IN ('cheap-pro', 'fair-mini') ORDER BY l.listing_id`).all() as Array<Record<string, unknown>>;
-    assert.deepEqual(scored.map((item) => ({ ...item })), [
-      { listing_id: 'cheap-pro', group_key: 'pro', typical_pln: 2600, deal_label: 'Very strong' },
-      { listing_id: 'fair-mini', group_key: 'mini', typical_pln: 1500, deal_label: 'Watch' },
-    ]);
-    assert.deepEqual(captured.map((candidate) => [candidate.listing.listingId, candidate.typical, Math.round(candidate.discountPercent)]), [['cheap-pro', 2600, 25]]);
-
-    // The watch reports readiness the way scoring counts it, per group.
-    const grouped = context.service.getWatches().find((watch) => watch.id === 'grouped-watch')!;
-    assert.equal(grouped.samples, 39);
-    assert.equal(grouped.status, 'Ready');
-    assert.equal(grouped.unassignedSamples, 0);
-    assert.deepEqual(grouped.groupStats, [
-      { key: 'mini', name: '13 mini', samples: 13, targetSamples: 10, typical: 1500, ready: true },
-      { key: 'base', name: '13', samples: 13, targetSamples: 10, typical: 2000, ready: true },
-      { key: 'pro', name: '13 Pro', samples: 13, targetSamples: 10, typical: 2600, ready: true },
-    ]);
-    const feedGroups = new Map(context.service.getListings().filter((listing) => listing.watchId === 'grouped-watch').map((listing) => [listing.listingId, listing.group]));
-    assert.equal(feedGroups.get('cheap-pro'), '13 Pro');
-    assert.equal(feedGroups.get('fair-mini'), '13 mini');
-    assert.equal(context.service.listingDetail('OLX:cheap-pro', 'grouped-watch').listing.group, '13 Pro');
-
-    // Removing the groups clears assignments and the per-group deal labels.
-    context.db.prepare("UPDATE watches SET groups_json = '[]' WHERE id = ?").run('grouped-watch');
-    assert.deepEqual(context.service.reassignWatchGroups('grouped-watch'), { assigned: 0, unassigned: 39 });
-    const cleared = context.db.prepare("SELECT COUNT(*) AS count FROM watch_listings WHERE watch_id = 'grouped-watch' AND (group_key IS NOT NULL OR typical_pln IS NOT NULL)").get() as { count: number };
-    assert.equal(cleared.count, 0);
-    const ungrouped = context.service.getWatches().find((watch) => watch.id === 'grouped-watch')!;
-    assert.equal(ungrouped.groupStats, undefined);
-    assert.equal(context.service.getListings().find((listing) => listing.listingId === 'cheap-pro')?.group, undefined, 'ungrouped watches carry no group field');
+    // 19% below the Pro median: a Strong deal that must clear the z-score on
+    // the pooled within-variant spread.
+    (context.service as any).fetchOlxApi = olxListings([{ id: 'strong-pro', title: 'iPhone 13 Pro 128GB', price: 2106 }]);
+    await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('pooled-watch'));
+    assert.deepEqual(captured.map((candidate) => [candidate.listing.listingId, candidate.typical, Math.round(candidate.discountPercent)]), [['strong-pro', 2600, 19]]);
+    const stored = context.db.prepare("SELECT wl.variant_key, wl.variant_source, wl.deal_label FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE l.listing_id = 'strong-pro'").get() as Record<string, unknown>;
+    assert.deepEqual({ ...stored }, { variant_key: 'pro', variant_source: 'rule', deal_label: 'Strong' });
   } finally { context.close(); }
 });
 
-test('asks Jev to place unmatched potential deals before the relevance pass, and reuses the pick', async () => {
+test('asks Jev to place Other listings that could be deals, before the relevance pass, and reuses the pick', async () => {
   const restore = liveJevEnv();
   const asked: string[] = [];
   const relevanceChecked: string[] = [];
   const context = fixture({
-    classifyWatchGroupWithJev: async (ctx: any) => {
+    classifyWatchVariantWithJev: async (ctx: any) => {
       asked.push(ctx.title);
-      return { groupKey: 'pro', decision: 'group', confidence: 0.9, unsure: false };
+      return { variantId: 'pro', decision: 'variant', confidence: 0.9, unsure: false };
     },
     classifyListingRelevanceWithJev: async (ctx: any) => {
       relevanceChecked.push(ctx.title);
@@ -2135,119 +2427,120 @@ test('asks Jev to place unmatched potential deals before the relevance pass, and
     classifyListingRelevanceWithVision: async () => { throw new Error('Vision must not be called'); },
   });
   try {
-    seedGroupedWatch(context.db, 'jev-group-watch');
-    context.service.reassignWatchGroups('jev-group-watch');
+    // A broad "iphone" query lets titles without "13" through the watch filter.
+    seedVariantWatch(context.db, context.service, 'jev-variant-watch', 'iphone');
     const captured: Array<{ listing: { listingId: string }; typical: number }> = [];
     (context.service as any).processDealCandidates = async (candidates: typeof captured) => { captured.push(...candidates); };
-    // "13Pro" defeats the whole-word rules; the 3300 zł listing cannot be a
-    // deal in any group, so it is never sent to Jev.
-    (context.service as any).fetchOlxApi = olxListings([
-      { id: 'glued-pro', title: 'iPhone 13Pro 128GB', price: 1950 },
-      { id: 'glued-max', title: 'iPhone 13ProMax 256GB', price: 3300 },
+    // "trzynastka" defeats the term rules; the 3300 zł listing cannot be a
+    // deal in any variant, so it is never sent to Jev.
+    const fetchSlang = olxListings([
+      { id: 'slang-pro', title: 'iPhone trzynastka Pro 128GB', price: 1950 },
+      { id: 'slang-max', title: 'iPhone trzynastka Pro Max 256GB', price: 3300 },
     ]);
-    const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('jev-group-watch');
-    await (context.service as any).runWatch(row);
+    let fetches = 0;
+    (context.service as any).fetchOlxApi = async () => { fetches += 1; return fetchSlang(); };
+    const row = () => context.db.prepare('SELECT * FROM watches WHERE id = ?').get('jev-variant-watch');
+    await (context.service as any).runWatch(row());
 
-    assert.deepEqual(asked, ['iPhone 13Pro 128GB']);
-    assert.deepEqual(relevanceChecked, ['iPhone 13Pro 128GB'], 'the Jev-placed deal still gets its relevance check');
-    const stored = (context.db.prepare(`SELECT l.listing_id, wl.group_key, wl.group_source, wl.typical_pln FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id
-      WHERE l.listing_id IN ('glued-pro', 'glued-max') ORDER BY l.listing_id`).all() as Array<Record<string, unknown>>).map((item) => ({ ...item }));
+    assert.deepEqual(asked, ['iPhone trzynastka Pro 128GB']);
+    assert.ok(relevanceChecked.includes('iPhone trzynastka Pro 128GB'), 'the Jev-placed deal still gets its relevance check');
+    const stored = (context.db.prepare(`SELECT l.listing_id, wl.variant_key, wl.variant_source, wl.typical_pln FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id
+      WHERE l.listing_id IN ('slang-pro', 'slang-max') ORDER BY l.listing_id`).all() as Array<Record<string, unknown>>).map((item) => ({ ...item }));
     assert.deepEqual(stored, [
-      { listing_id: 'glued-max', group_key: null, group_source: null, typical_pln: null },
-      { listing_id: 'glued-pro', group_key: 'pro', group_source: 'jev', typical_pln: 2600 },
+      { listing_id: 'slang-max', variant_key: '__other__', variant_source: 'rule', typical_pln: null },
+      { listing_id: 'slang-pro', variant_key: 'pro', variant_source: 'jev', typical_pln: 2600 },
     ]);
-    assert.deepEqual(captured.map((candidate) => [candidate.listing.listingId, candidate.typical]), [['glued-pro', 2600]]);
-    const logged = context.db.prepare("SELECT COUNT(*) AS count FROM jev_shadow_log WHERE task = 'group'").get() as { count: number };
-    assert.equal(logged.count, 1);
+    assert.deepEqual(captured.map((candidate) => [candidate.listing.listingId, candidate.typical]), [['slang-pro', 2600]]);
+    assert.equal((context.db.prepare("SELECT COUNT(*) AS count FROM jev_shadow_log WHERE task = 'variant'").get() as { count: number }).count, 1);
 
     // The stored pick is reused on the next scan without another Jev call.
-    await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('jev-group-watch'));
+    await (context.service as any).runWatch(row(), { forceAll: true });
+    assert.equal(fetches, 2, 'the second scan ran');
     assert.equal(asked.length, 1);
-    const kept = context.db.prepare("SELECT wl.group_key, wl.group_source FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE l.listing_id = 'glued-pro'").get() as Record<string, unknown>;
-    assert.deepEqual({ ...kept }, { group_key: 'pro', group_source: 'jev' });
+    const kept = context.db.prepare("SELECT wl.variant_key, wl.variant_source FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE l.listing_id = 'slang-pro'").get() as Record<string, unknown>;
+    assert.deepEqual({ ...kept }, { variant_key: 'pro', variant_source: 'jev' });
 
-    // Editing groups drops Jev picks (they were made against the old definitions).
-    context.service.reassignWatchGroups('jev-group-watch');
-    const dropped = context.db.prepare("SELECT wl.group_key, wl.group_source FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE l.listing_id = 'glued-pro'").get() as Record<string, unknown>;
-    assert.deepEqual({ ...dropped }, { group_key: null, group_source: null });
+    // Editing variants re-derives Jev picks (they were made against the old definitions).
+    context.service.retagWatchVariants('jev-variant-watch');
+    const dropped = context.db.prepare("SELECT wl.variant_key, wl.variant_source FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE l.listing_id = 'slang-pro'").get() as Record<string, unknown>;
+    assert.deepEqual({ ...dropped }, { variant_key: '__other__', variant_source: 'rule' });
   } finally {
     restore();
     context.close();
   }
 });
 
-test('keeps unsure or failed Jev group answers unscored, caching answers but retrying failures', async () => {
+test('keeps unsure or failed Jev variant answers in Other, caching answers but retrying failures', async () => {
   const restore = liveJevEnv();
   let calls = 0;
   const context = fixture({
-    classifyWatchGroupWithJev: async (ctx: any) => {
+    classifyWatchVariantWithJev: async (ctx: any) => {
       calls += 1;
       if (ctx.title.includes('broken')) throw new Error('provider down');
       return ctx.title.includes('maybe')
-        ? { groupKey: 'pro', decision: 'group', confidence: 0.5, unsure: true }
-        : { groupKey: null, decision: 'none', confidence: 0.9, unsure: false };
+        ? { variantId: 'pro', decision: 'variant', confidence: 0.5, unsure: true }
+        : { variantId: null, decision: 'none', confidence: 0.9, unsure: false };
     },
     classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.95, unsure: false }),
   });
   try {
-    seedGroupedWatch(context.db, 'unsure-group-watch');
-    context.service.reassignWatchGroups('unsure-group-watch');
+    seedVariantWatch(context.db, context.service, 'unsure-variant-watch', 'iphone');
     (context.service as any).processDealCandidates = async () => {};
     (context.service as any).fetchOlxApi = olxListings([
-      { id: 'maybe', title: 'iPhone 13Pro maybe', price: 1500 },
-      { id: 'other', title: 'iPhone 13XR other', price: 1500 },
-      { id: 'broken', title: 'iPhone 13Pro broken', price: 1500 },
+      { id: 'maybe', title: 'iPhone trzynastka maybe', price: 1500 },
+      { id: 'other', title: 'iPhone XR other', price: 1500 },
+      { id: 'broken', title: 'iPhone trzynastka broken', price: 1500 },
     ]);
-    const row = () => context.db.prepare('SELECT * FROM watches WHERE id = ?').get('unsure-group-watch');
+    const row = () => context.db.prepare('SELECT * FROM watches WHERE id = ?').get('unsure-variant-watch');
     await (context.service as any).runWatch(row());
     assert.equal(calls, 3);
-    const grouped = context.db.prepare("SELECT COUNT(*) AS count FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE l.listing_id IN ('maybe', 'other', 'broken') AND wl.group_key IS NOT NULL").get() as { count: number };
-    assert.equal(grouped.count, 0);
-    // Answers are cached (including the unsure one); only the failed call is retried.
-    await (context.service as any).runWatch(row());
-    assert.equal(calls, 4);
+    const placed = context.db.prepare("SELECT COUNT(*) AS count FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE l.listing_id IN ('maybe', 'other', 'broken') AND wl.variant_key <> '__other__'").get() as { count: number };
+    assert.equal(placed.count, 0);
+    await (context.service as any).runWatch(row(), { forceAll: true });
+    assert.equal(calls, 4, 'only the failed call is retried');
   } finally {
     restore();
     context.close();
   }
 });
 
-test('moves a listing to a group manually, re-scores it, and keeps the pick across scans and edits', async () => {
+test('moves a listing to a variant manually, re-scores it, and keeps the pick across scans and edits', async () => {
   const context = fixture();
   try {
-    seedGroupedWatch(context.db, 'manual-group-watch');
-    context.service.reassignWatchGroups('manual-group-watch');
+    seedVariantWatch(context.db, context.service, 'manual-variant-watch');
     const key = 'OLX:iPhone-13-0';
 
-    const moved = context.service.setListingGroup('manual-group-watch', key, 'pro');
-    assert.equal(moved.listing.group, '13 Pro');
-    assert.equal(moved.listing.groupSource, 'manual');
+    const moved = context.service.setListingVariant('manual-variant-watch', key, 'pro');
+    assert.deepEqual([moved.listing.variantKey, moved.listing.variantLabel, moved.listing.variantSource], ['pro', '13 Pro', 'manual']);
     assert.equal(moved.listing.typical, 2600);
     assert.equal(moved.listing.dealLabel, 'Very strong');
-    assert.deepEqual(moved.groups?.map((group) => group.key), ['mini', 'base', 'pro']);
+    assert.deepEqual(moved.variantGroups?.map((group) => group.id), ['mini', 'base', 'pro']);
 
-    // A scan that sees the listing again, and a groups edit, both keep the manual pick.
+    // A scan that sees the listing again, and a variant edit, both keep the manual pick.
     (context.service as any).processDealCandidates = async () => {};
-    (context.service as any).fetchOlxApi = olxListings([{ id: 'iPhone-13-0', title: 'iPhone 13 128GB', price: 1900 }]);
-    await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('manual-group-watch'));
-    context.service.reassignWatchGroups('manual-group-watch');
-    const afterScan = context.service.listingDetail(key, 'manual-group-watch').listing;
-    assert.deepEqual([afterScan.groupKey, afterScan.groupSource], ['pro', 'manual']);
+    const fetchSame = olxListings([{ id: 'iPhone-13-0', title: 'iPhone 13 128GB', price: 1900 }]);
+    let fetches = 0;
+    (context.service as any).fetchOlxApi = async () => { fetches += 1; return fetchSame(); };
+    await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('manual-variant-watch'), { forceAll: true });
+    assert.equal(fetches, 1, 'the scan ran');
+    context.service.retagWatchVariants('manual-variant-watch');
+    const afterScan = context.service.listingDetail(key, 'manual-variant-watch').listing;
+    assert.deepEqual([afterScan.variantKey, afterScan.variantSource], ['pro', 'manual']);
 
-    // Back to automatic: the rules put it in the base group again.
-    const automatic = context.service.setListingGroup('manual-group-watch', key, null);
-    assert.deepEqual([automatic.listing.groupKey, automatic.listing.groupSource, automatic.listing.typical], ['base', 'rule', 2000]);
+    // Back to automatic: the rules put it in the base variant again.
+    const automatic = context.service.setListingVariant('manual-variant-watch', key, null);
+    assert.deepEqual([automatic.listing.variantKey, automatic.listing.variantSource, automatic.listing.typical], ['base', 'rule', 2000]);
 
-    // A manual pick whose group is removed falls back to the rules.
-    context.service.setListingGroup('manual-group-watch', key, 'pro');
-    context.db.prepare('UPDATE watches SET groups_json = ? WHERE id = ?').run(JSON.stringify(iphoneGroups.filter((group) => group.key !== 'pro')), 'manual-group-watch');
-    context.service.reassignWatchGroups('manual-group-watch');
-    const removed = context.service.listingDetail(key, 'manual-group-watch').listing;
-    assert.deepEqual([removed.groupKey, removed.groupSource], ['base', 'rule']);
+    // A manual pick whose variant is removed falls back to the rules.
+    context.service.setListingVariant('manual-variant-watch', key, 'pro');
+    context.db.prepare('UPDATE watches SET variant_groups_json = ? WHERE id = ?').run(JSON.stringify(iphoneVariants.filter((group) => group.id !== 'pro')), 'manual-variant-watch');
+    context.service.retagWatchVariants('manual-variant-watch');
+    const removed = context.service.listingDetail(key, 'manual-variant-watch').listing;
+    assert.deepEqual([removed.variantKey, removed.variantSource], ['base', 'rule']);
 
-    assert.throws(() => context.service.setListingGroup('manual-group-watch', key, 'pro'), /Unknown group/);
-    assert.throws(() => context.service.setListingGroup('manual-group-watch', 'OLX:not-here', 'base'), /not part of this watch/);
+    assert.throws(() => context.service.setListingVariant('manual-variant-watch', key, 'pro'), /Unknown variant/);
+    assert.throws(() => context.service.setListingVariant('manual-variant-watch', 'OLX:not-here', 'base'), /not part of this watch/);
     seedWatch(context.db, 'plain-watch');
-    assert.throws(() => context.service.setListingGroup('plain-watch', key, 'base'), /no model groups/);
+    assert.throws(() => context.service.setListingVariant('plain-watch', key, 'base'), /no model variants/);
   } finally { context.close(); }
 });

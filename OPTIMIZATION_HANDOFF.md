@@ -1,6 +1,6 @@
 # Scout optimization handoff
 
-Performance review of the Scout codebase, completed 2026-09-01 against commit `e1d0113` (clean tree on `main`). Everything below was verified by reading the code and by running read-only queries against the live database at `data/scout.sqlite` — the numbers and query plans in this document are measured, not assumed. Read `NEXT_AGENT.md` first for posture and boundaries; this file only covers the optimization work.
+Performance review of the Scout codebase, completed 2026-09-01 against commit `e1d0113` (clean tree on `main`). Everything below was verified by reading the code and by running read-only queries against the live database at `data/scout.sqlite` — the numbers and query plans in this document are measured, not assumed. Read `CLAUDE.md` first for posture and boundaries; this file only covers the optimization work.
 
 ## Ground rules
 
@@ -8,7 +8,7 @@ Performance review of the Scout codebase, completed 2026-09-01 against commit `e
 - Do **not** restart the user's running Scout process or write to `data/scout.sqlite` — it belongs to a live deployment. For any experiment, copy the database or use a temp `SCOUT_DB_PATH`.
 - Never edit an existing file under `migrations/` — `openDatabase` (`server/db.ts:63-98`) records a SHA-256 checksum per file and refuses to start on mismatch. All schema work goes into a new `migrations/014_<name>.sql` (a `VACUUM INTO` backup is taken automatically before each migration).
 - Preserve fail-closed behavior in connectors. None of the work below should change what users see, except where a semantic change is explicitly called out in "Needs a product decision".
-- Verification before declaring done: `npm run typecheck`, `npm test`, `npm run build` (see `NEXT_AGENT.md`). Existing tests live in `tests/` and cover service behavior including triggers — keep them green.
+- Verification before declaring done: `npm run typecheck`, `npm test`, `npm run build` (see `CLAUDE.md`). Existing tests live in `tests/` and cover service behavior including triggers — keep them green.
 
 ## Verified baseline (2026-09-01)
 

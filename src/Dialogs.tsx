@@ -8,22 +8,21 @@ import {
   LoaderCircle,
   Plus,
   Send,
-  Trash2,
   X,
   Zap,
 } from "lucide-react";
 import { api } from "./api";
 import { marketplaceColors } from "./data";
 import type { WatchPreset } from "./presets";
-import type { Marketplace, MarketWatch, NotificationRecord, Watch, WatchGroup } from "./types";
+import type { Marketplace, MarketWatch, NotificationRecord, VariantGroup, Watch } from "./types";
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
 
-/** Editable group row; `rowId` keeps React identity stable while `key` (empty for new rows) is assigned by the server. */
-type GroupDraft = WatchGroup & { rowId: number };
-let nextGroupRowId = 0;
-const groupDraft = (group?: WatchGroup): GroupDraft => ({ key: group?.key ?? "", name: group?.name ?? "", terms: group?.terms ?? "", excluded: group?.excluded ?? "", rowId: nextGroupRowId++ });
+// crypto.randomUUID() needs a secure context, which a plain-HTTP LAN origin
+// is not; this id only has to be unique within one watch.
+const newVariantId = () =>
+  `variant-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
 export function WatchDialog({
   initialWatch = null,
@@ -43,6 +42,13 @@ export function WatchDialog({
   const [location, setLocation] = useState(initialWatch?.location?.trim() || preset?.location?.trim() || "Polska");
   const [condition, setCondition] = useState(initialWatch?.condition ?? preset?.condition ?? "Any");
   const [interval, setIntervalValue] = useState(String(initialWatch?.interval ?? 5));
+  const [sourceIntervals, setSourceIntervals] = useState<Record<string, string>>(() => {
+    const initial: Record<string, string> = {};
+    for (const [marketplace, minutes] of Object.entries(initialWatch?.sourceIntervals ?? {})) {
+      if (typeof minutes === "number" && Number.isFinite(minutes)) initial[marketplace] = String(minutes);
+    }
+    return initial;
+  });
   const [sensitivity, setSensitivity] = useState(String(initialWatch?.sensitivity ?? 1));
   const [exactUrls, setExactUrls] = useState(initialWatch?.exactUrls.join("\n") ?? "");
   const [sources, setSources] = useState<Marketplace[]>(initialWatch?.sources ?? preset?.sources ?? [
@@ -54,10 +60,10 @@ export function WatchDialog({
   const [maxPrice, setMaxPrice] = useState(initialWatch?.maxPrice === null || initialWatch?.maxPrice === undefined ? preset?.maxPrice === null || preset?.maxPrice === undefined ? "" : String(preset.maxPrice) : String(initialWatch.maxPrice));
   const [shippingOnly, setShippingOnly] = useState(initialWatch?.shippingOnly ?? preset?.shippingOnly ?? false);
   const [typoVariants, setTypoVariants] = useState(initialWatch?.typoVariants ?? false);
-  const [aiRelevance, setAiRelevance] = useState(initialWatch?.aiRelevance ?? true);
+  const [aiRelevance, setAiRelevance] = useState(initialWatch?.aiRelevance ?? preset?.aiRelevance ?? true);
+  const [variantGroups, setVariantGroups] = useState<VariantGroup[]>(initialWatch?.variantGroups ?? []);
   const [referenceOptions, setReferenceOptions] = useState<MarketWatch[]>([]);
   const [referenceMarketWatchId, setReferenceMarketWatchId] = useState(initialWatch?.referenceMarketWatchId ?? "");
-  const [groups, setGroups] = useState<GroupDraft[]>(() => (initialWatch?.groups ?? []).map(groupDraft));
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const numericInterval = Number(interval);
@@ -67,11 +73,11 @@ export function WatchDialog({
     (numericMin === null || numericMin >= 0) &&
     (numericMax === null || numericMax > 0) &&
     (numericMin === null || numericMax === null || numericMin <= numericMax);
-  // Fully blank rows are dropped on save; half-filled rows block it.
-  const filledGroups = groups.filter((group) => group.name.trim() || group.terms.trim() || group.excluded.trim());
-  const validGroups = filledGroups.every((group) => group.name.trim() && group.terms.trim());
-  const updateGroup = (rowId: number, patch: Partial<WatchGroup>) =>
-    setGroups((current) => current.map((group) => (group.rowId === rowId ? { ...group, ...patch } : group)));
+  const validSourceIntervals = Object.entries(sourceIntervals).every(([, raw]) => {
+    if (raw === "") return true;
+    const minutes = Number(raw);
+    return Number.isInteger(minutes) && minutes >= 5 && minutes <= 1440;
+  });
   const canSubmit = Boolean(
     name.trim() &&
       query.trim() &&
@@ -80,7 +86,7 @@ export function WatchDialog({
       numericInterval >= 5 &&
       numericInterval <= 1440 &&
       validPrices &&
-      validGroups,
+      validSourceIntervals,
   );
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -102,6 +108,14 @@ export function WatchDialog({
     setError(null);
     const rawSensitivity = Number(sensitivity);
     const safeSensitivity = Number.isFinite(rawSensitivity) && rawSensitivity >= 0.6 && rawSensitivity <= 1.6 ? rawSensitivity : 1;
+    const parsedSourceIntervals: Partial<Record<Marketplace, number>> = {};
+    for (const [source, raw] of Object.entries(sourceIntervals)) {
+      if (raw === "") continue;
+      const minutes = Number(raw);
+      if (!Number.isInteger(minutes) || minutes < 5 || minutes > 1440) continue;
+      if (!sources.includes(source as Marketplace)) continue;
+      parsedSourceIntervals[source as Marketplace] = minutes;
+    }
     try {
       await onSubmit({
         ...(initialWatch?.id ? { id: initialWatch.id } : {}),
@@ -118,6 +132,7 @@ export function WatchDialog({
         readiness: initialWatch?.readiness ?? 0,
         status: initialWatch?.status ?? "Learning",
         interval: numericInterval,
+        sourceIntervals: parsedSourceIntervals,
         nextScan: "due now",
         enabled: initialWatch?.enabled ?? true,
         exactUrls: exactUrls
@@ -128,10 +143,12 @@ export function WatchDialog({
         shippingOnly,
         typoVariants,
         aiRelevance,
+        variantGroups: cleanVariantGroups,
+        variants: initialWatch?.variants ?? [],
+        dealCounts: initialWatch?.dealCounts ?? { exceptional: 0, veryStrong: 0, strong: 0 },
         referenceMarketWatchId: referenceMarketWatchId.trim() ? referenceMarketWatchId.trim() : null,
         minPrice: numericMin,
         maxPrice: numericMax,
-        groups: filledGroups.map((group) => ({ key: group.key, name: group.name.trim(), terms: group.terms.trim(), excluded: group.excluded.trim() })),
       });
     } catch (submitError) {
       setError(errorMessage(submitError));
@@ -144,6 +161,23 @@ export function WatchDialog({
         ? current.filter((item) => item !== source)
         : [...current, source],
     );
+  const setSourceInterval = (source: Marketplace, value: string) =>
+    setSourceIntervals((current) => ({ ...current, [source]: value }));
+  const addVariant = () =>
+    setVariantGroups((current) =>
+      current.length >= 12
+        ? current
+        : [...current, { id: newVariantId(), label: "", terms: "" }],
+    );
+  const updateVariant = (index: number, patch: Partial<VariantGroup>) =>
+    setVariantGroups((current) =>
+      current.map((group, position) => (position === index ? { ...group, ...patch } : group)),
+    );
+  const removeVariant = (index: number) =>
+    setVariantGroups((current) => current.filter((_, position) => position !== index));
+  const cleanVariantGroups = variantGroups
+    .map((group) => ({ ...group, label: group.label.trim(), terms: group.terms.trim() }))
+    .filter((group) => group.label && group.terms);
   return (
     <div
       className="modal-backdrop"
@@ -246,7 +280,7 @@ export function WatchDialog({
           </div>
           <div className="field-row">
             <label className="field-label">
-              Polling interval <span>5–1440 min</span>
+              Default polling interval <span>5–1440 min</span>
               <input
                 type="number"
                 min="5"
@@ -286,6 +320,32 @@ export function WatchDialog({
                 ),
               )}
             </div>
+            {sources.length ? (
+              <div className="source-intervals">
+                <small className="source-intervals-hint">
+                  Optional per-marketplace check interval. Leave blank to follow the default.
+                </small>
+                {sources.map((source) => (
+                  <label className="source-interval-row" key={source}>
+                    <span className="source-interval-name">
+                      <i style={{ background: marketplaceColors[source] }} />
+                      {source}
+                    </span>
+                    <input
+                      type="number"
+                      min="5"
+                      max="1440"
+                      inputMode="numeric"
+                      aria-label={`${source} polling interval in minutes`}
+                      placeholder={`Default · ${interval || 5}`}
+                      value={sourceIntervals[source] ?? ""}
+                      onChange={(event) => setSourceInterval(source, event.target.value)}
+                    />
+                    <em>min</em>
+                  </label>
+                ))}
+              </div>
+            ) : null}
           </div>
           <label className="check-option check-option--modal">
             <input type="checkbox" checked={shippingOnly} onChange={(event) => setShippingOnly(event.target.checked)} />
@@ -299,6 +359,40 @@ export function WatchDialog({
             <input type="checkbox" checked={aiRelevance} onChange={(event) => setAiRelevance(event.target.checked)} />
             <span><strong>Use AI relevance filtering</strong><small>Exclude accessories, replacement parts, services, and unrelated listings when OpenRouter is configured</small></span>
           </label>
+          <div className="field-label">
+            <span>Model variants <span>optional · split a broad search by model</span></span>
+            <div className="variant-editor">
+              {variantGroups.map((group, index) => (
+                <div className="variant-row" key={group.id}>
+                  <input
+                    value={group.label}
+                    onChange={(event) => updateVariant(index, { label: event.target.value })}
+                    placeholder="Label, e.g. 1660 Super"
+                  />
+                  <input
+                    value={group.terms}
+                    onChange={(event) => updateVariant(index, { terms: event.target.value })}
+                    placeholder="Match terms, e.g. 1660 super"
+                  />
+                  <button
+                    type="button"
+                    className="icon-button"
+                    onClick={() => removeVariant(index)}
+                    aria-label={`Remove ${group.label || "variant"}`}
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+              ))}
+              <button type="button" className="ghost-button" disabled={variantGroups.length >= 12} onClick={addVariant}>
+                <Plus size={15} />
+                Add variant
+              </button>
+              <small className="field-hint">
+                The most specific match wins, so “1660 super” and “1660 ti” take precedence over “1660”. Listings that match no group share an “Other” baseline. Each variant learns its own typical price and alerts separately.
+              </small>
+            </div>
+          </div>
           <label className="field-label">
             Fallback baseline <span>optional · research series</span>
             <select value={referenceMarketWatchId} onChange={(event) => setReferenceMarketWatchId(event.target.value)}>
@@ -314,38 +408,6 @@ export function WatchDialog({
               </span>
             </div>
           ) : null}
-          <div className="field-label">
-            <span>Model groups <span>optional · score each model separately</span></span>
-            {groups.length ? (
-              <div className="group-editor">
-                <div className="group-editor-row group-editor-row--head" aria-hidden="true">
-                  <span>Name</span><span>Terms</span><span>Excluded</span><span />
-                </div>
-                {groups.map((group, index) => (
-                  <div className="group-editor-row" key={group.rowId}>
-                    <input aria-label={`Group ${index + 1} name`} value={group.name} onChange={(event) => updateGroup(group.rowId, { name: event.target.value })} placeholder="13 Pro" />
-                    <input aria-label={`Group ${index + 1} terms`} value={group.terms} onChange={(event) => updateGroup(group.rowId, { terms: event.target.value })} placeholder="13, pro" />
-                    <input aria-label={`Group ${index + 1} excluded terms`} value={group.excluded} onChange={(event) => updateGroup(group.rowId, { excluded: event.target.value })} placeholder="optional" />
-                    <button type="button" className="icon-button" onClick={() => setGroups((current) => current.filter((item) => item.rowId !== group.rowId))} aria-label={`Remove group ${group.name || index + 1}`}>
-                      <Trash2 size={15} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            ) : null}
-            <button type="button" className="outline-button group-editor-add" disabled={groups.length >= 20} onClick={() => setGroups((current) => [...current, groupDraft()])}>
-              <Plus size={15} />Add group
-            </button>
-          </div>
-          {groups.length ? (
-            <div className="modal-note">
-              <Info size={16} />
-              <span>
-                Each listing is scored only against its own group, so a cheap 13 mini never looks like a cheap 13 Pro. Terms are comma-separated whole words that must all appear in the title; use | for alternatives (pro max|promax). The most specific match wins, so a base group needs no exclusions. Listings matching no group are kept but not scored. Groups need 10 listings each and 30 across the watch before alerting.
-              </span>
-            </div>
-          ) : null}
-          {!validGroups ? <div className="form-error" role="alert"><AlertTriangle size={15} />Every group needs a name and at least one term.</div> : null}
           <label className="field-label">
             Exact search URLs <span>optional · one per line</span>
             <textarea
@@ -364,6 +426,7 @@ export function WatchDialog({
             </div>
           ) : null}
           {!validPrices ? <div className="form-error" role="alert"><AlertTriangle size={15} />Minimum price cannot exceed maximum price.</div> : null}
+          {!validSourceIntervals ? <div className="form-error" role="alert"><AlertTriangle size={15} />Per-marketplace intervals must be whole minutes between 5 and 1440.</div> : null}
           <div className="modal-note">
             <Zap size={16} />
             <span>

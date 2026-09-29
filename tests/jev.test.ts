@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULT_JEV_MODEL, FUZZY_MATCH_MIN_CONFIDENCE, JEV_DECISIONS_URL, NEGOTIABILITY_MIN_CONFIDENCE, RELEVANCE_UNSURE_HIGH, RELEVANCE_UNSURE_LOW, VERIFICATION_MIN_CONFIDENCE, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchGroupWithJev, isFuzzyMatchUnsure, isNegotiabilityUnsure, isRelevanceUnsure, isVerificationUnsure, resolveJevModel, verifyListingDescriptionWithJev } from '../server/jev';
+import { DEFAULT_JEV_MODEL, FUZZY_MATCH_MIN_CONFIDENCE, JEV_DECISIONS_URL, NEGOTIABILITY_MIN_CONFIDENCE, RELEVANCE_UNSURE_HIGH, RELEVANCE_UNSURE_LOW, VERIFICATION_MIN_CONFIDENCE, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchVariantWithJev, isFuzzyMatchUnsure, isNegotiabilityUnsure, isRelevanceUnsure, isVerificationUnsure, resolveJevModel, verifyListingDescriptionWithJev } from '../server/jev';
 import { DEFAULT_VISION_MODEL, VISION_MAX_IMAGES, classifyListingRelevanceWithVision, resolveVisionModel, verifyListingDescriptionWithVision } from '../server/vision';
 
 const relevanceContext = {
@@ -372,26 +372,26 @@ test('tolerates provider schema drift in vision verification', async () => {
   assert.equal(badConf.confidence, 0.5);
 });
 
-test('maps positional group choices back to the watch group keys', async () => {
-  const groups = [
-    { key: '13-mini', name: '13 mini', terms: '13, mini' },
-    { key: '13-pro', name: '13 Pro', terms: '13 pro' },
+test('maps positional variant choices back to the watch variant ids', async () => {
+  const variants = [
+    { id: '13-mini', label: '13 mini', terms: '13, mini' },
+    { id: '13-pro', label: '13 Pro', terms: '13 pro' },
   ];
   let sentBody: Record<string, any> = {};
-  const run = (answer: unknown) => classifyWatchGroupWithJev(
-    { query: 'iphone 13', title: 'iPhone trzynastka Pro 128', condition: 'Używane', groups },
+  const run = (answer: unknown) => classifyWatchVariantWithJev(
+    { query: 'iphone 13', title: 'iPhone trzynastka Pro 128', condition: 'Używane', variants },
     { apiKey: 'sk-or-v1-test' },
     (_input, init) => {
       sentBody = JSON.parse(String((init as RequestInit)?.body)) as Record<string, any>;
-      return Promise.resolve(Response.json({ model: 'm', answers: { group: answer } }));
+      return Promise.resolve(Response.json({ model: 'm', answers: { variant: answer } }));
     },
   );
 
-  assert.deepEqual(await run({ type: 'choice', choice: 'g2', confidence: 0.9 }), { groupKey: '13-pro', decision: 'group', confidence: 0.9, unsure: false });
-  assert.equal(sentBody.session_id, 'scout:jev-group:v1');
-  assert.deepEqual(Object.keys(sentBody.questions.group.criteria), ['g1', 'g2', 'none', 'unknown']);
-  assert.deepEqual(sentBody.state.groups, [{ id: 'g1', name: '13 mini', terms: '13, mini' }, { id: 'g2', name: '13 Pro', terms: '13 pro' }]);
-  assert.deepEqual(await run({ type: 'choice', choice: 'G1', confidence: 0.6 }), { groupKey: '13-mini', decision: 'group', confidence: 0.6, unsure: true }, 'low confidence stays unsure');
-  assert.deepEqual(await run({ type: 'choice', choice: 'none', confidence: 0.95 }), { groupKey: null, decision: 'none', confidence: 0.95, unsure: false });
-  assert.deepEqual(await run({ type: 'choice', choice: 'g9', confidence: 0.95 }), { groupKey: null, decision: 'unknown', confidence: 0.95, unsure: true }, 'unknown ids never assign');
+  assert.deepEqual(await run({ type: 'choice', choice: 'v2', confidence: 0.9 }), { variantId: '13-pro', decision: 'variant', confidence: 0.9, unsure: false });
+  assert.equal(sentBody.session_id, 'scout:jev-variant:v1');
+  assert.deepEqual(Object.keys(sentBody.questions.variant.criteria), ['v1', 'v2', 'none', 'unknown']);
+  assert.deepEqual(sentBody.state.variants, [{ id: 'v1', label: '13 mini', terms: '13, mini' }, { id: 'v2', label: '13 Pro', terms: '13 pro' }]);
+  assert.deepEqual(await run({ type: 'choice', choice: 'V1', confidence: 0.6 }), { variantId: '13-mini', decision: 'variant', confidence: 0.6, unsure: true }, 'low confidence stays unsure');
+  assert.deepEqual(await run({ type: 'choice', choice: 'none', confidence: 0.95 }), { variantId: null, decision: 'none', confidence: 0.95, unsure: false });
+  assert.deepEqual(await run({ type: 'choice', choice: 'v9', confidence: 0.95 }), { variantId: null, decision: 'unknown', confidence: 0.95, unsure: true }, 'unknown ids never assign');
 });

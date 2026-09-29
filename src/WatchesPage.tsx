@@ -26,7 +26,15 @@ import {
 import { api } from "./api";
 import { marketplaceColors } from "./data";
 import { AnalyticsTrendChart, formatAnalyticsDate, formatAnalyticsPrice } from "./AnalyticsTrendChart";
-import type { Watch, WatchAnalytics } from "./types";
+import type { Marketplace, Watch, WatchAnalytics } from "./types";
+
+const intervalLabel = (watch: Watch): string => {
+  const overrides = watch.sourceIntervals;
+  if (!overrides || !Object.keys(overrides).length) return `every ${watch.interval} min`;
+  return watch.sources
+    .map((source) => `${source} ${overrides[source] ?? watch.interval}m`)
+    .join(" · ");
+};
 
 const formatPln = (value: number | null) =>
   value === null ? "Learning" : `${value.toLocaleString("pl-PL")} zł`;
@@ -220,7 +228,7 @@ function WatchRow({
           <div className="watch-tags">
             <span>include: {watch.terms || "query terms"}</span>
             <span>exclude: {watch.excluded || "none"}</span>
-            <span>every {watch.interval} min</span>
+            <span>{intervalLabel(watch)}</span>
             {watch.minPrice !== null || watch.maxPrice !== null ? (
               <span>
                 price:{" "}
@@ -234,7 +242,6 @@ function WatchRow({
                 zł
               </span>
             ) : null}
-            {watch.groups.length ? <span>{watch.groups.length} model group{watch.groups.length === 1 ? "" : "s"}</span> : null}
             {watch.shippingOnly ? <span>shipping only</span> : null}
             {watch.aiRelevance ? <span>AI relevance</span> : null}
             {watch.exactUrls.length ? (
@@ -244,11 +251,28 @@ function WatchRow({
               </span>
             ) : null}
           </div>
+          <div className="watch-deals" role="group" aria-label={`Strong findings for ${watch.name}`}>
+            <span className="deal-count deal-count--exceptional" title="Exceptional findings — 30%+ below baseline">
+              <i aria-hidden="true" />
+              <strong>{watch.dealCounts.exceptional}</strong>
+              Exceptional
+            </span>
+            <span className="deal-count deal-count--very-strong" title="Very strong findings — 20%+ below baseline">
+              <i aria-hidden="true" />
+              <strong>{watch.dealCounts.veryStrong}</strong>
+              Very strong
+            </span>
+            <span className="deal-count deal-count--strong" title="Strong findings — 12%+ below baseline">
+              <i aria-hidden="true" />
+              <strong>{watch.dealCounts.strong}</strong>
+              Strong
+            </span>
+          </div>
         </div>
       </div>
       <div className="watch-progress">
         <div>
-          <span>{watch.groupStats ? "Pooled baseline" : "Learning baseline"}</span>
+          <span>Learning baseline</span>
           <strong>
             {watch.samples} / {watch.targetSamples} samples
           </strong>
@@ -258,9 +282,25 @@ function WatchRow({
         </b>
         <small>
           {watch.observationHours}h observed · {Number.isFinite(watch.readiness) ? Math.min(100, Math.max(0, watch.readiness)) : 0}% ready
-          {watch.unassignedSamples ? ` · ${watch.unassignedSamples} unmatched` : ""}
         </small>
       </div>
+      {watch.variants?.length ? (
+        <div className="watch-variants" aria-label="Model variants">
+          {watch.variants.map((variant) => {
+            const ready = variant.readiness >= 100;
+            return (
+              <span
+                key={variant.key}
+                className={`variant-chip ${ready ? "variant-chip--ready" : "variant-chip--learning"}`}
+                title={`${variant.samples} / ${variant.targetSamples} samples · ${variant.observationHours}h observed`}
+              >
+                <strong>{variant.label}</strong>
+                <small>{ready ? formatPln(variant.typical) : `${variant.samples}/${variant.targetSamples} samples`}</small>
+              </span>
+            );
+          })}
+        </div>
+      ) : null}
       <div className="watch-actions">
         <span className="next-scan">
           <Clock3 size={15} />
@@ -394,21 +434,6 @@ function WatchRow({
           ) : null}
         </div>
       </div>
-      {watch.groupStats?.length ? (
-        <ul className="watch-groups" aria-label={`Model groups for ${watch.name}`}>
-          {watch.groupStats.map((group) => (
-            <li
-              key={group.key}
-              className={group.ready ? "watch-group watch-group--ready" : "watch-group"}
-              title={group.ready ? "Scored and able to alert" : `Learning: needs ${group.targetSamples} listings in this group and ${watch.targetSamples} across the watch`}
-            >
-              <strong>{group.name}</strong>
-              <span>{group.samples < group.targetSamples ? `${group.samples}/${group.targetSamples}` : `${group.samples} listings`}</span>
-              {group.typical !== null ? <span>{formatPln(Math.round(group.typical))}</span> : null}
-            </li>
-          ))}
-        </ul>
-      ) : null}
     </article>
   );
 }

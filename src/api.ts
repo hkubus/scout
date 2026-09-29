@@ -66,13 +66,16 @@ const json = (method: string, body?: unknown): RequestInit => body === undefined
 
 export const api = {
   dashboard: (signal?: AbortSignal) => request<DashboardData>('/api/dashboard', { signal }),
-  listings: (options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string } = {}, signal?: AbortSignal) => {
+  listings: (options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string; sort?: 'newest' | 'strongest' | 'price'; decision?: ListingDecision; visibility?: 'visible' | 'hidden' | 'all' } = {}, signal?: AbortSignal) => {
     const params = new URLSearchParams();
     if (options.page !== undefined) params.set('page', String(options.page));
     if (options.pageSize !== undefined) params.set('pageSize', String(options.pageSize));
     if (options.marketplace) params.set('marketplace', options.marketplace);
     if (options.q) params.set('q', options.q);
     if (options.watchId) params.set('watchId', options.watchId);
+    if (options.sort) params.set('sort', options.sort);
+    if (options.decision) params.set('decision', options.decision);
+    if (options.visibility) params.set('visibility', options.visibility);
     return request<{ listings: DashboardData['listings']; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/listings${params.toString() ? `?${params}` : ''}`, { signal });
   },
   watches: (includeArchived = false, signal?: AbortSignal) => request<{ watches: Watch[] }>(`/api/watches?includeArchived=${includeArchived ? 'true' : 'false'}`, { signal }),
@@ -85,8 +88,8 @@ export const api = {
     return request<AnalyticsData>(`/api/analytics?${params}`, { signal });
   },
   createWatch: (watch: Omit<Watch, 'id'> & { id?: string }) => request<{ watch: Watch }>('/api/watches', json('POST', watch)),
-  updateWatch: (id: string, patch: Partial<Pick<Watch, 'name' | 'query' | 'terms' | 'excluded' | 'sources' | 'location' | 'condition' | 'interval' | 'exactUrls' | 'sensitivity' | 'shippingOnly' | 'aiRelevance' | 'typoVariants' | 'referenceMarketWatchId' | 'minPrice' | 'maxPrice' | 'enabled' | 'groups'>> & { archived?: boolean }) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
-  search: (filters: SearchFilters, signal?: AbortSignal) => request<ManualSearchResponse>('/api/search', { ...json('POST', filters), signal }, 60_000),
+  updateWatch: (id: string, patch: Partial<Pick<Watch, 'name' | 'query' | 'terms' | 'excluded' | 'sources' | 'location' | 'condition' | 'interval' | 'sourceIntervals' | 'exactUrls' | 'sensitivity' | 'shippingOnly' | 'aiRelevance' | 'typoVariants' | 'variantGroups' | 'referenceMarketWatchId' | 'minPrice' | 'maxPrice' | 'enabled'>> & { archived?: boolean }) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
+  search: (filters: SearchFilters, signal?: AbortSignal) => request<ManualSearchResponse>('/api/search', { ...json('POST', filters), signal }, 90_000),
   marketResearch: (options: { page?: number; pageSize?: number; watchId?: string; status?: 'active' | 'ended' | 'superseded' } = {}, signal?: AbortSignal) => {
     const params = new URLSearchParams();
     if (options.page !== undefined) params.set('page', String(options.page));
@@ -109,7 +112,7 @@ export const api = {
   listingDetail: (key: string, watchId?: string | null) => request<ListingDetail>(`/api/listing-detail?key=${encodeURIComponent(key)}${watchId ? `&watchId=${encodeURIComponent(watchId)}` : ''}`),
   compareVerification: (key: string) => request<VerificationComparison>('/api/ai/compare-verification', json('POST', { key }), 60_000),
   listingAction: (key: string) => request<ListingAction>(`/api/listing-actions?key=${encodeURIComponent(key)}`),
-  setListingGroup: (key: string, watchId: string, groupKey: string | null) => request<ListingDetail>('/api/listing-group', json('PUT', { key, watchId, groupKey })),
+  setListingVariant: (key: string, watchId: string, variantId: string | null) => request<ListingDetail>('/api/listing-variant', json('PUT', { key, watchId, variantId })),
   updateListingAction: (key: string, action: { decision: ListingDecision | null; note: string; hidden?: boolean }) => request<{ action: ListingAction }>('/api/listing-actions', json('PATCH', { key, ...action })),
   scan: (watchId?: string) => request<{ queued: boolean; message: string }>('/api/scans', json('POST', watchId ? { watchId } : {})),
   settings: () => request<SettingsData>('/api/settings'),

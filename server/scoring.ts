@@ -10,13 +10,13 @@ export interface ScoreResult {
 
 export const BASELINE_MIN_SAMPLES = 30;
 export const BASELINE_MIN_HOURS = 6;
-/** A group's own median needs this many samples; its spread and the 30-sample floor are pooled across groups. */
-export const GROUP_MIN_SAMPLES = 10;
+/** A model variant's own median needs this many samples; its spread and the 30-sample floor are pooled across variants. */
+export const VARIANT_MIN_SAMPLES = 10;
 
 export interface PooledSpread {
-  /** Median absolute deviation of price / group-median ratios, or null before any group has enough samples. */
+  /** Median absolute deviation of price / variant-median ratios, or null before any variant has enough samples. */
   spreadRatio: number | null;
-  /** Samples from groups that reached GROUP_MIN_SAMPLES. */
+  /** Samples from variants that reached VARIANT_MIN_SAMPLES. */
   samples: number;
 }
 
@@ -28,16 +28,16 @@ export function median(values: number[]) {
 }
 
 /**
- * Within-group price noise measured across the whole watch: each price is
- * expressed as a ratio to its own group's median and the ratios are pooled.
- * Groups below GROUP_MIN_SAMPLES are left out because a small group's MAD
+ * Within-variant price noise measured across the whole watch: each price is
+ * expressed as a ratio to its own variant's median and the ratios are pooled.
+ * Variants below VARIANT_MIN_SAMPLES are left out because a small bucket's MAD
  * understates its spread (its median element contributes a zero deviation).
  */
-export function pooledGroupSpread(groups: Iterable<number[]>): PooledSpread {
+export function pooledVariantSpread(buckets: Iterable<number[]>): PooledSpread {
   const deviations: number[] = [];
-  for (const prices of groups) {
+  for (const prices of buckets) {
     const usable = prices.filter((value) => Number.isFinite(value) && value > 0);
-    if (usable.length < GROUP_MIN_SAMPLES) continue;
+    if (usable.length < VARIANT_MIN_SAMPLES) continue;
     const typical = median(usable)!;
     for (const value of usable) deviations.push(Math.abs(value / typical - 1));
   }
@@ -45,11 +45,11 @@ export function pooledGroupSpread(groups: Iterable<number[]>): PooledSpread {
 }
 
 export function scoreDeal(prices: number[], price: number, options: { minSamples?: number; minHours?: number; observedHours?: number; sensitivity?: number; typicalOverride?: number; pooled?: PooledSpread } = {}): ScoreResult {
-  // Grouped watches pass their group's prices plus the pooled spread: the
-  // typical comes from the group, while the MAD and the 30-sample readiness
-  // floor come from all groups together.
+  // Named model variants pass their bucket's prices plus the pooled spread:
+  // the typical comes from the variant, while the MAD and the 30-sample
+  // readiness floor come from all named variants together.
   const pooled = options.pooled;
-  const minSamples = options.minSamples ?? (pooled ? GROUP_MIN_SAMPLES : BASELINE_MIN_SAMPLES);
+  const minSamples = options.minSamples ?? (pooled ? VARIANT_MIN_SAMPLES : BASELINE_MIN_SAMPLES);
   const minHours = options.minHours ?? BASELINE_MIN_HOURS;
   const usablePrices = prices.filter((value) => Number.isFinite(value) && value > 0);
   // A typicalOverride (e.g. a reference series' probable-sale median) seeds the
@@ -71,7 +71,14 @@ export function scoreDeal(prices: number[], price: number, options: { minSamples
   const rawSensitivity = options.sensitivity ?? 1;
   const sensitivity = Number.isFinite(rawSensitivity) && rawSensitivity >= 0.6 && rawSensitivity <= 1.6 ? rawSensitivity : 1;
   const isReady = usablePrices.length >= minSamples && (!pooled || pooled.samples >= BASELINE_MIN_SAMPLES) && (options.observedHours ?? 0) >= minHours;
-  const qualifies = isReady && deviation >= 3.1 / sensitivity && discountPercent >= 18;
+  // A "Very strong" discount (the same >= 20% tier the feed labels) alerts even
+  // when the watch's price spread is too wide to clear the robust z-score. A
+  // heterogeneous watch can otherwise hold every genuine discount forever:
+  // MAD/robustScale grows with the spread, so a 20-40% discount can sit below
+  // the 3.1 deviation bar. Strong (18-20%) still has to clear it, and the
+  // readiness floor plus the high-priority description verification still apply.
+  const veryStrong = discountPercent >= 20;
+  const qualifies = isReady && discountPercent >= 18 && (veryStrong || deviation >= 3.1 / sensitivity);
   return { typical, mad, deviation, discountPercent, confidence, isReady, qualifies };
 }
 

@@ -170,17 +170,17 @@ export default function ListingDetailDrawer({
     }
   };
 
-  const changeGroup = async (groupKey: string | null) => {
+  const changeVariant = async (variantId: string | null) => {
     if (!currentListing.watchId) return;
     setSaving(true);
     setError(null);
     try {
-      const result = await api.setListingGroup(marketplaceListingKey, currentListing.watchId, groupKey);
+      const result = await api.setListingVariant(marketplaceListingKey, currentListing.watchId, variantId);
       setDetail(result);
       if (result.listing.typical !== null) setResalePrice(String(result.listing.typical));
       onUpdated(result.listing);
-    } catch (groupError) {
-      setError(errorMessage(groupError));
+    } catch (variantError) {
+      setError(errorMessage(variantError));
     } finally {
       setSaving(false);
     }
@@ -213,7 +213,7 @@ export default function ListingDetailDrawer({
       <aside className="listing-drawer" role="dialog" aria-modal="true" aria-labelledby="listing-detail-title">
         <div className="listing-drawer-header">
           <div>
-            <span className="drawer-kicker">{currentListing.marketplace} · {currentListing.watch}{currentListing.group ? ` · ${currentListing.group}` : currentListing.group === null ? " · no model group" : ""}</span>
+            <span className="drawer-kicker">{currentListing.marketplace} · {currentListing.watch}</span>
             <h2 id="listing-detail-title">{currentListing.title}</h2>
           </div>
           <button className="icon-button" onClick={onClose} aria-label="Close listing details">
@@ -227,35 +227,36 @@ export default function ListingDetailDrawer({
             </div>
             <div className="drawer-hero-copy">
               <strong className="drawer-price">{formatPln(currentListing.price)}</strong>
-              <span>{currentListing.typical === null ? currentListing.group === null ? "Matches no model group — not scored" : "Baseline is still learning" : `${Math.abs(currentListing.belowTypical ?? 0).toFixed(1)}% below typical`}{currentListing.typicalSource === "reference-band" ? " · series baseline" : ""}</span>
+              <span>{currentListing.typical === null ? "Baseline is still learning" : `${Math.abs(currentListing.belowTypical ?? 0).toFixed(1)}% below typical`}{currentListing.typicalSource === "reference-band" ? " · series baseline" : ""}</span>
               <small>{currentListing.condition || "Condition not specified"}{currentListing.location ? ` · ${currentListing.location}` : ""}</small>
+              {currentListing.variantLabel ? <em className="decision-chip decision-chip--variant" title="Model variant this listing is scored against, not the watch-wide blend">{currentListing.variantLabel}</em> : null}
             </div>
           </div>
 
-          {detail.groups?.length && currentListing.watchId ? <section className="drawer-section">
+          {detail.variantGroups?.length && currentListing.watchId ? <section className="drawer-section">
             <div className="drawer-section-heading">
-              <div><span className="drawer-section-kicker">Scored within</span><h3>Model group</h3></div>
+              <div><span className="drawer-section-kicker">Scored within</span><h3>Model variant</h3></div>
               <Layers size={17} />
             </div>
             <label className="field-label">
-              Group
+              Variant
               <select
-                value={currentListing.groupSource === "manual" ? currentListing.groupKey ?? "" : ""}
+                value={currentListing.variantSource === "manual" ? currentListing.variantKey ?? "" : ""}
                 disabled={saving}
-                onChange={(event) => void changeGroup(event.target.value || null)}
+                onChange={(event) => void changeVariant(event.target.value || null)}
               >
-                <option value="">Automatic{currentListing.groupSource !== "manual" ? ` — ${currentListing.group ?? "no match"}` : ""}</option>
-                {detail.groups.map((group) => <option key={group.key} value={group.key}>{group.name}</option>)}
+                <option value="">Automatic{currentListing.variantSource !== "manual" ? ` — ${currentListing.variantLabel ?? "Other / unclassified"}` : ""}</option>
+                {detail.variantGroups.map((group) => <option key={group.id} value={group.id}>{group.label}</option>)}
               </select>
             </label>
             <p className="drawer-section-copy">
-              {currentListing.groupSource === "manual"
-                ? "Set manually — scans keep this group until you switch back to automatic."
-                : currentListing.groupSource === "jev"
-                  ? "Placed by AI because no group's terms matched the title."
-                  : currentListing.groupSource === "rule"
-                    ? "Matched by the group's terms."
-                    : "No group's terms matched, so this listing is not scored. Pick a group to score it."}
+              {currentListing.variantSource === "manual"
+                ? "Set manually — scans keep this variant until you switch back to automatic."
+                : currentListing.variantSource === "jev"
+                  ? "Placed by AI because no variant's terms matched the title."
+                  : currentListing.variantKey && detail.variantGroups.some((group) => group.id === currentListing.variantKey)
+                    ? "Matched by the variant's terms."
+                    : "No variant's terms matched, so this listing is scored with Other / unclassified. Pick a variant to score it against that model."}
             </p>
           </section> : null}
 

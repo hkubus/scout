@@ -1,7 +1,6 @@
 node_modules
 dist
 dist-server
-dist-mcp
 data
 .env
 *.log

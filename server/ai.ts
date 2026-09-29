@@ -10,7 +10,7 @@ const LISTING_DESCRIPTION_VERIFICATION_CACHE_VERSION = 'v3';
 const LISTING_CONDITION_MATCH_CACHE_VERSION = 'v1';
 const LISTING_TERM_MATCH_CACHE_VERSION = 'v1';
 const LISTING_NEGOTIABILITY_CACHE_VERSION = 'v1';
-const LISTING_GROUP_CACHE_VERSION = 'v1';
+const LISTING_VARIANT_CACHE_VERSION = 'v1';
 export const LISTING_DESCRIPTION_MAX_CHARS = 6_000;
 
 const responseHealingPlugins = [{ id: 'response-healing' }] as const;
@@ -241,15 +241,15 @@ export function listingNegotiabilityInputHash(context: { marketplace: string; ti
     .digest('hex');
 }
 
-/** Keyed on the full group definitions: editing any group re-asks instead of reusing a stale pick. */
-export function listingGroupInputHash(context: { query: string; title: string; condition?: string | null; groups: Array<{ key: string; name: string; terms: string; excluded: string }> }) {
+/** Keyed on the full variant definitions: editing any variant re-asks instead of reusing a stale pick. */
+export function listingVariantInputHash(context: { query: string; title: string; condition?: string | null; variants: Array<{ id: string; label: string; terms: string; exclude?: string }> }) {
   return createHash('sha256')
     .update(JSON.stringify({
-      version: LISTING_GROUP_CACHE_VERSION,
+      version: LISTING_VARIANT_CACHE_VERSION,
       title: normalizeCacheText(context.title),
       condition: normalizeCacheText(context.condition),
       query: normalizeCacheText(context.query),
-      groups: context.groups.map((group) => [group.key, normalizeCacheText(group.name), normalizeCacheTerms(group.terms), normalizeCacheTerms(group.excluded)]),
+      variants: context.variants.map((variant) => [variant.id, normalizeCacheText(variant.label), normalizeCacheTerms(variant.terms), normalizeCacheTerms(variant.exclude ?? '')]),
     }))
     .digest('hex');
 }

@@ -1,21 +1,23 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { createReadStream, existsSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { listings as seedListings, watches as seedWatches } from '../src/data';
 import type { Marketplace } from '../src/types';
 import { validateSearchUrl } from './marketplaces';
+import { createScoutMcpServer } from './mcp';
+import { debugApiEnabled, ScoutDebug } from './debug';
 import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
 import { isPubliclyBoundHost, RateLimiter, securityHeaders } from './security';
-import { ScoutService, ServiceError } from './service';
+import { normalizeSourceIntervals, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
-import { normalizeWatchGroups, watchGroupsInputSchema } from './watchGroups';
 
 const port = Number(process.env.PORT ?? 3001);
 if (!Number.isInteger(port) || port < 1 || port > 65_535) {
@@ -53,9 +55,10 @@ app.addHook('onRequest', async (request, reply) => {
   const url = request.raw.url?.split('?', 1)[0] ?? '';
   const isApi = url.startsWith('/api/');
   const isEvents = url === '/events';
-  if (!isApi && !isEvents) return;
+  const isMcp = url === '/mcp';
+  if (!isApi && !isEvents && !isMcp) return;
 
-  const expensive = /\/search$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/snapshot-images\/|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(url);
+  const expensive = isMcp || /\/search$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/snapshot-images\/|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(url);
   const limit = expensive ? 30 : 240;
   const bucket = rateLimiter.consume(`${request.ip}:${expensive ? 'expensive' : url}`, limit);
   reply.header('X-RateLimit-Limit', String(limit));
@@ -83,6 +86,7 @@ function emit(event: string, payload: unknown) {
   }
 }
 const service = new ScoutService(db, emit, { publicExposureWarning });
+const debug = debugApiEnabled() ? new ScoutDebug(db, service) : null;
 const marketplaceParam = z.enum(['OLX', 'Allegro Lokalnie', 'Vinted']);
 const marketplaceSources = z.array(marketplaceParam).min(1).max(3).refine((sources) => new Set(sources).size === sources.length, { message: 'Marketplace sources must be unique' });
 const resourceIdParams = z.object({ id: z.string().trim().min(1).max(160) });
@@ -104,10 +108,28 @@ app.get('/api/ready', async (_request, reply) => {
 });
 app.get('/api/dashboard', async () => service.dashboard());
 app.get('/api/listings', async (request, reply) => {
-  const parsed = z.object({ marketplace: marketplaceParam.optional(), q: z.string().max(240).optional(), watchId: z.string().trim().min(1).max(160).optional(), page: z.coerce.number().int().min(1).optional().default(1), pageSize: z.coerce.number().int().min(1).max(500).optional().default(200) }).strict().safeParse(request.query);
+  const parsed = z.object({
+    marketplace: marketplaceParam.optional(),
+    q: z.string().max(240).optional(),
+    watchId: z.string().trim().min(1).max(160).optional(),
+    page: z.coerce.number().int().min(1).optional().default(1),
+    pageSize: z.coerce.number().int().min(1).max(500).optional().default(200),
+    sort: z.enum(['newest', 'strongest', 'price']).optional().default('newest'),
+    decision: z.enum(['buy', 'watch', 'pass']).optional(),
+    visibility: z.enum(['visible', 'hidden', 'all']).optional().default('visible'),
+  }).strict().safeParse(request.query);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid listing filters' });
   const query = parsed.data;
-  const page = service.listingsPage({ marketplace: query.marketplace, q: query.q, watchId: query.watchId, page: query.page, pageSize: query.pageSize });
+  const page = service.listingsPage({
+    marketplace: query.marketplace,
+    q: query.q,
+    watchId: query.watchId,
+    page: query.page,
+    pageSize: query.pageSize,
+    sort: query.sort,
+    decision: query.decision,
+    visibility: query.visibility,
+  });
   return { listings: page.listings, pagination: page.pagination };
 });
 app.get('/api/listing-detail', async (request, reply) => {
@@ -136,14 +158,14 @@ app.patch('/api/listing-actions', async (request, reply) => {
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid listing action', details: parsed.error.flatten() });
   return { action: service.updateListingAction(parsed.data.key, parsed.data.decision, parsed.data.note, parsed.data.hidden) };
 });
-app.put('/api/listing-group', async (request, reply) => {
+app.put('/api/listing-variant', async (request, reply) => {
   const parsed = z.object({
     key: z.string().min(3).max(500),
     watchId: z.string().trim().min(1).max(160),
-    groupKey: z.string().trim().min(1).max(60).nullable(),
+    variantId: z.string().trim().min(1).max(64).nullable(),
   }).strict().safeParse(request.body);
-  if (!parsed.success) return reply.code(400).send({ error: 'Invalid listing group', details: parsed.error.flatten() });
-  return service.setListingGroup(parsed.data.watchId, parsed.data.key, parsed.data.groupKey);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid listing variant', details: parsed.error.flatten() });
+  return service.setListingVariant(parsed.data.watchId, parsed.data.key, parsed.data.variantId);
 });
 app.get('/api/watches', async (request, reply) => {
   const strictBoolean = z.union([z.boolean(), z.string().regex(/^(?:true|false)$/i).transform((value) => value.toLowerCase() === 'true')]);
@@ -198,14 +220,13 @@ app.delete('/api/marketplace-sessions/:marketplace', async (request) => {
   return service.deleteMarketplaceSession(params.data.marketplace);
 });
 
-/** Normalized groups as stored JSON, or an error message for a 400. */
-function watchGroupsJson(groups: z.infer<typeof watchGroupsInputSchema>): { json: string } | { error: string } {
-  try {
-    return { json: JSON.stringify(normalizeWatchGroups(groups)) };
-  } catch (error) {
-    return { error: error instanceof Error ? error.message : 'Invalid groups' };
-  }
-}
+const variantGroupInput = z.object({
+  id: z.string().trim().min(1).max(64).regex(/^[a-z0-9][a-z0-9_-]*$/i),
+  label: z.string().trim().min(1).max(80),
+  terms: z.string().trim().min(1).max(240),
+  exclude: z.string().trim().max(240).optional(),
+}).strict();
+const variantGroupsInput = z.array(variantGroupInput).max(12);
 
 const watchInput = z.object({
   id: z.string().trim().min(1).max(160).optional(),
@@ -217,15 +238,16 @@ const watchInput = z.object({
   location: z.string().max(120).optional().default('Polska'),
   condition: z.string().max(80).optional().default('Any'),
   interval: z.number().int().min(5).max(24 * 60).optional().default(5),
+  sourceIntervals: z.record(z.string(), z.number().int().min(5).max(1440)).optional().default({}),
   exactUrls: z.array(z.string().url()).max(20).optional().default([]),
   sensitivity: z.number().min(0.6).max(1.6).optional().default(1),
   shippingOnly: z.boolean().optional().default(false),
   typoVariants: z.boolean().optional().default(false),
   aiRelevance: z.boolean().optional().default(true),
+  variantGroups: variantGroupsInput.optional().default([]),
   referenceMarketWatchId: z.string().trim().max(160).nullable().optional().default(null),
   minPrice: z.number().nonnegative().nullable().optional().default(null),
   maxPrice: z.number().positive().nullable().optional().default(null),
-  groups: watchGroupsInputSchema.optional().default([]),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
 
 app.post('/api/watches', async (request, reply) => {
@@ -239,12 +261,11 @@ app.post('/api/watches', async (request, reply) => {
   if (value.referenceMarketWatchId && !db.prepare('SELECT 1 FROM market_watches WHERE id = ?').get(value.referenceMarketWatchId)) {
     return reply.code(400).send({ error: 'Reference research watch not found' });
   }
-  const groups = watchGroupsJson(value.groups);
-  if ('error' in groups) return reply.code(400).send({ error: groups.error });
   const id = value.id ?? `watch-${randomUUID()}`;
   const now = nowIso();
+  const sourceIntervals = normalizeSourceIntervals(value.sources, value.sourceIntervals);
   try {
-    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, sensitivity, shipping_only, typo_variants, ai_relevance, reference_market_watch_id, min_price_pln, max_price_pln, groups_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, groups.json, 1, now, now, now);
+    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, source_intervals_json, sensitivity, shipping_only, typo_variants, ai_relevance, variant_groups_json, reference_market_watch_id, min_price_pln, max_price_pln, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, JSON.stringify(sourceIntervals), value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, JSON.stringify(value.variantGroups), value.referenceMarketWatchId, value.minPrice, value.maxPrice, 1, now, now, now);
   } catch (error) {
     if (error instanceof Error && /UNIQUE|PRIMARY KEY|constraint/i.test(error.message)) {
       return reply.code(409).send({ error: 'A watch with this id already exists' });
@@ -264,13 +285,14 @@ app.patch('/api/watches/:id', async (request, reply) => {
     terms: z.string().max(240).optional(), excluded: z.string().max(240).optional(), sources: marketplaceSources.optional(),
     location: z.string().max(120).optional(), condition: z.string().max(80).optional(), exactUrls: z.array(z.string().url()).max(20).optional(),
     sensitivity: z.number().min(0.6).max(1.6).optional(),
-    enabled: z.boolean().optional(), interval: z.number().int().min(5).max(1440).optional(), shippingOnly: z.boolean().optional(),
+    enabled: z.boolean().optional(), interval: z.number().int().min(5).max(1440).optional(),
+    sourceIntervals: z.record(z.string(), z.number().int().min(5).max(1440)).optional(), shippingOnly: z.boolean().optional(),
     aiRelevance: z.boolean().optional(),
     typoVariants: z.boolean().optional(),
+    variantGroups: variantGroupsInput.optional(),
     referenceMarketWatchId: z.string().trim().max(160).nullable().optional(),
     archived: z.boolean().optional(),
     minPrice: z.number().nonnegative().nullable().optional(), maxPrice: z.number().positive().nullable().optional(),
-    groups: watchGroupsInputSchema.optional(),
   }).strict().safeParse(request.body);
   if (!patchInput.success) return reply.code(400).send({ error: 'Invalid watch update', details: patchInput.error.flatten() });
   const body = patchInput.data;
@@ -299,9 +321,11 @@ app.patch('/api/watches/:id', async (request, reply) => {
   if (body.sensitivity !== undefined) { fields.push('sensitivity = ?'); values.push(body.sensitivity); }
   if (typeof body.enabled === 'boolean') { fields.push('enabled = ?'); values.push(body.enabled ? 1 : 0); }
   if (body.interval !== undefined) { fields.push('interval_minutes = ?'); values.push(body.interval); }
+  if (body.sourceIntervals !== undefined) { fields.push('source_intervals_json = ?'); values.push(JSON.stringify(normalizeSourceIntervals(sources, body.sourceIntervals))); }
   if (typeof body.shippingOnly === 'boolean') { fields.push('shipping_only = ?'); values.push(body.shippingOnly ? 1 : 0); }
   if (typeof body.aiRelevance === 'boolean') { fields.push('ai_relevance = ?'); values.push(body.aiRelevance ? 1 : 0); }
   if (typeof body.typoVariants === 'boolean') { fields.push('typo_variants = ?'); values.push(body.typoVariants ? 1 : 0); }
+  if (body.variantGroups !== undefined) { fields.push('variant_groups_json = ?'); values.push(JSON.stringify(body.variantGroups)); }
   if (body.referenceMarketWatchId !== undefined) {
     if (body.referenceMarketWatchId && !db.prepare('SELECT 1 FROM market_watches WHERE id = ?').get(body.referenceMarketWatchId)) {
       return reply.code(400).send({ error: 'Reference research watch not found' });
@@ -311,12 +335,6 @@ app.patch('/api/watches/:id', async (request, reply) => {
   }
   if (body.minPrice !== undefined) { fields.push('min_price_pln = ?'); values.push(body.minPrice); }
   if (body.maxPrice !== undefined) { fields.push('max_price_pln = ?'); values.push(body.maxPrice); }
-  if (body.groups !== undefined) {
-    const groups = watchGroupsJson(body.groups);
-    if ('error' in groups) return reply.code(400).send({ error: groups.error });
-    fields.push('groups_json = ?');
-    values.push(groups.json);
-  }
   if (body.archived !== undefined) {
     fields.push('archived_at = ?');
     values.push(body.archived ? nowIso() : null);
@@ -329,7 +347,9 @@ app.patch('/api/watches/:id', async (request, reply) => {
   values.push(nowIso(), params.data.id);
   const result = db.prepare(`UPDATE watches SET ${fields.join(', ')}, updated_at = ? WHERE id = ?`).run(...(values as any[]));
   if (!result.changes) return reply.code(404).send({ error: 'Watch not found' });
-  if (body.groups !== undefined) service.reassignWatchGroups(params.data.id);
+  // Repartition the watch's saved listings immediately when the model groups
+  // change; otherwise the new keys would only converge one scan at a time.
+  if (body.variantGroups !== undefined) service.retagWatchVariants(params.data.id);
   emit('watch', { id: params.data.id, archived: body.archived });
   return { ok: true };
 });
@@ -344,6 +364,10 @@ const searchInput = z.object({
   shippingOnly: z.boolean().optional().default(false),
   condition: z.string().max(80).optional().default('Any'),
   location: z.string().max(120).optional().default(''),
+  ownerType: z.enum(['private', 'business']).nullable().optional().default(null),
+  page: z.number().int().min(1).max(10).optional().default(1),
+  searchId: z.string().trim().min(1).max(80).optional(),
+  aiRelevance: z.boolean().optional().default(true),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
 
 app.post('/api/search', async (request, reply) => {
@@ -567,6 +591,45 @@ app.post('/api/notifications/preview', async (request, reply) => {
   return buildDiscordEmbed({ listing: { marketplace: body.marketplace, listingId: body.listingId, title: body.title, price: body.price, currency: 'PLN', url: validatedUrl.url, observedAt: nowIso() }, typical: body.typical, discountPercent: discount, confidence: 92 });
 });
 
+// Read-only debug access to the live database for development and agent
+// troubleshooting (see README "Debug API"). Queries use a separate read-only
+// connection and encrypted credentials are redacted. Disable with
+// SCOUT_DEBUG_API=false.
+if (debug) {
+  app.get('/api/debug/schema', async () => debug.schema());
+  app.get('/api/debug/runtime', async () => debug.runtime());
+  app.get('/api/debug/tables/:table', async (request, reply) => {
+    const params = z.object({ table: z.string().trim().min(1).max(120) }).safeParse(request.params);
+    const query = z.object({
+      limit: z.coerce.number().int().min(1).max(1000).optional(),
+      offset: z.coerce.number().int().min(0).optional(),
+      orderBy: z.string().trim().min(1).max(120).optional(),
+      direction: z.enum(['asc', 'desc']).optional(),
+    }).safeParse(request.query);
+    if (!params.success || !query.success) return reply.code(400).send({ error: 'Invalid table request' });
+    return debug.tableRows(params.data.table, query.data);
+  });
+  app.post('/api/debug/query', async (request, reply) => {
+    const body = z.object({
+      sql: z.string().trim().min(1).max(20_000),
+      params: z.union([z.array(z.union([z.string(), z.number(), z.null()])).max(100), z.record(z.union([z.string(), z.number(), z.null()]))]).optional(),
+      maxRows: z.number().int().min(1).max(5000).optional(),
+    }).safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: body.error.issues[0]?.message ?? 'Invalid query request' });
+    return debug.query(body.data.sql, body.data.params ?? [], body.data.maxRows);
+  });
+  app.get('/api/debug/snapshot', async (_request, reply) => {
+    const snapshot = debug.snapshot();
+    const stream = createReadStream(snapshot.path);
+    stream.on('close', snapshot.cleanup);
+    return reply
+      .header('Content-Disposition', `attachment; filename="${snapshot.filename}"`)
+      .header('Content-Length', String(snapshot.bytes))
+      .type('application/vnd.sqlite3')
+      .send(stream);
+  });
+}
+
 app.get('/events', async (request, reply) => {
   if (clients.size >= 50) return reply.code(429).send({ error: 'Too many live connections. Try again later.' });
   reply.hijack();
@@ -578,11 +641,40 @@ app.get('/events', async (request, reply) => {
   request.raw.on('close', () => clients.delete(client));
 });
 
+// Scout's MCP server speaks Streamable HTTP (JSON-RPC over POST /mcp) so
+// MCP clients connect over HTTP instead of stdio. Stateless per-request
+// servers keep every request independent: no session ids, no resumability,
+// any replica can serve any call. Like the REST API, the endpoint is
+// unauthenticated by design — keep it on a trusted LAN/VPN.
+app.post('/mcp', async (request, reply) => {
+  reply.hijack();
+  const mcpServer = createScoutMcpServer(service, debug);
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  reply.raw.on('close', () => {
+    transport.close().catch(() => {});
+    mcpServer.close().catch(() => {});
+  });
+  try {
+    await mcpServer.connect(transport);
+    await transport.handleRequest(request.raw, reply.raw, request.body);
+  } catch (error) {
+    app.log.error(error);
+    if (!reply.raw.headersSent) {
+      reply.raw.writeHead(500, { 'content-type': 'application/json' });
+      reply.raw.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null }));
+    }
+  }
+});
+
+// Stateless mode has no GET stream or DELETE session to serve.
+app.get('/mcp', async (_request, reply) => reply.code(405).send({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed: use POST /mcp with an MCP JSON-RPC request.' }, id: null }));
+app.delete('/mcp', async (_request, reply) => reply.code(405).send({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed: this server is stateless.' }, id: null }));
+
 const distPath = process.env.SCOUT_DIST_PATH?.trim() || resolve(process.cwd(), 'dist');
 if (existsSync(distPath)) {
   await app.register(fastifyStatic, { root: distPath, wildcard: false });
   app.setNotFoundHandler((request, reply) => {
-    if (request.url.startsWith('/api') || request.url === '/events') return reply.code(404).send({ error: 'Not found' });
+    if (request.url.startsWith('/api') || request.url === '/events' || request.url === '/mcp') return reply.code(404).send({ error: 'Not found' });
     if (request.method !== 'GET' && request.method !== 'HEAD') return reply.code(404).send({ error: 'Not found' });
     return reply.sendFile('index.html');
   });
@@ -607,7 +699,7 @@ const diagnosticsInterval = setInterval(() => {
   service.logDiagnostic(formatMemoryLine());
 }, 30 * 60_000);
 
-app.addHook('onClose', async () => { clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); for (const client of clients) client.end(); try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ } db.close(); });
+app.addHook('onClose', async () => { debug?.close(); clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); for (const client of clients) client.end(); try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ } db.close(); });
 let shuttingDown = false;
 const shutdown = async (signal: string) => {
   if (shuttingDown) return;

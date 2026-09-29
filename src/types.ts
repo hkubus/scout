@@ -5,6 +5,31 @@ export type DealLabel = 'Exceptional' | 'Very strong' | 'Strong' | 'Watch';
 export type NotificationPriority = 'strong' | 'very-strong' | 'exceptional';
 export type ListingDecision = 'buy' | 'watch' | 'pass';
 
+/**
+ * One model bucket inside a watch. A watch searches broadly (e.g. "1660") and
+ * these groups split the matches into separately scored products (1660,
+ * 1660 Super, 1660 Ti), each with its own learned baseline and readiness.
+ */
+export interface VariantGroup {
+  /** Stable identity; renaming the label must not reset the learned baseline. */
+  id: string;
+  label: string;
+  /** Comma-separated terms; every term must be present in the listing title. */
+  terms: string;
+  /** Optional comma-separated terms that veto a match. */
+  exclude?: string;
+}
+
+/** Per-model progress shown on the watch card once variant groups exist. */
+export interface WatchVariantStat {
+  key: string;
+  label: string;
+  samples: number;
+  targetSamples: number;
+  observationHours: number;
+  readiness: number;
+  typical: number | null;
+}
 export type ListingDescriptionVerificationDecision = 'pass' | 'reject' | 'unknown';
 export type ListingDescriptionVerificationStatus = ListingDescriptionVerificationDecision | 'pending' | 'not-configured' | 'fallback';
 
@@ -42,6 +67,11 @@ export interface Listing {
   typical: number | null;
   /** Where the displayed typical comes from: the watch's own history or a reference research series band. */
   typicalSource?: 'own-history' | 'reference-band' | null;
+  /** Model-variant bucket this listing scored against, when the watch groups variants. */
+  variantKey?: string | null;
+  variantLabel?: string | null;
+  /** How the variant was chosen: the variant's term rules, a Jev fallback pick, or a manual override. */
+  variantSource?: 'rule' | 'jev' | 'manual' | null;
   belowTypical: number | null;
   observed: string;
   observedAt: string;
@@ -50,11 +80,6 @@ export interface Listing {
   image: string;
   url: string;
   watch: string;
-  /** Model group the listing is scored in; null when its grouped watch matched no group, absent for ungrouped watches. */
-  group?: string | null;
-  groupKey?: string | null;
-  /** How the group was chosen: the watch's rules, a Jev fallback pick, or a manual override. */
-  groupSource?: 'rule' | 'jev' | 'manual' | null;
   condition?: string;
   location?: string;
   shippingAvailable: boolean | null;
@@ -94,8 +119,8 @@ export interface ListingDetail {
   verificationTrace?: VerificationTraceEntry[] | null;
   verificationInputHash?: string | null;
   verificationModel?: string | null;
-  /** The owning watch's model groups, for reassigning the listing; absent for ungrouped watches. */
-  groups?: WatchGroup[];
+  /** The owning watch's model variants, for reassigning the listing; absent for ungrouped watches. */
+  variantGroups?: VariantGroup[];
 }
 
 export interface VerificationTraceEntry {
@@ -125,6 +150,18 @@ export interface VerificationComparison {
   llm: { ok: true; verification: ListingDescriptionVerification; raw: unknown } | { ok: false; error: string };
 }
 
+/**
+ * Current visible Strong+ findings for one watch, split by deal tier. Counts
+ * are listings still seen within the feed freshness window, excluding rows the
+ * watch filters out and any the user marked as hidden. All zeros means the
+ * watch has no qualifying findings right now (or is still learning).
+ */
+export interface WatchDealCounts {
+  exceptional: number;
+  veryStrong: number;
+  strong: number;
+}
+
 export interface Watch {
   id: string;
   name: string;
@@ -140,6 +177,8 @@ export interface Watch {
   readiness: number;
   status: 'Learning' | 'Ready' | 'Paused' | 'Archived';
   interval: number;
+  /** Optional per-marketplace check cadence in minutes; unset sources use interval. */
+  sourceIntervals?: Partial<Record<Marketplace, number>>;
   nextScan: string;
   enabled: boolean;
   exactUrls: string[];
@@ -147,40 +186,15 @@ export interface Watch {
   shippingOnly: boolean;
   typoVariants: boolean;
   aiRelevance: boolean;
+  variantGroups: VariantGroup[];
+  /** Per-model sample/readiness/typical breakdown; empty without configured groups. */
+  variants: WatchVariantStat[];
+  /** How many Exceptional/Very strong/Strong findings this watch currently has. */
+  dealCounts: WatchDealCounts;
   referenceMarketWatchId: string | null;
   minPrice: number | null;
   maxPrice: number | null;
   archivedAt?: string | null;
-  /** Model groups; when present each listing is scored against its own group's typical price. */
-  groups: WatchGroup[];
-  /** Per-group baseline progress, present only for grouped watches. */
-  groupStats?: WatchGroupStats[];
-  /** Grouped watches only: comparable listings that matched no group and are not scored. */
-  unassignedSamples?: number;
-}
-
-export interface WatchGroupStats {
-  key: string;
-  name: string;
-  samples: number;
-  targetSamples: number;
-  /** Group median, shown once the group has its own sample floor. */
-  typical: number | null;
-  /** Scored and able to alert: group floor, pooled floor, and observation window all met. */
-  ready: boolean;
-}
-
-/**
- * One model group of a watch. `terms` are comma-separated and must all appear
- * in the title as whole words; `|` separates alternatives within a term
- * (e.g. `pro max|promax`). `excluded` uses the same syntax. The most specific
- * matching group wins.
- */
-export interface WatchGroup {
-  key: string;
-  name: string;
-  terms: string;
-  excluded: string;
 }
 
 export interface WatchAnalyticsPoint {
@@ -308,11 +322,20 @@ export interface SearchFilters {
   shippingOnly?: boolean;
   condition?: string;
   location?: string;
+  /** OLX only: private sellers or business accounts. */
+  ownerType?: "private" | "business" | null;
+  /** 1-based marketplace result page; the UI pages past the per-request cap. */
+  page?: number;
+  /** Client-generated id that correlates streamed per-source progress events. */
+  searchId?: string;
+  /** Run the Jev/LLM relevance filter for this search; default true when omitted. */
+  aiRelevance?: boolean;
 }
 
 export interface SearchSourceStatus {
   source: Marketplace;
-  status: 'ok' | 'error';
+  /** `searching` is a client-side placeholder until the source reports back. */
+  status: "ok" | "error" | "searching";
   count: number;
   pendingShipping: number;
   durationMs: number;
