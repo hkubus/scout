@@ -9,6 +9,7 @@ import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, legacyLis
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchVariantWithJev, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
 import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, verifyListingDescriptionWithVision, visionToVerification } from './vision';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
+import { Limiter } from './limiter';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, median, pooledVariantSpread, scoreDeal, type PooledSpread } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
 import { normalizeFilterText } from './text';
@@ -138,6 +139,11 @@ const SNAPSHOT_CAPTURES_PER_SCAN = 8;
 const SNAPSHOT_MAX_IMAGES = 12;
 const SNAPSHOT_MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 const SNAPSHOT_MAX_ATTEMPTS = 3;
+// In-flight request cap per marketplace, shared by watch scans, research
+// scans, manual searches and detail checks; queued requests wait FIFO.
+const MARKETPLACE_REQUEST_CONCURRENCY = 2;
+// Concurrent Chromium renders across all marketplaces (each can be its own browser process).
+const BROWSER_RENDER_CONCURRENCY = 2;
 /**
  * The anonymous marketplace APIs (OLX offers, Vinted catalog, Lokalnie
  * additional-data) reject Scout's plain identifier UA; a modern Chrome UA plus
@@ -641,9 +647,24 @@ export class ScoutService {
   }
 
   schedulerTick() {
-    this.lastSchedulerTickAt = nowIso();
-    if (!this.tryAcquireSchedulerLease()) return;
-    this.queueDue();
+    // A failed tick is logged and retried on the next interval instead of
+    // escaping setInterval and ending the process. The tick timestamp only
+    // advances on success, so /api/ready reports a scheduler that keeps failing.
+    try {
+      if (this.tryAcquireSchedulerLease()) this.queueDue();
+      this.lastSchedulerTickAt = nowIso();
+    } catch (error) {
+      this.logBackgroundError('Scheduler tick', error);
+    }
+  }
+
+  /** Runs detached async work; a rejection is logged instead of becoming an unhandled rejection. */
+  private background(label: string, task: Promise<unknown>) {
+    task.catch((error) => this.logBackgroundError(label, error));
+  }
+
+  private logBackgroundError(label: string, error: unknown) {
+    this.log('error', 'diagnostics', `${label} failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 
   private tryAcquireSchedulerLease() {
@@ -2972,7 +2993,7 @@ export class ScoutService {
   queueMarketScan(id: string) {
     const row = this.stmt('SELECT * FROM market_watches WHERE id = ? AND enabled = 1').get(id) as WatchRow | undefined;
     if (!row) throw new ServiceError('Enabled market watch not found', 404);
-    void this.runMarketWatch(row);
+    this.background(`Research scan ${row.name}`, this.runMarketWatch(row));
     return { queued: true, message: `Queued ${row.name}` };
   }
 
@@ -3067,16 +3088,15 @@ export class ScoutService {
     const runningKey = `market:${row.id}`;
     if (this.running.has(runningKey)) return;
     this.running.add(runningKey);
-    const sources = parseJson<Marketplace[]>(row.sources_json, []);
-    const version = this.ensureMarketWatchVersion(row);
-    let latestBackoffUntil: string | null = null;
     try {
+      const sources = parseJson<Marketplace[]>(row.sources_json, []);
+      const version = this.ensureMarketWatchVersion(row);
+      let latestBackoffUntil: string | null = null;
       await Promise.all(sources.map(async (source) => {
         const paths: string[] = [];
         const onPath: ConnectorPathReporter = (path) => { if (!paths.includes(path)) paths.push(path); };
         const started = nowIso();
-        const latest = this.stmt('SELECT backoff_until FROM connector_runs WHERE source = ? ORDER BY started_at DESC LIMIT 1').get(source) as { backoff_until?: string } | undefined;
-        const backoffUntil = latest?.backoff_until && Date.parse(latest.backoff_until) > Date.now() ? latest.backoff_until : null;
+        const backoffUntil = this.activeConnectorBackoff(source);
         if (backoffUntil && (!latestBackoffUntil || Date.parse(backoffUntil) > Date.parse(latestBackoffUntil))) latestBackoffUntil = backoffUntil;
         const runId = this.recordRun(source, backoffUntil ? 'skipped' : 'running', backoffUntil ? `Skipped research for ${row.name}; connector backoff is active` : `Researching ${row.name}`, started, backoffUntil ? started : null);
         const scanId = this.createScan(String(row.id), 'research', source, started);
@@ -3166,7 +3186,7 @@ export class ScoutService {
           this.failScan(scanId, error);
           const message = error instanceof Error ? error.message : 'Research connector failed';
           this.log('error', 'research', `${row.name} · ${source}: failed via ${paths.join(' → ') || 'unstarted path'} — ${message}`);
-          this.finishRun(runId, 'error', message);
+          this.finishRun(runId, 'error', message, this.connectorBackoffAfterFailure(source, runId));
         }
       }));
       const finished = nowIso();
@@ -3353,7 +3373,11 @@ export class ScoutService {
       if (definition.name === 'ntfy' && !ntfyConfigured) return { ...definition, status: 'Idle', detail: 'ntfy not configured', lastSuccess: 'Never', requests: 0, latency: '—' };
       const last = healthBySource.get(definition.name);
       if (!last) return { ...definition, status: 'Idle', detail: definition.name === 'Discord' ? 'Webhook configured; no delivery yet' : definition.name === 'ntfy' ? 'ntfy configured; no delivery yet' : 'No connector run yet', lastSuccess: 'Never', requests: 0, latency: '—' };
-      const status: Connector['status'] = last.status === 'ok' ? 'OK' : last.status === 'error' ? 'Degraded' : last.status === 'running' ? 'Warning' : 'Idle';
+      const status: Connector['status'] = last.status === 'ok' ? 'OK'
+        : last.status === 'error' ? 'Degraded'
+        : last.status === 'running' ? 'Warning'
+        : last.status === 'skipped' && this.activeConnectorBackoff(definition.name) ? 'Degraded'
+        : 'Idle';
       return { ...definition, status, detail: last.message || (status === 'OK' ? 'Last run completed' : 'Waiting for a run'), lastSuccess: relativeTime(last.last_success), requests: Number(last.source_count), latency: duration(last.started_at, last.finished_at) };
     });
   }
@@ -3605,34 +3629,39 @@ export class ScoutService {
       : this.stmt('SELECT * FROM watches WHERE enabled = 1').all() as WatchRow[];
     if (!rows.length) throw new ServiceError(watchId ? 'Enabled watch not found' : 'There are no enabled watches to scan', 404);
     // A manual scan ignores the per-marketplace schedule and checks every source.
-    for (const row of rows) void this.runWatch(row, { forceAll: true });
+    for (const row of rows) this.background(`Scan ${row.name}`, this.runWatch(row, { forceAll: true }));
     return { queued: true, message: `Queued ${rows.length} ${rows.length === 1 ? 'watch' : 'watches'}` };
   }
 
   queueDue() {
-    this.pruneRetention();
-    void this.processNotificationRetries();
-    void this.processDailyDigest();
+    // Retention failing must not block scans, so it is isolated from the rest of the tick.
+    try {
+      this.pruneRetention();
+    } catch (error) {
+      this.logBackgroundError('Retention pruning', error);
+    }
+    this.background('Notification retries', this.processNotificationRetries());
+    this.background('Daily digest', this.processDailyDigest());
     const rows = this.stmt('SELECT * FROM watches WHERE enabled = 1 AND next_scan_at <= ?').all(nowIso()) as WatchRow[];
-    for (const row of rows) void this.runWatch(row);
+    for (const row of rows) this.background(`Scan ${row.name}`, this.runWatch(row));
     const marketRows = this.stmt('SELECT * FROM market_watches WHERE enabled = 1 AND next_scan_at <= ?').all(nowIso()) as WatchRow[];
-    for (const row of marketRows) void this.runMarketWatch(row);
+    for (const row of marketRows) this.background(`Research scan ${row.name}`, this.runMarketWatch(row));
   }
 
   private async runWatch(row: WatchRow, options: { forceAll?: boolean } = {}) {
     if (this.running.has(row.id)) return;
     this.running.add(row.id);
-    const sources = parseJson<Marketplace[]>(row.sources_json, []);
-    const exactUrls = parseJson<string[]>(row.exact_urls_json, []);
-    // Each marketplace keeps its own next-check time so a slow source can be
-    // left alone while a fast one is polled. A source with no recorded time
-    // (first run, newly added) is always due; "Scan now" forces every source.
-    const storedSourceNext = parseJson<Record<string, string>>(row.source_next_scan_json, {});
-    const dueSources = options.forceAll ? sources : dueWatchSources(sources, storedSourceNext);
-    // Reference-series fallback is computed once per scan, like the baseline.
-    const referenceMedian = row.reference_market_watch_id ? this.referenceBandMedian(String(row.reference_market_watch_id)) : null;
-    const backoffBySource = new Map<string, string>();
     try {
+      const sources = parseJson<Marketplace[]>(row.sources_json, []);
+      const exactUrls = parseJson<string[]>(row.exact_urls_json, []);
+      // Each marketplace keeps its own next-check time so a slow source can be
+      // left alone while a fast one is polled. A source with no recorded time
+      // (first run, newly added) is always due; "Scan now" forces every source.
+      const storedSourceNext = parseJson<Record<string, string>>(row.source_next_scan_json, {});
+      const dueSources = options.forceAll ? sources : dueWatchSources(sources, storedSourceNext);
+      // Reference-series fallback is computed once per scan, like the baseline.
+      const referenceMedian = row.reference_market_watch_id ? this.referenceBandMedian(String(row.reference_market_watch_id)) : null;
+      const backoffBySource = new Map<string, string>();
       if (!dueSources.length) {
         const pending = sources.map((source) => storedSourceNext[source]).filter((value): value is string => Boolean(value)).sort();
         if (pending.length) this.stmt('UPDATE watches SET next_scan_at = ?, updated_at = ? WHERE id = ?').run(pending[0], nowIso(), row.id);
@@ -3641,9 +3670,8 @@ export class ScoutService {
       await Promise.all(dueSources.map(async (source) => {
         const paths: string[] = [];
         const onPath: ConnectorPathReporter = (path) => { if (!paths.includes(path)) paths.push(path); };
-        const latest = this.stmt('SELECT backoff_until FROM connector_runs WHERE source = ? ORDER BY started_at DESC LIMIT 1').get(source) as { backoff_until?: string } | undefined;
         const started = nowIso();
-        const backoffUntil = latest?.backoff_until && Date.parse(latest.backoff_until) > Date.now() ? latest.backoff_until : null;
+        const backoffUntil = this.activeConnectorBackoff(source);
         if (backoffUntil) backoffBySource.set(source, backoffUntil);
         const runId = this.recordRun(source, backoffUntil ? 'skipped' : 'running', backoffUntil ? `Skipped ${row.name}; connector backoff is active` : `Scanning ${row.name}`, started, backoffUntil ? started : null);
         const scanId = this.createScan(String(row.id), 'watch', source, started);
@@ -3744,11 +3772,8 @@ export class ScoutService {
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Connector failed';
           this.failScan(scanId, error);
-          const recent = this.stmt('SELECT status FROM connector_runs WHERE source = ? AND id != ? ORDER BY started_at DESC LIMIT 8').all(source, runId) as Array<{ status: string }>;
-          const consecutiveFailures = recent.findIndex((run) => run.status !== 'error');
-          const failureCount = consecutiveFailures === -1 ? recent.length : consecutiveFailures;
           this.log('error', 'watch', `${row.name} · ${source}: failed via ${paths.join(' → ') || 'unstarted path'} — ${message}`);
-          this.finishRun(runId, 'error', message, new Date(Date.now() + exponentialBackoff(failureCount)).toISOString());
+          this.finishRun(runId, 'error', message, this.connectorBackoffAfterFailure(source, runId));
         }
       }));
       const finished = nowIso();
@@ -3801,7 +3826,33 @@ export class ScoutService {
     return source === 'OLX' ? buildOlxSearchApiUrl(query, filters) : buildMarketplaceSearchUrl(source, query, filters);
   }
 
-  private async fetchOlxApi(url: string): Promise<OlxApiFetchResult> {
+  /**
+   * Every marketplace request goes through a per-marketplace limiter, and
+   * every Chromium render through a shared one. Due watches and research
+   * scans all start together, so without a cap one tick bursts every source
+   * at once — the pattern that trips anti-bot fences — and each 403/429
+   * fallback launches its own browser.
+   */
+  private readonly marketplaceLimiters = new Map<Marketplace, Limiter>();
+  private readonly browserLimiter = new Limiter(BROWSER_RENDER_CONCURRENCY);
+
+  private marketplaceRequest<T>(marketplace: Marketplace, task: () => Promise<T>): Promise<T> {
+    let limiter = this.marketplaceLimiters.get(marketplace);
+    if (!limiter) {
+      limiter = new Limiter(MARKETPLACE_REQUEST_CONCURRENCY);
+      this.marketplaceLimiters.set(marketplace, limiter);
+    }
+    return limiter.run(task);
+  }
+
+  private fetchOlxApi(url: string) { return this.marketplaceRequest('OLX', () => this.requestOlxApi(url)); }
+  private fetchVintedApi(url: string) { return this.marketplaceRequest('Vinted', () => this.requestVintedApi(url)); }
+  private fetchVintedItemPage(url: string) { return this.marketplaceRequest('Vinted', () => this.requestVintedItemPage(url)); }
+  private fetchAllegroLokalnieApi(url: string, body: string | null) { return this.marketplaceRequest('Allegro Lokalnie', () => this.requestAllegroLokalnieApi(url, body)); }
+  private fetchPublicPage(url: string, marketplace: Marketplace) { return this.marketplaceRequest(marketplace, () => this.requestPublicPage(url, marketplace)); }
+  private renderPublicPage(url: string, marketplace: Marketplace, storageState?: MarketplaceStorageState) { return this.browserLimiter.run(() => this.renderInBrowser(url, marketplace, storageState)); }
+
+  private async requestOlxApi(url: string): Promise<OlxApiFetchResult> {
     const validation = validateSearchUrl(url, 'OLX');
     if (!validation.valid) throw new Error(validation.reason);
     let requestUrl = validation.url;
@@ -3830,7 +3881,7 @@ export class ScoutService {
    * once on 401 per the community-verified refresh pattern. A missing or
    * fenced bootstrap throws so the adapter falls back to the rendered page.
    */
-  private async fetchVintedApi(url: string): Promise<VintedApiFetchResult> {
+  private async requestVintedApi(url: string): Promise<VintedApiFetchResult> {
     const validation = validateSearchUrl(url, 'Vinted');
     if (!validation.valid) throw new Error(validation.reason);
     let response = await this.fetchVintedWithCookies(validation.url);
@@ -3898,7 +3949,7 @@ export class ScoutService {
    * 403/429 fall back to the Chromium render. The item JSON routes stay
    * untouched — they are closed to anonymous clients.
    */
-  private async fetchVintedItemPage(url: string): Promise<VintedPageFetchResult> {
+  private async requestVintedItemPage(url: string): Promise<VintedPageFetchResult> {
     const validation = validateSearchUrl(url, 'Vinted');
     if (!validation.valid) throw new Error(validation.reason);
     const headers = { 'user-agent': MARKETPLACE_API_USER_AGENT, accept: 'text/html,application/xhtml+xml', 'accept-language': 'pl-PL,pl;q=0.9' };
@@ -3923,7 +3974,7 @@ export class ScoutService {
   }
 
   /** Anonymous Lokalnie JSON surface (batch condition enrichment); no cookies, no CSRF. */
-  private async fetchAllegroLokalnieApi(url: string, body: string | null): Promise<AllegroApiFetchResult> {
+  private async requestAllegroLokalnieApi(url: string, body: string | null): Promise<AllegroApiFetchResult> {
     const validation = validateSearchUrl(url, 'Allegro Lokalnie');
     if (!validation.valid) throw new Error(validation.reason);
     const headers: Record<string, string> = { 'user-agent': MARKETPLACE_API_USER_AGENT, accept: 'application/json' };
@@ -3934,7 +3985,7 @@ export class ScoutService {
     return { status: response.status, json };
   }
 
-  private async fetchPublicPage(url: string, marketplace: Marketplace) {
+  private async requestPublicPage(url: string, marketplace: Marketplace): Promise<string> {
     const validation = validateSearchUrl(url, marketplace);
     if (!validation.valid) throw new Error(validation.reason);
     const authenticatedState = this.readMarketplaceSession(marketplace);
@@ -3977,7 +4028,7 @@ export class ScoutService {
     return response.text();
   }
 
-  private async renderPublicPage(url: string, marketplace: Marketplace, storageState?: MarketplaceStorageState) {
+  private async renderInBrowser(url: string, marketplace: Marketplace, storageState?: MarketplaceStorageState): Promise<string> {
     let browser: Browser | undefined;
     let context: BrowserContext | undefined;
     let ownsBrowser = false;
@@ -4232,8 +4283,22 @@ export class ScoutService {
     const variantKey = association.variant_key;
     const variantLabel = variantKey ? variantLabelFor(variantKey, groups) : null;
     const { score, useReference, dealStrength: scoredStrength } = this.variantDealScore(row, listing.price, baselines, variantKey ?? OTHER_VARIANT_KEY, referenceMedian);
-    const observation = this.stmt('INSERT INTO observations (listing_id, watch_id, watch_listing_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?, ?)').run(stored.id, row.id, association.id, scanId, listing.price, observedAt);
-    const observationId = Number(observation.lastInsertRowid);
+    // An unchanged price does not add a row per scan. A same-day run of one
+    // price keeps its first row untouched (so MIN(observed_at) readiness and
+    // first-observed gates never move) plus one trailing row that later scans
+    // advance. Daily analytics read each day's latest row, so they see the
+    // same price and score as with a row per scan; a price change or a new
+    // UTC day always starts a new row.
+    const recent = this.stmt('SELECT id, price_pln, observed_at FROM observations WHERE watch_id = ? AND listing_id = ? ORDER BY observed_at DESC, id DESC LIMIT 2').all(row.id, stored.id) as Array<{ id: number; price_pln: number; observed_at: string }>;
+    const observedDay = observedAt.slice(0, 10);
+    const extendsRun = recent.length === 2 && recent.every((item) => Number(item.price_pln) === listing.price && String(item.observed_at).slice(0, 10) === observedDay);
+    let observationId: number;
+    if (extendsRun) {
+      observationId = Number(recent[0].id);
+      this.stmt('UPDATE observations SET watch_listing_id = ?, scan_id = ?, observed_at = ?, baseline_pln = NULL, discount_percent = NULL, deal_strength = NULL, deal_label = NULL WHERE id = ?').run(association.id, scanId, observedAt, observationId);
+    } else {
+      observationId = Number(this.stmt('INSERT INTO observations (listing_id, watch_id, watch_listing_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?, ?)').run(stored.id, row.id, association.id, scanId, listing.price, observedAt).lastInsertRowid);
+    }
     if (score.isReady && score.typical !== null) {
       const discountPercent = score.discountPercent ?? 0;
       const dealStrength = scoredStrength ?? 1;
@@ -4648,6 +4713,23 @@ export class ScoutService {
   private recordRun(source: string, status: string, message: string, startedAt: string, finishedAt: string | null) {
     const result = this.stmt('INSERT INTO connector_runs (source, status, message, started_at, finished_at) VALUES (?, ?, ?, ?, ?)').run(source, status, message, startedAt, finishedAt);
     return Number(result.lastInsertRowid);
+  }
+
+  /**
+   * Backoff comes from the latest finished outcome (ok/error), never from
+   * skipped or in-flight rows: a skip recorded while backoff is active must
+   * not clear it, and a concurrent 'running' row must not hide it.
+   */
+  private activeConnectorBackoff(source: string): string | null {
+    const latest = this.stmt("SELECT backoff_until FROM connector_runs WHERE source = ? AND status IN ('ok', 'error') ORDER BY started_at DESC, id DESC LIMIT 1").get(source) as { backoff_until?: string | null } | undefined;
+    return latest?.backoff_until && Date.parse(latest.backoff_until) > Date.now() ? latest.backoff_until : null;
+  }
+
+  /** Backoff deadline for a failed run; doubles with each consecutive failed outcome, ignoring skips. */
+  private connectorBackoffAfterFailure(source: string, runId: number): string {
+    const recent = this.stmt("SELECT status FROM connector_runs WHERE source = ? AND id != ? AND status IN ('ok', 'error') ORDER BY started_at DESC, id DESC LIMIT 8").all(source, runId) as Array<{ status: string }>;
+    const streak = recent.findIndex((run) => run.status !== 'error');
+    return new Date(Date.now() + exponentialBackoff(streak === -1 ? recent.length : streak)).toISOString();
   }
 
   private finishRun(id: number, status: string, message: string, backoffUntil: string | null = null) {

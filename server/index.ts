@@ -707,6 +707,9 @@ const shutdown = async (signal: string) => {
   app.log.info({ signal }, 'Shutting down');
   await app.close();
 };
+// Background work is caught in the service; this is the last line of defence
+// so one stray rejection is logged rather than ending the monitor.
+process.on('unhandledRejection', (reason) => { app.log.error({ err: reason }, 'Unhandled promise rejection'); });
 process.once('SIGTERM', () => { void shutdown('SIGTERM'); });
 process.once('SIGINT', () => { void shutdown('SIGINT'); });
 await app.listen({ port, host });
