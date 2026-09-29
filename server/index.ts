@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
@@ -10,6 +11,7 @@ import { z } from 'zod';
 import { listings as seedListings, watches as seedWatches } from '../src/data';
 import type { Marketplace } from '../src/types';
 import { validateSearchUrl } from './marketplaces';
+import { createScoutMcpServer } from './mcp';
 import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
 import { isPubliclyBoundHost, RateLimiter, securityHeaders } from './security';
@@ -52,9 +54,10 @@ app.addHook('onRequest', async (request, reply) => {
   const url = request.raw.url?.split('?', 1)[0] ?? '';
   const isApi = url.startsWith('/api/');
   const isEvents = url === '/events';
-  if (!isApi && !isEvents) return;
+  const isMcp = url === '/mcp';
+  if (!isApi && !isEvents && !isMcp) return;
 
-  const expensive = /\/search$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/snapshot-images\/|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(url);
+  const expensive = isMcp || /\/search$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/snapshot-images\/|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(url);
   const limit = expensive ? 30 : 240;
   const bucket = rateLimiter.consume(`${request.ip}:${expensive ? 'expensive' : url}`, limit);
   reply.header('X-RateLimit-Limit', String(limit));
@@ -588,11 +591,40 @@ app.get('/events', async (request, reply) => {
   request.raw.on('close', () => clients.delete(client));
 });
 
+// Scout's MCP server speaks Streamable HTTP (JSON-RPC over POST /mcp) so
+// MCP clients connect over HTTP instead of stdio. Stateless per-request
+// servers keep every request independent: no session ids, no resumability,
+// any replica can serve any call. Like the REST API, the endpoint is
+// unauthenticated by design — keep it on a trusted LAN/VPN.
+app.post('/mcp', async (request, reply) => {
+  reply.hijack();
+  const mcpServer = createScoutMcpServer(service);
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  reply.raw.on('close', () => {
+    transport.close().catch(() => {});
+    mcpServer.close().catch(() => {});
+  });
+  try {
+    await mcpServer.connect(transport);
+    await transport.handleRequest(request.raw, reply.raw, request.body);
+  } catch (error) {
+    app.log.error(error);
+    if (!reply.raw.headersSent) {
+      reply.raw.writeHead(500, { 'content-type': 'application/json' });
+      reply.raw.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null }));
+    }
+  }
+});
+
+// Stateless mode has no GET stream or DELETE session to serve.
+app.get('/mcp', async (_request, reply) => reply.code(405).send({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed: use POST /mcp with an MCP JSON-RPC request.' }, id: null }));
+app.delete('/mcp', async (_request, reply) => reply.code(405).send({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed: this server is stateless.' }, id: null }));
+
 const distPath = process.env.SCOUT_DIST_PATH?.trim() || resolve(process.cwd(), 'dist');
 if (existsSync(distPath)) {
   await app.register(fastifyStatic, { root: distPath, wildcard: false });
   app.setNotFoundHandler((request, reply) => {
-    if (request.url.startsWith('/api') || request.url === '/events') return reply.code(404).send({ error: 'Not found' });
+    if (request.url.startsWith('/api') || request.url === '/events' || request.url === '/mcp') return reply.code(404).send({ error: 'Not found' });
     if (request.method !== 'GET' && request.method !== 'HEAD') return reply.code(404).send({ error: 'Not found' });
     return reply.sendFile('index.html');
   });

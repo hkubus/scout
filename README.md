@@ -133,6 +133,19 @@ Very strong and exceptional deals receive an additional conservative safeguard w
 
 Jev and vision requests retry transient OpenRouter provider failures with backoff. The legacy DeepSeek verification path uses OpenRouter response healing and retries once on malformed JSON. If a technical OpenRouter failure remains, Scout records a `fallback` status and sends the deterministic alert while showing the error; explicit `reject` and `unknown` decisions still hold the alert.
 
+## MCP server (Streamable HTTP)
+
+Scout exposes a Model Context Protocol server over Streamable HTTP at `POST /mcp` (same host/port as the API), so AI assistants connect over HTTP instead of stdio:
+
+```bash
+curl -s -X POST http://127.0.0.1:3001/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+It is stateless (one fresh server per request, no session ids) and offers twelve tools: `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail`, `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_queue_scan`, and `scout_connectors`. `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. Like the REST API it has no built-in authentication — keep it on a trusted LAN/VPN and never expose it directly to the public internet.
+
 ## Optional marketplace sessions
 
 Scout can use a manually authenticated browser session for your own OLX, Allegro Lokalnie, or Vinted account. This keeps the marketplace login and any MFA/CAPTCHA steps in your browser; Scout does not collect passwords or attempt to bypass verification.
