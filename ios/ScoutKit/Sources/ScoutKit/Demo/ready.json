@@ -1,0 +1,23 @@
+{
+  "status": "ready",
+  "database": {
+    "ok": true,
+    "error": null
+  },
+  "scheduler": {
+    "lastTickAt": "2026-09-30T08:29:48.000Z",
+    "ageMs": 12000,
+    "healthy": true
+  },
+  "scans": {
+    "staleOrInterrupted": 0
+  },
+  "migrations": {
+    "count": 26,
+    "latest": "025_variant_source"
+  },
+  "connectors": {
+    "degraded": [],
+    "degradedCount": 0
+  }
+}
