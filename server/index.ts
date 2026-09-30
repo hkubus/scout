@@ -13,6 +13,7 @@ import { validateSearchUrl } from './marketplaces';
 import { debugApiEnabled, ScoutDebug } from './debug';
 import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
+import { compressApiResponse } from './compression';
 import { apiTokenCredentialId, bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
 import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
 import { dashboardTopParam, NO_LOCATION_FILTER, normalizeSourceIntervals, olxCategoryToJson, ScoutService, ServiceError } from './service';
@@ -123,6 +124,8 @@ app.addHook('onRequest', async (request, reply) => {
     return reply.code(429).send({ error: 'Too many requests. Try again later.' });
   }
 });
+// Compress large /api/* JSON bodies for clients that accept br or gzip.
+app.addHook('onSend', compressApiResponse);
 app.addHook('onSend', async (request, reply) => {
   // request.protocol honours X-Forwarded-Proto only from SCOUT_TRUST_PROXY hops.
   // Keep a stricter per-route policy (e.g. the sandboxed snapshot-image CSP).
