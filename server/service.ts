@@ -2503,23 +2503,26 @@ export class ScoutService {
     const marketplace = options.marketplace ?? null;
 
     // Identical relevance/shipping/price semantics to watchAnalytics so the
-    // page never counts listings a watch itself would ignore.
+    // page never counts listings a watch itself would ignore. Driven from the
+    // associations (the result already inner-joined them) so listing-level
+    // filters run per association and observations are range seeks on
+    // observations_watch_listing instead of a full scan.
     const predicates = [
       'w.archived_at IS NULL',
       'o.observed_at >= ?',
-      "NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)",
+      "NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)",
       "(w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))",
       '(w.min_price_pln IS NULL OR o.price_pln >= w.min_price_pln)',
       '(w.max_price_pln IS NULL OR o.price_pln <= w.max_price_pln)',
     ];
     const params: unknown[] = [cutoff];
-    if (watchId) { predicates.push('o.watch_id = ?'); params.push(watchId); }
+    if (watchId) { predicates.push('w.id = ?'); params.push(watchId); }
     if (marketplace) { predicates.push('l.marketplace = ?'); params.push(marketplace); }
     const rows = this.stmt(`SELECT date(o.observed_at) AS day, o.listing_id AS listing_id, o.watch_id AS watch_id, w.name AS watch_name, l.marketplace AS marketplace, o.price_pln AS price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at, wl.first_seen_at AS first_seen_at
-      FROM observations o
-      JOIN listings l ON l.id = o.listing_id
-      JOIN watches w ON w.id = o.watch_id
-      JOIN watch_listings wl ON wl.watch_id = o.watch_id AND wl.listing_id = o.listing_id
+      FROM watches w
+      JOIN watch_listings wl ON wl.watch_id = w.id
+      JOIN listings l ON l.id = wl.listing_id
+      CROSS JOIN observations o INDEXED BY observations_watch_listing ON o.watch_id = wl.watch_id AND o.listing_id = wl.listing_id
       WHERE ${predicates.join(' AND ')}
       GROUP BY day, o.watch_id, o.listing_id`).all(...params) as Array<Record<string, any>>;
     const observations: AnalyticsObservation[] = rows.map((row) => ({

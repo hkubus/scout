@@ -1095,13 +1095,13 @@ function seedWatchStatsScenario(db: any) {
   link.run();
 }
 
-function captureStatsRows(db: any) {
+function captureRows(db: any, marker: string) {
   const captured: unknown[][] = [];
   const proxy = new Proxy(db, {
     get(target, property) {
       if (property === 'prepare') return (sql: string) => {
         const statement = target.prepare(sql);
-        if (!sql.includes('WITH a AS MATERIALIZED')) return statement;
+        if (!sql.includes(marker)) return statement;
         return new Proxy(statement, {
           get(inner, key) {
             if (key === 'all') return (...params: unknown[]) => { const rows = inner.all(...params); captured.push(rows); return rows; };
@@ -1121,7 +1121,7 @@ test('association-driven watch stats match the per-observation aggregate', () =>
   const context = fixture();
   try {
     seedWatchStatsScenario(context.db);
-    const { proxy, captured } = captureStatsRows(context.db);
+    const { proxy, captured } = captureRows(context.db, 'WITH a AS MATERIALIZED');
     const service = new ScoutService(proxy, () => {});
     const sortRows = (rows: any[]) => rows.map((row) => ({ ...row })).sort((a, b) => `${a.watch_id}|${a.variant_key}`.localeCompare(`${b.watch_id}|${b.variant_key}`));
     for (const includeArchived of [0, 1]) {
@@ -1172,6 +1172,44 @@ test('listing detail price history matches the unsplit history query', () => {
     context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run('OLX', 'unassociated', 'CPU', 100, 'https://example.test/unassociated', now, now);
     const manual = context.db.prepare("SELECT id FROM listings WHERE listing_id = 'unassociated'").get() as { id: number };
     assert.deepEqual(context.service.listingDetail('OLX:unassociated').history, expected(manual.id, null));
+  } finally { context.close(); }
+});
+
+test('association-driven analytics rows match the observation-driven query in order', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const { proxy, captured } = captureRows(context.db, 'CROSS JOIN observations o INDEXED BY observations_watch_listing ON o.watch_id = wl.watch_id AND o.listing_id = wl.listing_id\n      WHERE');
+    const service = new ScoutService(proxy, () => {});
+    const legacy = (options: { days: number; watchId?: string; marketplace?: string }) => {
+      const predicates = [
+        'w.archived_at IS NULL',
+        'o.observed_at >= ?',
+        "NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)",
+        "(w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))",
+        '(w.min_price_pln IS NULL OR o.price_pln >= w.min_price_pln)',
+        '(w.max_price_pln IS NULL OR o.price_pln <= w.max_price_pln)',
+      ];
+      const params: Array<string | number> = [new Date(Date.now() - options.days * 24 * 60 * 60_000).toISOString()];
+      if (options.watchId) { predicates.push('o.watch_id = ?'); params.push(options.watchId); }
+      if (options.marketplace) { predicates.push('l.marketplace = ?'); params.push(options.marketplace); }
+      return context.db.prepare(`SELECT date(o.observed_at) AS day, o.listing_id AS listing_id, o.watch_id AS watch_id, w.name AS watch_name, l.marketplace AS marketplace, o.price_pln AS price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at, wl.first_seen_at AS first_seen_at
+        FROM observations o
+        JOIN listings l ON l.id = o.listing_id
+        JOIN watches w ON w.id = o.watch_id
+        JOIN watch_listings wl ON wl.watch_id = o.watch_id AND wl.listing_id = o.listing_id
+        WHERE ${predicates.join(' AND ')}
+        GROUP BY day, o.watch_id, o.listing_id`).all(...params);
+    };
+    for (const options of [{ days: 30 }, { days: 7 }, { days: 30, watchId: 'stats-bounded' }, { days: 30, marketplace: 'OLX' as const }, { days: 30, watchId: 'stats-shipping', marketplace: 'Vinted' as const }]) {
+      captured.length = 0;
+      service.analytics(options);
+      assert.equal(captured.length, 1);
+      const expected = legacy(options);
+      assert.ok(expected.length > 0 || options.marketplace === 'Vinted');
+      // Same rows, same order; the bare columns come from the MAX(observed_at) row.
+      assert.deepEqual((captured[0] as any[]).map((row) => ({ ...row })), (expected as any[]).map((row) => ({ ...row })));
+    }
   } finally { context.close(); }
 });
 
