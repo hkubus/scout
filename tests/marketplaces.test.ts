@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, buildVintedSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createVintedJsonAdapter, dedupeKey, normalizeListing, parseAllegroBatchEnrichmentApi, parseAllegroCards, parseListingAvailability, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseOlxListingAvailabilityApi, parseOlxOffersApi, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, parseVintedCatalogApi, parseVintedItemPageAvailability, validateSearchUrl, type ConnectorAdapter } from '../server/marketplaces';
+import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxSearchApiUrl, olxSearchPathSegments, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type OlxSearchPathParams, buildVintedSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createVintedJsonAdapter, dedupeKey, normalizeListing, parseAllegroBatchEnrichmentApi, parseAllegroCards, parseListingAvailability, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseOlxListingAvailabilityApi, parseOlxOffersApi, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, parseVintedCatalogApi, parseVintedItemPageAvailability, validateSearchUrl, type ConnectorAdapter } from '../server/marketplaces';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { median, pruneBefore, scoreDeal } from '../server/scoring';
@@ -772,4 +772,76 @@ test('applies manual and watch price, condition, and location filters', () => {
   assert.deepEqual(filterListings(listings, 'i5 8400', '', '', { minPrice: 150, maxPrice: 300 }).map((listing) => listing.listingId), ['1', '2']);
   assert.deepEqual(filterListings(listings, 'i5 8400', '', '', { condition: 'Used', location: 'Warszawa' }).map((listing) => listing.listingId), ['1', '3']);
   assert.deepEqual(filterListings(listings, 'i5 8400', '', '', { condition: 'New' }).map((listing) => listing.listingId), ['2']);
+});
+
+test('scopes OLX API searches to a category and parses category facet counts', () => {
+  const url = new URL(buildOlxSearchApiUrl('rtx 3070', { olxCategoryId: 2184, sort: 'newest' }));
+  assert.equal(url.searchParams.get('category_id'), '2184');
+  assert.equal(new URL(buildOlxSearchApiUrl('rtx 3070', { olxCategoryId: null })).searchParams.has('category_id'), false);
+  const facetsUrl = new URL(buildOlxCategoryFacetsUrl(' rtx 3070 '));
+  assert.equal(facetsUrl.pathname, '/api/v1/offers/metadata/search/');
+  assert.equal(facetsUrl.searchParams.get('query'), 'rtx 3070');
+  assert.equal(JSON.parse(facetsUrl.searchParams.get('facets')!)[0].field, 'category_without_exclusions');
+  // Shape captured from the live endpoint on 2026-09-30.
+  const facets = parseOlxCategoryFacets({ data: { total_count: 733, facets: { category_without_exclusions: [
+    { id: 443, count: 709, label: 'Komputery', url: '/elektronika/komputery/q-rtx-3070' },
+    { id: 2184, count: 84, label: 'Karty graficzne', url: '/elektronika/komputery/podzespoly-i-czesci/karty-graficzne/q-rtx-3070' },
+    { id: 'bad', count: 3, label: 'Broken', url: '/x/q-rtx-3070' },
+    { id: 12, count: 1, label: '', url: '/x/q-rtx-3070' },
+  ] } } });
+  assert.deepEqual(facets, [
+    { id: 443, label: 'Komputery', path: 'elektronika/komputery', count: 709 },
+    { id: 2184, label: 'Karty graficzne', path: 'elektronika/komputery/podzespoly-i-czesci/karty-graficzne', count: 84 },
+  ]);
+  assert.deepEqual(parseOlxCategoryFacets({ data: { facets: [] } }), []);
+  assert.throws(() => parseOlxCategoryFacets({ error: { status: 400 } }), /did not contain data/);
+});
+
+test('resolves pasted OLX category and city paths without silently widening them', async () => {
+  assert.deepEqual(olxSearchPathSegments('https://www.olx.pl/elektronika/komputery/krakow/q-rtx-3070/?search%5Bdist%5D=30'), ['elektronika', 'komputery', 'krakow']);
+  assert.deepEqual(olxSearchPathSegments('https://www.olx.pl/oferty/q-rtx-3070/'), []);
+  assert.deepEqual(olxSearchPathSegments('https://www.olx.pl/d/q-rtx-3070/'), ['d']);
+  assert.deepEqual(parseOlxFriendlyLinks({ data: [], metadata: {} }), null);
+  assert.deepEqual(parseOlxFriendlyLinks({ data: { category_id: 2184, region_id: 4, city_id: 8959 } }), { categoryId: 2184, regionId: 4, cityId: 8959 });
+  // Mirrors OLX: unknown trailing category slugs fall back to the parent,
+  // unknown single segments are a 404 (null here).
+  const known: Record<string, OlxSearchPathParams> = {
+    elektronika: { categoryId: 99 },
+    'elektronika,komputery': { categoryId: 443 },
+    'elektronika,komputery,nonsense': { categoryId: 443 },
+    'elektronika,komputery,krakow': { categoryId: 443, regionId: 4, cityId: 8959 },
+    krakow: { regionId: 4, cityId: 8959 },
+  };
+  const lookups: string[] = [];
+  const fetchParams = async (segments: string[]) => { lookups.push(segments.join(',')); return known[segments.join(',')] ?? null; };
+  assert.deepEqual(await resolveOlxSearchPath(['elektronika', 'komputery'], fetchParams), { categoryId: 443 });
+  assert.deepEqual(lookups, ['elektronika,komputery', 'elektronika']);
+  assert.deepEqual(await resolveOlxSearchPath(['elektronika', 'komputery', 'krakow'], fetchParams), { categoryId: 443, regionId: 4, cityId: 8959 });
+  assert.deepEqual(await resolveOlxSearchPath(['krakow'], fetchParams), { regionId: 4, cityId: 8959 });
+  await assert.rejects(resolveOlxSearchPath(['elektronika', 'komputery', 'nonsense'], fetchParams), (error: unknown) => error instanceof SearchConfigError && /"nonsense"/.test(error.message));
+  await assert.rejects(resolveOlxSearchPath(['d'], fetchParams), SearchConfigError);
+});
+
+test('the OLX adapter keeps a pasted URL category and fails closed on paths and ids OLX rejects', async () => {
+  const requested: string[] = [];
+  const adapter = createOlxJsonAdapter('OLX', async (url) => {
+    requested.push(url);
+    if (url.includes('category_id=1')) return { status: 400, json: { error: { status: 400, detail: 'Request validation failed with error: [Category 1 does not exist]' } } };
+    return { status: 200, json: { data: [], metadata: { visible_total_count: 0 } } };
+  }, undefined, async (segments) => segments.join('/') === 'elektronika/komputery/krakow' ? { categoryId: 443, regionId: 4, cityId: 8959 } : Promise.reject(new SearchConfigError(`unknown ${segments.join('/')}`)));
+  await adapter.fetchPublicSearch('https://www.olx.pl/elektronika/komputery/krakow/q-rtx-3070/?search%5Bdist%5D=30&search%5Bprivate_business%5D=private');
+  const api = new URL(requested[0]);
+  assert.equal(api.searchParams.get('category_id'), '443');
+  assert.equal(api.searchParams.get('city_id'), '8959');
+  assert.equal(api.searchParams.get('distance'), '30');
+  assert.equal(api.searchParams.has('region_id'), false);
+  assert.equal(api.searchParams.get('owner_type'), 'private');
+  assert.equal(api.searchParams.get('query'), 'rtx-3070');
+  await assert.rejects(adapter.fetchPublicSearch('https://www.olx.pl/nonsense/q-rtx-3070/'), SearchConfigError);
+  await assert.rejects(adapter.fetchPublicSearch('https://www.olx.pl/api/v1/offers/?query=x&category_id=1'), (error: unknown) => error instanceof SearchConfigError && /Category 1 does not exist/.test(error.message));
+  const unresolved = createOlxJsonAdapter('OLX', async () => ({ status: 200, json: { data: [] } }));
+  await assert.rejects(unresolved.fetchPublicSearch('https://www.olx.pl/elektronika/q-rtx-3070/'), SearchConfigError);
+  // Outages stay ordinary errors so connector backoff still applies.
+  const outage = createOlxJsonAdapter('OLX', async () => ({ status: 503, json: null }));
+  await assert.rejects(outage.fetchPublicSearch('https://www.olx.pl/oferty/q-rtx-3070/'), (error: unknown) => error instanceof Error && !(error instanceof SearchConfigError));
 });

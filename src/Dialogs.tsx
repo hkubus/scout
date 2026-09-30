@@ -14,8 +14,9 @@ import {
 } from "lucide-react";
 import { api } from "./api";
 import { marketplaceColors } from "./data";
+import { OlxCategoryPicker } from "./OlxCategoryPicker";
 import type { WatchPreset } from "./presets";
-import type { Marketplace, MarketWatch, NotificationRecord, VariantGroup, Watch } from "./types";
+import type { Marketplace, MarketWatch, NotificationRecord, OlxCategory, VariantGroup, Watch } from "./types";
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
@@ -61,6 +62,7 @@ export function WatchDialog({
   const [maxPrice, setMaxPrice] = useState(initialWatch?.maxPrice === null || initialWatch?.maxPrice === undefined ? preset?.maxPrice === null || preset?.maxPrice === undefined ? "" : String(preset.maxPrice) : String(initialWatch.maxPrice));
   const [shippingOnly, setShippingOnly] = useState(initialWatch?.shippingOnly ?? preset?.shippingOnly ?? false);
   const [typoVariants, setTypoVariants] = useState(initialWatch?.typoVariants ?? false);
+  const [olxCategory, setOlxCategory] = useState<OlxCategory | null>(initialWatch?.olxCategory ?? preset?.olxCategory ?? null);
   const [aiRelevance, setAiRelevance] = useState(initialWatch?.aiRelevance ?? preset?.aiRelevance ?? true);
   const [variantGroups, setVariantGroups] = useState<VariantGroup[]>(initialWatch?.variantGroups ?? []);
   // New watches wait for listings and then propose their own groups.
@@ -155,6 +157,9 @@ export function WatchDialog({
         referenceMarketWatchId: referenceMarketWatchId.trim() ? referenceMarketWatchId.trim() : null,
         minPrice: numericMin,
         maxPrice: numericMax,
+        // Kept only while OLX is a source, so a removed source cannot leave a
+        // hidden scope behind for when it is re-added.
+        olxCategory: sources.includes("OLX") ? olxCategory : null,
       });
     } catch (submitError) {
       setError(errorMessage(submitError));
@@ -293,6 +298,9 @@ export function WatchDialog({
               </select>
             </label>
           </div>
+          {sources.includes("OLX") ? (
+            <OlxCategoryPicker query={query} value={olxCategory} onChange={setOlxCategory} />
+          ) : null}
           <div className="field-row">
             <label className="field-label">
               Minimum price <span>PLN · optional</span>

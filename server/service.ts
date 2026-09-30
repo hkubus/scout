@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { connect as connectHttp2 } from 'node:http2';
 import { chromium, type Browser, type BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
-import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
+import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext } from './ai';
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchVariantWithJev, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
@@ -2017,6 +2017,7 @@ export class ScoutService {
       dealCounts,
       minPrice: row.min_price_pln === null ? null : Number(row.min_price_pln),
       maxPrice: row.max_price_pln === null ? null : Number(row.max_price_pln),
+      olxCategory: olxCategoryFromJson(row.olx_category_json),
       archivedAt: row.archived_at ?? null,
     };
   }
@@ -2817,7 +2818,7 @@ export class ScoutService {
       const tasks = input.sources.map(async (source) => {
       const started = Date.now();
       try {
-        const fetched = await this.fetchSearchPages(source, input.query, { ...input, page });
+        const fetched = await this.fetchSearchPages(source, input.query, { ...input, olxCategoryId: input.olxCategory?.id ?? null, page });
         const deterministicFilters = { minPrice: input.minPrice, maxPrice: input.maxPrice, condition: input.condition, location: input.location, shippingOnly: false };
         const comparable = filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters);
         // Cache-first like watch scans: only a few cold listings fetch an item
@@ -2913,7 +2914,7 @@ export class ScoutService {
       ? this.stmt('SELECT * FROM market_watch_versions WHERE id = ?').get(row.active_version_id) as WatchRow | undefined
       : undefined;
     return version ?? {
-      id: `${row.id}:legacy`, market_watch_id: row.id, query: row.query, included_terms: row.included_terms ?? '', excluded_terms: row.excluded_terms ?? '', location: row.location ?? 'Polska', condition: row.condition ?? 'Any', sources_json: row.sources_json, min_price_pln: row.min_price_pln, max_price_pln: row.max_price_pln, shipping_only: row.shipping_only, typo_variants: row.typo_variants,
+      id: `${row.id}:legacy`, market_watch_id: row.id, query: row.query, included_terms: row.included_terms ?? '', excluded_terms: row.excluded_terms ?? '', location: row.location ?? 'Polska', condition: row.condition ?? 'Any', sources_json: row.sources_json, min_price_pln: row.min_price_pln, max_price_pln: row.max_price_pln, shipping_only: row.shipping_only, typo_variants: row.typo_variants, olx_category_json: row.olx_category_json ?? null,
     };
   }
 
@@ -2922,7 +2923,7 @@ export class ScoutService {
     const versionId = `${row.id}:v1`;
     const now = nowIso();
     this.transaction(() => {
-      this.stmt('INSERT OR IGNORE INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, row.id, row.query, row.included_terms ?? '', row.excluded_terms ?? '', row.location ?? 'Polska', row.condition ?? 'Any', row.sources_json, row.min_price_pln, row.max_price_pln, row.shipping_only ? 1 : 0, row.typo_variants ? 1 : 0, now);
+      this.stmt('INSERT OR IGNORE INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, row.id, row.query, row.included_terms ?? '', row.excluded_terms ?? '', row.location ?? 'Polska', row.condition ?? 'Any', row.sources_json, row.min_price_pln, row.max_price_pln, row.shipping_only ? 1 : 0, row.typo_variants ? 1 : 0, row.olx_category_json ?? null, now);
       this.stmt("UPDATE market_listings SET version_id = ? WHERE market_watch_id = ? AND version_id IS NULL AND status <> 'superseded'").run(versionId, row.id);
       this.stmt('UPDATE market_price_observations SET version_id = ? WHERE market_listing_id IN (SELECT id FROM market_listings WHERE market_watch_id = ?) AND version_id IS NULL').run(versionId, row.id);
       this.stmt('UPDATE market_watches SET active_version_id = ? WHERE id = ? AND active_version_id IS NULL').run(versionId, row.id);
@@ -2981,7 +2982,7 @@ export class ScoutService {
       const endedPrices = endedPricesByWatch.get(row.id) ?? [];
       return {
         id: row.id, name: row.name, query: version.query, terms: version.included_terms ?? '', excluded: version.excluded_terms ?? '', location: version.location ?? 'Polska', condition: version.condition ?? 'Any', sources: parseJson<Marketplace[]>(version.sources_json, []),
-        intervalHours: Number(row.interval_hours), minPrice: version.min_price_pln === null || version.min_price_pln === undefined ? null : Number(version.min_price_pln), maxPrice: version.max_price_pln === null || version.max_price_pln === undefined ? null : Number(version.max_price_pln), shippingOnly: Boolean(version.shipping_only), typoVariants: Boolean(version.typo_variants), enabled: Boolean(row.enabled), nextScan: Boolean(row.enabled) ? relativeTimeFuture(row.next_scan_at) : 'Paused',
+        intervalHours: Number(row.interval_hours), minPrice: version.min_price_pln === null || version.min_price_pln === undefined ? null : Number(version.min_price_pln), maxPrice: version.max_price_pln === null || version.max_price_pln === undefined ? null : Number(version.max_price_pln), shippingOnly: Boolean(version.shipping_only), typoVariants: Boolean(version.typo_variants), olxCategory: olxCategoryFromJson(version.olx_category_json), enabled: Boolean(row.enabled), nextScan: Boolean(row.enabled) ? relativeTimeFuture(row.next_scan_at) : 'Paused',
         lastScan: relativeTime(row.last_scan_at), totalListings: Number(counts.total ?? 0), activeListings: Number(counts.active ?? 0), endedListings: Number(counts.ended ?? 0),
         estimatedMedianPrice: endedPrices.length ? median(endedPrices) : null,
         saleBand: computeSaleBand(bandSamplesByWatch.get(row.id) ?? [], SALE_BAND_WINDOW_DAYS, bandComputedAt),
@@ -3106,12 +3107,14 @@ export class ScoutService {
     maxPrice: number | null;
     shippingOnly: boolean;
     typoVariants: boolean;
+    olxCategory?: OlxCategory | null;
   }) {
     const now = nowIso();
     const versionId = `${input.id}:v1`;
+    const olxCategory = olxCategoryToJson(input.olxCategory);
     this.transaction(() => {
-      this.stmt('INSERT INTO market_watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, interval_hours, min_price_pln, max_price_pln, shipping_only, typo_variants, enabled, active_version_id, next_scan_at, last_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?)').run(input.id, input.name, input.query, input.terms, input.excluded, input.location, input.condition, JSON.stringify(input.sources), input.intervalHours, input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, input.typoVariants ? 1 : 0, versionId, now, now, now);
-      this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, input.id, input.query, input.terms, input.excluded, input.location, input.condition, JSON.stringify(input.sources), input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, input.typoVariants ? 1 : 0, now);
+      this.stmt('INSERT INTO market_watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, interval_hours, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, enabled, active_version_id, next_scan_at, last_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?)').run(input.id, input.name, input.query, input.terms, input.excluded, input.location, input.condition, JSON.stringify(input.sources), input.intervalHours, input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, input.typoVariants ? 1 : 0, olxCategory, versionId, now, now, now);
+      this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, input.id, input.query, input.terms, input.excluded, input.location, input.condition, JSON.stringify(input.sources), input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, input.typoVariants ? 1 : 0, olxCategory, now);
     });
     return this.marketResearch().watches.find((watch) => watch.id === input.id)!;
   }
@@ -3130,11 +3133,12 @@ export class ScoutService {
     maxPrice?: number | null;
     shippingOnly?: boolean;
     typoVariants?: boolean;
+    olxCategory?: OlxCategory | null;
   }) {
     const row = this.stmt('SELECT * FROM market_watches WHERE id = ?').get(id) as WatchRow | undefined;
     if (!row) throw new ServiceError('Market watch not found', 404);
     const currentVersion = this.marketWatchVersion(row);
-    const criteriaChanged = patch.query !== undefined || patch.terms !== undefined || patch.excluded !== undefined || patch.location !== undefined || patch.condition !== undefined || patch.sources !== undefined || patch.minPrice !== undefined || patch.maxPrice !== undefined || patch.shippingOnly !== undefined || patch.typoVariants !== undefined;
+    const criteriaChanged = patch.query !== undefined || patch.terms !== undefined || patch.excluded !== undefined || patch.location !== undefined || patch.condition !== undefined || patch.sources !== undefined || patch.minPrice !== undefined || patch.maxPrice !== undefined || patch.shippingOnly !== undefined || patch.typoVariants !== undefined || patch.olxCategory !== undefined;
     const now = nowIso();
     this.transaction(() => {
       const directFields: string[] = [];
@@ -3155,15 +3159,16 @@ export class ScoutService {
           maxPrice: patch.maxPrice === undefined ? (currentVersion.max_price_pln === null || currentVersion.max_price_pln === undefined ? null : Number(currentVersion.max_price_pln)) : patch.maxPrice,
           shippingOnly: patch.shippingOnly === undefined ? Boolean(currentVersion.shipping_only) : patch.shippingOnly,
           typoVariants: patch.typoVariants === undefined ? Boolean(currentVersion.typo_variants) : patch.typoVariants,
+          olxCategory: patch.olxCategory === undefined ? olxCategoryToJson(olxCategoryFromJson(currentVersion.olx_category_json)) : olxCategoryToJson(patch.olxCategory),
         };
-        const changed = next.query !== currentVersion.query || next.terms !== (currentVersion.included_terms ?? '') || next.excluded !== (currentVersion.excluded_terms ?? '') || next.location !== (currentVersion.location ?? 'Polska') || next.condition !== (currentVersion.condition ?? 'Any') || JSON.stringify(next.sources) !== String(currentVersion.sources_json) || next.minPrice !== (currentVersion.min_price_pln ?? null) || next.maxPrice !== (currentVersion.max_price_pln ?? null) || next.shippingOnly !== Boolean(currentVersion.shipping_only) || next.typoVariants !== Boolean(currentVersion.typo_variants);
+        const changed = next.query !== currentVersion.query || next.terms !== (currentVersion.included_terms ?? '') || next.excluded !== (currentVersion.excluded_terms ?? '') || next.location !== (currentVersion.location ?? 'Polska') || next.condition !== (currentVersion.condition ?? 'Any') || JSON.stringify(next.sources) !== String(currentVersion.sources_json) || next.minPrice !== (currentVersion.min_price_pln ?? null) || next.maxPrice !== (currentVersion.max_price_pln ?? null) || next.shippingOnly !== Boolean(currentVersion.shipping_only) || next.typoVariants !== Boolean(currentVersion.typo_variants) || olxCategoryFromJson(next.olxCategory)?.id !== olxCategoryFromJson(currentVersion.olx_category_json)?.id;
         if (changed) {
           const versionId = `${id}:v${Date.now()}-${randomBytes(3).toString('hex')}`;
           if (row.active_version_id) this.stmt('UPDATE market_watch_versions SET closed_at = ? WHERE id = ? AND closed_at IS NULL').run(now, row.active_version_id);
-          this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, id, next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, next.typoVariants ? 1 : 0, now);
+          this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, id, next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, next.typoVariants ? 1 : 0, next.olxCategory, now);
           this.stmt("UPDATE market_listings SET status = 'superseded', ended_at = COALESCE(ended_at, ?), ended_reason = COALESCE(ended_reason, 'Research criteria changed') WHERE market_watch_id = ? AND (version_id = ? OR version_id IS NULL) AND status <> 'superseded'").run(now, id, row.active_version_id ?? currentVersion.id);
-          directFields.push('query = ?', 'included_terms = ?', 'excluded_terms = ?', 'location = ?', 'condition = ?', 'sources_json = ?', 'min_price_pln = ?', 'max_price_pln = ?', 'shipping_only = ?', 'typo_variants = ?', 'active_version_id = ?', 'next_scan_at = ?');
-          directValues.push(next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, next.typoVariants ? 1 : 0, versionId, now);
+          directFields.push('query = ?', 'included_terms = ?', 'excluded_terms = ?', 'location = ?', 'condition = ?', 'sources_json = ?', 'min_price_pln = ?', 'max_price_pln = ?', 'shipping_only = ?', 'typo_variants = ?', 'olx_category_json = ?', 'active_version_id = ?', 'next_scan_at = ?');
+          directValues.push(next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, next.typoVariants ? 1 : 0, next.olxCategory, versionId, now);
         }
       }
       if (!directFields.length) throw new ServiceError('No supported fields', 400);
@@ -3202,7 +3207,7 @@ export class ScoutService {
         }
         try {
           const adapter = this.createConnectorAdapter(source, onPath);
-          const searchFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' as const };
+          const searchFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, olxCategoryId: olxCategoryFromJson(row.olx_category_json)?.id ?? null, sort: 'newest' as const };
           const mainListings = await this.fetchSearchPages(source, row.query, searchFilters, onPath);
           // Typo variants come from the immutable criteria version, like every
           // other research criterion, and append one page per variant query.
@@ -3281,7 +3286,7 @@ export class ScoutService {
           this.failScan(scanId, error);
           const message = error instanceof Error ? error.message : 'Research connector failed';
           this.log('error', 'research', `${row.name} · ${source}: failed via ${paths.join(' → ') || 'unstarted path'} — ${message}`);
-          this.finishRun(runId, 'error', message, this.connectorBackoffAfterFailure(source, runId));
+          this.finishFailedRun(runId, source, error, message);
         }
       }));
       const finished = nowIso();
@@ -3495,7 +3500,7 @@ export class ScoutService {
       if (!last) return { ...definition, status: 'Idle', detail: definition.name === 'Discord' ? 'Webhook configured; no delivery yet' : definition.name === 'ntfy' ? 'ntfy configured; no delivery yet' : 'No connector run yet', lastSuccess: 'Never', requests: 0, latency: '—' };
       const status: Connector['status'] = last.status === 'ok' ? 'OK'
         : last.status === 'error' ? 'Degraded'
-        : last.status === 'running' ? 'Warning'
+        : last.status === 'running' || last.status === 'warning' ? 'Warning'
         : last.status === 'skipped' && this.activeConnectorBackoff(definition.name) ? 'Degraded'
         : 'Idle';
       return { ...definition, status, detail: last.message || (status === 'OK' ? 'Last run completed' : 'Waiting for a run'), lastSuccess: relativeTime(last.last_success), requests: Number(last.source_count), latency: duration(last.started_at, last.finished_at) };
@@ -3805,7 +3810,7 @@ export class ScoutService {
         }
         try {
           const matchingExact = exactUrls.filter((url) => validateSearchUrl(url, source).valid);
-          const searchFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, sort: 'newest' as const };
+          const searchFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, olxCategoryId: olxCategoryFromJson(row.olx_category_json)?.id ?? null, sort: 'newest' as const };
           const urls = matchingExact.length
             ? matchingExact
             : [this.marketplaceSearchRequestUrl(source, row.query, searchFilters)];
@@ -3896,7 +3901,7 @@ export class ScoutService {
           const message = error instanceof Error ? error.message : 'Connector failed';
           this.failScan(scanId, error);
           this.log('error', 'watch', `${row.name} · ${source}: failed via ${paths.join(' → ') || 'unstarted path'} — ${message}`);
-          this.finishRun(runId, 'error', message, this.connectorBackoffAfterFailure(source, runId));
+          this.finishFailedRun(runId, source, error, message);
         }
       }));
       const finished = nowIso();
@@ -3933,7 +3938,7 @@ export class ScoutService {
    * through those explicit fallbacks.
    */
   private createConnectorAdapter(source: Marketplace, onPath?: ConnectorPathReporter): ConnectorAdapter {
-    if (source === 'OLX') return createOlxJsonAdapter(source, (url) => this.fetchOlxApi(url), onPath);
+    if (source === 'OLX') return createOlxJsonAdapter(source, (url) => this.fetchOlxApi(url), onPath, (segments) => this.resolveOlxSearchPath(segments));
     if (source === 'Vinted') {
       return createVintedJsonAdapter(
         source,
@@ -3947,6 +3952,39 @@ export class ScoutService {
       return createAllegroLokalnieAdapter(source, (url) => this.fetchPublicPage(url, source), (url, body) => this.fetchAllegroLokalnieApi(url, body), onPath);
     }
     return createPublicAdapter(source, (url) => this.fetchPublicPage(url, source), onPath);
+  }
+
+  /**
+   * OLX category/place paths are stable, so each pasted path is resolved once
+   * per process, including "not recognised" answers. Transient lookup
+   * failures are evicted so they cannot pin a watch as broken until restart.
+   */
+  private olxPathCache = new Map<string, Promise<OlxSearchPathParams>>();
+
+  private resolveOlxSearchPath(segments: string[]) {
+    const key = segments.join('/');
+    let pending = this.olxPathCache.get(key);
+    if (!pending) {
+      pending = resolveOlxSearchPath(segments, async (path) => {
+        const { status, json } = await this.fetchOlxApi(buildOlxFriendlyLinksUrl(path));
+        if (status === 404) return null;
+        if (status < 200 || status >= 300) throw new Error(`OLX path lookup returned HTTP ${status}`);
+        return parseOlxFriendlyLinks(json);
+      });
+      pending.catch((error) => { if (!(error instanceof SearchConfigError)) this.olxPathCache.delete(key); });
+      this.olxPathCache.set(key, pending);
+    }
+    return pending;
+  }
+
+  /**
+   * OLX's per-category hit counts for a query, for the watch category picker.
+   * One metadata request; no offers are fetched or stored.
+   */
+  async olxCategories(query: string): Promise<OlxCategoryFacet[]> {
+    const { status, json } = await this.fetchOlxApi(buildOlxCategoryFacetsUrl(query));
+    if (status < 200 || status >= 300) throw new ServiceError(`OLX category lookup returned HTTP ${status}`, 502);
+    return parseOlxCategoryFacets(json);
   }
 
   /** Watches pass their original query and filters straight into the OLX API instead of round-tripping an HTML URL slug. */
@@ -4875,9 +4913,33 @@ export class ScoutService {
     return new Date(Date.now() + exponentialBackoff(streak === -1 ? recent.length : streak)).toISOString();
   }
 
+  /**
+   * A misconfigured watch fails its own scan but is recorded as a warning
+   * without backoff: 'warning' rows are outside the ok/error outcomes that
+   * drive backoff, so one bad category cannot stall every watch on the
+   * connector or lengthen the next real outage's backoff.
+   */
+  private finishFailedRun(runId: number, source: string, error: unknown, message: string) {
+    if (error instanceof SearchConfigError) this.finishRun(runId, 'warning', message);
+    else this.finishRun(runId, 'error', message, this.connectorBackoffAfterFailure(source, runId));
+  }
+
   private finishRun(id: number, status: string, message: string, backoffUntil: string | null = null) {
     this.stmt('UPDATE connector_runs SET status = ?, message = ?, finished_at = ?, backoff_until = ? WHERE id = ?').run(status, message, nowIso(), backoffUntil, id);
   }
+}
+
+/** Read a stored OLX category, dropping anything malformed rather than scanning with a bad id. */
+export function olxCategoryFromJson(value: unknown): OlxCategory | null {
+  const parsed = typeof value === 'string' && value ? parseJson<unknown>(value, null) : null;
+  if (!parsed || typeof parsed !== 'object') return null;
+  const { id, label, path } = parsed as Record<string, unknown>;
+  if (typeof id !== 'number' || !Number.isInteger(id) || id <= 0) return null;
+  return { id, label: typeof label === 'string' ? label : String(id), path: typeof path === 'string' ? path : '' };
+}
+
+export function olxCategoryToJson(category: OlxCategory | null | undefined): string | null {
+  return category ? JSON.stringify({ id: category.id, label: category.label, path: category.path }) : null;
 }
 
 function relativeTimeFuture(value?: string | null) {

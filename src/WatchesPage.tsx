@@ -243,6 +243,7 @@ function WatchRow({
               </span>
             ) : null}
             {watch.shippingOnly ? <span>shipping only</span> : null}
+            {watch.olxCategory && watch.sources.includes("OLX") ? <span>OLX category: {watch.olxCategory.label}</span> : null}
             {watch.aiRelevance ? <span>AI relevance</span> : null}
             {watch.exactUrls.length ? (
               <span>

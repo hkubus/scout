@@ -24,6 +24,7 @@ import { api } from "./api";
 import { marketplaceColors } from "./data";
 import { AnalyticsTrendChart, formatAnalyticsDate, formatAnalyticsPrice } from "./AnalyticsTrendChart";
 import { marketWatchInputFromListing } from "./presets";
+import { OlxCategoryPicker } from "./OlxCategoryPicker";
 import { PriceSparkline } from "./PriceSparkline";
 import type {
   Marketplace,
@@ -33,6 +34,7 @@ import type {
   MarketWatch,
   MarketWatchInput,
   MarketWatchTrend,
+  OlxCategory,
   PriceHistoryPoint,
   SaleBand,
 } from "./types";
@@ -388,6 +390,7 @@ function MarketWatchFilterSummary({ watch }: { watch: MarketWatch }) {
   if (watch.condition !== "Any") tags.push(`condition: ${watch.condition}`);
   if (watch.location && watch.location !== "Polska") tags.push(`location: ${watch.location}`);
   if (watch.shippingOnly) tags.push("shipping only");
+  if (watch.olxCategory) tags.push(`OLX category: ${watch.olxCategory.label}`);
   return <div className="research-watch-filters">{tags.length ? tags.map((tag) => <span key={tag}>{tag}</span>) : <span>All prices · any condition</span>}</div>;
 }
 
@@ -618,6 +621,7 @@ function MarketWatchDialog({
   const [maxPrice, setMaxPrice] = useState(initialWatch?.maxPrice === null || initialWatch?.maxPrice === undefined ? preset?.maxPrice === null || preset?.maxPrice === undefined ? "" : String(preset.maxPrice) : String(initialWatch.maxPrice));
   const [shippingOnly, setShippingOnly] = useState(initialWatch?.shippingOnly ?? preset?.shippingOnly ?? false);
   const [typoVariants, setTypoVariants] = useState(initialWatch?.typoVariants ?? preset?.typoVariants ?? false);
+  const [olxCategory, setOlxCategory] = useState<OlxCategory | null>(initialWatch?.olxCategory ?? preset?.olxCategory ?? null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const numericInterval = Number(interval);
@@ -638,7 +642,7 @@ function MarketWatchDialog({
     setSubmitting(true);
     setError(null);
     try {
-      await onSubmit({ name: name.trim(), query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), location: location.trim() || "Polska", condition, sources, intervalHours: numericInterval, minPrice: numericMin, maxPrice: numericMax, shippingOnly, typoVariants });
+      await onSubmit({ name: name.trim(), query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), location: location.trim() || "Polska", condition, sources, intervalHours: numericInterval, minPrice: numericMin, maxPrice: numericMax, shippingOnly, typoVariants, olxCategory: sources.includes("OLX") ? olxCategory : null });
     } catch (submitError) {
       setError(errorMessage(submitError));
       setSubmitting(false);
@@ -657,6 +661,7 @@ function MarketWatchDialog({
           <div className="field-row"><label className="field-label">Location <span>where available</span><input value={location} onChange={(event) => setLocation(event.target.value)} placeholder="Anywhere" /></label><label className="field-label">Condition<select value={condition} onChange={(event) => setCondition(event.target.value)}><option>Any</option><option>New</option><option>Used</option><option>Like new</option><option>Very good</option><option>Good</option></select></label></div>
           <div className="field-row"><label className="field-label">Minimum price <span>PLN · optional</span><input type="number" min="0" step="1" value={minPrice} onChange={(event) => setMinPrice(event.target.value)} placeholder="No minimum" /></label><label className="field-label">Maximum price <span>PLN · optional</span><input type="number" min="1" step="1" value={maxPrice} onChange={(event) => setMaxPrice(event.target.value)} placeholder="No maximum" /></label></div>
           <div className="field-row"><label className="field-label">Snapshot interval <span>6–168 hours</span><input type="number" min="6" max="168" value={interval} onChange={(event) => setIntervalValue(event.target.value)} /></label><div className="field-label"><span>Sources</span><div className="source-options">{(["OLX", "Allegro Lokalnie", "Vinted"] as Marketplace[]).map((source) => <button type="button" key={source} aria-pressed={sources.includes(source)} className={`source-option ${sources.includes(source) ? "source-option--selected" : ""}`} onClick={() => toggleSource(source)}><i style={{ background: marketplaceColors[source] }} />{source}{sources.includes(source) ? <Check size={15} /> : null}</button>)}</div></div></div>
+          {sources.includes("OLX") ? <OlxCategoryPicker query={query} value={olxCategory} onChange={setOlxCategory} /> : null}
           <label className="check-option check-option--modal"><input type="checkbox" checked={shippingOnly} onChange={(event) => setShippingOnly(event.target.checked)} /><span><strong>Require shipping</strong><small>Only save listings with confirmed delivery options</small></span></label>
           <label className="check-option check-option--modal"><input type="checkbox" checked={typoVariants} onChange={(event) => setTypoVariants(event.target.checked)} /><span><strong>Scan typo variants</strong><small>Catch misspelled listings — up to 2 extra searches per scan</small></span></label>
           {error ? <div className="form-error" role="alert"><AlertTriangle size={15} />{error}</div> : null}
