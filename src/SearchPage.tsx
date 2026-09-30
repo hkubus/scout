@@ -5,6 +5,7 @@ import { marketplaceColors } from "./data";
 import { subscribe } from "./events";
 import type { WatchPreset } from "./presets";
 import { OlxCategoryPicker } from "./OlxCategoryPicker";
+import { ListingSignalChips } from "./ListingTable";
 import type { Listing, Marketplace, OlxCategory, SearchFilters, SearchSourceStatus } from "./types";
 
 const formatPln = (value: number | null) =>
@@ -245,7 +246,7 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
             </select>
           </label>
           <label className="field-label">
-            Seller <span>OLX only</span>
+            Seller <span>OLX, Vinted</span>
             <select
               value={ownerType}
               onChange={(event) => setOwnerType(event.target.value)}
@@ -387,7 +388,7 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
                   {loadingMore ? "Loading…" : "Load more"}
                 </button>
               ) : null}
-              <button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly, aiRelevance, olxCategory: sources.includes("OLX") ? olxCategory : null })}><Bell size={15} />Save as watch</button>
+              <button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly, aiRelevance, olxCategory: sources.includes("OLX") ? olxCategory : null, sellerType: ownerType === "Any" ? null : ownerType.toLowerCase() as "private" | "business" })}><Bell size={15} />Save as watch</button>
             </div>
           ) : null}
         </div>
@@ -439,6 +440,7 @@ function SearchResultsTable({ listings, onSelect }: { listings: Listing[]; onSel
             <div>
               <strong>{listing.title}</strong>
               <span>{listing.subtitle || "No extra details"}</span>
+              <ListingSignalChips listing={listing} />
             </div>
           </button>
           <div className="marketplace-cell" role="cell">

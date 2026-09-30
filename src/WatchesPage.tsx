@@ -244,6 +244,8 @@ function WatchRow({
             ) : null}
             {watch.shippingOnly ? <span>shipping only</span> : null}
             {watch.olxCategory && watch.sources.includes("OLX") ? <span>OLX category: {watch.olxCategory.label}</span> : null}
+            {watch.sellerType ? <span>{watch.sellerType === "private" ? "private sellers" : "business sellers"}</span> : null}
+            {watch.ignorePromoted ? <span>no promoted</span> : null}
             {watch.aiRelevance ? <span>AI relevance</span> : null}
             {watch.exactUrls.length ? (
               <span>

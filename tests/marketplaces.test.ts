@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxSearchApiUrl, olxSearchPathSegments, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type OlxSearchPathParams, buildVintedSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createVintedJsonAdapter, dedupeKey, normalizeListing, parseAllegroBatchEnrichmentApi, parseAllegroCards, parseListingAvailability, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseOlxListingAvailabilityApi, parseOlxOffersApi, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, parseVintedCatalogApi, parseVintedItemPageAvailability, validateSearchUrl, type ConnectorAdapter } from '../server/marketplaces';
+import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxSearchApiUrl, olxSearchPathSegments, parseOlxCategoryFacets, parseVintedPageSignals, parseOlxFriendlyLinks, resolveOlxSearchPath, type OlxSearchPathParams, buildVintedSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createVintedJsonAdapter, dedupeKey, normalizeListing, parseAllegroBatchEnrichmentApi, parseAllegroCards, parseListingAvailability, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseOlxListingAvailabilityApi, parseOlxOffersApi, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, parseVintedCatalogApi, parseVintedItemPageAvailability, validateSearchUrl, type ConnectorAdapter } from '../server/marketplaces';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { median, pruneBefore, scoreDeal } from '../server/scoring';
@@ -193,7 +193,12 @@ test('maps OLX offers API payloads onto normalized listings', () => {
   assert.equal(listing.location, 'Małopolskie, Łapanów');
   assert.equal(listing.shippingAvailable, true);
   assert.equal(listing.imageUrl, 'https://ireland.apollo.olxcdn.com/v1/files/nl9i997bhz1g1-PL/image;s=320x240');
-  assert.equal(listing.observedAt, '2026-08-20T19:40:08+02:00');
+  // Posting time is its own field; observedAt is when Scout saw it.
+  assert.equal(listing.postedAt, '2026-08-20T17:40:08.000Z');
+  assert.equal(listing.refreshedAt, '2026-08-31T14:51:09.000Z');
+  assert.notEqual(listing.observedAt, '2026-08-20T19:40:08+02:00');
+  assert.equal(listing.promoted, null);
+  assert.equal(listing.sellerType, null);
   assert.equal(listing.url, 'https://www.olx.pl/d/oferta/iphon-13-128gb-100-baterii-black-CID99-ID1bVYyE.html');
 });
 
@@ -844,4 +849,50 @@ test('the OLX adapter keeps a pasted URL category and fails closed on paths and 
   // Outages stay ordinary errors so connector backoff still applies.
   const outage = createOlxJsonAdapter('OLX', async () => ({ status: 503, json: null }));
   await assert.rejects(outage.fetchPublicSearch('https://www.olx.pl/oferty/q-rtx-3070/'), (error: unknown) => error instanceof Error && !(error instanceof SearchConfigError));
+});
+
+test('reads OLX posting time, promotion and seller type from search results', () => {
+  const offer = (id: number, extra: Record<string, unknown>) => ({
+    id, url: `https://www.olx.pl/d/oferta/gpu-ID${id}.html`, title: 'RTX 3070', created_time: '2025-06-01T10:00:00+02:00', last_refresh_time: '2026-09-30T19:49:59+02:00',
+    params: [{ key: 'price', value: { value: 1300, currency: 'PLN' } }], ...extra,
+  });
+  // Shape captured from the live endpoint on 2026-09-30.
+  const [dealer, privateSeller, highlighted] = parseOlxOffersApi({ data: [
+    offer(1, { business: true, promotion: { highlighted: false, urgent: false, top_ad: true, options: ['bundle_optimum'] } }),
+    offer(2, { business: false, promotion: { highlighted: false, urgent: false, top_ad: false } }),
+    offer(3, { business: false, promotion: { highlighted: true, urgent: false, top_ad: false } }),
+  ], metadata: { visible_total_count: 3 } });
+  assert.deepEqual([dealer.sellerType, dealer.promoted], ['business', true]);
+  assert.deepEqual([privateSeller.sellerType, privateSeller.promoted], ['private', false]);
+  assert.equal(highlighted.promoted, true);
+  assert.equal(dealer.postedAt, '2025-06-01T08:00:00.000Z');
+  assert.equal(dealer.refreshedAt, '2026-09-30T17:49:59.000Z');
+});
+
+test('reads Vinted promotion and business flags per item from the catalog page and API', () => {
+  // The catalog page embeds card data as escaped JSON inside a script.
+  const item = (id: number, promoted: boolean, business: boolean) => `{\\"id\\":${id},\\"productItem\\":{\\"id\\":${id},\\"title\\":\\"RTX\\",\\"isPromoted\\":${promoted},\\"user\\":{\\"id\\":9,\\"photo\\":null,\\"isBusiness\\":${business}},\\"photos\\":[{\\"url\\":\\"x\\"}]}}`;
+  const script = `<script>self.__next_f.push([1,"{\\"items\\":{\\"items\\":[${item(11, false, true)},${item(12, true, false)}]}}"])</script>`;
+  const signals = parseVintedPageSignals(script);
+  assert.deepEqual(signals.get('11'), { promoted: false, sellerType: 'business' });
+  assert.deepEqual(signals.get('12'), { promoted: true, sellerType: 'private' });
+  const card = (id: number) => `<a data-testid="product-item-id-${id}--overlay-link" href="/items/${id}-rtx" title="RTX 3070, Stan: Dobry, 1 200,00 zł, 1 262,70 zł"></a>`;
+  const cards = parseVintedCards(`${script}${card(11)}${card(12)}${card(13)}`);
+  assert.deepEqual(cards.map((listing) => [listing.listingId, listing.sellerType, listing.promoted]), [['11', 'business', false], ['12', 'private', true], ['13', null, null]]);
+  const api = parseVintedCatalogApi({ items: [{ id: 5, title: 'RTX', price: { amount: '900.0', currency_code: 'PLN' }, url: 'https://www.vinted.pl/items/5-rtx', user: { id: 1, business: true }, promoted: true }] });
+  assert.deepEqual([api[0].sellerType, api[0].promoted], ['business', true]);
+});
+
+test('seller-type and promoted filters drop only listings known to be the other kind', () => {
+  const base = { currency: 'PLN' as const, observedAt: new Date().toISOString(), title: 'RTX 3070', price: 1300 };
+  const listings = [
+    { ...base, marketplace: 'OLX' as const, listingId: 'dealer', url: 'https://www.olx.pl/d/oferta/a', sellerType: 'business' as const, promoted: true },
+    { ...base, marketplace: 'OLX' as const, listingId: 'private', url: 'https://www.olx.pl/d/oferta/b', sellerType: 'private' as const, promoted: false },
+    { ...base, marketplace: 'Allegro Lokalnie' as const, listingId: 'unknown', url: 'https://allegrolokalnie.pl/oferta/c', sellerType: null, promoted: null },
+  ];
+  const ids = (filters: Parameters<typeof filterListings>[4]) => filterListings(listings, 'rtx 3070', '', '', filters).map((listing) => listing.listingId);
+  assert.deepEqual(ids({}), ['dealer', 'private', 'unknown']);
+  assert.deepEqual(ids({ sellerType: 'private' }), ['private', 'unknown']);
+  assert.deepEqual(ids({ sellerType: 'business' }), ['dealer', 'unknown']);
+  assert.deepEqual(ids({ ignorePromoted: true }), ['private', 'unknown']);
 });

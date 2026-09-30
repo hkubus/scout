@@ -16,7 +16,7 @@ import { api } from "./api";
 import { marketplaceColors } from "./data";
 import { OlxCategoryPicker } from "./OlxCategoryPicker";
 import type { WatchPreset } from "./presets";
-import type { Marketplace, MarketWatch, NotificationRecord, OlxCategory, VariantGroup, Watch } from "./types";
+import type { Marketplace, MarketWatch, NotificationRecord, OlxCategory, SellerType, VariantGroup, Watch } from "./types";
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
@@ -62,6 +62,8 @@ export function WatchDialog({
   const [shippingOnly, setShippingOnly] = useState(initialWatch?.shippingOnly ?? preset?.shippingOnly ?? false);
   const [typoVariants, setTypoVariants] = useState(initialWatch?.typoVariants ?? false);
   const [olxCategory, setOlxCategory] = useState<OlxCategory | null>(initialWatch?.olxCategory ?? preset?.olxCategory ?? null);
+  const [sellerType, setSellerType] = useState<SellerType | null>(initialWatch?.sellerType ?? preset?.sellerType ?? null);
+  const [ignorePromoted, setIgnorePromoted] = useState(initialWatch?.ignorePromoted ?? false);
   const [aiRelevance, setAiRelevance] = useState(initialWatch?.aiRelevance ?? preset?.aiRelevance ?? true);
   const [variantGroups, setVariantGroups] = useState<VariantGroup[]>(initialWatch?.variantGroups ?? []);
   // New watches wait for listings and then propose their own groups.
@@ -159,6 +161,8 @@ export function WatchDialog({
         // Kept only while OLX is a source, so a removed source cannot leave a
         // hidden scope behind for when it is re-added.
         olxCategory: sources.includes("OLX") ? olxCategory : null,
+        sellerType,
+        ignorePromoted,
       });
     } catch (submitError) {
       setError(errorMessage(submitError));
@@ -275,19 +279,32 @@ export function WatchDialog({
               />
             </label>
           </div>
-          <label className="field-label">
-            Condition
-            <select
-              value={condition}
-              onChange={(event) => setCondition(event.target.value)}
-            >
-              <option>Any</option>
-              <option>New</option>
-              <option>Like new</option>
-              <option>Very good</option>
-              <option>Good</option>
-            </select>
-          </label>
+          <div className="field-row">
+            <label className="field-label">
+              Condition
+              <select
+                value={condition}
+                onChange={(event) => setCondition(event.target.value)}
+              >
+                <option>Any</option>
+                <option>New</option>
+                <option>Like new</option>
+                <option>Very good</option>
+                <option>Good</option>
+              </select>
+            </label>
+            <label className="field-label">
+              Seller <span>OLX, Vinted</span>
+              <select
+                value={sellerType ?? ""}
+                onChange={(event) => setSellerType(event.target.value === "private" || event.target.value === "business" ? event.target.value : null)}
+              >
+                <option value="">Any seller</option>
+                <option value="private">Private only</option>
+                <option value="business">Business only</option>
+              </select>
+            </label>
+          </div>
           {sources.includes("OLX") ? (
             <OlxCategoryPicker query={query} value={olxCategory} onChange={setOlxCategory} />
           ) : null}
@@ -373,6 +390,10 @@ export function WatchDialog({
           <label className="check-option check-option--modal">
             <input type="checkbox" checked={shippingOnly} onChange={(event) => setShippingOnly(event.target.checked)} />
             <span><strong>Require shipping</strong><small>Only learn from and alert on listings with confirmed shipping</small></span>
+          </label>
+          <label className="check-option check-option--modal">
+            <input type="checkbox" checked={ignorePromoted} onChange={(event) => setIgnorePromoted(event.target.checked)} />
+            <span><strong>Skip promoted listings</strong><small>Ignore paid placements and highlighted ads, which are mostly dealers (OLX, Vinted)</small></span>
           </label>
           <label className="check-option check-option--modal">
             <input type="checkbox" checked={typoVariants} onChange={(event) => setTypoVariants(event.target.checked)} />

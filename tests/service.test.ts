@@ -620,7 +620,8 @@ test('hides and unhides a listing without deleting its history', () => {
     context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run('hidden-watch', 'Hidden watch', 'brakes', '["OLX"]', 1, lastSeen, firstSeen, lastSeen);
     context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run('OLX', 'hidden-listing', 'Cheap brake pads', 500, 'https://www.olx.pl/d/oferta/hidden-listing', firstSeen, lastSeen);
     const listing = context.db.prepare('SELECT id FROM listings WHERE listing_id = ?').get('hidden-listing') as { id: number };
-    context.db.prepare('INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)').run('hidden-watch', listing.id, firstSeen, lastSeen);
+    // New to this watch today: "New today" counts arrivals, not re-sightings.
+    context.db.prepare('INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)').run('hidden-watch', listing.id, lastSeen, lastSeen);
 
     assert.equal(context.service.getListings()[0].hidden, false);
     assert.equal(context.service.dashboard().stats.newToday, 1);
@@ -1123,7 +1124,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1612,7 +1613,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 30);
+    assert.equal(after.migrations.count, 31);
   } finally { context.close(); }
 });
 
@@ -2865,5 +2866,42 @@ test('a stored town no longer filters watch scans and the API reports no locatio
     await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('town-watch'), { forceAll: true });
     assert.equal((context.db.prepare("SELECT COUNT(*) AS count FROM watch_listings WHERE watch_id = 'town-watch'").get() as { count: number }).count, 1);
     assert.equal(context.service.getWatches().find((watch) => watch.id === 'town-watch')?.location, 'Polska');
+  } finally { context.close(); }
+});
+
+test('private-only watches ask OLX for private sellers, skip promoted ads, and keep the first posting time', async () => {
+  const context = fixture();
+  try {
+    seedWatch(context.db, 'private-watch', { query: 'rtx 3070' });
+    context.db.prepare("UPDATE watches SET seller_type = 'private', ignore_promoted = 1 WHERE id = 'private-watch'").run();
+    const watch = context.service.getWatches().find((candidate) => candidate.id === 'private-watch')!;
+    assert.deepEqual([watch.sellerType, watch.ignorePromoted], ['private', true]);
+    const oldPost = '2025-06-01T08:00:00.000Z';
+    const offer = (id: number, extra: Record<string, unknown>) => ({ id, url: `https://www.olx.pl/d/oferta/gpu-ID${id}.html`, title: 'RTX 3070 8GB', params: [{ key: 'price', value: { value: 1300, currency: 'PLN' } }], ...extra });
+    let createdTime = oldPost;
+    const requested: string[] = [];
+    (context.service as any).fetchOlxApi = async (url: string) => {
+      requested.push(url);
+      return { status: 200, json: { data: [
+        offer(1, { business: false, created_time: createdTime, last_refresh_time: '2026-09-30T17:00:00.000Z', promotion: { top_ad: false, highlighted: false, urgent: false } }),
+        offer(2, { business: false, promotion: { top_ad: true, highlighted: false, urgent: false } }),
+        offer(3, { business: true, promotion: { top_ad: false, highlighted: false, urgent: false } }),
+      ], metadata: { visible_total_count: 3 } } };
+    };
+    const row = () => context.db.prepare('SELECT * FROM watches WHERE id = ?').get('private-watch');
+    await (context.service as any).runWatch(row(), { forceAll: true });
+    assert.equal(new URL(requested[0]).searchParams.get('owner_type'), 'private');
+    const stored = context.db.prepare("SELECT l.listing_id, l.posted_at, l.seller_type, l.promoted FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id WHERE wl.watch_id = 'private-watch'").all() as Array<{ listing_id: string; posted_at: string; seller_type: string; promoted: number }>;
+    assert.deepEqual(stored.map((item) => item.listing_id), ['1'], 'promoted and business offers are neither learned from nor alerted on');
+    assert.deepEqual([stored[0].posted_at, stored[0].seller_type, stored[0].promoted], [oldPost, 'private', 0]);
+    // A relisted offer reporting a later created_time keeps the first posting time.
+    createdTime = '2026-09-30T18:00:00.000Z';
+    await (context.service as any).runWatch(row(), { forceAll: true });
+    assert.equal((context.db.prepare("SELECT posted_at FROM listings WHERE listing_id = '1'").get() as { posted_at: string }).posted_at, oldPost);
+    const listing = context.service.getListings().find((candidate) => candidate.listingId === '1')!;
+    assert.equal(listing.postedAt, oldPost);
+    assert.equal(listing.sellerType, 'private');
+    // First seen today but posted long ago: not "new today".
+    assert.equal(context.service.dashboard().stats.newToday, 0);
   } finally { context.close(); }
 });

@@ -452,6 +452,8 @@ const watchInput = z.object({
   minPrice: z.number().nonnegative().nullable().optional().default(null),
   maxPrice: z.number().positive().nullable().optional().default(null),
   olxCategory: olxCategoryInput.nullable().optional().default(null),
+  sellerType: z.enum(['private', 'business']).nullable().optional().default(null),
+  ignorePromoted: z.boolean().optional().default(false),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
 
 app.post('/api/watches', async (request, reply) => {
@@ -469,7 +471,7 @@ app.post('/api/watches', async (request, reply) => {
   const now = nowIso();
   const sourceIntervals = normalizeSourceIntervals(value.sources, value.sourceIntervals);
   try {
-    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, source_intervals_json, sensitivity, shipping_only, typo_variants, ai_relevance, variant_groups_json, variant_groups_auto, reference_market_watch_id, min_price_pln, max_price_pln, olx_category_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, NO_LOCATION_FILTER, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, JSON.stringify(sourceIntervals), value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, JSON.stringify(value.variantGroups), value.variantGroupsAuto && !value.variantGroups.length ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, olxCategoryToJson(value.olxCategory), 1, now, now, now);
+    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, source_intervals_json, sensitivity, shipping_only, typo_variants, ai_relevance, variant_groups_json, variant_groups_auto, reference_market_watch_id, min_price_pln, max_price_pln, olx_category_json, seller_type, ignore_promoted, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, NO_LOCATION_FILTER, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, JSON.stringify(sourceIntervals), value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, JSON.stringify(value.variantGroups), value.variantGroupsAuto && !value.variantGroups.length ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, olxCategoryToJson(value.olxCategory), value.sellerType, value.ignorePromoted ? 1 : 0, 1, now, now, now);
   } catch (error) {
     if (error instanceof Error && /UNIQUE|PRIMARY KEY|constraint/i.test(error.message)) {
       return reply.code(409).send({ error: 'A watch with this id already exists' });
@@ -499,6 +501,8 @@ app.patch('/api/watches/:id', async (request, reply) => {
     archived: z.boolean().optional(),
     minPrice: z.number().nonnegative().nullable().optional(), maxPrice: z.number().positive().nullable().optional(),
     olxCategory: olxCategoryInput.nullable().optional(),
+    sellerType: z.enum(['private', 'business']).nullable().optional(),
+    ignorePromoted: z.boolean().optional(),
   }).strict().safeParse(request.body);
   if (!patchInput.success) return reply.code(400).send({ error: 'Invalid watch update', details: patchInput.error.flatten() });
   const body = patchInput.data;
@@ -551,6 +555,8 @@ app.patch('/api/watches/:id', async (request, reply) => {
   if (body.minPrice !== undefined) { fields.push('min_price_pln = ?'); values.push(body.minPrice); }
   if (body.maxPrice !== undefined) { fields.push('max_price_pln = ?'); values.push(body.maxPrice); }
   if (body.olxCategory !== undefined) { fields.push('olx_category_json = ?'); values.push(olxCategoryToJson(body.olxCategory)); }
+  if (body.sellerType !== undefined) { fields.push('seller_type = ?'); values.push(body.sellerType); }
+  if (typeof body.ignorePromoted === 'boolean') { fields.push('ignore_promoted = ?'); values.push(body.ignorePromoted ? 1 : 0); }
   if (body.archived !== undefined) {
     fields.push('archived_at = ?');
     values.push(body.archived ? nowIso() : null);

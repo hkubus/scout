@@ -784,6 +784,11 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .decision-chip--reference { color: var(--teal); background: rgba(21, 155, 150, .12); }
 .decision-chip--ai-filtered { color: var(--muted); background: var(--surface-muted); border: 1px dashed var(--line-strong); font-weight: 600; }
 .decision-chip--hidden { display: inline-flex; align-items: center; gap: 3px; color: var(--muted); background: var(--surface-muted); border: 1px solid var(--line-strong); font-weight: 600; }
+.decision-chip--age { color: var(--muted); background: var(--surface-muted); font-weight: 600; }
+.decision-chip--age-fresh { color: var(--green); background: rgba(58, 171, 97, .12); }
+.decision-chip--age-old { color: var(--orange); background: rgba(241, 90, 53, .1); }
+.decision-chip--promoted { color: var(--muted); background: var(--surface-muted); border: 1px solid var(--line-strong); font-weight: 600; }
+.decision-chip--business { color: var(--blue); background: var(--blue-soft); font-weight: 600; }
 .snapshot-price-history { margin-top: 12px; display: grid; gap: 8px; }
 .snapshot-price-history > strong { font-size: 12px; }
 .listing-drawer-backdrop { position: fixed; inset: 0; z-index: 60; display: flex; justify-content: flex-end; background: rgba(12, 17, 26, .48); backdrop-filter: blur(3px); }

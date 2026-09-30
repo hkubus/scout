@@ -98,7 +98,7 @@ export const api = {
     return request<AnalyticsData>(`/api/analytics?${params}`, { signal });
   },
   createWatch: (watch: Omit<Watch, 'id'> & { id?: string }) => request<{ watch: Watch }>('/api/watches', json('POST', watch)),
-  updateWatch: (id: string, patch: Partial<Pick<Watch, 'name' | 'query' | 'terms' | 'excluded' | 'sources' | 'condition' | 'interval' | 'sourceIntervals' | 'exactUrls' | 'sensitivity' | 'shippingOnly' | 'aiRelevance' | 'typoVariants' | 'variantGroups' | 'variantGroupsAuto' | 'referenceMarketWatchId' | 'minPrice' | 'maxPrice' | 'olxCategory' | 'enabled'>> & { archived?: boolean }) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
+  updateWatch: (id: string, patch: Partial<Pick<Watch, 'name' | 'query' | 'terms' | 'excluded' | 'sources' | 'condition' | 'interval' | 'sourceIntervals' | 'exactUrls' | 'sensitivity' | 'shippingOnly' | 'aiRelevance' | 'typoVariants' | 'variantGroups' | 'variantGroupsAuto' | 'referenceMarketWatchId' | 'minPrice' | 'maxPrice' | 'olxCategory' | 'sellerType' | 'ignorePromoted' | 'enabled'>> & { archived?: boolean }) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
   suggestVariantGroups: (id: string) => request<VariantSuggestions>(`/api/watches/${encodeURIComponent(id)}/variant-suggestions`, json('POST', {})),
   olxCategories: (query: string, signal?: AbortSignal) => request<{ categories: OlxCategoryOption[] }>(`/api/marketplaces/olx/categories?${new URLSearchParams({ query })}`, { signal }),
   search: (filters: SearchFilters, signal?: AbortSignal) => request<ManualSearchResponse>('/api/search', { ...json('POST', filters), signal }, 90_000),

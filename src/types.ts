@@ -61,6 +61,8 @@ export interface ListingDetailSnapshot {
   verificationStatus?: ListingDescriptionVerificationStatus | null;
 }
 
+export type SellerType = 'private' | 'business';
+
 export interface Listing {
   id: string;
   /** Global marketplace identity, safe for external links and triage actions. */
@@ -93,6 +95,16 @@ export interface Listing {
   location?: string;
   shippingAvailable: boolean | null;
   priceNegotiable?: boolean | null;
+  /** When Scout first saw the listing (for this watch). */
+  firstSeenAt?: string | null;
+  /** When the seller posted it, where the marketplace says (OLX). */
+  postedAt?: string | null;
+  /** The seller's latest refresh or paid bump (OLX). */
+  refreshedAt?: string | null;
+  /** Paid placement or highlight; null when unknown. */
+  promoted?: boolean | null;
+  /** From the marketplace's business-account flag; null when unknown. */
+  sellerType?: SellerType | null;
   listingId?: string;
   decision?: ListingDecision | null;
   note?: string;
@@ -223,6 +235,10 @@ export interface Watch {
   maxPrice: number | null;
   /** OLX scans only search this category; null searches all of OLX. */
   olxCategory?: OlxCategory | null;
+  /** Only learn from and alert on this seller type; null is any seller. */
+  sellerType?: SellerType | null;
+  /** Skip paid placements and highlights. */
+  ignorePromoted?: boolean;
   archivedAt?: string | null;
 }
 

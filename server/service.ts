@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { connect as connectHttp2 } from 'node:http2';
 import { chromium, type Browser, type BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
-import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
+import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, type SellerType, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext } from './ai';
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchVariantWithJev, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
@@ -1505,7 +1505,7 @@ export class ScoutService {
   private async fuzzyRescueForSearch(
     fetched: NormalizedListing[],
     search: { query: string; includedTerms: string; excludedTerms: string; condition?: string },
-    finalFilters: { minPrice?: number | null; maxPrice?: number | null; condition?: string; shippingOnly: boolean },
+    finalFilters: { minPrice?: number | null; maxPrice?: number | null; condition?: string; shippingOnly: boolean; sellerType?: SellerType | null; ignorePromoted?: boolean },
     source: Marketplace,
     gate?: (listing: NormalizedListing) => boolean,
   ): Promise<NormalizedListing[]> {
@@ -2018,6 +2018,8 @@ export class ScoutService {
       minPrice: row.min_price_pln === null ? null : Number(row.min_price_pln),
       maxPrice: row.max_price_pln === null ? null : Number(row.max_price_pln),
       olxCategory: olxCategoryFromJson(row.olx_category_json),
+      sellerType: sellerTypeFromRow(row.seller_type),
+      ignorePromoted: Boolean(row.ignore_promoted),
       archivedAt: row.archived_at ?? null,
     };
   }
@@ -2072,6 +2074,11 @@ export class ScoutService {
       location: row.location || undefined,
       shippingAvailable: row.marketplace === 'Vinted' ? true : row.shipping_available === null ? null : Boolean(row.shipping_available),
       priceNegotiable: row.price_negotiable === null || row.price_negotiable === undefined ? null : Boolean(row.price_negotiable),
+      firstSeenAt: row.watch_first_seen_at ?? row.first_seen_at ?? null,
+      postedAt: row.posted_at ?? null,
+      refreshedAt: row.refreshed_at ?? null,
+      promoted: row.promoted === null || row.promoted === undefined ? null : Boolean(row.promoted),
+      sellerType: row.seller_type === 'private' || row.seller_type === 'business' ? row.seller_type : null,
       listingId: String(row.listing_id),
       decision: parseListingDecision(row.listing_decision),
       note: typeof row.listing_note === 'string' ? row.listing_note : '',
@@ -2627,7 +2634,7 @@ export class ScoutService {
     const total = Number((this.stmt(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(500, Math.floor(options.pageSize ?? 200)));
-    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.variant_key AS variant_key, wl.variant_source AS variant_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note, a.hidden AS listing_hidden, CASE WHEN ${aiFilteredPredicate} THEN 1 ELSE 0 END AS ai_filtered
+    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.posted_at, l.refreshed_at, l.promoted, l.seller_type, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.variant_key AS variant_key, wl.variant_source AS variant_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note, a.hidden AS listing_hidden, CASE WHEN ${aiFilteredPredicate} THEN 1 ELSE 0 END AS ai_filtered
       FROM listings l
       JOIN watch_listings wl ON wl.listing_id = l.id
       JOIN watches w ON w.id = wl.watch_id
@@ -2819,7 +2826,7 @@ export class ScoutService {
       const started = Date.now();
       try {
         const fetched = await this.fetchSearchPages(source, input.query, { ...input, olxCategoryId: input.olxCategory?.id ?? null, page });
-        const deterministicFilters = { minPrice: input.minPrice, maxPrice: input.maxPrice, condition: input.condition, shippingOnly: false };
+        const deterministicFilters = { minPrice: input.minPrice, maxPrice: input.maxPrice, condition: input.condition, sellerType: input.ownerType ?? null, shippingOnly: false };
         const comparable = filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters);
         // Cache-first like watch scans: only a few cold listings fetch an item
         // page per search; the rest surface as pending delivery checks.
@@ -2881,6 +2888,7 @@ export class ScoutService {
           price: listing.price, typical: null, belowTypical: null, observed: 'just now', observedAt: listing.observedAt,
           dealStrength: 1, dealLabel: 'Watch', image: listing.imageUrl ?? '', url: listing.url, watch: 'Manual search',
           condition: listing.condition, location: listing.location, shippingAvailable: listing.shippingAvailable ?? null, priceNegotiable: listing.priceNegotiable ?? null,
+          postedAt: listing.postedAt ?? null, refreshedAt: listing.refreshedAt ?? null, promoted: listing.promoted ?? null, sellerType: listing.sellerType ?? null,
         }));
         const status: SearchSourceStatus = {
           source, status: 'ok', count: relevant.length, pendingShipping, durationMs: Date.now() - started,
@@ -3514,7 +3522,11 @@ export class ScoutService {
     let strongDeals = 0;
     for (const listing of listings) {
       if (listing.aiFiltered || listing.hidden) continue;
-      if (Date.parse(listing.observedAt) >= todayTime) newToday += 1;
+      // Posted today, not merely bumped or re-seen today: OLX refreshes keep
+      // old offers at the top of "newest". Sources without a posting time
+      // fall back to when Scout first saw the listing.
+      const arrivedAt = listing.postedAt ?? listing.firstSeenAt ?? listing.observedAt;
+      if (Date.parse(arrivedAt) >= todayTime) newToday += 1;
       if (listing.dealStrength >= 4) strongDeals += 1;
     }
     const lastScan = parseJson<{ at?: string }>(this.getSetting('last_scan'), {});
@@ -3807,7 +3819,7 @@ export class ScoutService {
         }
         try {
           const matchingExact = exactUrls.filter((url) => validateSearchUrl(url, source).valid);
-          const searchFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), olxCategoryId: olxCategoryFromJson(row.olx_category_json)?.id ?? null, sort: 'newest' as const };
+          const searchFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), olxCategoryId: olxCategoryFromJson(row.olx_category_json)?.id ?? null, ownerType: sellerTypeFromRow(row.seller_type), sort: 'newest' as const };
           const urls = matchingExact.length
             ? matchingExact
             : [this.marketplaceSearchRequestUrl(source, row.query, searchFilters)];
@@ -3827,7 +3839,7 @@ export class ScoutService {
           }
           const fetched = [...new Map(mainListings.map((listing) => [`${listing.marketplace}:${listing.listingId}`, listing])).values()];
           this.log('info', 'watch', `${row.name} · ${source}: ${matchingExact.length ? `exact-urls (${matchingExact.length})` : 'query-search'}${variantFetches.length ? ` + typo-variants (${variantFetches.join(', ')})` : ''} → ${paths.join(' → ') || 'no fetch'} · fetched=${fetched.length}`);
-          const deterministicFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: false };
+          const deterministicFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, sellerType: sellerTypeFromRow(row.seller_type), ignorePromoted: Boolean(row.ignore_promoted), shippingOnly: false };
           const comparable = filterListings(fetched, row.query, row.included_terms, row.excluded_terms, deterministicFilters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
           let filtered = filterListings(comparable, row.query, row.included_terms, row.excluded_terms, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) });
@@ -4346,12 +4358,13 @@ export class ScoutService {
 
   private storeManualListing(listing: NormalizedListing) {
     const observedAt = nowIso();
-    this.stmt(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, availability_status, last_verified_at, first_seen_at, last_seen_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, ?)
-      ON CONFLICT(marketplace, listing_id) DO UPDATE SET title = excluded.title, price_pln = excluded.price_pln, url = excluded.url, image_url = COALESCE(excluded.image_url, listings.image_url), condition = COALESCE(excluded.condition, listings.condition), location = COALESCE(excluded.location, listings.location), shipping_available = COALESCE(excluded.shipping_available, listings.shipping_available), price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), availability_status = 'live', last_verified_at = excluded.last_verified_at, last_seen_at = excluded.last_seen_at`).run(
+    this.stmt(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, posted_at, refreshed_at, promoted, seller_type, availability_status, last_verified_at, first_seen_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, ?)
+      ON CONFLICT(marketplace, listing_id) DO UPDATE SET title = excluded.title, price_pln = excluded.price_pln, url = excluded.url, image_url = COALESCE(excluded.image_url, listings.image_url), condition = COALESCE(excluded.condition, listings.condition), location = COALESCE(excluded.location, listings.location), shipping_available = COALESCE(excluded.shipping_available, listings.shipping_available), price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), posted_at = COALESCE(listings.posted_at, excluded.posted_at), refreshed_at = COALESCE(excluded.refreshed_at, listings.refreshed_at), promoted = COALESCE(excluded.promoted, listings.promoted), seller_type = COALESCE(excluded.seller_type, listings.seller_type), availability_status = 'live', last_verified_at = excluded.last_verified_at, last_seen_at = excluded.last_seen_at`).run(
       listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null,
       listing.shippingAvailable === null || listing.shippingAvailable === undefined ? null : listing.shippingAvailable ? 1 : 0,
       listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0,
+      ...listingSignalParams(listing),
       observedAt, observedAt, observedAt,
     );
   }
@@ -4445,10 +4458,10 @@ export class ScoutService {
     const observedAt = nowIso();
     // RETURNING removes the follow-up SELECT for the row id on both the
     // insert and the conflict-update branch of each upsert.
-    const stored = this.stmt(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, availability_status, last_verified_at, first_seen_at, last_seen_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, ?)
-      ON CONFLICT(marketplace, listing_id) DO UPDATE SET title = excluded.title, price_pln = excluded.price_pln, url = excluded.url, image_url = COALESCE(excluded.image_url, listings.image_url), condition = COALESCE(excluded.condition, listings.condition), location = COALESCE(excluded.location, listings.location), shipping_available = COALESCE(excluded.shipping_available, listings.shipping_available), price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), availability_status = 'live', ended_reason = NULL, last_verified_at = excluded.last_verified_at, last_seen_at = excluded.last_seen_at
-      RETURNING id`).get(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable === null ? null : listing.shippingAvailable ? 1 : 0, listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0, observedAt, observedAt, observedAt) as { id: number };
+    const stored = this.stmt(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, posted_at, refreshed_at, promoted, seller_type, availability_status, last_verified_at, first_seen_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, ?)
+      ON CONFLICT(marketplace, listing_id) DO UPDATE SET title = excluded.title, price_pln = excluded.price_pln, url = excluded.url, image_url = COALESCE(excluded.image_url, listings.image_url), condition = COALESCE(excluded.condition, listings.condition), location = COALESCE(excluded.location, listings.location), shipping_available = COALESCE(excluded.shipping_available, listings.shipping_available), price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), posted_at = COALESCE(listings.posted_at, excluded.posted_at), refreshed_at = COALESCE(excluded.refreshed_at, listings.refreshed_at), promoted = COALESCE(excluded.promoted, listings.promoted), seller_type = COALESCE(excluded.seller_type, listings.seller_type), availability_status = 'live', ended_reason = NULL, last_verified_at = excluded.last_verified_at, last_seen_at = excluded.last_seen_at
+      RETURNING id`).get(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable === null ? null : listing.shippingAvailable ? 1 : 0, listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0, ...listingSignalParams(listing), observedAt, observedAt, observedAt) as { id: number };
     // A manual pick saved while this scan ran still wins over the scan's
     // view, and scoring uses whatever variant the row ends up with.
     const association = this.stmt(`INSERT INTO watch_listings (watch_id, listing_id, variant_key, variant_source, first_seen_at, last_seen_at)
@@ -4926,6 +4939,15 @@ export class ScoutService {
   }
 }
 
+export function sellerTypeFromRow(value: unknown): SellerType | null {
+  return value === 'private' || value === 'business' ? value : null;
+}
+
+/** posted_at, refreshed_at, promoted, seller_type for the listings upserts. */
+function listingSignalParams(listing: NormalizedListing): [string | null, string | null, number | null, string | null] {
+  return [listing.postedAt ?? null, listing.refreshedAt ?? null, listing.promoted === null || listing.promoted === undefined ? null : listing.promoted ? 1 : 0, listing.sellerType ?? null];
+}
+
 /**
  * Scout no longer filters by location: shipped listings from anywhere count.
  * The API still reports this value (and the columns keep it) because older
@@ -4959,6 +4981,13 @@ export type ListingFilters = {
   minPrice?: number | null;
   maxPrice?: number | null;
   condition?: string;
+  /**
+   * Keep only this seller type. Listings whose type the marketplace does not
+   * report are kept: an unknown flag is not evidence of a dealer.
+   */
+  sellerType?: SellerType | null;
+  /** Drop paid placements and highlights. */
+  ignorePromoted?: boolean;
   /**
    * Manual search only: when the strict all-terms match returns nothing, accept
    * listings that match a majority of the implicit query tokens instead of
@@ -5049,7 +5078,9 @@ function evaluateDeterministic(
   const priceOk = (options.minPrice === null || options.minPrice === undefined || listing.price >= options.minPrice)
     && (options.maxPrice === null || options.maxPrice === undefined || listing.price <= options.maxPrice);
   const shippingOk = !options.shippingOnly || listing.marketplace === 'Vinted' || listing.shippingAvailable === true;
-  return { termOk, conditionOk, priceOk, shippingOk };
+  const sellerOk = (!options.sellerType || !listing.sellerType || listing.sellerType === options.sellerType)
+    && (!options.ignorePromoted || listing.promoted !== true);
+  return { termOk, conditionOk, priceOk, shippingOk, sellerOk };
 }
 
 export function filterListings(listings: NormalizedListing[], query: string, includedRaw: string, excludedRaw: string, filters: ListingFilters | boolean = {}) {
@@ -5062,7 +5093,7 @@ export function filterListings(listings: NormalizedListing[], query: string, inc
     const title = normalizeFilterText(listing.title);
     const condition = normalizeFilterText(listing.condition ?? '');
     const evaluated = evaluateDeterministic(listing, title, condition, included, excluded, requestedCondition, options, relaxed);
-    return evaluated.termOk && evaluated.conditionOk && evaluated.priceOk && evaluated.shippingOk;
+    return evaluated.termOk && evaluated.conditionOk && evaluated.priceOk && evaluated.shippingOk && evaluated.sellerOk;
   });
   const strict = evaluate(false);
   // Only manual search opts into the relaxed retry, and never when the user
@@ -5095,7 +5126,7 @@ export function findFuzzyRescueCandidates(
     const title = normalizeFilterText(listing.title);
     const condition = normalizeFilterText(listing.condition ?? '');
     const evaluated = evaluateDeterministic(listing, title, condition, included, excluded, requestedCondition, options);
-    if (!evaluated.priceOk || !evaluated.shippingOk) continue;
+    if (!evaluated.priceOk || !evaluated.shippingOk || !evaluated.sellerOk) continue;
     if (!evaluated.termOk && evaluated.conditionOk && hasTermFilter) termCandidates.push(listing);
     else if (!evaluated.conditionOk && evaluated.termOk && hasConditionFilter) conditionCandidates.push(listing);
   }
