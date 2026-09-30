@@ -23,6 +23,7 @@ import {
   SlidersHorizontal,
   Tag,
   TrendingUp,
+  Wallet,
   WifiOff,
 } from "lucide-react";
 import { api, UNAUTHORIZED_EVENT, type AuthSession } from "./api";
@@ -46,6 +47,7 @@ const navItems: Array<{ id: View; label: string; icon: typeof Grid2X2 }> = [
   { id: "market-research", label: "Market research", icon: BarChart3 },
   { id: "analytics", label: "Analytics", icon: TrendingUp },
   { id: "listings", label: "Listings", icon: Tag },
+  { id: "flips", label: "Flips", icon: Wallet },
   { id: "connectors", label: "Connectors", icon: PlugZap },
   { id: "logs", label: "Logs", icon: ScrollText },
   { id: "settings", label: "Settings", icon: Settings2 },
@@ -58,6 +60,8 @@ const loadConnectorsPage = () => import("./ConnectorsPage");
 const loadLogsPage = () => import("./LogsPage");
 const loadSearchPage = () => import("./SearchPage");
 const loadListingsPage = () => import("./ListingsPage");
+const loadFlipsPage = () => import("./FlipsPage");
+const LazyFlipsPage = lazy(loadFlipsPage);
 const LazyMarketResearchPage = lazy(loadMarketResearchPage);
 const LazyAnalyticsPage = lazy(loadAnalyticsPage);
 const LazySettingsPage = lazy(loadSettingsPage);
@@ -80,6 +84,7 @@ const routeLoaders: Partial<Record<View, () => Promise<unknown>>> = {
   "market-research": loadMarketResearchPage,
   analytics: loadAnalyticsPage,
   listings: loadListingsPage,
+  flips: loadFlipsPage,
   connectors: loadConnectorsPage,
   logs: loadLogsPage,
   settings: loadSettingsPage,
@@ -224,6 +229,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
   const [analyticsRefreshKey, setAnalyticsRefreshKey] = useState(0);
   const [listingsRefreshKey, setListingsRefreshKey] = useState(0);
   const [logsRefreshKey, setLogsRefreshKey] = useState(0);
+  const [flipsRefreshKey, setFlipsRefreshKey] = useState(0);
   const [selectedWatchId, setSelectedWatchId] = useState<string | null>(
     null,
   );
@@ -288,6 +294,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     source.addEventListener("ai-description-verification", refresh);
     source.addEventListener("market-watch", () => { setMarketRefreshKey((value) => value + 1); setAnalyticsRefreshKey((value) => value + 1); });
     source.addEventListener("log", () => setLogsRefreshKey((value) => value + 1));
+    source.addEventListener("flips", () => setFlipsRefreshKey((value) => value + 1));
     source.onerror = () => setConnection("offline");
     return () => {
       if (refreshTimer !== null) window.clearTimeout(refreshTimer);
@@ -629,6 +636,11 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
             />
           </Suspense>
         ) : null}
+        {view === "flips" ? (
+          <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading flips…</div>}>
+            <LazyFlipsPage refreshKey={flipsRefreshKey} onToast={notify} />
+          </Suspense>
+        ) : null}
         {view === "connectors" ? (
           <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading connectors…</div>}>
             <LazyConnectorsPage
@@ -695,6 +707,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
             listing={selectedListing}
             onClose={() => setSelectedListing(null)}
             onUpdated={updateListingAction}
+            onFlipAdded={(flip) => notify(`${flip.title} added to Flips.`)}
             onCreateWatch={(preset) => {
               setSelectedListing(null);
               setWatchPreset(preset);

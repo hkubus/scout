@@ -3554,6 +3554,9 @@ export class ScoutService {
       exportedAt: nowIso(),
       note: 'Encrypted credentials, browser sessions, and raw secret values are intentionally omitted. Use the authenticated database backup command for a complete restore point.',
       watches: rows('watches'),
+      // The operator's own flip ledger: their data, so it is exported, but
+      // never exposed through the debug API.
+      flips: rows('flips'),
       listings: rows('listings'),
       observations: rows('observations'),
       listingRelevance: rows('listing_relevance'),

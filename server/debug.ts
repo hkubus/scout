@@ -69,6 +69,14 @@ function stripLeadingComments(sql: string) {
   }
 }
 
+/**
+ * The operator's private bookkeeping (the flip ledger) is not debugging data:
+ * it is left out of the table list, refused in read-only SQL, and emptied in
+ * snapshots. Export it through the authenticated /api/export instead.
+ */
+const PRIVATE_TABLES = ['flips'];
+const PRIVATE_TABLE_PATTERN = new RegExp(`\\b(?:${PRIVATE_TABLES.join('|')})\\b`, 'i');
+
 const quoteIdent = (name: string) => `"${name.replace(/"/g, '""')}"`;
 
 // Runs in a child process: opens its own read-only connection, blanks the
@@ -87,7 +95,8 @@ process.stdin.on('end', () => {
     db = new DatabaseSync(path, { readOnly: true });
     db.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 2000;');
     if (typeof db.setAuthorizer === 'function' && constants) {
-      db.setAuthorizer((action, table, column) => (action === constants.SQLITE_READ && table === 'marketplace_sessions' && column === 'storage_state_encrypted' ? constants.SQLITE_IGNORE : constants.SQLITE_OK));
+      db.setAuthorizer((action, table, column) => (action === constants.SQLITE_READ && table === 'flips' ? constants.SQLITE_DENY
+        : action === constants.SQLITE_READ && table === 'marketplace_sessions' && column === 'storage_state_encrypted' ? constants.SQLITE_IGNORE : constants.SQLITE_OK));
     }
   } catch (error) { out({ error: 'open', message: String(error && error.message || error) }); return; }
   let statement;
@@ -162,7 +171,7 @@ export class ScoutDebug {
   }
 
   private tableNames(): string[] {
-    return (this.reader().prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>).map((row) => row.name);
+    return (this.reader().prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>).map((row) => row.name).filter((name) => !PRIVATE_TABLES.includes(name));
   }
 
   /** Every table and view with columns, indexes, and row counts, plus file and migration state. */
@@ -235,6 +244,8 @@ export class ScoutDebug {
   async query(sql: string, params: unknown[] | Record<string, unknown> = [], maxRows = 500) {
     const statementText = stripLeadingComments(sql);
     if (!READ_STATEMENT.test(statementText)) throw new ServiceError('Only SELECT, WITH, VALUES, EXPLAIN, and PRAGMA statements are allowed', 400);
+    // Belt and braces with the child's authorizer, which older Node builds lack.
+    if (PRIVATE_TABLE_PATTERN.test(statementText)) throw new ServiceError('The flip ledger is private and not available through the debug API', 403);
     const limit = Math.min(Math.max(1, Math.trunc(maxRows)), QUERY_MAX_ROWS);
     const started = performance.now();
     const result = await runQueryChild({ path: this.databasePath, sql: statementText, params, maxRows: limit }, this.queryTimeoutMs);
@@ -283,6 +294,7 @@ export class ScoutDebug {
           for (const row of rows) if (typeof row.value === 'string' && ENCRYPTED_SECRET.test(row.value)) update.run(REDACTED, row.key);
         }
         if (hasTable('marketplace_sessions')) copy.prepare('UPDATE marketplace_sessions SET storage_state_encrypted = ?').run(REDACTED);
+        for (const table of PRIVATE_TABLES) if (hasTable(table)) copy.exec(`DELETE FROM ${quoteIdent(table)}`);
         copy.exec('VACUUM');
       } finally {
         copy.close();

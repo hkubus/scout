@@ -1,4 +1,4 @@
-import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, NotificationPriority, NotificationRecord, OlxCategoryOption, PriceHistoryPoint, SearchFilters, SettingsData, VariantSuggestions, VerificationComparison, Watch, WatchAnalytics } from './types';
+import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, FeePresets, Flip, FlipsData, NotificationPriority, NotificationRecord, OlxCategoryOption, PriceHistoryPoint, SearchFilters, SettingsData, VariantSuggestions, VerificationComparison, Watch, WatchAnalytics } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -100,6 +100,11 @@ export const api = {
   createWatch: (watch: Omit<Watch, 'id'> & { id?: string }) => request<{ watch: Watch }>('/api/watches', json('POST', watch)),
   updateWatch: (id: string, patch: Partial<Pick<Watch, 'name' | 'query' | 'terms' | 'excluded' | 'sources' | 'condition' | 'interval' | 'sourceIntervals' | 'exactUrls' | 'sensitivity' | 'shippingOnly' | 'aiRelevance' | 'typoVariants' | 'variantGroups' | 'variantGroupsAuto' | 'referenceMarketWatchId' | 'minPrice' | 'maxPrice' | 'olxCategory' | 'sellerType' | 'ignorePromoted' | 'enabled'>> & { archived?: boolean }) => request<{ ok: true }>(`/api/watches/${encodeURIComponent(id)}`, json('PATCH', patch)),
   suggestVariantGroups: (id: string) => request<VariantSuggestions>(`/api/watches/${encodeURIComponent(id)}/variant-suggestions`, json('POST', {})),
+  flips: (signal?: AbortSignal) => request<FlipsData>('/api/flips', { signal }),
+  createFlip: (flip: Pick<Flip, 'title' | 'buyChannel' | 'boughtOn' | 'buyPrice'> & Partial<Pick<Flip, 'listingKey' | 'watchId' | 'buyCosts' | 'listedOn' | 'note'>>) => request<{ flip: Flip }>('/api/flips', json('POST', flip)),
+  updateFlip: (id: number, patch: Partial<Omit<Flip, 'id' | 'createdAt' | 'updatedAt'>>) => request<{ flip: Flip }>(`/api/flips/${id}`, json('PATCH', patch)),
+  deleteFlip: (id: number) => request<{ ok: true }>(`/api/flips/${id}`, json('DELETE')),
+  saveFeePresets: (presets: FeePresets) => request<{ feePresets: FeePresets }>('/api/flips/fee-presets', json('PUT', presets)),
   olxCategories: (query: string, signal?: AbortSignal) => request<{ categories: OlxCategoryOption[] }>(`/api/marketplaces/olx/categories?${new URLSearchParams({ query })}`, { signal }),
   search: (filters: SearchFilters, signal?: AbortSignal) => request<ManualSearchResponse>('/api/search', { ...json('POST', filters), signal }, 90_000),
   marketResearch: (options: { page?: number; pageSize?: number; watchId?: string; status?: 'active' | 'ended' | 'superseded' } = {}, signal?: AbortSignal) => {

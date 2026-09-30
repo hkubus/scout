@@ -11,6 +11,7 @@ import {
   Info,
   Layers,
   LoaderCircle,
+  PackageCheck,
   Scale,
   ShieldCheck,
   Tag,
@@ -20,7 +21,9 @@ import { api } from "./api";
 import { watchPresetFromListing, type WatchPreset } from "./presets";
 import { PriceSparkline } from "./PriceSparkline";
 import { listingAge } from "./listingSignals";
+import { DEFAULT_FEE_PRESETS, FLIP_CHANNELS, saleFee, type FeePresets, type FlipChannel } from "./profit";
 import type {
+  Flip,
   Listing,
   ListingDecision,
   ListingDetail,
@@ -55,11 +58,13 @@ export default function ListingDetailDrawer({
   onClose,
   onUpdated,
   onCreateWatch,
+  onFlipAdded,
 }: {
   listing: Listing;
   onClose: () => void;
   onUpdated: (listing: Listing) => void;
   onCreateWatch?: (preset: WatchPreset) => void;
+  onFlipAdded?: (flip: Flip) => void;
 }) {
   const [detail, setDetail] = useState<ListingDetail>({
     listing,
@@ -74,6 +79,12 @@ export default function ListingDetailDrawer({
   const [shippingCost, setShippingCost] = useState("");
   const [extraCost, setExtraCost] = useState("");
   const [resalePrice, setResalePrice] = useState(listing.typical === null ? "" : String(listing.typical));
+  // Resell on the same platform by default; the fee comes from the operator's
+  // presets on the Flips page. Display-only, like the rest of the calculator.
+  const [sellOn, setSellOn] = useState<FlipChannel>(listing.marketplace);
+  const [feePresets, setFeePresets] = useState<FeePresets>(DEFAULT_FEE_PRESETS);
+  const [addingFlip, setAddingFlip] = useState(false);
+  const [flipAdded, setFlipAdded] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [comparison, setComparison] = useState<VerificationComparison | null>(null);
@@ -89,12 +100,43 @@ export default function ListingDetailDrawer({
   };
   const totalCost = currentListing.price + toFiniteCost(shippingCost) + toFiniteCost(extraCost);
   const expectedResale = resalePrice === "" ? null : Number(resalePrice);
-  const expectedProfit = expectedResale === null || !Number.isFinite(expectedResale) ? null : expectedResale - totalCost;
+  const resaleFee = expectedResale === null || !Number.isFinite(expectedResale) ? 0 : saleFee(expectedResale, feePresets[sellOn]);
+  const expectedProfit = expectedResale === null || !Number.isFinite(expectedResale) ? null : expectedResale - resaleFee - totalCost;
   // ROI is profit relative to what you spend; margin is profit relative to the sale price.
   const expectedRoi = expectedProfit === null || totalCost <= 0 ? null : (expectedProfit / totalCost) * 100;
   const expectedMargin = expectedProfit === null || expectedResale === null || expectedResale <= 0 ? null : (expectedProfit / expectedResale) * 100;
   const typicalSavings = currentListing.typical === null ? null : currentListing.typical - totalCost;
   const showDescriptionSafeguard = currentListing.dealStrength >= 4 || Boolean(detail.descriptionSnapshot);
+
+  useEffect(() => {
+    let active = true;
+    api.flips().then((result) => { if (active) setFeePresets(result.feePresets); }).catch(() => { /* estimates fall back to the default presets */ });
+    return () => { active = false; };
+  }, []);
+
+  const addFlip = async () => {
+    setAddingFlip(true);
+    setError(null);
+    try {
+      const today = new Date();
+      const boughtOn = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+      const result = await api.createFlip({
+        title: currentListing.title.slice(0, 200),
+        listingKey: marketplaceListingKey,
+        watchId: currentListing.watchId ?? null,
+        buyChannel: currentListing.marketplace,
+        boughtOn,
+        buyPrice: currentListing.price,
+        buyCosts: toFiniteCost(shippingCost) + toFiniteCost(extraCost),
+      });
+      setFlipAdded(true);
+      onFlipAdded?.(result.flip);
+    } catch (addError) {
+      setError(errorMessage(addError));
+    } finally {
+      setAddingFlip(false);
+    }
+  };
 
   useEffect(() => {
     let active = true;
@@ -408,6 +450,7 @@ export default function ListingDetailDrawer({
               <label className="field-label">Shipping / fees <span>PLN</span><input type="number" min="0" step="1" value={shippingCost} onChange={(event) => setShippingCost(event.target.value)} placeholder="0" /></label>
               <label className="field-label">Other cost <span>PLN</span><input type="number" min="0" step="1" value={extraCost} onChange={(event) => setExtraCost(event.target.value)} placeholder="0" /></label>
               <label className="field-label">Expected resale <span>PLN</span><input type="number" min="0" step="1" value={resalePrice} onChange={(event) => setResalePrice(event.target.value)} placeholder="Add estimate" /></label>
+              <label className="field-label">Sell on <span>{resaleFee ? `fee ${formatPln(Math.round(resaleFee))}` : "no seller fee"}</span><select value={sellOn} onChange={(event) => setSellOn(event.target.value as FlipChannel)}>{FLIP_CHANNELS.map((channel) => <option key={channel}>{channel}</option>)}</select></label>
             </div>
             <div className="calculator-results">
               <div><span>Total cost</span><strong>{formatPln(totalCost)}</strong></div>
@@ -415,6 +458,10 @@ export default function ListingDetailDrawer({
               <div><span>ROI on cost</span><strong className={expectedRoi === null ? "" : expectedRoi >= 0 ? "result-positive" : "result-negative"}>{expectedRoi === null ? "—" : `${expectedRoi.toFixed(1)}%`}</strong></div>
               <div><span>Margin on sale</span><strong className={expectedMargin === null ? "" : expectedMargin >= 0 ? "result-positive" : "result-negative"}>{expectedMargin === null ? "—" : `${expectedMargin.toFixed(1)}%`}</strong></div>
             </div>
+            <button type="button" className="outline-button drawer-flip-button" disabled={addingFlip || flipAdded} onClick={() => void addFlip()}>
+              {addingFlip ? <LoaderCircle size={15} className="spin" /> : flipAdded ? <Check size={15} /> : <PackageCheck size={15} />}
+              {flipAdded ? "Added to Flips" : "I bought this"}
+            </button>
             {typicalSavings !== null ? <div className={`calculator-callout ${typicalSavings >= 0 ? "calculator-callout--positive" : "calculator-callout--negative"}`}><Info size={15} />{typicalSavings >= 0 ? `${formatPln(typicalSavings)} below the learned typical price after extra costs.` : `${formatPln(Math.abs(typicalSavings))} above the learned typical price after extra costs.`}</div> : null}
           </section>
         </div>

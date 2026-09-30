@@ -17,6 +17,8 @@ import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
 import { apiTokenCredentialId, bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
 import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
+import { FlipStore } from './flips';
+import { FLIP_CHANNELS } from '../src/profit';
 import { NO_LOCATION_FILTER, normalizeSourceIntervals, olxCategoryToJson, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 import { parseVariantGroups } from './variants';
@@ -207,6 +209,7 @@ function emit(event: string, payload: unknown) {
 }
 const service = new ScoutService(db, emit, { publicExposureWarning: publicExposureWarning && !auth.enabled, authEnabled: auth.enabled });
 const debug = debugApiEnabled(auth.enabled) ? new ScoutDebug(db, service) : null;
+const flips = new FlipStore(db, (payload) => emit('flips', payload));
 const marketplaceParam = z.enum(['OLX', 'Allegro Lokalnie', 'Vinted']);
 const marketplaceSources = z.array(marketplaceParam).min(1).max(3).refine((sources) => new Set(sources).size === sources.length, { message: 'Marketplace sources must be unique' });
 const resourceIdParams = z.object({ id: z.string().trim().min(1).max(160) });
@@ -597,6 +600,57 @@ const searchInput = z.object({
   searchId: z.string().trim().min(1).max(80).optional(),
   aiRelevance: z.boolean().optional().default(true),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
+
+// Flip ledger. Calendar dates only: the operator's own bookkeeping days.
+const flipDate = z.string().regex(/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/);
+const flipChannel = z.enum(FLIP_CHANNELS);
+const flipAmount = z.number().nonnegative().max(10_000_000);
+const flipFields = {
+  title: z.string().trim().min(1).max(200),
+  listingKey: z.string().trim().max(240).nullable().optional(),
+  watchId: z.string().trim().max(160).nullable().optional(),
+  buyChannel: flipChannel,
+  boughtOn: flipDate,
+  buyPrice: flipAmount,
+  buyCosts: flipAmount.optional(),
+  listedOn: z.array(flipChannel).max(4).optional(),
+  note: z.string().max(2000).optional(),
+};
+const flipIdParams = z.object({ id: z.coerce.number().int().positive() });
+
+app.get('/api/flips', async () => flips.list());
+app.post('/api/flips', async (request, reply) => {
+  const parsed = z.object(flipFields).strict().safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid flip', details: parsed.error.flatten() });
+  return reply.code(201).send({ flip: flips.create(parsed.data) });
+});
+app.patch('/api/flips/:id', async (request, reply) => {
+  const params = flipIdParams.safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid flip id is required' });
+  const parsed = z.object({
+    ...Object.fromEntries(Object.entries(flipFields).map(([key, schema]) => [key, (schema as z.ZodTypeAny).optional()])),
+    soldOn: flipDate.nullable().optional(),
+    saleChannel: flipChannel.nullable().optional(),
+    salePrice: flipAmount.nullable().optional(),
+    saleFee: flipAmount.nullable().optional(),
+    saleCosts: flipAmount.nullable().optional(),
+    delisted: z.array(flipChannel).max(4).optional(),
+  }).strict().safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid flip update', details: parsed.error.flatten() });
+  return { flip: flips.update(params.data.id, parsed.data as Parameters<FlipStore['update']>[1]) };
+});
+app.delete('/api/flips/:id', async (request, reply) => {
+  const params = flipIdParams.safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid flip id is required' });
+  flips.delete(params.data.id);
+  return { ok: true };
+});
+app.put('/api/flips/fee-presets', async (request, reply) => {
+  const preset = z.object({ percent: z.number().min(0).max(50), fixed: z.number().min(0).max(1000) }).strict();
+  const parsed = z.object(Object.fromEntries(FLIP_CHANNELS.map((channel) => [channel, preset])) as Record<(typeof FLIP_CHANNELS)[number], typeof preset>).strict().safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid fee presets', details: parsed.error.flatten() });
+  return { feePresets: flips.setFeePresets(parsed.data) };
+});
 
 app.get('/api/marketplaces/olx/categories', async (request, reply) => {
   const parsed = z.object({ query: z.string().trim().min(1).max(240) }).strict().safeParse(request.query);
