@@ -10,6 +10,9 @@ struct WatchDetailView: View {
     @State private var error: String?
     @State private var scanMessage: String?
     @State private var editor: WatchEditorRequest?
+    /// The watch changes the shown watch was fetched for; a range change
+    /// alone only needs new analytics.
+    @State private var loadedVersion: WatchVersion?
 
     init(watch: Watch) {
         _watch = State(initialValue: watch)
@@ -165,18 +168,28 @@ struct WatchDetailView: View {
         .sheet(item: $editor) { request in
             WatchEditorView(request: request) { _ in }
         }
-        .refreshable { await load() }
+        .refreshable {
+            loadedVersion = nil
+            await load()
+        }
         .reloadOnChange(of: LoadKey(days: days, version: version)) { await load() }
     }
 
     @discardableResult
     private func load() async -> Bool {
         guard let client = model.client else { return false }
+        let id = watch.id
+        let days = days
+        let version = version
         do {
-            analytics = try await client.watchAnalytics(id: watch.id, days: days)
-            if let fresh = try await client.watches(includeArchived: true).first(where: { $0.id == watch.id }) {
-                watch = fresh
+            async let loadedAnalytics = client.watchAnalytics(id: id, days: days)
+            if loadedVersion != version {
+                if let fresh = try await client.watches(includeArchived: true).first(where: { $0.id == id }) {
+                    watch = fresh
+                }
+                loadedVersion = version
             }
+            analytics = try await loadedAnalytics
             error = nil
             return true
         } catch {
@@ -202,6 +215,7 @@ struct WatchDetailView: View {
         Task { @MainActor in
             do {
                 try await client.updateWatch(id: watch.id, patch: WatchPatch(archived: archived))
+                loadedVersion = nil
                 await load()
                 model.refreshUnlessLive()
             } catch {
@@ -216,6 +230,7 @@ struct WatchDetailView: View {
         Task { @MainActor in
             do {
                 try await client.updateWatch(id: watch.id, patch: WatchPatch(enabled: enabled))
+                loadedVersion = nil
                 await load()
             } catch {
                 model.report(error)

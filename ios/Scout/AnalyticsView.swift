@@ -208,12 +208,14 @@ struct AnalyticsView: View {
     @discardableResult
     private func load() async -> Bool {
         guard let client = model.client else { return false }
+        let (days, watchId, marketplace) = (store.days, store.watchId, store.marketplace)
         do {
-            store.data = try await client.analytics(days: store.days, watchId: store.watchId, marketplace: store.marketplace)
-            store.error = nil
+            async let loaded = client.analytics(days: days, watchId: watchId, marketplace: marketplace)
             if store.watches.isEmpty {
                 store.watches = (try? await client.watches()) ?? []
             }
+            store.data = try await loaded
+            store.error = nil
             return true
         } catch {
             if !error.isCancellation { store.error = error.localizedDescription }

@@ -6,11 +6,6 @@ import ScoutKit
 final class LoadMemory {
     var key: AnyHashable?
     var loadedAt: Date?
-
-    func forget() {
-        key = nil
-        loadedAt = nil
-    }
 }
 
 /// Loads when the screen first appears and whenever `key` changes, like

@@ -201,15 +201,27 @@ struct ResearchWatchDetailView: View {
     @State private var scanMessage: String?
     @State private var editor: MarketWatchEditorRequest?
     @State private var confirmingDelete = false
+    /// The changes the shown summary was fetched for; a range change alone
+    /// only needs a new trend.
+    @State private var loadedVersion: WatchVersion?
 
     init(watch: MarketWatch) {
         _watch = State(initialValue: watch)
     }
 
-    private struct LoadKey: Hashable {
-        var days: Int
+    /// Changes to this research watch, including ones that name no watch.
+    private struct WatchVersion: Hashable {
         var changes: Int
         var allMarketWatches: Int
+    }
+
+    private struct LoadKey: Hashable {
+        var days: Int
+        var version: WatchVersion
+    }
+
+    private var version: WatchVersion {
+        WatchVersion(changes: model.marketWatchChanges[watch.id, default: 0], allMarketWatches: model.allMarketWatchesToken)
     }
 
     var body: some View {
@@ -317,8 +329,11 @@ struct ResearchWatchDetailView: View {
         .sheet(item: $editor) { request in
             MarketWatchEditorView(request: request)
         }
-        .refreshable { await load() }
-        .reloadOnChange(of: LoadKey(days: days, changes: model.marketWatchChanges[watch.id, default: 0], allMarketWatches: model.allMarketWatchesToken)) { await load() }
+        .refreshable {
+            loadedVersion = nil
+            await load()
+        }
+        .reloadOnChange(of: LoadKey(days: days, version: version)) { await load() }
     }
 
     private func trendStats(_ trend: MarketWatchTrend) -> [StatGrid.Item] {
@@ -340,11 +355,18 @@ struct ResearchWatchDetailView: View {
     @discardableResult
     private func load() async -> Bool {
         guard let client = model.client else { return false }
+        let id = watch.id
+        let days = days
+        let version = version
         do {
-            trend = try await client.marketWatchTrend(id: watch.id, days: days)
-            if let fresh = try await client.marketResearch(page: 1, pageSize: 1).watches.first(where: { $0.id == watch.id }) {
-                watch = fresh
+            async let loadedTrend = client.marketWatchTrend(id: id, days: days)
+            if loadedVersion != version {
+                if let fresh = try await client.marketResearch(page: 1, pageSize: 1).watches.first(where: { $0.id == id }) {
+                    watch = fresh
+                }
+                loadedVersion = version
             }
+            trend = try await loadedTrend
             error = nil
             return true
         } catch {
@@ -370,6 +392,7 @@ struct ResearchWatchDetailView: View {
         Task { @MainActor in
             do {
                 try await client.setMarketWatchEnabled(id: watch.id, enabled: enabled)
+                loadedVersion = nil
                 await load()
             } catch {
                 model.report(error)
