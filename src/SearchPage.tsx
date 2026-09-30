@@ -4,7 +4,8 @@ import { api } from "./api";
 import { marketplaceColors } from "./data";
 import { subscribe } from "./events";
 import type { WatchPreset } from "./presets";
-import type { Listing, Marketplace, SearchFilters, SearchSourceStatus } from "./types";
+import { OlxCategoryPicker } from "./OlxCategoryPicker";
+import type { Listing, Marketplace, OlxCategory, SearchFilters, SearchSourceStatus } from "./types";
 
 const formatPln = (value: number | null) =>
   value === null ? "Learning" : `${value.toLocaleString("pl-PL")} zł`;
@@ -63,6 +64,7 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
   const [ownerType, setOwnerType] = useState("Any");
   const [location, setLocation] = useState("");
   const [shippingOnly, setShippingOnly] = useState(false);
+  const [olxCategory, setOlxCategory] = useState<OlxCategory | null>(null);
   // Persisted across searches: once a user turns the Jev relevance filter off,
   // their next searches stay fast until they re-enable it here.
   const [aiRelevance, setAiRelevance] = useState(
@@ -103,6 +105,7 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
     condition,
     location: location.trim() || "Polska",
     ownerType: ownerType === "Any" ? null : ownerType.toLowerCase() as "private" | "business",
+    olxCategory: sources.includes("OLX") ? olxCategory : null,
     page: targetPage,
     aiRelevance,
   });
@@ -281,6 +284,11 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
             />
           </label>
         </div>
+        {sources.includes("OLX") ? (
+          <div className="search-olx-category">
+            <OlxCategoryPicker query={query} value={olxCategory} onChange={setOlxCategory} />
+          </div>
+        ) : null}
         <div className="search-options-row">
           <div>
             <span className="filter-label">Sources</span>
@@ -389,7 +397,7 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
                   {loadingMore ? "Loading…" : "Load more"}
                 </button>
               ) : null}
-              <button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, location: location.trim() || "Polska", condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly, aiRelevance })}><Bell size={15} />Save as watch</button>
+              <button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, location: location.trim() || "Polska", condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly, aiRelevance, olxCategory: sources.includes("OLX") ? olxCategory : null })}><Bell size={15} />Save as watch</button>
             </div>
           ) : null}
         </div>

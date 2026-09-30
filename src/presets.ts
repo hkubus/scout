@@ -1,4 +1,4 @@
-import type { Listing, MarketTrackedListing, Marketplace, MarketWatchInput } from "./types";
+import type { Listing, MarketTrackedListing, Marketplace, MarketWatchInput, OlxCategory } from "./types";
 
 export type WatchPreset = {
   query: string;
@@ -12,6 +12,8 @@ export type WatchPreset = {
   shippingOnly: boolean;
   /** Carry the search's AI-relevance choice into the new watch. */
   aiRelevance?: boolean;
+  /** Carry the search's OLX category scope into the new watch. */
+  olxCategory?: OlxCategory | null;
 };
 
 /** Polish cities commonly appended to marketplace titles; stripped from prefilled queries. */

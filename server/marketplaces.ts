@@ -52,6 +52,35 @@ export interface MarketplaceSearchFilters {
    * other marketplaces have no equivalent param, so they ignore it.
    */
   ownerType?: 'private' | 'business' | null;
+  /**
+   * OLX only: scope the search to one category id picked from OLX's own
+   * facet counts. The other marketplaces have no shared taxonomy.
+   */
+  olxCategoryId?: number | null;
+}
+
+/**
+ * An OLX category as picked for a watch. `path` is OLX's slug path (e.g.
+ * `elektronika/komputery/podzespoly-i-czesci/karty-graficzne`); only `id` is
+ * sent on scans, the label and path are for display.
+ */
+export interface OlxCategory {
+  id: number;
+  label: string;
+  path: string;
+}
+
+/**
+ * A watch or search that cannot run as configured (a pasted URL Scout cannot
+ * translate, an OLX category that no longer exists). These fail the scan
+ * visibly but are not a marketplace outage, so they must not put the whole
+ * connector into backoff.
+ */
+export class SearchConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SearchConfigError';
+  }
 }
 
 const hosts: Record<Marketplace, string[]> = {
@@ -793,6 +822,7 @@ export function buildOlxSearchApiUrl(query: string, filters: MarketplaceSearchFi
   if (condition === 'new' || condition === 'used') url.searchParams.set('filter_enum_state[0]', condition);
   if (filters.shippingOnly) url.searchParams.set('courier', 'on');
   if (filters.ownerType) url.searchParams.set('owner_type', filters.ownerType);
+  if (filters.olxCategoryId) url.searchParams.set('category_id', String(filters.olxCategoryId));
   if (filters.sort === 'newest') url.searchParams.set('sort_by', 'created_at:desc');
   const page = filters.page;
   if (page !== undefined && Number.isInteger(page) && page > 1 && page <= 10) url.searchParams.set('offset', String((page - 1) * OLX_API_PAGE_LIMIT));
@@ -800,16 +830,136 @@ export function buildOlxSearchApiUrl(query: string, filters: MarketplaceSearchFi
   return url.toString();
 }
 
-/** Translate an OLX HTML search URL (e.g. a pasted exact URL) into an offers API URL. */
-function olxSearchApiUrlFromSearchPage(url: string) {
+export interface OlxCategoryFacet extends OlxCategory {
+  count: number;
+}
+
+const OLX_CATEGORY_FACET_LIMIT = 30;
+
+/**
+ * OLX's search metadata endpoint returns per-category hit counts for a query
+ * (the numbers in the site's category sidebar) without fetching any offers.
+ */
+export function buildOlxCategoryFacetsUrl(query: string) {
+  const url = new URL('https://www.olx.pl/api/v1/offers/metadata/search/');
+  url.searchParams.set('query', query.trim());
+  url.searchParams.set('facets', JSON.stringify([{ field: 'category_without_exclusions', fetchLabel: true, fetchUrl: true, limit: OLX_CATEGORY_FACET_LIMIT }]));
+  return url.toString();
+}
+
+/**
+ * Parse category facets. Each facet URL is the category's search path plus
+ * the query slug (`/elektronika/komputery/q-rtx-3070`); the slug is dropped so
+ * the stored path identifies the category alone.
+ */
+export function parseOlxCategoryFacets(json: unknown): OlxCategoryFacet[] {
+  const data = isRecord(json) && isRecord(json.data) ? json.data : undefined;
+  if (!data) throw new Error('OLX search metadata response did not contain data');
+  const facets = isRecord(data.facets) && Array.isArray(data.facets.category_without_exclusions) ? data.facets.category_without_exclusions : [];
+  const categories: OlxCategoryFacet[] = [];
+  for (const facet of facets) {
+    if (!isRecord(facet)) continue;
+    const id = Number(facet.id);
+    const count = Number(facet.count);
+    const label = typeof facet.label === 'string' ? facet.label.trim() : '';
+    const path = typeof facet.url === 'string' ? decodedPathSegments(facet.url.split('?')[0]).filter((segment) => !segment.startsWith('q-')).join('/') : '';
+    if (!Number.isInteger(id) || id <= 0 || !label || !path || !Number.isFinite(count)) continue;
+    categories.push({ id, label: label.slice(0, 120), path: path.slice(0, 240), count });
+  }
+  return categories;
+}
+
+/**
+ * Category and place ids behind an OLX search-page path, as resolved by OLX's
+ * friendly-links endpoint.
+ */
+export interface OlxSearchPathParams {
+  categoryId?: number;
+  regionId?: number;
+  cityId?: number;
+}
+
+export type OlxSearchPathResolver = (segments: string[]) => Promise<OlxSearchPathParams>;
+
+function decodedPathSegments(pathname: string) {
+  return pathname.split('/').filter(Boolean).map((segment) => { try { return decodeURIComponent(segment); } catch { return segment; } });
+}
+
+/**
+ * The category/place segments of a pasted OLX search URL, i.e. everything
+ * before `q-…` (`/elektronika/komputery/krakow/q-rtx-3070/` →
+ * `['elektronika', 'komputery', 'krakow']`). `oferty` is OLX's generic search
+ * root and carries no filter.
+ */
+export function olxSearchPathSegments(url: string): string[] {
+  let parsed: URL;
+  try { parsed = new URL(url); } catch { return []; }
+  if (!isApprovedMarketplaceHost('OLX', parsed.hostname)) return [];
+  const segments = decodedPathSegments(parsed.pathname);
+  const queryIndex = segments.findIndex((segment) => segment.startsWith('q-'));
+  if (queryIndex <= 0) return [];
+  return segments.slice(0, queryIndex).filter((segment) => segment !== 'oferty');
+}
+
+export function buildOlxFriendlyLinksUrl(segments: string[]) {
+  return `https://www.olx.pl/api/v1/friendly-links/query-params/${segments.map((segment) => encodeURIComponent(segment)).join(',')}`;
+}
+
+/**
+ * Parse a friendly-links response. OLX answers unknown single segments with
+ * 404 and an empty `data` array for the bare search root; both mean the path
+ * named nothing Scout can scope by.
+ */
+export function parseOlxFriendlyLinks(json: unknown): OlxSearchPathParams | null {
+  const data = isRecord(json) && isRecord(json.data) ? json.data : undefined;
+  if (!data) return null;
+  const id = (value: unknown) => (typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined);
+  const params: OlxSearchPathParams = { categoryId: id(data.category_id), regionId: id(data.region_id), cityId: id(data.city_id) };
+  return params.categoryId || params.regionId || params.cityId ? params : null;
+}
+
+/**
+ * Resolve a pasted search path to OLX ids, failing closed instead of silently
+ * widening. friendly-links quietly falls back to the parent category for an
+ * unknown trailing slug (`elektronika,nonsense` → Elektronika), so a
+ * multi-segment category path must resolve to something other than its
+ * parent. A place, when present, is the last segment of OLX search URLs.
+ */
+export async function resolveOlxSearchPath(segments: string[], fetchParams: (segments: string[]) => Promise<OlxSearchPathParams | null>): Promise<OlxSearchPathParams> {
+  const path = segments.join('/');
+  const resolved = await fetchParams(segments);
+  if (!resolved) throw new SearchConfigError(`OLX did not recognise the search path "${path}"`);
+  const categorySegments = resolved.cityId || resolved.regionId ? segments.slice(0, -1) : segments;
+  if (resolved.categoryId && categorySegments.length > 1) {
+    const parent = await fetchParams(categorySegments.slice(0, -1));
+    if (parent?.categoryId === resolved.categoryId) throw new SearchConfigError(`OLX did not recognise the category "${categorySegments.at(-1)}" in "${path}"`);
+  }
+  if (!resolved.categoryId && categorySegments.length) throw new SearchConfigError(`OLX did not recognise the category in "${path}"`);
+  return resolved;
+}
+
+/**
+ * Translate an OLX HTML search URL (e.g. a pasted exact URL) into an offers
+ * API URL. Category and place path segments must already be resolved into
+ * `pathParams`; they are never dropped silently.
+ */
+function olxSearchApiUrlFromSearchPage(url: string, pathParams: OlxSearchPathParams = {}) {
   let parsed: URL;
   try { parsed = new URL(url); } catch { return null; }
   if (!isApprovedMarketplaceHost('OLX', parsed.hostname)) return null;
   if (parsed.pathname.replace(/\/+$/, '').startsWith('/api/v1/offers')) return parsed.toString();
-  const query = parsed.pathname.split('/').map((segment) => { try { return decodeURIComponent(segment); } catch { return segment; } }).find((segment) => segment.startsWith('q-'))?.slice(2);
+  const query = decodedPathSegments(parsed.pathname).find((segment) => segment.startsWith('q-'))?.slice(2);
   if (!query) return null;
   const api = new URL(OLX_OFFERS_API_URL);
   api.searchParams.set('query', query);
+  if (pathParams.categoryId) api.searchParams.set('category_id', String(pathParams.categoryId));
+  if (pathParams.cityId) {
+    api.searchParams.set('city_id', String(pathParams.cityId));
+    const distance = Number(parsed.searchParams.get('search[dist]'));
+    if (Number.isInteger(distance) && distance > 0 && distance <= 100) api.searchParams.set('distance', String(distance));
+  } else if (pathParams.regionId) {
+    api.searchParams.set('region_id', String(pathParams.regionId));
+  }
   const from = parsed.searchParams.get('search[filter_float_price:from]');
   const to = parsed.searchParams.get('search[filter_float_price:to]');
   if (from) api.searchParams.set('filter_float_price:from', from);
@@ -818,6 +968,8 @@ function olxSearchApiUrlFromSearchPage(url: string) {
   if (parsed.searchParams.get('courier') === 'on') api.searchParams.set('courier', 'on');
   const state = parsed.searchParams.get('search[filter_enum_state][0]') ?? parsed.searchParams.get('state');
   if (state === 'new' || state === 'used') api.searchParams.set('filter_enum_state[0]', state);
+  const ownerType = parsed.searchParams.get('search[private_business]');
+  if (ownerType === 'private' || ownerType === 'business') api.searchParams.set('owner_type', ownerType);
   const page = Number(parsed.searchParams.get('page'));
   if (Number.isInteger(page) && page > 1 && page <= 10) api.searchParams.set('offset', String((page - 1) * OLX_API_PAGE_LIMIT));
   api.searchParams.set('limit', String(OLX_API_PAGE_LIMIT));
@@ -903,15 +1055,21 @@ function olxListingIdFromUrl(url: string) {
  * numeric shape degrade to `unknown` rather than risking a false 404 terminal
  * classification.
  */
-export function createOlxJsonAdapter(marketplace: Marketplace, fetcher: (url: string) => Promise<OlxApiFetchResult>, onPath?: ConnectorPathReporter): ConnectorAdapter {
+export function createOlxJsonAdapter(marketplace: Marketplace, fetcher: (url: string) => Promise<OlxApiFetchResult>, onPath?: ConnectorPathReporter, resolvePath?: OlxSearchPathResolver): ConnectorAdapter {
   return {
     marketplace,
     async fetchPublicSearch(url) {
-      const apiUrl = olxSearchApiUrlFromSearchPage(url);
-      if (!apiUrl) throw new Error('OLX search URL could not be translated to the offers API');
+      const segments = olxSearchPathSegments(url);
+      if (segments.length && !resolvePath) throw new SearchConfigError('OLX category and location paths need a path resolver');
+      const pathParams = segments.length && resolvePath ? await resolvePath(segments) : {};
+      const apiUrl = olxSearchApiUrlFromSearchPage(url, pathParams);
+      if (!apiUrl) throw new SearchConfigError('OLX search URL could not be translated to the offers API');
       const validation = validateSearchUrl(apiUrl, marketplace);
       if (!validation.valid) throw new Error(validation.reason);
       const { status, json } = await fetcher(validation.url);
+      // OLX answers 400 for parameters it rejects, e.g. a category id it has
+      // since retired. That is this search's problem, not an outage.
+      if (status === 400) throw new SearchConfigError(`OLX rejected the search: ${olxApiErrorDetail(json) ?? 'HTTP 400'}`);
       if (status < 200 || status >= 300) throw new Error(`OLX offers API returned HTTP ${status}`);
       onPath?.('olx-offers-api');
       return parseOlxOffersApi(json);

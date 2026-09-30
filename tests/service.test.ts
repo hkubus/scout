@@ -8,7 +8,7 @@ import { parseMarketplaceStorageState } from '../server/marketplace-sessions';
 import { DeepSeekError } from '../server/ai';
 import { listingDescriptionVerificationInputHash, listingRelevanceInputHash } from '../server/ai';
 import { VisionError } from '../server/vision';
-import { ScoutService, ServiceError, decryptSecret, encryptSecret, escapeDiscordMarkdown, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
+import { ScoutService, ServiceError, decryptSecret, olxCategoryFromJson, olxCategoryToJson, encryptSecret, escapeDiscordMarkdown, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
 
 // Pin the legacy DeepSeek path for pre-existing tests: live Jev is the
 // production default whenever a key is available, but these tests assert
@@ -1069,7 +1069,7 @@ test('keeps market research separate and reports ended-listing price estimates',
     const research = context.service.marketResearch();
     const { saleBand, ...marketWatch } = research.watches[0];
     assert.deepEqual(marketWatch, {
-      id: 'market-watch', name: 'GPU market', query: 'rtx 4070', terms: '12gb', excluded: 'parts', location: 'Warszawa', condition: 'New', sources: ['OLX', 'Vinted'], intervalHours: 24, minPrice: 1000, maxPrice: 2500, shippingOnly: true, typoVariants: false, enabled: true, nextScan: 'due now', lastScan: 'just now', totalListings: 3, activeListings: 1, endedListings: 2, estimatedMedianPrice: 2200,
+      id: 'market-watch', name: 'GPU market', query: 'rtx 4070', terms: '12gb', excluded: 'parts', location: 'Warszawa', condition: 'New', sources: ['OLX', 'Vinted'], intervalHours: 24, minPrice: 1000, maxPrice: 2500, shippingOnly: true, typoVariants: false, olxCategory: null, enabled: true, nextScan: 'due now', lastScan: 'just now', totalListings: 3, activeListings: 1, endedListings: 2, estimatedMedianPrice: 2200,
     });
     // Both ended rows lack a verified ended reason, so the band stays open.
     assert.deepEqual({ ...saleBand, computedAt: null }, { p25: null, median: null, p75: null, sampleCount: 2, eligibleCount: 0, excludedStale: 0, windowDays: 90, computedAt: null });
@@ -1123,7 +1123,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1612,7 +1612,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 28);
+    assert.equal(after.migrations.count, 29);
   } finally { context.close(); }
 });
 
@@ -2745,4 +2745,110 @@ test('escapes seller titles so a digest line cannot inject its own Discord link'
   const line = `[${escapeDiscordMarkdown(title)}](https://www.olx.pl/d/oferta/x)`;
   assert.equal(line, '[RTX 4090 FE\\]\\(https://phish.example/pay\\) \\[](https://www.olx.pl/d/oferta/x)');
   assert.equal(escapeDiscordMarkdown('**bold** _x_ `c` ~s~ |a| <@1>'), '\\*\\*bold\\*\\* \\_x\\_ \\`c\\` \\~s\\~ \\|a\\| \\<@1\\>');
+});
+
+test('OLX watch scans send the watch category and a rejected category warns without backing off OLX', async () => {
+  const context = fixture();
+  try {
+    seedWatch(context.db, 'gpu-watch', { query: 'rtx 3070' });
+    context.db.prepare('UPDATE watches SET olx_category_json = ? WHERE id = ?').run(olxCategoryToJson({ id: 2184, label: 'Karty graficzne', path: 'elektronika/komputery/podzespoly-i-czesci/karty-graficzne' }), 'gpu-watch');
+    assert.deepEqual(context.service.getWatches().find((watch) => watch.id === 'gpu-watch')?.olxCategory, { id: 2184, label: 'Karty graficzne', path: 'elektronika/komputery/podzespoly-i-czesci/karty-graficzne' });
+    const requested: string[] = [];
+    let rejectCategory = false;
+    (context.service as any).fetchOlxApi = async (url: string) => {
+      requested.push(url);
+      if (rejectCategory) return { status: 400, json: { error: { status: 400, detail: 'Request validation failed with error: [Category 2184 does not exist]' } } };
+      return { status: 200, json: { data: [], metadata: { visible_total_count: 0 } } };
+    };
+    const row = () => context.db.prepare('SELECT * FROM watches WHERE id = ?').get('gpu-watch');
+    await (context.service as any).runWatch(row(), { forceAll: true });
+    assert.equal(new URL(requested[0]).searchParams.get('category_id'), '2184');
+
+    rejectCategory = true;
+    await (context.service as any).runWatch(row(), { forceAll: true });
+    const run = context.db.prepare("SELECT status, message, backoff_until FROM connector_runs WHERE source = 'OLX' ORDER BY id DESC LIMIT 1").get() as { status: string; message: string; backoff_until: string | null };
+    assert.equal(run.status, 'warning');
+    assert.match(run.message, /Category 2184 does not exist/);
+    assert.equal(run.backoff_until, null);
+    assert.equal((context.db.prepare("SELECT status FROM scans WHERE watch_id = 'gpu-watch' ORDER BY rowid DESC LIMIT 1").get() as { status: string }).status, 'failed');
+    assert.equal(context.service.getConnectors().find((connector) => connector.name === 'OLX')?.status, 'Warning');
+    // Other OLX watches keep scanning: no backoff was recorded.
+    seedWatch(context.db, 'other-watch');
+    const before = requested.length;
+    await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('other-watch'), { forceAll: true });
+    assert.equal(requested.length, before + 1);
+    assert.equal(new URL(requested.at(-1)!).searchParams.has('category_id'), false);
+  } finally { context.close(); }
+});
+
+test('resolves pasted OLX exact-URL paths once and fails an unrecognised path closed', async () => {
+  const context = fixture();
+  try {
+    seedWatch(context.db, 'exact-watch');
+    context.db.prepare('UPDATE watches SET exact_urls_json = ? WHERE id = ?').run(JSON.stringify(['https://www.olx.pl/elektronika/komputery/q-cpu/']), 'exact-watch');
+    const requested: string[] = [];
+    (context.service as any).fetchOlxApi = async (url: string) => {
+      requested.push(url);
+      if (url.includes('/friendly-links/query-params/elektronika,komputery')) return { status: 200, json: { data: { category_id: 443 } } };
+      if (url.includes('/friendly-links/query-params/elektronika')) return { status: 200, json: { data: { category_id: 99 } } };
+      if (url.includes('/friendly-links/')) return { status: 404, json: { error: { status: 404, detail: 'Parameters can not be resolved.' } } };
+      return { status: 200, json: { data: [], metadata: { visible_total_count: 0 } } };
+    };
+    const row = () => context.db.prepare('SELECT * FROM watches WHERE id = ?').get('exact-watch');
+    await (context.service as any).runWatch(row(), { forceAll: true });
+    await (context.service as any).runWatch(row(), { forceAll: true });
+    const lookups = requested.filter((url) => url.includes('/friendly-links/'));
+    assert.equal(lookups.length, 2, 'the path and its parent are resolved once, then cached');
+    const searches = requested.filter((url) => url.includes('/api/v1/offers/?'));
+    assert.equal(searches.length, 2);
+    assert.ok(searches.every((url) => new URL(url).searchParams.get('category_id') === '443'));
+
+    context.db.prepare('UPDATE watches SET exact_urls_json = ? WHERE id = ?').run(JSON.stringify(['https://www.olx.pl/nieznane/q-cpu/']), 'exact-watch');
+    await (context.service as any).runWatch(row(), { forceAll: true });
+    const run = context.db.prepare("SELECT status, message, backoff_until FROM connector_runs WHERE source = 'OLX' ORDER BY id DESC LIMIT 1").get() as { status: string; message: string; backoff_until: string | null };
+    assert.equal(run.status, 'warning');
+    assert.match(run.message, /did not recognise the search path "nieznane"/);
+    assert.equal(run.backoff_until, null);
+    assert.equal(requested.filter((url) => url.includes('/api/v1/offers/?')).length, 2, 'an unresolved path never runs a wider search');
+  } finally { context.close(); }
+});
+
+test('an OLX category is part of the immutable research criteria', async () => {
+  const context = fixture();
+  try {
+    const gpu = { id: 2184, label: 'Karty graficzne', path: 'elektronika/komputery/podzespoly-i-czesci/karty-graficzne' };
+    context.service.createMarketWatch({ id: 'research-gpu', name: 'GPU', query: 'rtx 3070', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false, olxCategory: gpu });
+    const versions = () => (context.db.prepare('SELECT COUNT(*) AS count FROM market_watch_versions WHERE market_watch_id = ?').get('research-gpu') as { count: number }).count;
+    assert.deepEqual(context.service.marketResearch().watches[0].olxCategory, gpu);
+    // Resending the same category (the edit dialog always does) is not a change.
+    context.service.updateMarketWatch('research-gpu', { name: 'GPU market', olxCategory: { ...gpu, label: 'Renamed label' } });
+    assert.equal(versions(), 1);
+    context.service.updateMarketWatch('research-gpu', { olxCategory: null });
+    assert.equal(versions(), 2);
+    assert.equal(context.service.marketResearch().watches[0].olxCategory, null);
+    context.service.updateMarketWatch('research-gpu', { olxCategory: gpu });
+    assert.equal(versions(), 3);
+    const requested: string[] = [];
+    (context.service as any).fetchOlxApi = async (url: string) => { requested.push(url); return { status: 200, json: { data: [], metadata: { visible_total_count: 0 } } }; };
+    await (context.service as any).runMarketWatch(context.db.prepare('SELECT * FROM market_watches WHERE id = ?').get('research-gpu'));
+    assert.equal(new URL(requested[0]).searchParams.get('category_id'), '2184');
+  } finally { context.close(); }
+});
+
+test('manual searches pass an OLX category through and category lookups parse OLX facets', async () => {
+  const context = fixture();
+  try {
+    const requested: string[] = [];
+    (context.service as any).fetchOlxApi = async (url: string) => {
+      requested.push(url);
+      if (url.includes('/metadata/search/')) return { status: 200, json: { data: { facets: { category_without_exclusions: [{ id: 2184, count: 84, label: 'Karty graficzne', url: '/elektronika/komputery/podzespoly-i-czesci/karty-graficzne/q-rtx-3070' }] } } } };
+      return { status: 200, json: { data: [], metadata: { visible_total_count: 0 } } };
+    };
+    assert.deepEqual(await context.service.olxCategories('rtx 3070'), [{ id: 2184, label: 'Karty graficzne', path: 'elektronika/komputery/podzespoly-i-czesci/karty-graficzne', count: 84 }]);
+    await context.service.manualSearch({ query: 'rtx 3070', sources: ['OLX'], olxCategory: { id: 2184, label: 'Karty graficzne', path: '' }, aiRelevance: false });
+    assert.equal(new URL(requested.at(-1)!).searchParams.get('category_id'), '2184');
+    assert.equal(olxCategoryFromJson('{"id":"2184"}'), null);
+    assert.equal(olxCategoryFromJson('not json'), null);
+    assert.equal(olxCategoryFromJson(null), null);
+  } finally { context.close(); }
 });

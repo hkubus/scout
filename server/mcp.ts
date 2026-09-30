@@ -28,6 +28,7 @@ export const SCOUT_MCP_TOOL_NAMES = [
   'scout_market_research',
   'scout_market_trend',
   'scout_search',
+  'scout_olx_categories',
   'scout_queue_scan',
   'scout_connectors',
 ] as const;
@@ -155,12 +156,21 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       condition: z.string().max(80).optional().default('Any'),
       location: z.string().max(120).optional().default(''),
       ownerType: z.enum(['private', 'business']).nullable().optional(),
+      olxCategoryId: z.number().int().positive().optional().describe('OLX only: search one category; ids come from scout_olx_categories.'),
       page: z.number().int().min(1).max(10).optional().default(1),
       aiRelevance: z.boolean().optional().default(true),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
-  }, async (input) => {
-    try { return text(await service.manualSearch(input)); } catch (error) { return toolError(error); }
+  }, async ({ olxCategoryId, ...input }) => {
+    try { return text(await service.manualSearch({ ...input, olxCategory: olxCategoryId ? { id: olxCategoryId, label: String(olxCategoryId), path: '' } : null })); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_olx_categories', {
+    description: 'OLX categories matching a query, with hit counts (e.g. "rtx 3070" → Karty graficzne · 84, Laptopy · 231). Use an id to scope scout_search. One live metadata request; no offers are fetched.',
+    inputSchema: { query: z.string().trim().min(1).max(240) },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ query }) => {
+    try { return text({ categories: await service.olxCategories(query) }); } catch (error) { return toolError(error); }
   });
 
   server.registerTool('scout_queue_scan', {

@@ -17,7 +17,7 @@ import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
 import { apiTokenCredentialId, bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
 import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
-import { normalizeSourceIntervals, ScoutService, ServiceError } from './service';
+import { normalizeSourceIntervals, olxCategoryToJson, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 import { parseVariantGroups } from './variants';
 
@@ -113,7 +113,7 @@ app.addHook('onRequest', async (request, reply) => {
   const route = request.routeOptions.url;
   if (!isProtectedRoute(route)) return;
 
-  const expensive = route === '/mcp' || /\/search$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route);
+  const expensive = route === '/mcp' || /\/search$|\/categories$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route);
   const limit = expensive ? 30 : 240;
   // Snapshot images use the general limit so a screen of saved photos loads.
   // Key on the route template, not the raw URL, so ids cannot mint new buckets.
@@ -420,6 +420,14 @@ const variantGroupInput = z.object({
 }).strict();
 const variantGroupsInput = z.array(variantGroupInput).max(12);
 
+// Picked from OLX's own facets; the label and path are display-only, so the
+// schema only has to keep them bounded and slug-shaped.
+const olxCategoryInput = z.object({
+  id: z.number().int().positive().max(1_000_000_000),
+  label: z.string().trim().min(1).max(120),
+  path: z.string().trim().max(240).regex(/^(?:[a-z0-9-]+(?:\/[a-z0-9-]+)*)?$/),
+}).strict();
+
 const watchInput = z.object({
   id: z.string().trim().min(1).max(160).optional(),
   name: z.string().trim().min(1).max(120),
@@ -441,6 +449,7 @@ const watchInput = z.object({
   referenceMarketWatchId: z.string().trim().max(160).nullable().optional().default(null),
   minPrice: z.number().nonnegative().nullable().optional().default(null),
   maxPrice: z.number().positive().nullable().optional().default(null),
+  olxCategory: olxCategoryInput.nullable().optional().default(null),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
 
 app.post('/api/watches', async (request, reply) => {
@@ -458,7 +467,7 @@ app.post('/api/watches', async (request, reply) => {
   const now = nowIso();
   const sourceIntervals = normalizeSourceIntervals(value.sources, value.sourceIntervals);
   try {
-    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, source_intervals_json, sensitivity, shipping_only, typo_variants, ai_relevance, variant_groups_json, variant_groups_auto, reference_market_watch_id, min_price_pln, max_price_pln, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, JSON.stringify(sourceIntervals), value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, JSON.stringify(value.variantGroups), value.variantGroupsAuto && !value.variantGroups.length ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, 1, now, now, now);
+    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, source_intervals_json, sensitivity, shipping_only, typo_variants, ai_relevance, variant_groups_json, variant_groups_auto, reference_market_watch_id, min_price_pln, max_price_pln, olx_category_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, JSON.stringify(sourceIntervals), value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, JSON.stringify(value.variantGroups), value.variantGroupsAuto && !value.variantGroups.length ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, olxCategoryToJson(value.olxCategory), 1, now, now, now);
   } catch (error) {
     if (error instanceof Error && /UNIQUE|PRIMARY KEY|constraint/i.test(error.message)) {
       return reply.code(409).send({ error: 'A watch with this id already exists' });
@@ -487,6 +496,7 @@ app.patch('/api/watches/:id', async (request, reply) => {
     referenceMarketWatchId: z.string().trim().max(160).nullable().optional(),
     archived: z.boolean().optional(),
     minPrice: z.number().nonnegative().nullable().optional(), maxPrice: z.number().positive().nullable().optional(),
+    olxCategory: olxCategoryInput.nullable().optional(),
   }).strict().safeParse(request.body);
   if (!patchInput.success) return reply.code(400).send({ error: 'Invalid watch update', details: patchInput.error.flatten() });
   const body = patchInput.data;
@@ -539,6 +549,7 @@ app.patch('/api/watches/:id', async (request, reply) => {
   }
   if (body.minPrice !== undefined) { fields.push('min_price_pln = ?'); values.push(body.minPrice); }
   if (body.maxPrice !== undefined) { fields.push('max_price_pln = ?'); values.push(body.maxPrice); }
+  if (body.olxCategory !== undefined) { fields.push('olx_category_json = ?'); values.push(olxCategoryToJson(body.olxCategory)); }
   if (body.archived !== undefined) {
     fields.push('archived_at = ?');
     values.push(body.archived ? nowIso() : null);
@@ -573,10 +584,17 @@ const searchInput = z.object({
   condition: z.string().max(80).optional().default('Any'),
   location: z.string().max(120).optional().default(''),
   ownerType: z.enum(['private', 'business']).nullable().optional().default(null),
+  olxCategory: olxCategoryInput.nullable().optional().default(null),
   page: z.number().int().min(1).max(10).optional().default(1),
   searchId: z.string().trim().min(1).max(80).optional(),
   aiRelevance: z.boolean().optional().default(true),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
+
+app.get('/api/marketplaces/olx/categories', async (request, reply) => {
+  const parsed = z.object({ query: z.string().trim().min(1).max(240) }).strict().safeParse(request.query);
+  if (!parsed.success) return reply.code(400).send({ error: 'A search query is required' });
+  return { categories: await service.olxCategories(parsed.data.query) };
+});
 
 app.post('/api/search', async (request, reply) => {
   const parsed = searchInput.safeParse(request.body);
@@ -597,6 +615,7 @@ const marketWatchInput = z.object({
   maxPrice: z.number().positive().nullable().optional().default(null),
   shippingOnly: z.boolean().optional().default(false),
   typoVariants: z.boolean().optional().default(false),
+  olxCategory: olxCategoryInput.nullable().optional().default(null),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
 
 app.get('/api/market-watches', async (request, reply) => {
@@ -611,7 +630,7 @@ app.post('/api/market-watches', async (request, reply) => {
   const value = parsed.data;
   const id = `market-watch-${randomUUID()}`;
   const now = nowIso();
-  const watch = service.createMarketWatch({ id, name: value.name, query: value.query, terms: value.terms, excluded: value.excluded, location: value.location, condition: value.condition, sources: value.sources, intervalHours: value.intervalHours, minPrice: value.minPrice, maxPrice: value.maxPrice, shippingOnly: value.shippingOnly, typoVariants: value.typoVariants });
+  const watch = service.createMarketWatch({ id, name: value.name, query: value.query, terms: value.terms, excluded: value.excluded, location: value.location, condition: value.condition, sources: value.sources, intervalHours: value.intervalHours, minPrice: value.minPrice, maxPrice: value.maxPrice, shippingOnly: value.shippingOnly, typoVariants: value.typoVariants, olxCategory: value.olxCategory });
   service.queueMarketScan(id);
   emit('market-watch', { refresh: true, id });
   return reply.code(201).send({ watch });
@@ -634,6 +653,7 @@ app.patch('/api/market-watches/:id', async (request, reply) => {
     maxPrice: z.number().positive().nullable().optional(),
     shippingOnly: z.boolean().optional(),
     typoVariants: z.boolean().optional(),
+    olxCategory: olxCategoryInput.nullable().optional(),
   }).strict().safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid market watch update', details: parsed.error.flatten() });
   const current = db.prepare('SELECT min_price_pln, max_price_pln FROM market_watches WHERE id = ?').get(params.data.id) as { min_price_pln: number | null; max_price_pln: number | null } | undefined;

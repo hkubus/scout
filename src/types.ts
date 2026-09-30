@@ -171,6 +171,21 @@ export interface WatchDealCounts {
   strong: number;
 }
 
+/**
+ * An OLX category a watch or search is scoped to, picked from OLX's own facet
+ * counts. `path` is OLX's slug path; only `id` is sent to OLX.
+ */
+export interface OlxCategory {
+  id: number;
+  label: string;
+  path: string;
+}
+
+export interface OlxCategoryOption extends OlxCategory {
+  /** OLX hits for the query in this category (includes subcategories). */
+  count: number;
+}
+
 export interface Watch {
   id: string;
   name: string;
@@ -205,6 +220,8 @@ export interface Watch {
   referenceMarketWatchId: string | null;
   minPrice: number | null;
   maxPrice: number | null;
+  /** OLX scans only search this category; null searches all of OLX. */
+  olxCategory?: OlxCategory | null;
   archivedAt?: string | null;
 }
 
@@ -335,6 +352,8 @@ export interface SearchFilters {
   location?: string;
   /** OLX only: private sellers or business accounts. */
   ownerType?: "private" | "business" | null;
+  /** OLX only: search a single category. */
+  olxCategory?: OlxCategory | null;
   /** 1-based marketplace result page; the UI pages past the per-request cap. */
   page?: number;
   /** Client-generated id that correlates streamed per-source progress events. */
@@ -384,6 +403,8 @@ export interface MarketWatch {
   maxPrice: number | null;
   shippingOnly: boolean;
   typoVariants: boolean;
+  /** Part of the research criteria: changing it starts a new series. */
+  olxCategory?: OlxCategory | null;
   enabled: boolean;
   nextScan: string;
   lastScan: string;
@@ -395,7 +416,7 @@ export interface MarketWatch {
   activeVersionId?: string | null;
 }
 
-export type MarketWatchInput = Pick<MarketWatch, 'name' | 'query' | 'terms' | 'excluded' | 'location' | 'condition' | 'sources' | 'intervalHours' | 'minPrice' | 'maxPrice' | 'shippingOnly' | 'typoVariants'>;
+export type MarketWatchInput = Pick<MarketWatch, 'name' | 'query' | 'terms' | 'excluded' | 'location' | 'condition' | 'sources' | 'intervalHours' | 'minPrice' | 'maxPrice' | 'shippingOnly' | 'typoVariants' | 'olxCategory'>;
 
 export interface MarketTrackedListing {
   id: number;

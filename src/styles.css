@@ -280,6 +280,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .manual-search-query .primary-button { height: 48px; border-radius: 0 8px 8px 0; box-shadow: none; }
 .search-filter-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 13px; }
 .search-advanced-row { display: grid; grid-template-columns: 1fr 1fr; gap: 13px; }
+.search-olx-category { max-width: calc(50% - 6.5px); }
 .search-options-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
 .filter-label { display: block; margin-bottom: 8px; color: var(--text); font-size: 12px; font-weight: 600; }
 .check-option { display: flex; align-items: flex-start; gap: 9px; color: var(--text); font-size: 12px; cursor: pointer; }
@@ -503,6 +504,8 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .source-option i { width: 8px; height: 8px; border-radius: 50%; }
 .source-option svg { margin-left: 2px; color: var(--blue); }
 .source-option--selected { border-color: var(--blue); background: var(--blue-soft); color: var(--text); }
+.olx-category-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+.olx-category-picker .ghost-button { min-height: 40px; }
 .source-intervals { display: grid; gap: 6px; margin-top: 10px; }
 .source-intervals-hint { color: var(--muted); font-size: 10px; font-weight: 400; }
 .source-interval-row { display: grid; grid-template-columns: 1fr 108px auto; align-items: center; gap: 8px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-muted); color: var(--text); font-size: 12px; font-weight: 500; }
@@ -734,6 +737,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
   .manual-search-query input { flex-basis: calc(100% - 32px); }
   .manual-search-query .primary-button { width: 100%; height: 42px; border-radius: 7px; }
   .search-filter-grid, .search-advanced-row { grid-template-columns: 1fr; gap: 0; }
+  .search-olx-category { max-width: none; }
   .search-options-row { align-items: stretch; flex-direction: column; }
   .search-table--head { display: none; }
   .search-table { min-width: 0; grid-template-columns: minmax(0, 1fr) auto auto 27px; gap: 8px; padding: 11px 7px; }

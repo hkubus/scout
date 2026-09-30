@@ -124,6 +124,8 @@ Research snapshots are separate from deal-watch scoring. A valid empty search pa
 
 Watches and research watches can optionally scan typo variants to catch mispriced listings whose titles misspell the product. Each scan runs at most two extra one-page searches with deterministic misspellings of the query (adjacent transpositions, vowel deletions, doubled-letter removal; Polish diacritics are preserved). The variant set rotates across scans so every variant is eventually covered without ever exceeding the one-page-per-search budget. Toggling the option on a research watch changes its criteria and therefore starts a new comparable series.
 
+OLX searches every category by default, so a query like "rtx 3070" mostly returns whole PCs and laptops, and "iphone 13" mostly returns cases. Watches, research watches and manual searches can be scoped to one OLX category, picked from OLX's own hit counts for the query (`GET /api/marketplaces/olx/categories?query=…`). Only OLX scans use it; Allegro Lokalnie and Vinted are unaffected. Pasted OLX exact URLs keep their category and city path. Scout resolves the path through OLX and refuses to scan a path it cannot resolve exactly, instead of widening the search. A category OLX no longer accepts fails that watch's scan as a warning without backing off the whole OLX connector. Changing the category on a research watch starts a new comparable series.
+
 ### Probable-sale price bands
 
 For every research series Scout computes a p25–median–p75 band of **probable sales** from ended listings. The methodology is deliberately conservative:
@@ -186,7 +188,7 @@ curl -s -X POST http://127.0.0.1:3001/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-It is stateless (one fresh server per request, no session ids) and offers twelve tools (plus the four read-only `scout_debug_*` tools while the [Debug API](#debug-api) is enabled): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail`, `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_queue_scan`, and `scout_connectors`. `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. With auth enabled, MCP clients must send `Authorization: Bearer <token>` using a value from `SCOUT_API_TOKENS`.
+It is stateless (one fresh server per request, no session ids) and offers thirteen tools (plus the four read-only `scout_debug_*` tools while the [Debug API](#debug-api) is enabled): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail`, `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_olx_categories` (live OLX category counts for a query), `scout_queue_scan`, and `scout_connectors`. `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. With auth enabled, MCP clients must send `Authorization: Bearer <token>` using a value from `SCOUT_API_TOKENS`.
 
 ## iOS app
 
