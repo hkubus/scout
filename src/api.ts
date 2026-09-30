@@ -1,4 +1,4 @@
-import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, NotificationPriority, NotificationRecord, OlxCategoryOption, PriceHistoryPoint, SearchFilters, SettingsData, VariantSuggestions, VerificationComparison, Watch, WatchAnalytics } from './types';
+import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, NotificationPriority, NotificationRecord, OlxCategoryOption, PriceHistoryPoint, SearchFilters, SettingsData, VariantSuggestions, VerificationComparison, Watch, WatchAnalytics, Connector } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -76,6 +76,7 @@ export const api = {
   logout: () => request<{ ok: true }>('/api/auth/logout', { method: 'POST' }),
   logoutAll: () => request<{ ok: true }>('/api/auth/logout-all', { method: 'POST' }),
   dashboard: (signal?: AbortSignal) => request<DashboardData>('/api/dashboard', { signal }),
+  connectors: (signal?: AbortSignal) => request<{ connectors: Connector[] }>('/api/connectors', { signal }),
   listings: (options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string; sort?: 'newest' | 'strongest' | 'price'; decision?: ListingDecision; visibility?: 'visible' | 'hidden' | 'all' } = {}, signal?: AbortSignal) => {
     const params = new URLSearchParams();
     if (options.page !== undefined) params.set('page', String(options.page));

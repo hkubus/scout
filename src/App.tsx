@@ -28,6 +28,7 @@ import {
 import { api, UNAUTHORIZED_EVENT, type AuthSession } from "./api";
 import { emptyDashboard } from "./data";
 import { subscribe, subscribeStatus } from "./events";
+import { allLiveResources, dashboardResources, eventResources, planFlush, type LiveResource } from "./liveRefresh";
 import ListingTable from "./ListingTable";
 import type { WatchPreset } from "./presets";
 import type {
@@ -244,61 +245,116 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
       setToast({ message, type }),
     [],
   );
+  // Live refresh (see liveRefresh.ts): server events only mark resources
+  // stale in refs, so they do not re-render the app by themselves. flush()
+  // refetches what the visible view shows and leaves the rest stale until a
+  // view that needs it is shown; hidden tabs wait until they are visible.
+  const viewRef = useRef(view);
+  const dirty = useRef(new Set<LiveResource>(allLiveResources));
+  const dashboardLoaded = useRef(false);
+  const dashboardFetches = useRef(0);
+  const flushTimer = useRef<number | null>(null);
+  const flushRef = useRef<() => Promise<void>>(async () => {});
+  const scheduleFlush = useCallback(() => {
+    if (flushTimer.current !== null) return;
+    flushTimer.current = window.setTimeout(() => {
+      flushTimer.current = null;
+      void flushRef.current();
+    }, 100);
+  }, []);
   const refreshData = useCallback(
     async (showLoader = false) => {
       const sequence = ++refreshSequence.current;
+      for (const resource of dashboardResources) dirty.current.delete(resource);
+      dashboardFetches.current += 1;
       if (showLoader) setIsLoading(true);
       try {
         const next = await api.dashboard();
         if (sequence !== refreshSequence.current) return;
+        dashboardLoaded.current = true;
         setData(next);
         setConnection("online");
+        // Events that arrived while this request was in flight need a fresh one.
+        if (dirty.current.has("dashboard")) scheduleFlush();
       } catch (error) {
         if (sequence !== refreshSequence.current) return;
+        for (const resource of dashboardResources) dirty.current.add(resource);
         setConnection("offline");
         if (showLoader) notify(errorMessage(error), "error");
       } finally {
+        dashboardFetches.current -= 1;
         if (sequence === refreshSequence.current) {
           setIsLoading(false);
         }
       }
     },
-    [notify],
+    [notify, scheduleFlush],
   );
+  const flush = useCallback(async () => {
+    if (document.hidden) return;
+    const plan = planFlush(viewRef.current, dirty.current, dashboardLoaded.current, dashboardFetches.current > 0);
+    for (const resource of plan.clear) dirty.current.delete(resource);
+    if (plan.page === "listings") setListingsRefreshKey((value) => value + 1);
+    if (plan.page === "analytics") setAnalyticsRefreshKey((value) => value + 1);
+    if (plan.page === "market") setMarketRefreshKey((value) => value + 1);
+    const pending: Array<Promise<unknown>> = [];
+    if (plan.dashboard) pending.push(refreshData(!dashboardLoaded.current));
+    if (plan.connectors) {
+      pending.push(api.connectors().then(
+        (result) => setData((previous) => ({ ...previous, connectors: result.connectors })),
+        () => { dirty.current.add("connectors"); },
+      ));
+    }
+    await Promise.all(pending);
+  }, [refreshData]);
+  flushRef.current = flush;
 
   useEffect(() => {
-    void refreshData(true);
-  }, [refreshData]);
+    viewRef.current = view;
+    void flush();
+  }, [flush, view]);
   useEffect(() => {
-    let refreshTimer: number | null = null;
-    const refresh = () => {
-      setAnalyticsRefreshKey((value) => value + 1);
-      if (refreshTimer !== null) return;
-      refreshTimer = window.setTimeout(() => {
-        refreshTimer = null;
-        void refreshData(false);
-        setListingsRefreshKey((value) => value + 1);
-      }, 100);
+    const onVisibility = () => {
+      if (!document.hidden) void flush();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [flush]);
+  useEffect(() => {
+    const markDirty = (resources: readonly LiveResource[]) => {
+      for (const resource of resources) dirty.current.add(resource);
+      scheduleFlush();
     };
     const unsubscribers = [
       // A stream that comes back after a gap (server restart, hidden tab) may have missed events.
       subscribeStatus((status, reconnected) => {
         setConnection(status);
-        if (reconnected) refresh();
+        if (reconnected) markDirty(allLiveResources);
       }),
-      subscribe("scan", refresh),
-      subscribe("watch", refresh),
-      subscribe("notification", refresh),
-      subscribe("listing-action", refresh),
-      subscribe("ai-description-verification", refresh),
-      subscribe("market-watch", () => { setMarketRefreshKey((value) => value + 1); setAnalyticsRefreshKey((value) => value + 1); }),
+      ...Object.entries(eventResources).map(([event, resources]) => subscribe(event, () => markDirty(resources))),
       subscribe("log", () => setLogsRefreshKey((value) => value + 1)),
     ];
     return () => {
-      if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+      if (flushTimer.current !== null) window.clearTimeout(flushTimer.current);
+      flushTimer.current = null;
       for (const unsubscribe of unsubscribers) unsubscribe();
     };
-  }, [refreshData]);
+  }, [scheduleFlush]);
+  /** After a watch mutation: refetch what this view shows, mark the rest stale. */
+  const refreshAfterWatchChange = async () => {
+    for (const resource of eventResources.watch) dirty.current.add(resource);
+    if (viewRef.current !== "watches") {
+      // Watches refetches its own list when it is next shown.
+      setAllWatches(null);
+      return flush();
+    }
+    try {
+      const result = await api.watches(true);
+      setAllWatches(result.watches);
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    }
+  };
   useEffect(() => {
     if (view !== "watches") return;
     void api.watches(true).then((result) => setAllWatches(result.watches)).catch((error) => notify(errorMessage(error), "error"));
@@ -406,8 +462,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     withBusyWatch(watch, async () => {
       try {
         await api.updateWatch(watch.id, { enabled: !watch.enabled });
-        await refreshData(false);
-        setWatchRefreshKey((value) => value + 1);
+        await refreshAfterWatchChange();
         notify(
           watch.enabled ? `${watch.name} paused.` : `${watch.name} resumed.`,
         );
@@ -419,8 +474,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     withBusyWatch(watch, async () => {
       try {
         await api.updateWatch(watch.id, { shippingOnly: !watch.shippingOnly });
-        await refreshData(false);
-        setWatchRefreshKey((value) => value + 1);
+        await refreshAfterWatchChange();
         notify(
           `Shipping-only filter ${watch.shippingOnly ? "disabled" : "enabled"} for ${watch.name}.`,
         );
@@ -432,8 +486,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     withBusyWatch(watch, async () => {
       try {
         await api.updateWatch(watch.id, { aiRelevance: !watch.aiRelevance });
-        await refreshData(false);
-        setWatchRefreshKey((value) => value + 1);
+        await refreshAfterWatchChange();
         notify(
           `AI relevance filter ${watch.aiRelevance ? "disabled" : "enabled"} for ${watch.name}.`,
         );
@@ -449,8 +502,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     withBusyWatch(watch, async () => {
       try {
         await api.updateWatch(watch.id, { minPrice, maxPrice });
-        await refreshData(false);
-        setWatchRefreshKey((value) => value + 1);
+        await refreshAfterWatchChange();
         setEditingWatch(null);
         notify(`Price filter updated for ${watch.name}.`);
       } catch (error) {
@@ -467,10 +519,8 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     return withBusyWatch(fullWatch, async () => {
       try {
         await api.updateWatch(fullWatch.id, { name: fullWatch.name, query: fullWatch.query, terms: fullWatch.terms, excluded: fullWatch.excluded, sources: fullWatch.sources, condition: fullWatch.condition, interval: fullWatch.interval, sourceIntervals: fullWatch.sourceIntervals, exactUrls: fullWatch.exactUrls, sensitivity: fullWatch.sensitivity, shippingOnly: fullWatch.shippingOnly, typoVariants: fullWatch.typoVariants, variantGroups: fullWatch.variantGroups, variantGroupsAuto: fullWatch.variantGroupsAuto, aiRelevance: fullWatch.aiRelevance, referenceMarketWatchId: fullWatch.referenceMarketWatchId, minPrice: fullWatch.minPrice, maxPrice: fullWatch.maxPrice, olxCategory: fullWatch.olxCategory ?? null, enabled: fullWatch.enabled });
-        await refreshData(false);
+        await refreshAfterWatchChange();
         setEditingFullWatch(null);
-        setAllWatches(null);
-        setWatchRefreshKey((value) => value + 1);
         notify(`${fullWatch.name} updated.`);
       } catch (error) {
         notify(errorMessage(error), "error");
@@ -485,9 +535,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         return;
       try {
         await api.updateWatch(watch.id, { archived: !archived });
-        await refreshData(false);
-        setAllWatches(null);
-        setWatchRefreshKey((value) => value + 1);
+        await refreshAfterWatchChange();
         notify(`${watch.name} ${archived ? "restored" : "archived"}. Its history is still retained.`);
       } catch (error) {
         notify(errorMessage(error), "error");
@@ -498,8 +546,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
       if (!window.confirm(`Permanently delete “${watch.name}”? All observations and analytics will be removed.`)) return;
       try {
         await api.deleteWatch(watch.id);
-        await refreshData(false);
-        setWatchRefreshKey((value) => value + 1);
+        await refreshAfterWatchChange();
         notify(`${watch.name} permanently deleted.`);
       } catch (error) {
         notify(errorMessage(error), "error");
