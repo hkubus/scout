@@ -10,7 +10,7 @@ import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyLis
 import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, verifyListingDescriptionWithVision, visionToVerification } from './vision';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { Limiter } from './limiter';
-import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, median, pooledVariantSpread, scoreDeal, type PooledSpread } from './scoring';
+import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, median, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
 import { normalizeFilterText } from './text';
 import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assignVariant, finalizeVariantSuggestions, parseVariantGroups, suggestVariantGroupsFromTitles, variantLabelFor, type VariantGroup, type VariantSample } from './variants';
@@ -55,7 +55,8 @@ type DealNotificationCandidate = {
  * With no configured groups every row lands in the single OTHER bucket, which
  * reproduces the legacy watch-wide baseline exactly.
  */
-type WatchVariantBucket = { prices: number[]; firstObservedAt: string | null };
+/** `stats` is filled once the bucket is complete, so every listing in a scan reuses its median and MAD. */
+type WatchVariantBucket = { prices: number[]; firstObservedAt: string | null; stats?: PriceStats };
 type WatchBaselines = {
   groups: VariantGroup[];
   buckets: Map<string, WatchVariantBucket>;
@@ -4524,6 +4525,7 @@ export class ScoutService {
       if (bucket.prices.length < 400) bucket.prices.push(price);
     }
     for (const [key, first] of firstByVariant) bucketFor(key).firstObservedAt = first;
+    for (const bucket of buckets.values()) bucket.stats = priceStats(bucket.prices);
     // Other / unclassified is a mix by definition, so only named variants
     // feed the pooled spread.
     const pooled = groups.length
@@ -4539,16 +4541,16 @@ export class ScoutService {
   private dealScore(
     row: WatchRow,
     price: number,
-    baseline: { prices: number[]; firstObservedAt: string | null },
+    baseline: WatchVariantBucket,
     referenceMedian: number | null,
     pooled: PooledSpread | null = null,
-  ): { score: ReturnType<typeof scoreDeal>; useReference: boolean; dealStrength: number | null } {
+  ): { score: ScoreResult; useReference: boolean; dealStrength: number | null } {
     const observedHours = baseline.firstObservedAt ? Math.max(0, (Date.now() - Date.parse(baseline.firstObservedAt)) / 3_600_000) : 0;
     // The reference-band fallback seeds ranking/display only: while the watch's
     // own history is below the sample floor, its median stands in for the
     // typical. Once own samples reach the floor, own history always wins.
     const useReference = referenceMedian !== null && baseline.prices.length < (pooled ? VARIANT_MIN_SAMPLES : BASELINE_MIN_SAMPLES);
-    const score = scoreDeal(baseline.prices, price, { observedHours, sensitivity: Number(row.sensitivity ?? 1), ...(useReference ? { typicalOverride: referenceMedian } : {}), ...(pooled ? { pooled } : {}) });
+    const score = scoreDealFromStats(baseline.stats ?? priceStats(baseline.prices), price, { observedHours, sensitivity: Number(row.sensitivity ?? 1), ...(useReference ? { typicalOverride: referenceMedian } : {}), ...(pooled ? { pooled } : {}) });
     return { score, useReference, dealStrength: dealStrengthFromDiscount(score.discountPercent) };
   }
 

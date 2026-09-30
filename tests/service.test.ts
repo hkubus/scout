@@ -1426,7 +1426,7 @@ test('association-driven watch baselines match the per-observation queries', () 
         const row = { ...base, ...override };
         const actual = service.watchBaselines(row).buckets as Map<string, { prices: number[]; firstObservedAt: string | null }>;
         const expected = legacyWatchBaselines(context.db, row);
-        const normalize = (buckets: Map<string, { prices: number[]; firstObservedAt: string | null }>) => [...buckets.entries()].sort(([a], [b]) => a.localeCompare(b));
+        const normalize = (buckets: Map<string, { prices: number[]; firstObservedAt: string | null }>) => [...buckets.entries()].map(([key, { prices, firstObservedAt }]) => [key, { prices, firstObservedAt }] as const).sort(([a], [b]) => a.localeCompare(b));
         assert.deepEqual(normalize(actual), normalize(expected), `${row.id} ${JSON.stringify(override)}`);
         compared += actual.size;
       }
