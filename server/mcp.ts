@@ -4,6 +4,8 @@ import type { ScoutDebug } from './debug';
 import type { ScoutService } from './service';
 import { ServiceError } from './service';
 
+export const MCP_DASHBOARD_LISTINGS = 20;
+
 const marketplace = z.enum(['OLX', 'Allegro Lokalnie', 'Vinted']);
 
 function text(payload: unknown) {
@@ -55,10 +57,14 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
   });
 
   server.registerTool('scout_dashboard', {
-    description: 'Deal-monitor overview: current qualifying listings, watches, connector states, and Strong+ deal counters.',
+    description: `Deal-monitor overview: watches, connector states, Strong+ deal counters, and the newest ${MCP_DASHBOARD_LISTINGS} feed listings (listingsTruncated is true when the feed has more). Use scout_listings to page through the full feed.`,
     annotations: { readOnlyHint: true },
   }, async () => {
-    try { return text(service.dashboard()); } catch (error) { return toolError(error); }
+    try {
+      // The web dashboard carries a 500-row feed; an agent only needs the head.
+      const dashboard = service.dashboard();
+      return text({ ...dashboard, listings: dashboard.listings.slice(0, MCP_DASHBOARD_LISTINGS), listingsTruncated: dashboard.listings.length > MCP_DASHBOARD_LISTINGS });
+    } catch (error) { return toolError(error); }
   });
 
   server.registerTool('scout_watches', {
