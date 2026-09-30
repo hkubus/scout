@@ -2096,17 +2096,30 @@ export class ScoutService {
   private watches(includeArchived: boolean) {
     const rows = this.stmt(`SELECT * FROM watches ${includeArchived ? '' : 'WHERE archived_at IS NULL '}ORDER BY created_at DESC`).all() as WatchRow[];
     if (!rows.length) return [];
-    const statsRows = this.stmt(`SELECT o.watch_id, COALESCE(wl.variant_key, ?) AS variant_key, COUNT(DISTINCT o.listing_id) AS samples, MIN(o.observed_at) AS first_observed
-      FROM observations o
-      JOIN listings l ON l.id = o.listing_id
-      JOIN watches w ON w.id = o.watch_id
-      LEFT JOIN watch_listings wl ON wl.id = o.watch_listing_id
-      WHERE (? = 1 OR w.archived_at IS NULL)
-        AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)
-        AND (w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
-        AND (w.min_price_pln IS NULL OR o.price_pln >= w.min_price_pln)
-        AND (w.max_price_pln IS NULL OR o.price_pln <= w.max_price_pln)
-      GROUP BY o.watch_id, COALESCE(wl.variant_key, ?)`).all(OTHER_VARIANT_KEY, includeArchived ? 1 : 0, OTHER_VARIANT_KEY) as Array<{ watch_id: string; variant_key: string; samples: number; first_observed: string | null }>;
+    // One row per (watch, listing) association: listing-level filters run once
+    // per association and the earliest in-range observation is an ordered
+    // LIMIT-1 probe of observations_watch_listing, so the cost scales with
+    // associations instead of the whole observation history. Every
+    // observation's watch_listing_id is its (watch_id, listing_id)
+    // association, so this matches the per-observation aggregate exactly.
+    // MATERIALIZED keeps SQLite from flattening the CTE and re-running the
+    // probe per aggregate; HAVING drops variants with no in-range observation.
+    const statsRows = this.stmt(`WITH a AS MATERIALIZED (
+        SELECT wl.watch_id AS watch_id, COALESCE(wl.variant_key, ?1) AS variant_key,
+          (SELECT o.observed_at FROM observations o INDEXED BY observations_watch_listing
+            WHERE o.watch_id = wl.watch_id AND o.listing_id = wl.listing_id
+              AND (w.min_price_pln IS NULL OR o.price_pln >= w.min_price_pln)
+              AND (w.max_price_pln IS NULL OR o.price_pln <= w.max_price_pln)
+            ORDER BY o.observed_at LIMIT 1) AS first_observed
+        FROM watch_listings wl
+        JOIN watches w ON w.id = wl.watch_id
+        JOIN listings l ON l.id = wl.listing_id
+        WHERE (?2 = 1 OR w.archived_at IS NULL)
+          AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)
+          AND (w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
+      )
+      SELECT watch_id, variant_key, COUNT(first_observed) AS samples, MIN(first_observed) AS first_observed
+      FROM a GROUP BY watch_id, variant_key HAVING COUNT(first_observed) > 0`).all(OTHER_VARIANT_KEY, includeArchived ? 1 : 0) as Array<{ watch_id: string; variant_key: string; samples: number; first_observed: string | null }>;
     // Latest stored typical per variant. Every association in a variant shares
     // the value written by the most recent scan; MAX(last_seen_at) picks that
     // row so a stale pre-regroup value cannot win.

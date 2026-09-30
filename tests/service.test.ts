@@ -9,6 +9,7 @@ import { DeepSeekError } from '../server/ai';
 import { listingDescriptionVerificationInputHash, listingRelevanceInputHash } from '../server/ai';
 import { VisionError } from '../server/vision';
 import { ScoutService, ServiceError, decryptSecret, olxCategoryFromJson, olxCategoryToJson, encryptSecret, escapeDiscordMarkdown, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
+import { OTHER_VARIANT_KEY } from '../server/variants';
 
 // Pin the legacy DeepSeek path for pre-existing tests: live Jev is the
 // production default whenever a key is available, but these tests assert
@@ -1037,6 +1038,101 @@ test('price-filtered watches scope history and baseline samples to their range',
     for (const row of context.db.prepare('SELECT id, price_pln FROM listings').all() as Array<{ id: number; price_pln: number }>) observe.run(row.id, 'priced-watch', row.price_pln, now);
     assert.equal(context.service.getWatches()[0].samples, 1);
     assert.deepEqual(context.service.getListings().map((listing) => listing.id), ['OLX:in-range']);
+  } finally { context.close(); }
+});
+
+// The pre-rewrite per-observation stats aggregate, kept as the oracle for the
+// association-driven query in watches().
+const LEGACY_WATCH_STATS_SQL = `SELECT o.watch_id, COALESCE(wl.variant_key, ?) AS variant_key, COUNT(DISTINCT o.listing_id) AS samples, MIN(o.observed_at) AS first_observed
+  FROM observations o
+  JOIN listings l ON l.id = o.listing_id
+  JOIN watches w ON w.id = o.watch_id
+  LEFT JOIN watch_listings wl ON wl.id = o.watch_listing_id
+  WHERE (? = 1 OR w.archived_at IS NULL)
+    AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)
+    AND (w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
+    AND (w.min_price_pln IS NULL OR o.price_pln >= w.min_price_pln)
+    AND (w.max_price_pln IS NULL OR o.price_pln <= w.max_price_pln)
+  GROUP BY o.watch_id, COALESCE(wl.variant_key, ?)`;
+
+// Several watches exercising every stats filter: AI relevance on/off,
+// shipping-only, price bounds, variant keys, an archived watch and
+// associations whose observations all fall outside the price range.
+function seedWatchStatsScenario(db: any) {
+  const hoursAgo = (hours: number) => new Date(Date.now() - hours * 3_600_000).toISOString();
+  seedWatch(db, 'stats-plain');
+  seedWatch(db, 'stats-bounded');
+  seedWatch(db, 'stats-shipping');
+  seedWatch(db, 'stats-no-ai');
+  seedWatch(db, 'stats-archived');
+  db.prepare('UPDATE watches SET min_price_pln = 100, max_price_pln = 300 WHERE id = ?').run('stats-bounded');
+  db.prepare('UPDATE watches SET shipping_only = 1 WHERE id = ?').run('stats-shipping');
+  db.prepare('UPDATE watches SET ai_relevance = 0 WHERE id = ?').run('stats-no-ai');
+  db.prepare('UPDATE watches SET archived_at = ? WHERE id = ?').run(hoursAgo(1), 'stats-archived');
+  db.prepare('UPDATE watches SET variant_groups_json = ? WHERE id IN (?, ?)').run(JSON.stringify([{ id: 'a', label: 'A', terms: 'a', exclude: '' }, { id: 'b', label: 'B', terms: 'b', exclude: '' }]), 'stats-plain', 'stats-bounded');
+  const insertListing = db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, shipping_available, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+  const insertObservation = db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+  const link = db.prepare('UPDATE observations SET watch_listing_id = (SELECT id FROM watch_listings WHERE watch_id = observations.watch_id AND listing_id = observations.listing_id) WHERE watch_listing_id IS NULL');
+  const irrelevant = db.prepare(`INSERT INTO listing_relevance (watch_id, marketplace, listing_id, input_hash, model, relevant, reason, checked_at, relevance_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const watches = ['stats-plain', 'stats-bounded', 'stats-shipping', 'stats-no-ai', 'stats-archived'];
+  for (let index = 0; index < 40; index += 1) {
+    const marketplace = index % 5 === 0 ? 'Vinted' : 'OLX';
+    const listingId = `stats-${index}`;
+    insertListing.run(marketplace, listingId, `CPU ${index}`, 50 + index * 10, index % 3 === 0 ? 0 : 1, `https://example.test/${listingId}`, hoursAgo(80), hoursAgo(1));
+    const listing = db.prepare('SELECT id FROM listings WHERE listing_id = ?').get(listingId) as { id: number };
+    for (const [slot, watchId] of watches.entries()) {
+      if ((index + slot) % 4 === 3) continue;
+      // Prices drift across the bounded range so some associations are only
+      // partly in range and a few never are.
+      for (let step = 0; step < 3; step += 1) insertObservation.run(listing.id, watchId, 40 + index * 8 + step * 60, hoursAgo(72 - index - step * 5 - slot));
+      const variant = index % 7 === 0 ? null : ['a', 'b', 'other'][index % 3];
+      db.prepare('UPDATE watch_listings SET variant_key = ? WHERE watch_id = ? AND listing_id = ?').run(variant, watchId, listing.id);
+      if (index % 6 === 1) irrelevant.run(watchId, marketplace, listingId, `hash-${index}`, 'model', 0, 'no', hoursAgo(1), 'irrelevant');
+      else if (index % 6 === 2) irrelevant.run(watchId, marketplace, listingId, `hash-${index}`, 'model', 0, 'no', hoursAgo(1), 'relevant');
+      else if (index % 6 === 3) irrelevant.run(watchId, marketplace, listingId, `hash-${index}`, 'model', 1, 'yes', hoursAgo(1), 'unknown');
+    }
+  }
+  link.run();
+}
+
+function captureStatsRows(db: any) {
+  const captured: unknown[][] = [];
+  const proxy = new Proxy(db, {
+    get(target, property) {
+      if (property === 'prepare') return (sql: string) => {
+        const statement = target.prepare(sql);
+        if (!sql.includes('WITH a AS MATERIALIZED')) return statement;
+        return new Proxy(statement, {
+          get(inner, key) {
+            if (key === 'all') return (...params: unknown[]) => { const rows = inner.all(...params); captured.push(rows); return rows; };
+            const value = Reflect.get(inner, key);
+            return typeof value === 'function' ? value.bind(inner) : value;
+          },
+        });
+      };
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  return { proxy, captured };
+}
+
+test('association-driven watch stats match the per-observation aggregate', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const { proxy, captured } = captureStatsRows(context.db);
+    const service = new ScoutService(proxy, () => {});
+    const sortRows = (rows: any[]) => rows.map((row) => ({ ...row })).sort((a, b) => `${a.watch_id}|${a.variant_key}`.localeCompare(`${b.watch_id}|${b.variant_key}`));
+    for (const includeArchived of [0, 1]) {
+      captured.length = 0;
+      const watches = includeArchived ? service.allWatches() : service.getWatches();
+      assert.equal(watches.length, includeArchived ? 5 : 4);
+      const legacy = context.db.prepare(LEGACY_WATCH_STATS_SQL).all(OTHER_VARIANT_KEY, includeArchived, OTHER_VARIANT_KEY);
+      assert.ok(legacy.length > 8);
+      assert.equal(captured.length, 1);
+      assert.deepEqual(sortRows(captured[0] as any[]), sortRows(legacy as any[]));
+    }
   } finally { context.close(); }
 });
 
