@@ -140,8 +140,9 @@ public enum SharedStore {
         return groups
     }
 
-    /// The first group this process can actually use, if any.
-    public static var appGroup: String? {
+    /// The first group this process can actually use, if any. Entitlements
+    /// don't change while the process runs, so it is looked up once.
+    public static let appGroup: String? = {
         // On macOS containerURL returns a URL even without the entitlement, so
         // the check only means something on iOS.
         #if os(iOS)
@@ -149,7 +150,7 @@ public enum SharedStore {
         #else
         nil
         #endif
-    }
+    }()
 
     public static var isAvailable: Bool { appGroup != nil }
 
@@ -168,7 +169,9 @@ public enum SharedStore {
     }
 
     /// The API token for `serverURL`. It lives in the Keychain under the App
-    /// Group's access group, which the widget extension can read too.
+    /// Group's access group, which the widget extension can read too. Without
+    /// an App Group it is kept in the app's default access group, and a token
+    /// found there is moved into the group once one is available.
     public static var apiToken: String? {
         #if canImport(Security)
         TokenKeychain.read(accessGroup: appGroup)
@@ -177,9 +180,10 @@ public enum SharedStore {
         #endif
     }
 
-    public static func saveAPIToken(_ token: String?) {
+    /// Saves the token, or removes it when `nil` or empty.
+    public static func saveAPIToken(_ token: String?) throws {
         #if canImport(Security)
-        TokenKeychain.write(token, accessGroup: appGroup)
+        try TokenKeychain.write(token, accessGroup: appGroup)
         #endif
     }
 
@@ -207,10 +211,42 @@ public enum SharedStore {
     }
 }
 
+/// Why the API token couldn't be saved to or removed from the Keychain.
+public struct TokenStorageError: Error, Equatable, LocalizedError {
+    public enum Operation: String, Sendable {
+        /// Adding the new token failed; any earlier token is already gone.
+        case save
+        /// Removing the earlier token failed, so it may still be stored.
+        case remove
+    }
+
+    public var operation: Operation
+    public var status: Int32
+
+    public init(operation: Operation, status: Int32) {
+        self.operation = operation
+        self.status = status
+    }
+
+    /// The Keychain's explanation of `status`.
+    public var reason: String {
+        #if canImport(Security)
+        if let message = SecCopyErrorMessageString(status, nil) as String? { return "\(message) (\(status))" }
+        #endif
+        return "error \(status)"
+    }
+
+    public var errorDescription: String? {
+        "Couldn't \(operation.rawValue) the API token in the Keychain: \(reason)."
+    }
+}
+
 #if canImport(Security)
 private enum TokenKeychain {
     private static let service = "io.github.hkubus.scout.api-token"
 
+    /// Without an access group, lookups and deletes cover every group this
+    /// process can use, and adds go to its default group.
     private static func query(_ accessGroup: String?) -> [String: Any] {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -221,7 +257,16 @@ private enum TokenKeychain {
         return query
     }
 
+    /// Tries the App Group first, then any group, which finds a token saved
+    /// while no App Group was available; that one is moved into the group.
     static func read(accessGroup: String?) -> String? {
+        if let accessGroup, let token = copy(accessGroup) { return token }
+        guard let token = copy(nil) else { return nil }
+        if accessGroup != nil { try? write(token, accessGroup: accessGroup) }
+        return token
+    }
+
+    private static func copy(_ accessGroup: String?) -> String? {
         var lookup = query(accessGroup)
         lookup[kSecReturnData as String] = true
         lookup[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -230,14 +275,27 @@ private enum TokenKeychain {
         return String(data: data, encoding: .utf8)
     }
 
-    static func write(_ token: String?, accessGroup: String?) {
-        SecItemDelete(query(accessGroup) as CFDictionary)
-        guard let token, !token.isEmpty else { return }
+    static func write(_ token: String?, accessGroup: String?) throws {
+        let token = token ?? ""
+        // Remove every copy, including one in the default group, so a cleared
+        // token can't come back through the fallback lookup in `read`.
+        let deleted = SecItemDelete(query(nil) as CFDictionary)
+        guard deleted == errSecSuccess || deleted == errSecItemNotFound else {
+            throw TokenStorageError(operation: .remove, status: deleted)
+        }
+        guard !token.isEmpty else { return }
         var item = query(accessGroup)
         item[kSecValueData as String] = Data(token.utf8)
         // Widgets refresh while the phone is locked.
         item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        SecItemAdd(item as CFDictionary, nil)
+        var added = SecItemAdd(item as CFDictionary, nil)
+        if added == errSecMissingEntitlement, accessGroup != nil {
+            // Signed without the group as a Keychain access group: keep the
+            // token for the app at least, in its default group.
+            item.removeValue(forKey: kSecAttrAccessGroup as String)
+            added = SecItemAdd(item as CFDictionary, nil)
+        }
+        guard added == errSecSuccess else { throw TokenStorageError(operation: .save, status: added) }
     }
 }
 #endif

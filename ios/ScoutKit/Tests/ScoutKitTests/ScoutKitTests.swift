@@ -251,6 +251,46 @@ final class AuthTests: XCTestCase {
     }
 }
 
+final class RedirectGuardTests: XCTestCase {
+    private func redirect(_ from: String, _ to: String) -> String? {
+        var request = URLRequest(url: URL(string: to)!)
+        request.setValue("Bearer secret", forHTTPHeaderField: "Authorization")
+        return RedirectGuard.redirect(request, from: URL(string: from)).value(forHTTPHeaderField: "Authorization")
+    }
+
+    func testKeepsTheTokenOnTheSameOrigin() {
+        XCTAssertEqual(redirect("https://scout.lan/api/dashboard", "https://SCOUT.lan:443/scout/api/dashboard"), "Bearer secret")
+        XCTAssertEqual(redirect("http://scout.lan:3001/api", "http://scout.lan:3001/other"), "Bearer secret")
+        // An upgrade to TLS on the same host.
+        XCTAssertEqual(redirect("http://scout.lan/api", "https://scout.lan/api"), "Bearer secret")
+        XCTAssertEqual(redirect("http://scout.lan:3001/api", "https://scout.lan/api"), "Bearer secret")
+    }
+
+    func testDropsTheTokenWhenTheOriginChanges() {
+        XCTAssertNil(redirect("https://scout.lan/api", "https://evil.example/api"))
+        XCTAssertNil(redirect("https://scout.lan/api", "https://scout.lan:8443/api"))
+        XCTAssertNil(redirect("https://scout.lan/api", "http://scout.lan/api"))
+        XCTAssertNil(redirect("http://scout.lan/api", "https://scout.lan:8443/api"))
+        XCTAssertNil(redirect("https://scout.lan/api", "https://sub.scout.lan/api"))
+        XCTAssertNil(RedirectGuard.redirect(URLRequest(url: URL(string: "https://scout.lan")!), from: nil).value(forHTTPHeaderField: "Authorization"))
+    }
+
+    func testLeavesOtherHeadersAlone() {
+        var request = URLRequest(url: URL(string: "https://cdn.example/image.jpg")!)
+        request.setValue("Bearer secret", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let redirected = RedirectGuard.redirect(request, from: URL(string: "https://scout.lan/api/market-snapshot-images/1"))
+        XCTAssertNil(redirected.value(forHTTPHeaderField: "Authorization"))
+        XCTAssertEqual(redirected.value(forHTTPHeaderField: "Accept"), "application/json")
+    }
+
+    func testTokenStorageErrorIsDescriptive() {
+        let message = TokenStorageError(operation: .save, status: -34018).localizedDescription
+        XCTAssertTrue(message.hasPrefix("Couldn't save the API token in the Keychain"), message)
+        XCTAssertTrue(message.contains("-34018"), message)
+    }
+}
+
 private struct RoutingTransport: HTTPTransport {
     var respond: @Sendable (URLRequest) -> (Int, String)
 
@@ -408,9 +448,10 @@ final class MarketTests: XCTestCase {
     func testResearchWatchCrudInDemo() async throws {
         let created = try await client.createMarketWatch(MarketWatchDraft(name: "Switch market", query: "switch oled", intervalHours: 12))
         XCTAssertEqual(created.intervalHours, 12)
-        var draft = MarketWatchDraft(watch: created)
+        let original = MarketWatchDraft(watch: created)
+        var draft = original
         draft.maxPrice = 900
-        try await client.updateMarketWatch(id: created.id, draft: draft)
+        try await client.updateMarketWatch(id: created.id, draft: draft, original: original)
         try await client.setMarketWatchEnabled(id: created.id, enabled: false)
         var research = try await client.marketResearch()
         let updated = try XCTUnwrap(research.watches.first { $0.id == created.id })
@@ -420,6 +461,62 @@ final class MarketTests: XCTestCase {
         try await client.deleteMarketWatch(id: created.id)
         research = try await client.marketResearch()
         XCTAssertFalse(research.watches.contains { $0.id == created.id })
+    }
+
+    func testRenameSendsOnlyTheName() async throws {
+        let original = MarketWatchDraft(name: "Deck", query: "steam deck", terms: "oled", minPrice: 1000)
+        var draft = original
+        draft.name = "  Deck OLED "
+        let patch = draft.patch(from: original)
+        XCTAssertFalse(patch.changesCriteria)
+        let body = try JSONSerialization.jsonObject(with: JSONEncoder().encode(patch)) as? [String: Any]
+        XCTAssertEqual(body?.keys.sorted(), ["name"])
+        XCTAssertEqual(body?["name"] as? String, "Deck OLED")
+
+        let transport = RoutingTransport { request in
+            XCTAssertEqual(request.httpMethod, "PATCH")
+            XCTAssertEqual(String(decoding: request.httpBody ?? Data(), as: UTF8.self), #"{"name":"Deck OLED"}"#)
+            return (200, #"{"ok":true}"#)
+        }
+        try await ScoutClient(baseURL: URL(string: "https://host")!, transport: transport).updateMarketWatch(id: "m1", draft: draft, original: original)
+    }
+
+    func testPatchIgnoresWhitespaceAndSendsClearedPricesAsNull() throws {
+        let original = MarketWatchDraft(name: "Deck", query: "steam deck", location: "", minPrice: 1000)
+        var draft = original
+        draft.query = " steam deck "
+        draft.location = "Polska"
+        XCTAssertTrue(draft.patch(from: original).isEmpty)
+
+        draft.minPrice = nil
+        draft.intervalHours = 48
+        let patch = draft.patch(from: original)
+        XCTAssertTrue(patch.changesCriteria)
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(patch)) as? [String: Any])
+        XCTAssertEqual(body.keys.sorted(), ["intervalHours", "minPrice"])
+        XCTAssertTrue(body["minPrice"] is NSNull)
+        XCTAssertEqual(try JSONDecoder().decode(MarketWatchPatch.self, from: JSONEncoder().encode(patch)), patch)
+    }
+
+    func testUnchangedEditStillSendsAValidBody() async throws {
+        let original = MarketWatchDraft(name: "Deck", query: "steam deck")
+        let transport = RoutingTransport { request in
+            XCTAssertEqual(String(decoding: request.httpBody ?? Data(), as: UTF8.self), #"{"name":"Deck"}"#)
+            return (200, #"{"ok":true}"#)
+        }
+        try await ScoutClient(baseURL: URL(string: "https://host")!, transport: transport).updateMarketWatch(id: "m1", draft: original, original: original)
+    }
+
+    func testDemoRenameKeepsTheCriteria() async throws {
+        let created = try await client.createMarketWatch(MarketWatchDraft(name: "Switch market", query: "switch oled", minPrice: 500))
+        var draft = MarketWatchDraft(watch: created)
+        draft.name = "Switch OLED market"
+        try await client.updateMarketWatch(id: created.id, draft: draft, original: MarketWatchDraft(watch: created))
+        let research = try await client.marketResearch()
+        let updated = try XCTUnwrap(research.watches.first { $0.id == created.id })
+        XCTAssertEqual(updated.name, "Switch OLED market")
+        XCTAssertEqual(updated.query, "switch oled")
+        XCTAssertEqual(updated.minPrice, 500)
     }
 
     func testMarketDraftValidation() {

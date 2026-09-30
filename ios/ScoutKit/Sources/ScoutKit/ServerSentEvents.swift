@@ -95,7 +95,7 @@ extension ScoutClient {
         return AsyncThrowingStream { continuation in
             let task = Task { [request] in
                 do {
-                    let (bytes, response) = try await session.bytes(for: request)
+                    let (bytes, response) = try await session.bytes(for: request, delegate: RedirectGuard.shared)
                     guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                         throw (response as? HTTPURLResponse)?.statusCode == 401 ? ScoutAPIError.unauthorized(tokenProvided: tokenProvided) : ScoutAPIError.invalidResponse
                     }

@@ -86,8 +86,8 @@ struct SearchView: View {
                     if let created { model.showWatch(created) }
                 }
             }
-            .onChange(of: model.searchProgress) { _, event in
-                if let event { merge(event) }
+            .onChange(of: model.searchProgressCount) {
+                for event in model.takeSearchProgress() { merge(event) }
             }
             .task {
                 if let query = model.pendingSearchQuery {

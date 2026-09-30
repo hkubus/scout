@@ -131,8 +131,7 @@ export default function SettingsPage({
         ntfyTopic.trim() ||
         ntfyToken.trim() ||
         ntfyServerUrl.trim() !== "https://ntfy.sh" ||
-        ntfyMinimumPriority !== (settings?.ntfy?.minimumPriority ?? "exceptional") ||
-        ntfyOpenInApp !== (settings?.ntfy?.openInApp ?? false),
+        ntfyMinimumPriority !== (settings?.ntfy?.minimumPriority ?? "exceptional"),
       );
       const result = await api.saveSettings({
         interval: numericInterval,
@@ -155,7 +154,8 @@ export default function SettingsPage({
               topic: ntfyTopic.trim() || undefined,
               token: ntfyToken.trim() || undefined,
               minimumPriority: ntfyMinimumPriority,
-              openInApp: ntfyOpenInApp,
+              // Only meaningful once ntfy has a topic; the checkbox is disabled until then.
+              openInApp: ntfyCanOpenInApp ? ntfyOpenInApp : undefined,
             }
           : undefined,
       });
@@ -371,6 +371,7 @@ export default function SettingsPage({
   };
   const configured = settings?.webhookConfigured ?? false;
   const ntfyConfigured = settings?.ntfy?.configured ?? false;
+  const ntfyCanOpenInApp = ntfyConfigured || ntfyTopic.trim() !== "";
   const aiConfigured = settings?.ai?.configured ?? false;
   const settingsLoaded = settings !== null;
   return (
@@ -769,7 +770,12 @@ export default function SettingsPage({
             </label>
           </div>
           <label className="check-option">
-            <input type="checkbox" checked={ntfyOpenInApp} onChange={(event) => setNtfyOpenInApp(event.target.checked)} />
+            <input
+              type="checkbox"
+              disabled={!settingsLoaded || !ntfyCanOpenInApp}
+              checked={ntfyOpenInApp}
+              onChange={(event) => setNtfyOpenInApp(event.target.checked)}
+            />
             <span>
               <strong>Open alerts in the Scout iOS app</strong>
               <small>Tapping an alert opens the listing in the app; an "Open listing" button still goes to the marketplace. Leave off if you read ntfy on desktop or Android.</small>

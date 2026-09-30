@@ -139,23 +139,19 @@ public actor DemoTransport: HTTPTransport {
             }
             let body = (try? JSONSerialization.jsonObject(with: request.httpBody ?? Data())) as? [String: Any] ?? [:]
             if let value = body["enabled"] as? Bool { marketWatches[index].enabled = value }
-            if body["query"] != nil {
-                let draft = try JSONDecoder().decode(MarketWatchDraft.self, from: request.httpBody ?? Data())
-                let current = marketWatches[index]
-                marketWatches[index].name = draft.name
-                marketWatches[index].query = draft.query
-                marketWatches[index].terms = draft.terms
-                marketWatches[index].excluded = draft.excluded
-                marketWatches[index].location = draft.location
-                marketWatches[index].condition = draft.condition
-                marketWatches[index].sources = draft.sources
-                marketWatches[index].intervalHours = draft.intervalHours
-                marketWatches[index].minPrice = draft.minPrice
-                marketWatches[index].maxPrice = draft.maxPrice
-                marketWatches[index].shippingOnly = draft.shippingOnly
-                marketWatches[index].typoVariants = draft.typoVariants
-                marketWatches[index].enabled = current.enabled
-            }
+            let patch = try JSONDecoder().decode(MarketWatchPatch.self, from: request.httpBody ?? Data())
+            if let value = patch.name { marketWatches[index].name = value }
+            if let value = patch.query { marketWatches[index].query = value }
+            if let value = patch.terms { marketWatches[index].terms = value }
+            if let value = patch.excluded { marketWatches[index].excluded = value }
+            if let value = patch.location { marketWatches[index].location = value }
+            if let value = patch.condition { marketWatches[index].condition = value }
+            if let value = patch.sources { marketWatches[index].sources = value }
+            if let value = patch.intervalHours { marketWatches[index].intervalHours = value }
+            if let value = patch.minPrice { marketWatches[index].minPrice = value }
+            if let value = patch.maxPrice { marketWatches[index].maxPrice = value }
+            if let value = patch.shippingOnly { marketWatches[index].shippingOnly = value }
+            if let value = patch.typoVariants { marketWatches[index].typoVariants = value }
             return try respond(["ok": true])
         case "DELETE /api/market-watches/:id":
             marketWatches.removeAll { $0.id == watchID }

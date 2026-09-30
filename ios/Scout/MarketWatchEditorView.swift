@@ -156,7 +156,7 @@ struct MarketWatchEditorView: View {
             defer { saving = false }
             do {
                 if let id = request.watchID {
-                    try await client.updateMarketWatch(id: id, draft: draft)
+                    try await client.updateMarketWatch(id: id, draft: draft, original: request.draft)
                 } else {
                     _ = try await client.createMarketWatch(draft)
                 }

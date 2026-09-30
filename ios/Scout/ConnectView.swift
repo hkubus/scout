@@ -36,7 +36,6 @@ struct ConnectView: View {
                         .submitLabel(.go)
                         .onSubmit(connect)
                     SecureField("API token (if the server requires sign-in)", text: $apiToken)
-                        .textContentType(.password)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .submitLabel(.go)

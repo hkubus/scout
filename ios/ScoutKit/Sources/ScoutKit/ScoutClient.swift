@@ -35,9 +35,57 @@ public struct URLSessionTransport: HTTPTransport {
     }
 
     public func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request, delegate: RedirectGuard.shared)
         guard let http = response as? HTTPURLResponse else { throw ScoutAPIError.invalidResponse }
         return (data, http)
+    }
+}
+
+/// Keeps the API token on the server it was meant for: URLSession copies the
+/// `Authorization` header onto redirects, so it is dropped when a redirect
+/// leaves the original request's origin.
+public final class RedirectGuard: NSObject, URLSessionTaskDelegate, Sendable {
+    public static let shared = RedirectGuard()
+
+    public func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(Self.redirect(request, from: task.originalRequest?.url))
+    }
+
+    /// The redirected request, without `Authorization` unless it may be forwarded.
+    public static func redirect(_ request: URLRequest, from original: URL?) -> URLRequest {
+        guard request.value(forHTTPHeaderField: "Authorization") != nil,
+              !mayForwardCredentials(from: original, to: request.url)
+        else { return request }
+        var stripped = request
+        stripped.setValue(nil, forHTTPHeaderField: "Authorization")
+        return stripped
+    }
+
+    /// Same scheme, host, and port, or an http → https upgrade on the same host.
+    public static func mayForwardCredentials(from original: URL?, to target: URL?) -> Bool {
+        guard let from = original.flatMap(Origin.init), let to = target.flatMap(Origin.init) else { return false }
+        if from == to { return true }
+        return from.host == to.host && from.scheme == "http" && to.scheme == "https" && to.port == 443
+    }
+
+    private struct Origin: Equatable {
+        var scheme: String
+        var host: String
+        var port: Int
+
+        init?(_ url: URL) {
+            guard let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased(), !host.isEmpty else { return nil }
+            guard let port = url.port ?? (scheme == "https" ? 443 : scheme == "http" ? 80 : nil) else { return nil }
+            self.scheme = scheme
+            self.host = host
+            self.port = port
+        }
     }
 }
 
@@ -155,9 +203,17 @@ public struct ScoutClient: Sendable {
         return response.watch
     }
 
-    /// Changing search criteria starts a new comparable series on the server.
-    public func updateMarketWatch(id: String, draft: MarketWatchDraft) async throws {
-        let _: OkResponse = try await send("PATCH", "/api/market-watches/\(Self.pathSegment(id))", body: draft.normalized())
+    /// Sends only the fields that differ from `original`: any criteria field
+    /// in the body starts a new comparable series on the server.
+    public func updateMarketWatch(id: String, draft: MarketWatchDraft, original: MarketWatchDraft) async throws {
+        var patch = draft.patch(from: original)
+        // The server rejects an empty body; resending the name changes nothing.
+        if patch.isEmpty { patch.name = draft.normalized().name }
+        try await updateMarketWatch(id: id, patch: patch)
+    }
+
+    public func updateMarketWatch(id: String, patch: MarketWatchPatch) async throws {
+        let _: OkResponse = try await send("PATCH", "/api/market-watches/\(Self.pathSegment(id))", body: patch)
     }
 
     public func setMarketWatchEnabled(id: String, enabled: Bool) async throws {

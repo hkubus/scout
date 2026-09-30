@@ -32,12 +32,14 @@ struct ScoutTimelineProvider: AppIntentTimelineProvider {
         let address = configuration.serverAddress?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let client: ScoutClient
         var isDemo = false
+        var usesAppServer = true
         if !address.isEmpty {
             guard let url = try? ServerAddress.normalize(address) else {
                 return ScoutWidgetEntry(date: Date(), snapshot: anyCached, state: .offline("The server address in this widget's settings isn't valid."))
             }
             // Only send the app's token to the server the app connected to.
-            client = ScoutClient(baseURL: url, apiToken: url == SharedStore.serverURL ? SharedStore.apiToken : nil)
+            usesAppServer = url == SharedStore.serverURL
+            client = ScoutClient(baseURL: url, apiToken: usesAppServer ? SharedStore.apiToken : nil)
         } else if SharedStore.isDemo {
             client = ScoutClient(baseURL: DemoTransport.baseURL, transport: DemoTransport())
             isDemo = true
@@ -67,8 +69,20 @@ struct ScoutTimelineProvider: AppIntentTimelineProvider {
                 }
                 fallback = snapshot
             }
-            return ScoutWidgetEntry(date: Date(), snapshot: fallback, state: .offline(error.localizedDescription))
+            return ScoutWidgetEntry(date: Date(), snapshot: fallback, state: .offline(Self.message(for: error, usesAppServer: usesAppServer)))
         }
+    }
+
+    /// The client's sign-in errors tell the user to enter a token, which the
+    /// widget has no field for; it can only borrow the app's.
+    private static func message(for error: Error, usesAppServer: Bool) -> String {
+        guard case let ScoutAPIError.unauthorized(tokenProvided) = error else { return error.localizedDescription }
+        if !usesAppServer {
+            return "This server requires sign-in. Widgets can only use the app's API token, so edit the widget and enter the server the app is connected to, or leave the address blank."
+        }
+        return tokenProvided
+            ? "The server rejected the app's API token. Update it in the Scout app's Settings."
+            : "This server requires sign-in. Add an API token in the Scout app's Settings."
     }
 }
 

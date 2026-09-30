@@ -32,6 +32,17 @@ struct ListingLink: Hashable, Identifiable {
     init(_ listing: Listing) {
         self.init(key: listing.key, watchId: listing.watchId, preview: listing)
     }
+
+    // Identity only: the preview is display data and must not make two links
+    // to the same listing differ.
+    static func == (lhs: ListingLink, rhs: ListingLink) -> Bool {
+        lhs.key == rhs.key && lhs.watchId == rhs.watchId
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(key)
+        hasher.combine(watchId)
+    }
 }
 
 /// The full, filterable listing history (reached from Deals).
@@ -60,8 +71,10 @@ final class AppModel {
     var pendingNewWatch = false
     /// Query the Search tab runs when it appears (screenshots).
     var pendingSearchQuery: String?
-    /// Latest per-marketplace result streamed while a manual search runs.
-    private(set) var searchProgress: SearchProgressEvent?
+    /// Bumped for every per-marketplace result streamed while a manual search
+    /// runs; Search drains them with `takeSearchProgress()` so two quick
+    /// events can't coalesce into one change.
+    private(set) var searchProgressCount = 0
     /// What the widgets show, for the in-app widget preview.
     private(set) var widgetSnapshot: WidgetSnapshot?
     var showWidgetGallery = false
@@ -69,6 +82,7 @@ final class AppModel {
 
     @ObservationIgnored private var eventsTask: Task<Void, Never>?
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingSearchProgress: [SearchProgressEvent] = []
     @ObservationIgnored private let defaults = UserDefaults.standard
 
     private static let serverURLKey = "serverURL"
@@ -116,12 +130,40 @@ final class AppModel {
         let url = try ServerAddress.normalize(address)
         let candidate = ScoutClient(baseURL: url, apiToken: apiToken)
         try await candidate.verifyAccess()
+        let warning = try storeAPIToken(candidate.apiToken)
         defaults.set(url.absoluteString, forKey: Self.serverURLKey)
-        SharedStore.saveAPIToken(candidate.apiToken)
         client = candidate
         connection = .connecting
         syncWidgetConnection()
         startLiveUpdates()
+        if let warning { alertMessage = warning }
+    }
+
+    /// Replaces or clears the connected server's API token once the server
+    /// accepts the new one, as `connect` does.
+    func updateAPIToken(_ apiToken: String) async throws {
+        guard let current = client, !isDemo else { return }
+        let candidate = ScoutClient(baseURL: current.baseURL, apiToken: apiToken)
+        try await candidate.verifyAccess()
+        let warning = try storeAPIToken(candidate.apiToken)
+        client = candidate
+        syncWidgetConnection()
+        startLiveUpdates()
+        refresh()
+        if let warning { alertMessage = warning }
+    }
+
+    /// Keeps the token for later launches and the widgets. Throws when an
+    /// earlier token couldn't be removed, since the next launch would send it
+    /// to this server; returns a warning when only the new token wasn't kept,
+    /// which leaves this session working.
+    private func storeAPIToken(_ token: String?) throws -> String? {
+        do {
+            try SharedStore.saveAPIToken(token)
+            return nil
+        } catch let error as TokenStorageError where error.operation == .save {
+            return "Scout is connected, but the API token couldn't be saved in the Keychain (\(error.reason)). Enter it again in Settings after Scout restarts; widgets can't use it until then."
+        }
     }
 
     func useDemo() {
@@ -138,7 +180,11 @@ final class AppModel {
         openedListing = nil
         selectedTab = .deals
         widgetSnapshot = nil
-        SharedStore.saveAPIToken(nil)
+        do {
+            try SharedStore.saveAPIToken(nil)
+        } catch {
+            report(error)
+        }
         syncWidgetConnection()
     }
 
@@ -228,11 +274,19 @@ final class AppModel {
             }
         } else if event.event == "search" {
             if let progress = try? JSONDecoder().decode(SearchProgressEvent.self, from: Data(event.data.utf8)) {
-                searchProgress = progress
+                // Bounded in case Search isn't on screen to drain them.
+                pendingSearchProgress = Array((pendingSearchProgress + [progress]).suffix(50))
+                searchProgressCount += 1
             }
         } else if Self.refreshEvents.contains(event.event) {
             scheduleRefresh()
         }
+    }
+
+    /// Streamed search results since the last call, oldest first.
+    func takeSearchProgress() -> [SearchProgressEvent] {
+        defer { pendingSearchProgress = [] }
+        return pendingSearchProgress
     }
 
     /// Coalesces bursts of scan events into one reload.

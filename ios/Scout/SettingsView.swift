@@ -8,6 +8,9 @@ struct SettingsView: View {
     @State private var connectors: [Connector] = []
     @State private var serverSettings: ServerSettings?
     @State private var updatingNotifications = false
+    @State private var newAPIToken = ""
+    @State private var savingAPIToken = false
+    @State private var apiTokenError: String?
     @State private var error: String?
 
     var body: some View {
@@ -50,6 +53,8 @@ struct SettingsView: View {
                         Text(verbatim: model.isDemo ? "Leave demo" : "Change server")
                     }
                 }
+
+                apiTokenSection
 
                 if !connectors.isEmpty {
                     Section("Connectors") {
@@ -121,6 +126,64 @@ struct SettingsView: View {
         } catch {
             if !error.isCancellation { self.error = error.localizedDescription }
         }
+    }
+
+    @ViewBuilder
+    private var apiTokenSection: some View {
+        if !model.isDemo, let client = model.client {
+            Section {
+                LabeledContent("Current token", value: Self.masked(client.apiToken))
+                SecureField(client.apiToken == nil ? "Paste an API token" : "Paste a new API token", text: $newAPIToken)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.done)
+                    .onSubmit { saveAPIToken(newAPIToken) }
+                Button {
+                    saveAPIToken(newAPIToken)
+                } label: {
+                    HStack {
+                        Text("Save token")
+                        Spacer()
+                        if savingAPIToken { ProgressView() }
+                    }
+                }
+                .disabled(savingAPIToken || newAPIToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if client.apiToken != nil {
+                    Button("Remove token", role: .destructive) { saveAPIToken("") }
+                        .disabled(savingAPIToken)
+                }
+            } header: {
+                Text("API token")
+            } footer: {
+                if let apiTokenError {
+                    Text(apiTokenError).foregroundStyle(.red)
+                } else {
+                    Text("One of the server's SCOUT_API_TOKENS, sent with every request and kept in the Keychain. Scout checks a new token with the server before saving it.")
+                }
+            }
+        }
+    }
+
+    /// Verifies the token with the server, then keeps it; an empty one clears it.
+    private func saveAPIToken(_ token: String) {
+        guard !savingAPIToken else { return }
+        savingAPIToken = true
+        apiTokenError = nil
+        Task { @MainActor in
+            defer { savingAPIToken = false }
+            do {
+                try await model.updateAPIToken(token)
+                newAPIToken = ""
+            } catch {
+                if !error.isCancellation { apiTokenError = error.localizedDescription }
+            }
+        }
+    }
+
+    /// Only the last characters, enough to tell tokens apart.
+    private static func masked(_ token: String?) -> String {
+        guard let token else { return "None" }
+        return token.count > 8 ? "••••\(token.suffix(4))" : "••••"
     }
 
     @ViewBuilder

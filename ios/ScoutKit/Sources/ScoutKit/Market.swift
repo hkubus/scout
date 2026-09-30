@@ -248,6 +248,101 @@ extension MarketWatchDraft: Codable {
     }
 }
 
+/// A `PATCH /api/market-watches/:id` body with only the fields to change.
+/// The server starts a new comparable series whenever a criteria field is
+/// present, so edits send just what the user changed.
+public struct MarketWatchPatch: Hashable, Sendable {
+    public var name: String?
+    public var query: String?
+    public var terms: String?
+    public var excluded: String?
+    public var location: String?
+    public var condition: String?
+    public var sources: [Marketplace]?
+    public var intervalHours: Int?
+    /// `.some(nil)` clears the price.
+    public var minPrice: Double??
+    public var maxPrice: Double??
+    public var shippingOnly: Bool?
+    public var typoVariants: Bool?
+
+    public init() {}
+
+    public var isEmpty: Bool { self == MarketWatchPatch() }
+
+    /// True when the patch touches the search criteria (and so the series).
+    public var changesCriteria: Bool {
+        var rest = self
+        rest.name = nil
+        rest.intervalHours = nil
+        return !rest.isEmpty
+    }
+}
+
+extension MarketWatchDraft {
+    /// The fields that differ from `original`, both compared after
+    /// normalization, so a rename sends only the name.
+    public func patch(from original: MarketWatchDraft) -> MarketWatchPatch {
+        let new = normalized()
+        let old = original.normalized()
+        var patch = MarketWatchPatch()
+        if new.name != old.name { patch.name = new.name }
+        if new.query != old.query { patch.query = new.query }
+        if new.terms != old.terms { patch.terms = new.terms }
+        if new.excluded != old.excluded { patch.excluded = new.excluded }
+        if new.location != old.location { patch.location = new.location }
+        if new.condition != old.condition { patch.condition = new.condition }
+        if new.sources != old.sources { patch.sources = new.sources }
+        if new.intervalHours != old.intervalHours { patch.intervalHours = new.intervalHours }
+        if new.minPrice != old.minPrice { patch.minPrice = .some(new.minPrice) }
+        if new.maxPrice != old.maxPrice { patch.maxPrice = .some(new.maxPrice) }
+        if new.shippingOnly != old.shippingOnly { patch.shippingOnly = new.shippingOnly }
+        if new.typoVariants != old.typoVariants { patch.typoVariants = new.typoVariants }
+        return patch
+    }
+}
+
+extension MarketWatchPatch: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case name, query, terms, excluded, location, condition, sources, intervalHours
+        case minPrice, maxPrice, shippingOnly, typoVariants
+    }
+
+    // Absent fields are left out; a cleared price is sent as null.
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(name, forKey: .name)
+        try container.encodeIfPresent(query, forKey: .query)
+        try container.encodeIfPresent(terms, forKey: .terms)
+        try container.encodeIfPresent(excluded, forKey: .excluded)
+        try container.encodeIfPresent(location, forKey: .location)
+        try container.encodeIfPresent(condition, forKey: .condition)
+        try container.encodeIfPresent(sources, forKey: .sources)
+        try container.encodeIfPresent(intervalHours, forKey: .intervalHours)
+        if let minPrice { try container.encode(minPrice, forKey: .minPrice) }
+        if let maxPrice { try container.encode(maxPrice, forKey: .maxPrice) }
+        try container.encodeIfPresent(shippingOnly, forKey: .shippingOnly)
+        try container.encodeIfPresent(typoVariants, forKey: .typoVariants)
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init()
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+        query = try container.decodeIfPresent(String.self, forKey: .query)
+        terms = try container.decodeIfPresent(String.self, forKey: .terms)
+        excluded = try container.decodeIfPresent(String.self, forKey: .excluded)
+        location = try container.decodeIfPresent(String.self, forKey: .location)
+        condition = try container.decodeIfPresent(String.self, forKey: .condition)
+        sources = try container.decodeIfPresent([Marketplace].self, forKey: .sources)
+        intervalHours = try container.decodeIfPresent(Int.self, forKey: .intervalHours)
+        if container.contains(.minPrice) { minPrice = .some(try container.decodeIfPresent(Double.self, forKey: .minPrice)) }
+        if container.contains(.maxPrice) { maxPrice = .some(try container.decodeIfPresent(Double.self, forKey: .maxPrice)) }
+        shippingOnly = try container.decodeIfPresent(Bool.self, forKey: .shippingOnly)
+        typoVariants = try container.decodeIfPresent(Bool.self, forKey: .typoVariants)
+    }
+}
+
 // MARK: - Analytics
 
 /// `/api/analytics`: daily-deduplicated observations across deal watches.
