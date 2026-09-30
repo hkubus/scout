@@ -33,6 +33,27 @@ final class ScoutDateTests: XCTestCase {
         XCTAssertNil(ScoutDate.parse("10:24:18"))
         XCTAssertNil(ScoutDate.parse(nil))
     }
+
+    func testParsesMillisecondsOffsetsAndRejectsGarbage() throws {
+        // Fractional seconds can come back a few ulps off, so compare within a millisecond.
+        let millis = try XCTUnwrap(ScoutDate.parse("2026-09-30T08:30:00.123Z"))
+        XCTAssertEqual(millis.timeIntervalSince1970, 1_790_757_000.123, accuracy: 0.001)
+        let offset = try XCTUnwrap(ScoutDate.parse("2026-09-30T10:30:00.500+02:00"))
+        XCTAssertEqual(offset.timeIntervalSince1970, 1_790_757_000.5, accuracy: 0.001)
+        XCTAssertEqual(ScoutDate.parse("2026-09-30T10:30:00+02:00"), Date(timeIntervalSince1970: 1_790_757_000))
+        XCTAssertEqual(ScoutDate.parse(" 2026-09-30T08:30:00Z "), Date(timeIntervalSince1970: 1_790_757_000))
+        XCTAssertNil(ScoutDate.parse("garbage"))
+        XCTAssertNil(ScoutDate.parse(""))
+        XCTAssertNil(ScoutDate.parse("2026-09-30 08:30"))
+    }
+
+    func testParsesConcurrently() async {
+        let dates = await withTaskGroup(of: Date?.self) { group in
+            for _ in 0..<50 { group.addTask { ScoutDate.parse("2026-09-30T08:30:00.000Z") } }
+            return await group.reduce(into: [Date?]()) { $0.append($1) }
+        }
+        XCTAssertEqual(Set(dates), [Date(timeIntervalSince1970: 1_790_757_000)])
+    }
 }
 
 final class ServerSentEventParserTests: XCTestCase {
