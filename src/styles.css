@@ -304,6 +304,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .search-table { min-width: 900px; display: grid; grid-template-columns: minmax(300px, 2.2fr) 1.1fr .8fr .9fr 1.25fr 34px; align-items: center; gap: 16px; padding: 10px 14px; }
 .search-table--head { min-height: 35px; padding-top: 0; color: var(--muted); font-size: 12px; }
 .search-result-row { min-height: 69px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+.search-result-row { content-visibility: auto; contain-intrinsic-size: auto 69px; }
 .shipping-state { font-size: 11px; font-weight: 600; }
 .shipping-state--yes { color: var(--green); }
 .shipping-state--no { color: var(--orange); }

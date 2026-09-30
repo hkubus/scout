@@ -595,6 +595,11 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
       current?.id === listing.id ? { ...current, decision: listing.decision, note: listing.note, hidden: listing.hidden } : current,
     );
   }, []);
+  // Stable, so the memoized SearchPage skips App re-renders (toasts, connection).
+  const saveSearchAsWatch = useCallback((preset: WatchPreset) => {
+    setWatchPreset(preset);
+    setShowWatchDialog(true);
+  }, []);
   const toggleListingHidden = useCallback(async (listing: Listing) => {
     const nextHidden = !listing.hidden;
     try {
@@ -663,7 +668,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         ) : null}
         {view === "search" ? (
           <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading search…</div>}>
-            <LazySearchPage onSelectListing={setSelectedListing} onSaveWatch={(preset) => { setWatchPreset(preset); setShowWatchDialog(true); }} />
+            <LazySearchPage onSelectListing={setSelectedListing} onSaveWatch={saveSearchAsWatch} />
           </Suspense>
         ) : null}
         {view === "watches" ? (
