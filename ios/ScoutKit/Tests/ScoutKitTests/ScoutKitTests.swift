@@ -97,6 +97,18 @@ final class ClientTests: XCTestCase {
         }
     }
 
+    func testDashboardAsksForTheTopListingsOnlyWhenTold() async throws {
+        let requests = RequestLog()
+        let client = ScoutClient(baseURL: URL(string: "https://host/scout")!, transport: RoutingTransport { request in
+            requests.append(request)
+            return (200, #"{"listings":[],"watches":[],"connectors":[],"stats":{"watching":1,"newToday":2,"strongDeals":3},"lastScan":"just now","lastScanTime":"10:00"}"#)
+        })
+        _ = try await client.dashboard()
+        _ = try await client.dashboard(top: 12, timeout: 10)
+        XCTAssertEqual(requests.all.map { $0.url?.absoluteString }, ["https://host/scout/api/dashboard", "https://host/scout/api/dashboard?top=12"])
+        XCTAssertEqual(requests.all.map(\.timeoutInterval), [20, 10])
+    }
+
     func testReadinessAccepts503Body() async throws {
         let client = ScoutClient(baseURL: URL(string: "https://host")!, transport: StubTransport(status: 503, body: #"{"status":"degraded","connectors":{"degraded":["OLX"],"degradedCount":1}}"#))
         let readiness = try await client.readiness()
@@ -325,6 +337,14 @@ private struct RoutingTransport: HTTPTransport {
     }
 }
 
+private final class RequestLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests: [URLRequest] = []
+
+    func append(_ request: URLRequest) { lock.withLock { requests.append(request) } }
+    var all: [URLRequest] { lock.withLock { requests } }
+}
+
 private struct StubTransport: HTTPTransport {
     var status: Int
     var body: String
@@ -476,6 +496,28 @@ final class WidgetSnapshotTests: XCTestCase {
         XCTAssertNotNil(SharedStore.loadSnapshot(from: defaults))
         XCTAssertTrue(SharedStore.saveConnection(serverURL: server, isDemo: true, in: defaults))
         XCTAssertTrue(SharedStore.saveConnection(serverURL: URL(string: "https://b")!, isDemo: true, in: defaults))
+    }
+
+    func testDemoTopDashboardMatchesTheWidgetsPick() async throws {
+        let transport = DemoTransport()
+        let client = ScoutClient(baseURL: DemoTransport.baseURL, transport: transport)
+        let full = try await client.dashboard()
+        let top = try await client.dashboard(top: 3)
+        XCTAssertEqual(top.listings, Array(WidgetSnapshot.ranked(full.listings).prefix(3)))
+        XCTAssertEqual(top.watches, [])
+        XCTAssertEqual(top.connectors, [])
+        XCTAssertEqual(top.stats, full.stats)
+        XCTAssertEqual(top.lastScan, full.lastScan)
+        XCTAssertEqual(top.lastScanTime, full.lastScanTime)
+        let now = Date()
+        let widgetTop = try await client.dashboard(top: 12, timeout: 10)
+        XCTAssertEqual(WidgetSnapshot.make(from: widgetTop, now: now), WidgetSnapshot.make(from: full, now: now))
+        // Anything but an integer from 1 to 50 gets the full dashboard.
+        for value in ["0", "51", "-1", "x", "", "2.5"] {
+            let url = client.url("/api/dashboard", query: [URLQueryItem(name: "top", value: value)])
+            let (data, _) = try await transport.send(URLRequest(url: url))
+            XCTAssertEqual(try JSONDecoder().decode(DashboardData.self, from: data), full, value)
+        }
     }
 
     func testDefaultGroupIsAlwaysACandidate() {

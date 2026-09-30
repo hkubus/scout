@@ -36,7 +36,14 @@ public struct WidgetSnapshot: Codable, Hashable, Sendable {
 
     /// Strongest visible deals first, then the biggest discount, then the newest.
     public static func make(from dashboard: DashboardData, isDemo: Bool = false, source: String? = nil, limit: Int = 6, now: Date = Date()) -> WidgetSnapshot {
-        let deals = dashboard.listings
+        let deals = ranked(dashboard.listings).prefix(limit).map(WidgetDeal.init)
+        return WidgetSnapshot(generatedAt: now, stats: dashboard.stats, lastScan: dashboard.lastScan, deals: Array(deals), isDemo: isDemo, source: source)
+    }
+
+    /// The listings a widget may show, in the order it shows them. The server's
+    /// `/api/dashboard?top=N` applies the same filter and stable sort.
+    public static func ranked(_ listings: [Listing]) -> [Listing] {
+        listings
             .filter { $0.hidden != true && $0.aiFiltered != true && $0.decision != .pass }
             .sorted { lhs, rhs in
                 if lhs.dealStrength != rhs.dealStrength { return lhs.dealStrength > rhs.dealStrength }
@@ -45,9 +52,6 @@ public struct WidgetSnapshot: Codable, Hashable, Sendable {
                 if left != right { return left < right }
                 return lhs.observedAt > rhs.observedAt
             }
-            .prefix(limit)
-            .map(WidgetDeal.init)
-        return WidgetSnapshot(generatedAt: now, stats: dashboard.stats, lastScan: dashboard.lastScan, deals: Array(deals), isDemo: isDemo, source: source)
     }
 
     /// Same content as the widgets draw it. Ignores when it was generated,

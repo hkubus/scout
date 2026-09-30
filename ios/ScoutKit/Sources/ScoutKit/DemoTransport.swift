@@ -71,6 +71,12 @@ public actor DemoTransport: HTTPTransport {
             var data = dashboard
             data.listings = data.listings.map(applyAction).filter { $0.hidden != true }
             data.watches = data.watches.map(applyEnabled)
+            // Mirror the server's `?top=N` (1...50): the widget's top listings only.
+            if let top = query["top"].flatMap({ Int($0) }), (1...50).contains(top) {
+                data.listings = Array(WidgetSnapshot.ranked(data.listings).prefix(top))
+                data.watches = []
+                data.connectors = []
+            }
             return try respond(data)
         case "GET /api/listings":
             return try respond(listingsPage(query))
