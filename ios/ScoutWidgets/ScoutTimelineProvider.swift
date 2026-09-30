@@ -14,6 +14,10 @@ struct ScoutTimelineProvider: AppIntentTimelineProvider {
     /// otherwise keeps the extension and radio busy for each timeline.
     private static let dashboardTimeout: TimeInterval = 10
 
+    /// Whether this widget kind draws deal photos (Top deals does, Summary
+    /// doesn't), so only the ones it shows are downloaded.
+    var drawsThumbnails: Bool
+
     func placeholder(in context: Context) -> ScoutWidgetEntry {
         ScoutWidgetEntry(date: Date(), snapshot: .demo, state: .ready)
     }
@@ -22,18 +26,25 @@ struct ScoutTimelineProvider: AppIntentTimelineProvider {
         if context.isPreview, SharedStore.loadSnapshot() == nil, LocalCache.load() == nil {
             return placeholder(in: context)
         }
-        return await load(configuration)
+        return await load(configuration, thumbnails: thumbnailCount(in: context))
     }
 
     func timeline(for configuration: ScoutWidgetIntent, in context: Context) async -> Timeline<ScoutWidgetEntry> {
-        let entry = await load(configuration)
+        let entry = await load(configuration, thumbnails: thumbnailCount(in: context))
         return Timeline(entries: [entry], policy: .after(Date().addingTimeInterval(Self.refreshInterval)))
     }
 
-    /// Fetches fresh data from the configured server; falls back to the
+    private func thumbnailCount(in context: Context) -> Int {
+        WidgetLayout(context.family).thumbnailCount(drawsThumbnails: drawsThumbnails)
+    }
+
+    /// Fetches fresh data from the configured server, unless the app saved
+    /// some for the same server within the last minute; falls back to the
     /// newest snapshot this widget or the app saved for the same server.
-    private func load(_ configuration: ScoutWidgetIntent) async -> ScoutWidgetEntry {
-        let saved = [LocalCache.load(), SharedStore.loadSnapshot()]
+    private func load(_ configuration: ScoutWidgetIntent, thumbnails: Int) async -> ScoutWidgetEntry {
+        let local = LocalCache.load()
+        let shared = SharedStore.loadSnapshot()
+        let saved = [local, shared]
         let anyCached = saved.compactMap { $0 }.max { $0.generatedAt < $1.generatedAt }
         let address = configuration.serverAddress?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let client: ScoutClient
@@ -60,21 +71,24 @@ struct ScoutTimelineProvider: AppIntentTimelineProvider {
 
         let source = WidgetSnapshot.source(serverURL: client.baseURL, isDemo: isDemo)
         do {
-            var snapshot = WidgetSnapshot.make(from: try await client.dashboard(top: Self.dashboardTop, timeout: Self.dashboardTimeout), isDemo: isDemo, source: source)
-            snapshot.deals = await Thumbnails.attach(to: snapshot.deals)
-            LocalCache.save(snapshot)
+            var snapshot: WidgetSnapshot
+            if let shared, shared.isFresh(for: source, maxAge: WidgetFeed.maxAge) {
+                // The app just loaded the same dashboard and reloaded widgets.
+                snapshot = shared
+            } else {
+                snapshot = try await WidgetFeed.shared.snapshot(for: source) { [isDemo] in
+                    WidgetSnapshot.make(from: try await client.dashboard(top: Self.dashboardTop, timeout: Self.dashboardTimeout), isDemo: isDemo, source: source)
+                }
+            }
+            // Only download photos the widget hasn't saved already.
+            snapshot.reuseThumbnails(from: [local])
+            snapshot = await Thumbnails.attach(to: snapshot, limit: thumbnails)
+            await WidgetFeed.shared.save(snapshot)
             return ScoutWidgetEntry(date: Date(), snapshot: snapshot, state: .ready)
         } catch {
             var fallback = WidgetSnapshot.newest(saved, from: source)
-            // The app's copy has no thumbnails; reuse the widget's where the deal matches.
-            if let local = saved[0], local.source == source, var snapshot = fallback {
-                snapshot.deals = snapshot.deals.map { deal in
-                    var deal = deal
-                    deal.thumbnail = deal.thumbnail ?? local.deals.first { $0.id == deal.id }?.thumbnail
-                    return deal
-                }
-                fallback = snapshot
-            }
+            // The app's copy has no thumbnails; reuse the widget's for the same photos.
+            fallback?.reuseThumbnails(from: [local])
             return ScoutWidgetEntry(date: Date(), snapshot: fallback, state: .offline(Self.message(for: error, usesAppServer: usesAppServer)))
         }
     }
@@ -92,12 +106,65 @@ struct ScoutTimelineProvider: AppIntentTimelineProvider {
     }
 }
 
+/// Shares one dashboard load per server among the timelines WidgetKit
+/// requests together (each widget kind, size and configuration has its own),
+/// and reuses it for a minute. Failures aren't kept, so the next timeline
+/// tries again.
+private actor WidgetFeed {
+    static let shared = WidgetFeed()
+    static let maxAge: TimeInterval = 60
+
+    private var loads: [String: (startedAt: Date, task: Task<WidgetSnapshot, Error>)] = [:]
+
+    func snapshot(for source: String?, fetch: @escaping @Sendable () async throws -> WidgetSnapshot) async throws -> WidgetSnapshot {
+        let key = source ?? ""
+        if let load = loads[key], Date().timeIntervalSince(load.startedAt) < Self.maxAge {
+            return try await load.task.value
+        }
+        let task = Task { try await fetch() }
+        loads[key] = (Date(), task)
+        do {
+            return try await task.value
+        } catch {
+            if loads[key]?.task == task { loads[key] = nil }
+            throw error
+        }
+    }
+
+    /// Saves through the actor so concurrent timelines merge their
+    /// thumbnails one at a time instead of overwriting each other's.
+    func save(_ snapshot: WidgetSnapshot) {
+        LocalCache.save(snapshot)
+    }
+}
+
+private extension WidgetLayout {
+    init(_ family: WidgetFamily) {
+        switch family {
+        case .systemSmall: self = .systemSmall
+        case .systemMedium: self = .systemMedium
+        case .systemLarge: self = .systemLarge
+        default: self = .other
+        }
+    }
+}
+
 /// The widget's own copy of its last good snapshot, thumbnails included.
 private enum LocalCache {
     private static let key = "lastSnapshot"
 
+    /// Keeps the saved thumbnails of photos `snapshot` still shows but didn't
+    /// download (the Summary widget downloads none, a small Top deals widget
+    /// one), and skips the write when nothing drawn changed, as the app does
+    /// for the App Group copy.
     static func save(_ snapshot: WidgetSnapshot) {
-        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        let current = load()
+        var merged = snapshot
+        merged.reuseThumbnails(from: [current])
+        guard WidgetSnapshot.shouldReplace(current, with: merged)
+            || current?.deals.map(\.thumbnail) != merged.deals.map(\.thumbnail)
+        else { return }
+        guard let data = try? JSONEncoder().encode(merged) else { return }
         UserDefaults.standard.set(data, forKey: key)
     }
 
@@ -110,15 +177,18 @@ private enum LocalCache {
 /// Widgets render synchronously, so listing photos are downloaded and shrunk
 /// while building the timeline.
 private enum Thumbnails {
-    static func attach(to deals: [WidgetDeal]) async -> [WidgetDeal] {
-        await withTaskGroup(of: (Int, Data?).self) { group in
-            for (index, deal) in deals.enumerated() {
-                let address = deal.imageURL
+    /// Downloads the photos of the first `limit` deals that don't have one yet.
+    static func attach(to snapshot: WidgetSnapshot, limit: Int) async -> WidgetSnapshot {
+        let missing = snapshot.dealsMissingThumbnails(limit: limit)
+        guard !missing.isEmpty else { return snapshot }
+        return await withTaskGroup(of: (Int, Data?).self) { group in
+            for index in missing {
+                let address = snapshot.deals[index].imageURL
                 group.addTask { (index, await Thumbnails.fetch(address)) }
             }
-            var result = deals
+            var result = snapshot
             for await (index, data) in group {
-                result[index].thumbnail = data
+                result.deals[index].thumbnail = data
             }
             return result
         }
