@@ -96,7 +96,14 @@ public actor DemoTransport: HTTPTransport {
             return try respond(detail)
         case "PATCH /api/listing-actions":
             let body = try JSONDecoder().decode(ActionBody.self, from: request.httpBody ?? Data())
-            let action = ListingAction(decision: body.decision, note: body.note, hidden: body.hidden ?? false, updatedAt: ISO8601DateFormatter().string(from: Date()))
+            // Mirror the server's merge: omitted fields keep their stored value.
+            let current = actions[body.key]
+            let action = ListingAction(
+                decision: body.hasDecision ? body.decision : current?.decision,
+                note: body.note ?? current?.note ?? "",
+                hidden: body.hidden ?? current?.hidden ?? false,
+                updatedAt: ISO8601DateFormatter().string(from: Date())
+            )
             actions[body.key] = action
             return try respond(["action": action])
         case "PATCH /api/watches/:id":
@@ -348,8 +355,20 @@ public actor DemoTransport: HTTPTransport {
 
     private struct ActionBody: Decodable {
         var key: String
+        var hasDecision: Bool
         var decision: ListingDecision?
-        var note: String
+        var note: String?
         var hidden: Bool?
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            key = try container.decode(String.self, forKey: .key)
+            hasDecision = container.contains(.decision)
+            decision = try container.decodeIfPresent(ListingDecision.self, forKey: .decision)
+            note = try container.decodeIfPresent(String.self, forKey: .note)
+            hidden = try container.decodeIfPresent(Bool.self, forKey: .hidden)
+        }
+
+        private enum CodingKeys: String, CodingKey { case key, decision, note, hidden }
     }
 }

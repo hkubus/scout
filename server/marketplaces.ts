@@ -358,6 +358,26 @@ function structuredConditionLabel(value: unknown) {
   return value;
 }
 
+function labelSegments(label: string) {
+  return label.split(/,\s+/);
+}
+
+const VINTED_LABEL_PRICE = /^\d[\d\s ]*(?:[.,]\d{1,2})?\s*zł$/i;
+
+/**
+ * Vinted card labels end with the item price, optionally followed by the
+ * buyer total including the protection fee: "Title, Rozmiar: 38, Stan: Dobry,
+ * 89.00 zł, 95.35 zł". Earlier fields can end in bare numbers ("Rozmiar: 38",
+ * "GTX 1660"), so the price is read from the trailing comma-separated
+ * segments only, never from the first digits followed by "zł".
+ */
+function vintedCardPriceIndex(label: string) {
+  const segments = labelSegments(label).map((segment) => segment.trim());
+  const last = segments.length - 1;
+  if (last < 1 || !VINTED_LABEL_PRICE.test(segments[last])) return null;
+  return last >= 2 && VINTED_LABEL_PRICE.test(segments[last - 1]) ? last - 1 : last;
+}
+
 /** Parse Vinted's server-rendered public product overlays and accessible labels. */
 export function parseVintedCards(html: string) {
   const anchors = [...html.matchAll(/<a[^>]*data-testid=["']product-item-id-(\d+)--overlay-link["'][^>]*>/gi)];
@@ -368,9 +388,9 @@ export function parseVintedCards(html: string) {
     const href = attribute(tag, 'href');
     const label = attribute(tag, 'title');
     if (!href || !label) continue;
-    const priceRaw = label.match(/\d[\d\s.,]*\s*zł/i)?.[0];
-    const price = parsePolishPrice(priceRaw);
-    const title = label.split(/,\s*(?:Marka|Stan):/i)[0]?.trim();
+    const priceIndex = vintedCardPriceIndex(label);
+    const price = priceIndex === null ? null : parsePolishPrice(labelSegments(label)[priceIndex]);
+    const title = priceIndex === null ? undefined : labelSegments(label).slice(0, priceIndex).join(', ').split(/,\s*(?:Marka|Stan|Rozmiar):/i)[0]?.trim();
     if (!title || price === null) continue;
     const preceding = html.slice(Math.max(0, (anchor.index ?? 0) - 2200), anchor.index);
     const imageTags = [...preceding.matchAll(/<img[^>]*>/gi)];
@@ -610,6 +630,11 @@ export function parseStructuredListings(html: string, marketplace: Marketplace) 
         const url = item.url ?? offer?.url;
         const title = item.name ?? item.headline;
         const price = offer?.price ?? item.price;
+        // `NormalizedListing` is PLN-only; a price published in another
+        // currency (e.g. a cross-border Vinted item in SEK) is skipped rather
+        // than read as złoty.
+        const currency = offer?.priceCurrency ?? item.priceCurrency;
+        if (typeof currency === 'string' && currency.trim() && currency.trim().toUpperCase() !== 'PLN') continue;
         const listingId = item.sku ?? item.productID ?? item.identifier ?? (typeof url === 'string' ? url.split('/').filter(Boolean).at(-1) : undefined);
         if (!url || !title || price === undefined || !listingId) continue;
         try {

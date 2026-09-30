@@ -853,7 +853,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .ai-normalize-button { min-height: 34px; margin-top: 12px; font-size: 11px; }
 .calculator-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
 .calculator-fields .field-label:last-child { grid-column: 1 / -1; }
-.calculator-results { display: grid; grid-template-columns: 1.15fr 1fr 1fr; gap: 8px; margin-top: 15px; }
+.calculator-results { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 15px; }
 .calculator-results div { display: grid; gap: 5px; padding: 11px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-muted); }
 .calculator-results span { color: var(--muted); font-size: 10px; }
 .calculator-results strong { color: var(--text-strong); font-size: 15px; letter-spacing: -.2px; }

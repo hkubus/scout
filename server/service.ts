@@ -2516,15 +2516,19 @@ export class ScoutService {
   } = {}, knownWatches?: Watch[]) {
     const freshnessCutoff = new Date(Date.now() - MATCH_VISIBILITY_MS).toISOString();
     const aiFilteredPredicate = 'EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = \'irrelevant\' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)';
+    // The feed shows matches seen in the last 12 h, but listings you marked
+    // (Buy/Watch/Pass) or hid stay reviewable after newer posts push them off
+    // the scanned page, until retention prunes them.
+    const keepStale = Boolean(options.decision) || options.visibility === 'hidden';
     const predicates = [
       'w.archived_at IS NULL',
-      'wl.last_seen_at > ?',
+      ...(keepStale ? [] : ['wl.last_seen_at > ?']),
       ...(options.includeAiFiltered ? [] : [`NOT (${aiFilteredPredicate})`]),
       "(w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))",
       '(w.min_price_pln IS NULL OR l.price_pln >= w.min_price_pln)',
       '(w.max_price_pln IS NULL OR l.price_pln <= w.max_price_pln)',
     ];
-    const params: unknown[] = [freshnessCutoff];
+    const params: unknown[] = keepStale ? [] : [freshnessCutoff];
     if (options.marketplace) { predicates.push('l.marketplace = ?'); params.push(options.marketplace); }
     if (options.watchId) { predicates.push('w.id = ?'); params.push(options.watchId); }
     if (options.decision) { predicates.push('a.decision = ?'); params.push(options.decision); }
@@ -2686,9 +2690,14 @@ export class ScoutService {
     return { decision: parseListingDecision(row?.decision), note: row?.note ?? '', hidden: Number(row?.hidden ?? 0) === 1, updatedAt: row?.updated_at ?? null };
   }
 
-  updateListingAction(key: string, decision: ListingDecision | null, note: string, hidden = false): ListingAction {
+  /** Merges `patch` into the stored action; omitted fields keep their current value. */
+  updateListingAction(key: string, patch: { decision?: ListingDecision | null; note?: string; hidden?: boolean }): ListingAction {
     const { marketplace, listingId } = parseListingKey(key);
-    const safeNote = note.trim().slice(0, 2000);
+    const current = this.listingAction(key);
+    if (patch.decision === undefined && patch.note === undefined && patch.hidden === undefined) return current;
+    const decision = patch.decision === undefined ? current.decision : patch.decision;
+    const safeNote = (patch.note ?? current.note).trim().slice(0, 2000);
+    const hidden = patch.hidden ?? current.hidden;
     const timestamp = nowIso();
     if (decision === null && !safeNote && !hidden) {
       this.stmt('DELETE FROM listing_actions WHERE marketplace = ? AND listing_id = ?').run(marketplace, listingId);
@@ -4891,7 +4900,9 @@ function evaluateDeterministic(
   // majority of the query tokens rather than returning an empty page.
   if (!termOk && relaxed && !excludedHit && included.length > 1 && matchedTerms >= Math.ceil(included.length / 2)) termOk = true;
   const conditionOk = matchesRequestedCondition(requestedCondition, condition);
-  const locationOk = !requestedLocation || requestedLocation === 'polska' || location.includes(requestedLocation);
+  // Vinted listings carry no location and always ship, so a location filter
+  // would otherwise drop every one of them.
+  const locationOk = !requestedLocation || requestedLocation === 'polska' || listing.marketplace === 'Vinted' || location.includes(requestedLocation);
   const priceOk = (options.minPrice === null || options.minPrice === undefined || listing.price >= options.minPrice)
     && (options.maxPrice === null || options.maxPrice === undefined || listing.price <= options.maxPrice);
   const shippingOk = !options.shippingOnly || listing.marketplace === 'Vinted' || listing.shippingAvailable === true;

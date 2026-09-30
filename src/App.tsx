@@ -522,11 +522,8 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
   const toggleListingHidden = useCallback(async (listing: Listing) => {
     const nextHidden = !listing.hidden;
     try {
-      const result = await api.updateListingAction(listing.marketplaceListingKey ?? listing.id, {
-        decision: listing.decision ?? null,
-        note: listing.note ?? "",
-        hidden: nextHidden,
-      });
+      // Hide-only save: the server keeps the stored decision and note.
+      const result = await api.updateListingAction(listing.marketplaceListingKey ?? listing.id, { hidden: nextHidden });
       updateListingAction({ ...listing, decision: result.action.decision, note: result.action.note, hidden: result.action.hidden });
       notify(nextHidden ? "Listing hidden from the overview and alerts." : "Listing unhidden.");
     } catch (error) {

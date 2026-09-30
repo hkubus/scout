@@ -159,6 +159,14 @@ public struct ScoutClient: Sendable {
         return response.action
     }
 
+    /// Sends only the given fields; the server keeps the rest (for example the note).
+    /// Pass `decision: .some(nil)` to clear the decision; leave it out to keep it.
+    public func patchListingAction(key: String, decision: ListingDecision?? = .none, hidden: Bool? = nil) async throws -> ListingAction {
+        let body = ListingActionPatchBody(key: key, decision: decision, hidden: hidden)
+        let response: ListingActionResponse = try await send("PATCH", "/api/listing-actions", body: body)
+        return response.action
+    }
+
     public func createWatch(_ draft: WatchDraft) async throws -> Watch {
         let response: WatchResponse = try await send("POST", "/api/watches", body: draft.normalized())
         return response.watch
@@ -378,4 +386,20 @@ private struct ListingActionBody: Encodable {
     }
 
     private enum CodingKeys: String, CodingKey { case key, decision, note, hidden }
+}
+
+private struct ListingActionPatchBody: Encodable {
+    var key: String
+    var decision: ListingDecision??
+    var hidden: Bool?
+
+    // Omitted keys keep their stored value; `.some(nil)` sends JSON null to clear the decision.
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(key, forKey: .key)
+        if case .some(let value) = decision { try container.encode(value, forKey: .decision) }
+        try container.encodeIfPresent(hidden, forKey: .hidden)
+    }
+
+    private enum CodingKeys: String, CodingKey { case key, decision, hidden }
 }
