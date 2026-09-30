@@ -2412,26 +2412,37 @@ export class ScoutService {
     if (!row) throw new ServiceError('Watch not found', 404);
     const days = Math.max(7, Math.min(180, Math.floor(rangeDays)));
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60_000).toISOString();
-    // Identical WHERE semantics to the previous full fetch; only the row
-    // shipping changes. Raw-row totals stay exact via the aggregate — the
-    // reduced set cannot represent them.
-    const filters = `FROM observations o
-      JOIN listings l ON l.id = o.listing_id
-      WHERE o.watch_id = ?
-        AND o.observed_at >= ?
-        AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND EXISTS (SELECT 1 FROM watches rw WHERE rw.id = r.watch_id AND rw.ai_relevance = 1))
-        AND (? = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
-        AND (? IS NULL OR o.price_pln >= ?)
-        AND (? IS NULL OR o.price_pln <= ?)`;
-    const filterParams = [id, cutoff, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln] as unknown[];
-    const bounds = this.stmt(`SELECT COUNT(*) AS total, MIN(o.observed_at) AS first_at, MAX(o.observed_at) AS last_at ${filters}`).get(...filterParams) as { total?: number; first_at?: string | null; last_at?: string | null };
+    // Driven from the watch's associations: listing-level filters (relevance,
+    // shipping) run once per association and observations are range seeks on
+    // observations_watch_listing. Every observation belongs to its
+    // (watch_id, listing_id) association, so the row set is unchanged.
+    const filters = `NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND EXISTS (SELECT 1 FROM watches rw WHERE rw.id = r.watch_id AND rw.ai_relevance = 1))
+        AND (?3 = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
+        AND (?4 IS NULL OR o.price_pln >= ?4)
+        AND (?5 IS NULL OR o.price_pln <= ?5)`;
+    const filterParams = [id, cutoff, row.shipping_only ? 1 : 0, row.min_price_pln, row.max_price_pln] as unknown[];
     // Daily reduction in SQL: the last observation per listing per day
     // (ISO-8601 UTC timestamps sort correctly under date()). SQLite takes
     // bare columns from the MAX(observed_at) row, so price and typical are
-    // the ones observed last — matching the previous JS-side dedupe.
-    const dailyRows = this.stmt(`SELECT date(o.observed_at) AS day, o.listing_id, l.marketplace, o.price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at
-      ${filters}
+    // the ones observed last — matching the previous JS-side dedupe. COUNT is
+    // not a min/max aggregate, so it leaves that choice intact; adding
+    // MIN(observed_at) here would not.
+    const dailyRows = this.stmt(`SELECT date(o.observed_at) AS day, o.listing_id, l.marketplace, o.price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at, COUNT(*) AS n
+      FROM watch_listings wl
+      JOIN listings l ON l.id = wl.listing_id
+      CROSS JOIN observations o INDEXED BY observations_watch_listing ON o.watch_id = wl.watch_id AND o.listing_id = wl.listing_id AND o.observed_at >= ?2
+      WHERE wl.watch_id = ?1 AND ${filters}
       GROUP BY day, o.listing_id`).all(...filterParams) as Array<Record<string, any>>;
+    // Raw-row totals come from the per-group counts; the window's first and
+    // last observation are ordered LIMIT-1 probes with the same filters.
+    const probe = (direction: 'ASC' | 'DESC') => (this.stmt(`SELECT o.observed_at AS at FROM observations o
+      JOIN listings l ON l.id = o.listing_id
+      JOIN watch_listings wl ON wl.watch_id = o.watch_id AND wl.listing_id = o.listing_id
+      WHERE o.watch_id = ?1 AND o.observed_at >= ?2 AND ${filters}
+      ORDER BY o.observed_at ${direction} LIMIT 1`).get(...filterParams) as { at?: string } | undefined)?.at ?? null;
+    let totalObservations = 0;
+    for (const item of dailyRows) totalObservations += Number(item.n);
+    const bounds = { total: totalObservations, first_at: dailyRows.length ? probe('ASC') : null, last_at: dailyRows.length ? probe('DESC') : null };
     const observations = dailyRows.map((item): WatchAnalyticsObservation => ({
       listingId: Number(item.listing_id),
       marketplace: item.marketplace as Marketplace,

@@ -1213,6 +1213,44 @@ test('association-driven analytics rows match the observation-driven query in or
   } finally { context.close(); }
 });
 
+test('watch analytics daily rows and bounds match the observation-driven queries', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const { proxy, captured } = captureRows(context.db, 'COUNT(*) AS n');
+    const service = new ScoutService(proxy, () => {});
+    const filters = `FROM observations o
+      JOIN listings l ON l.id = o.listing_id
+      WHERE o.watch_id = ?
+        AND o.observed_at >= ?
+        AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND EXISTS (SELECT 1 FROM watches rw WHERE rw.id = r.watch_id AND rw.ai_relevance = 1))
+        AND (? = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
+        AND (? IS NULL OR o.price_pln >= ?)
+        AND (? IS NULL OR o.price_pln <= ?)`;
+    const legacyBounds = context.db.prepare(`SELECT COUNT(*) AS total, MIN(o.observed_at) AS first_at, MAX(o.observed_at) AS last_at ${filters}`);
+    const legacyDaily = context.db.prepare(`SELECT date(o.observed_at) AS day, o.listing_id, l.marketplace, o.price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at
+      ${filters}
+      GROUP BY day, o.listing_id`);
+    const watches = context.db.prepare('SELECT id, shipping_only, min_price_pln, max_price_pln FROM watches').all() as Array<Record<string, any>>;
+    // An out-of-range window exercises the empty case.
+    context.db.prepare('UPDATE watches SET min_price_pln = 100000 WHERE id = ?').run('stats-archived');
+    watches.find((watch) => watch.id === 'stats-archived')!.min_price_pln = 100000;
+    for (const watch of watches) {
+      for (const days of [7, 30]) {
+        captured.length = 0;
+        const analytics = service.watchAnalytics(watch.id, days);
+        assert.equal(captured.length, 1);
+        const params = [watch.id, new Date(Date.now() - days * 24 * 60 * 60_000).toISOString(), watch.shipping_only ? 1 : 0, watch.min_price_pln, watch.min_price_pln, watch.max_price_pln, watch.max_price_pln];
+        const bounds = legacyBounds.get(...params) as { total: number; first_at: string | null; last_at: string | null };
+        assert.equal(analytics.totalObservations, Number(bounds.total));
+        assert.equal(analytics.firstObservedAt, bounds.first_at);
+        assert.equal(analytics.lastObservedAt, bounds.last_at);
+        assert.deepEqual((captured[0] as any[]).map(({ n: _n, ...row }) => row), (legacyDaily.all(...params) as any[]).map((row) => ({ ...row })));
+      }
+    }
+  } finally { context.close(); }
+});
+
 test('market research filters match terms, price, condition, and shipping, from any town', () => {
   const listings = [
     { marketplace: 'OLX' as const, listingId: 'match', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/match', condition: 'New', location: 'Warszawa', shippingAvailable: true, observedAt: new Date().toISOString() },
