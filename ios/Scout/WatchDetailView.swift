@@ -9,6 +9,7 @@ struct WatchDetailView: View {
     @State private var days = 30
     @State private var error: String?
     @State private var scanMessage: String?
+    @State private var editor: WatchEditorRequest?
 
     init(watch: Watch) {
         _watch = State(initialValue: watch)
@@ -43,7 +44,7 @@ struct WatchDetailView: View {
                 }
                 .pickerStyle(.segmented)
                 if let analytics {
-                    AskingPriceChart(points: analytics.points)
+                    PriceBandChart(points: analytics.points.compactMap { PriceBandPoint($0) })
                         .frame(height: 190)
                         .padding(.vertical, 6)
                     if let median = analytics.current.medianPrice {
@@ -62,7 +63,7 @@ struct WatchDetailView: View {
                     }
                     LabeledContent("Listings seen", value: "\(analytics.current.listingCount)")
                     if let rate = analytics.current.strongDealRate {
-                        LabeledContent("Strong deal rate", value: rate.formatted(.percent.precision(.fractionLength(0))))
+                        LabeledContent("Strong deal rate", value: Format.percent(rate))
                     }
                 } else if let error {
                     Text(error).foregroundStyle(.secondary)
@@ -119,6 +120,11 @@ struct WatchDetailView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
+                    Button {
+                        editor = .edit(watch)
+                    } label: {
+                        Label("Edit watch", systemImage: "pencil")
+                    }
                     Button(action: scan) {
                         Label("Scan now", systemImage: "arrow.triangle.2.circlepath")
                     }
@@ -126,6 +132,9 @@ struct WatchDetailView: View {
                         Button(action: toggleEnabled) {
                             Label(watch.enabled ? "Pause watch" : "Resume watch", systemImage: watch.enabled ? "pause" : "play")
                         }
+                    }
+                    Button(role: watch.isArchived ? nil : .destructive, action: toggleArchived) {
+                        Label(watch.isArchived ? "Restore watch" : "Archive watch", systemImage: watch.isArchived ? "tray.and.arrow.up" : "archivebox")
                     }
                 } label: {
                     Label("Actions", systemImage: "ellipsis.circle")
@@ -136,6 +145,9 @@ struct WatchDetailView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(scanMessage ?? "")
+        }
+        .sheet(item: $editor) { request in
+            WatchEditorView(request: request) { _ in }
         }
         .refreshable { await load() }
         .task(id: "\(days)-\(model.refreshToken)") { await load() }
@@ -165,6 +177,20 @@ struct WatchDetailView: View {
         }
     }
 
+    private func toggleArchived() {
+        guard let client = model.client else { return }
+        let archived = !watch.isArchived
+        Task { @MainActor in
+            do {
+                try await client.updateWatch(id: watch.id, patch: WatchPatch(archived: archived))
+                await load()
+                model.refresh()
+            } catch {
+                model.report(error)
+            }
+        }
+    }
+
     private func toggleEnabled() {
         guard let client = model.client else { return }
         let enabled = !watch.enabled
@@ -174,47 +200,6 @@ struct WatchDetailView: View {
                 await load()
             } catch {
                 model.report(error)
-            }
-        }
-    }
-}
-
-private struct AskingPriceChart: View {
-    var points: [WatchAnalyticsPoint]
-
-    private struct Day: Identifiable {
-        var id: Date { date }
-        var date: Date
-        var median: Double
-        var lower: Double
-        var upper: Double
-    }
-
-    private var days: [Day] {
-        points.compactMap { point in
-            guard let date = point.day, let median = point.medianPrice else { return nil }
-            return Day(date: date, median: median, lower: point.lowerPrice ?? median, upper: point.upperPrice ?? median)
-        }
-    }
-
-    var body: some View {
-        if days.isEmpty {
-            ContentUnavailableView("No observations yet", systemImage: "chart.xyaxis.line")
-        } else {
-            Chart(days) { day in
-                AreaMark(x: .value("Day", day.date, unit: .day), yStart: .value("Low", day.lower), yEnd: .value("High", day.upper))
-                    .foregroundStyle(Color.scoutBlue.opacity(0.15))
-                LineMark(x: .value("Day", day.date, unit: .day), y: .value("Median", day.median))
-                    .foregroundStyle(Color.scoutBlue)
-            }
-            .chartYScale(domain: .automatic(includesZero: false))
-            .chartYAxis {
-                AxisMarks { value in
-                    AxisGridLine()
-                    AxisValueLabel {
-                        if let price = value.as(Double.self) { Text(Format.pln(price)) }
-                    }
-                }
             }
         }
     }

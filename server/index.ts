@@ -660,6 +660,7 @@ const settingsInput = z.object({
     topic: z.string().max(64).optional(),
     token: z.string().max(512).optional(),
     minimumPriority: notificationPriority.optional(),
+    openInApp: z.boolean().optional(),
   }).strict().optional(),
   ai: z.object({
     apiKey: z.string().max(512).optional(),

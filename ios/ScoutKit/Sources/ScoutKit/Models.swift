@@ -33,6 +33,13 @@ public struct Pagination: Codable, Hashable, Sendable {
     public var pageSize: Int
     public var total: Int
     public var hasNext: Bool
+
+    public init(page: Int, pageSize: Int, total: Int, hasNext: Bool) {
+        self.page = page
+        self.pageSize = pageSize
+        self.total = total
+        self.hasNext = hasNext
+    }
 }
 
 public struct ListingDescriptionVerification: Codable, Hashable, Sendable {
@@ -359,5 +366,140 @@ public struct ListingsQuery: Hashable, Sendable {
         if let watchId { items.append(URLQueryItem(name: "watchId", value: watchId)) }
         if let decision { items.append(URLQueryItem(name: "decision", value: decision.rawValue)) }
         return items
+    }
+}
+
+// MARK: - Manual search
+
+public enum SearchCondition: String, Codable, Hashable, Sendable, CaseIterable {
+    case any = "Any", new = "New", used = "Used"
+}
+
+public enum SellerType: String, Codable, Hashable, Sendable, CaseIterable {
+    case `private`, business
+}
+
+/// Body of `POST /api/search`: a one-off marketplace search that neither
+/// creates a watch nor touches any watch's price history.
+public struct SearchFilters: Codable, Hashable, Sendable {
+    public var query: String
+    public var terms: String
+    public var excluded: String
+    public var sources: [Marketplace]
+    public var minPrice: Double?
+    public var maxPrice: Double?
+    public var shippingOnly: Bool
+    public var condition: SearchCondition
+    public var location: String
+    /// OLX only.
+    public var ownerType: SellerType?
+    /// 1-based marketplace result page; the server caps it at 10.
+    public var page: Int
+    /// Correlates the streamed `search` progress events with this request.
+    public var searchId: String?
+    public var aiRelevance: Bool
+
+    public init(
+        query: String = "",
+        terms: String = "",
+        excluded: String = "",
+        sources: [Marketplace] = Marketplace.all,
+        minPrice: Double? = nil,
+        maxPrice: Double? = nil,
+        shippingOnly: Bool = false,
+        condition: SearchCondition = .any,
+        location: String = "",
+        ownerType: SellerType? = nil,
+        page: Int = 1,
+        searchId: String? = nil,
+        aiRelevance: Bool = true
+    ) {
+        self.query = query
+        self.terms = terms
+        self.excluded = excluded
+        self.sources = sources
+        self.minPrice = minPrice
+        self.maxPrice = maxPrice
+        self.shippingOnly = shippingOnly
+        self.condition = condition
+        self.location = location
+        self.ownerType = ownerType
+        self.page = page
+        self.searchId = searchId
+        self.aiRelevance = aiRelevance
+    }
+
+    /// The price range the server accepts: both bounds optional, minimum ≥ 0,
+    /// maximum > 0, and minimum not above maximum.
+    public var hasValidPriceRange: Bool {
+        if let minPrice, minPrice < 0 { return false }
+        if let maxPrice, maxPrice <= 0 { return false }
+        if let minPrice, let maxPrice, minPrice > maxPrice { return false }
+        return true
+    }
+
+    public var canSearch: Bool {
+        !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !sources.isEmpty && hasValidPriceRange
+    }
+
+    /// Trimmed copy for sending, with the web UI's `Polska` location default.
+    func normalized() -> SearchFilters {
+        var copy = self
+        copy.query = String(query.trimmingCharacters(in: .whitespacesAndNewlines).prefix(240))
+        copy.terms = terms.trimmingCharacters(in: .whitespacesAndNewlines)
+        copy.excluded = excluded.trimmingCharacters(in: .whitespacesAndNewlines)
+        let place = location.trimmingCharacters(in: .whitespacesAndNewlines)
+        copy.location = place.isEmpty ? "Polska" : place
+        return copy
+    }
+}
+
+public struct SearchSourceStatus: Codable, Hashable, Sendable {
+    public var source: Marketplace
+    /// `ok`, `error`, or the client-side placeholder `searching`.
+    public var status: String
+    public var count: Int
+    public var pendingShipping: Int
+    public var durationMs: Double
+    public var message: String
+
+    public init(source: Marketplace, status: String, count: Int, pendingShipping: Int, durationMs: Double, message: String) {
+        self.source = source
+        self.status = status
+        self.count = count
+        self.pendingShipping = pendingShipping
+        self.durationMs = durationMs
+        self.message = message
+    }
+
+    public static func searching(_ source: Marketplace) -> SearchSourceStatus {
+        SearchSourceStatus(source: source, status: "searching", count: 0, pendingShipping: 0, durationMs: 0, message: "Searching…")
+    }
+}
+
+public struct ManualSearchResponse: Codable, Hashable, Sendable {
+    public var listings: [Listing]
+    public var sources: [SearchSourceStatus]
+}
+
+/// Payload of the `search` server-sent event: one marketplace finished.
+public struct SearchProgressEvent: Codable, Hashable, Sendable {
+    public var searchId: String
+    public var page: Int
+    public var source: Marketplace
+    public var status: SearchSourceStatus
+    public var listings: [Listing]
+}
+
+extension Array where Element == Listing {
+    /// Merges streamed or paged results by listing id, cheapest first.
+    public func mergingSearchResults(_ incoming: [Listing]) -> [Listing] {
+        var byID: [String: Listing] = [:]
+        var order: [String] = []
+        for listing in self + incoming {
+            if byID[listing.id] == nil { order.append(listing.id) }
+            byID[listing.id] = listing
+        }
+        return order.compactMap { byID[$0] }.sorted { $0.price < $1.price }
     }
 }

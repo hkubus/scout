@@ -79,7 +79,7 @@ npm run build
 
 ## Notifications
 
-Settings supports Discord webhooks and ntfy topics. Each channel has its own minimum deal priority (`Strong`, `Very strong`, or `Exceptional`), so ntfy can be limited to only the most important alerts while Discord receives the broader stream. ntfy uses the standard JSON publish API and can optionally send a bearer access token; credentials are encrypted with `SCOUT_SECRET`. Alerts are owned by the watch that produced them, are suppressed for unchanged qualifying observations, and retry failed or interrupted deliveries with capped backoff from the scheduler.
+Settings supports Discord webhooks and ntfy topics. Each channel has its own minimum deal priority (`Strong`, `Very strong`, or `Exceptional`), so ntfy can be limited to only the most important alerts while Discord receives the broader stream. ntfy uses the standard JSON publish API and can optionally send a bearer access token; credentials are encrypted with `SCOUT_SECRET`. With "Open alerts in the Scout iOS app" on, tapping an ntfy alert opens the listing in the [iOS app](#ios-app) through a `scout://` link, and an "Open listing" action button keeps the marketplace page one tap away. Alerts are owned by the watch that produced them, are suppressed for unchanged qualifying observations, and retry failed or interrupted deliveries with capped backoff from the scheduler.
 
 An alert needs a ready baseline (30 comparable samples and 6 hours of watch history), an 18%+ discount below the learned median, and — for discounts between 18% and 20% — a robust price-deviation score of at least 3.1 (scaled by watch sensitivity). A **Very strong** discount (20%+ below the median) alerts as soon as the watch is ready even when the watch's own price spread fails that deviation test, so a heterogeneous search cannot keep silencing genuine discounts forever. Higher-priority deals are still subject to the description-verification safeguard below.
 
@@ -185,7 +185,7 @@ It is stateless (one fresh server per request, no session ids) and offers twelve
 
 ## iOS app
 
-`ios/` contains a native SwiftUI client covering the deal feed, listing triage, watches, and analytics. It is built on GitHub's macOS runners from the push mirror and installed with SideStore. See [`ios/README.md`](ios/README.md).
+`ios/` contains a native SwiftUI client covering the deal feed, search, listing triage, deal and research watches, analytics, and Home Screen widgets. It is built on GitHub's macOS runners from the push mirror and installed with SideStore. See [`ios/README.md`](ios/README.md).
 
 ## Debug API
 

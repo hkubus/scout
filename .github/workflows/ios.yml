@@ -62,6 +62,15 @@ jobs:
             -quiet build
           mkdir -p out/Payload
           cp -R build/device/Build/Products/Release-iphoneos/Scout.app out/Payload/
+          # SideStore re-signs the app, but it reads the entitlements it should
+          # request (the App Group shared with the widget) from the existing
+          # signature, so sign ad hoc with them: extension first, then the app.
+          APP=out/Payload/Scout.app
+          test -d "$APP/PlugIns/ScoutWidgets.appex"
+          codesign --force --sign - --entitlements ScoutWidgets/ScoutWidgets.entitlements "$APP/PlugIns/ScoutWidgets.appex"
+          codesign --force --sign - --entitlements Scout/Scout.entitlements "$APP"
+          codesign --display --entitlements - "$APP/PlugIns/ScoutWidgets.appex"
+          codesign --display --entitlements - "$APP"
           (cd out && zip -qry Scout.ipa Payload)
           ls -lh out/Scout.ipa
 

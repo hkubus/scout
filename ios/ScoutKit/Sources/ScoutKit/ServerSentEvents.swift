@@ -90,12 +90,14 @@ extension ScoutClient {
     public func events(session: URLSession = .shared) -> AsyncThrowingStream<ServerSentEvent, Error> {
         var request = URLRequest(url: eventsURL, timeoutInterval: 90) // server pings every 25s
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        authorize(&request)
+        let tokenProvided = apiToken != nil
         return AsyncThrowingStream { continuation in
             let task = Task { [request] in
                 do {
-                    let (bytes, response) = try await session.bytes(for: request)
+                    let (bytes, response) = try await session.bytes(for: request, delegate: RedirectGuard.shared)
                     guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                        throw ScoutAPIError.invalidResponse
+                        throw (response as? HTTPURLResponse)?.statusCode == 401 ? ScoutAPIError.unauthorized(tokenProvided: tokenProvided) : ScoutAPIError.invalidResponse
                     }
                     var parser = ServerSentEventParser()
                     for try await byte in bytes {

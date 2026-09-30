@@ -12,6 +12,8 @@ struct ListingDetailView: View {
     @State private var note = ""
     @State private var hidden = false
     @State private var saving = false
+    @State private var previewOnly = false
+    @State private var editor: WatchEditorRequest?
 
     var body: some View {
         List {
@@ -33,15 +35,29 @@ struct ListingDetailView: View {
                             .textSelection(.enabled)
                     }
                 }
-                facts(detail)
+                facts(detail.listing, detail: detail)
+                createWatch(detail.listing)
+            } else if previewOnly, let listing = link.preview {
+                header(listing)
+                Section {
+                    Text("Scout hasn't stored the full details for this listing yet.")
+                        .foregroundStyle(.secondary)
+                }
+                facts(listing, detail: nil)
+                createWatch(listing)
             }
         }
-        .overlay { LoadingOverlay(isLoaded: detail != nil, error: error, retry: load) }
-        .navigationTitle(detail?.listing.title ?? "Listing")
+        .sheet(item: $editor) { request in
+            WatchEditorView(request: request) { created in
+                if let created { model.showWatch(created) }
+            }
+        }
+        .overlay { LoadingOverlay(isLoaded: detail != nil || previewOnly, error: error, retry: load) }
+        .navigationTitle(shownListing?.title ?? "Listing")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                if let url = detail?.listing.webURL {
+                if let url = shownListing?.webURL {
                     ShareLink(item: url)
                     Link(destination: url) {
                         Label("Open listing", systemImage: "safari")
@@ -171,16 +187,33 @@ struct ListingDetailView: View {
         }
     }
 
-    private func facts(_ detail: ListingDetail) -> some View {
-        let listing = detail.listing
-        return Section("Details") {
+    private func createWatch(_ listing: Listing) -> some View {
+        Section {
+            Button {
+                editor = .create(WatchDraft(listing: listing))
+            } label: {
+                Label("Create a watch from this listing", systemImage: "bell.badge")
+            }
+        } footer: {
+            Text("Starts from the cleaned-up title, this marketplace, and a price range of ±25% around this price.")
+        }
+    }
+
+    private var shownListing: Listing? {
+        detail?.listing ?? (previewOnly ? link.preview : nil)
+    }
+
+    private func facts(_ listing: Listing, detail: ListingDetail?) -> some View {
+        Section("Details") {
             LabeledContent("Marketplace") { MarketplaceTag(marketplace: listing.marketplace) }
             LabeledContent("Watch", value: listing.watch)
             if let condition = listing.condition { LabeledContent("Condition", value: condition) }
             if let location = listing.location { LabeledContent("Location", value: location) }
             LabeledContent("Shipping", value: listing.shippingAvailable.map { $0 ? "Available" : "Pickup only" } ?? "Unknown")
-            LabeledContent("First seen", value: Format.relative(iso: detail.firstSeenAt))
-            LabeledContent("Last seen", value: Format.relative(iso: detail.lastSeenAt))
+            if let detail {
+                LabeledContent("First seen", value: Format.relative(iso: detail.firstSeenAt))
+                LabeledContent("Last seen", value: Format.relative(iso: detail.lastSeenAt))
+            }
         }
     }
 
@@ -198,9 +231,15 @@ struct ListingDetailView: View {
             decision = detail.action.decision
             note = detail.action.note
             hidden = detail.action.hidden
+            previewOnly = false
             error = nil
         } catch {
-            if !error.isCancellation { self.error = error.localizedDescription }
+            if error.isCancellation { return }
+            if link.preview != nil, let apiError = error as? ScoutAPIError, case .server(status: 404, message: _) = apiError {
+                previewOnly = true
+            } else {
+                self.error = error.localizedDescription
+            }
         }
     }
 
@@ -240,50 +279,6 @@ private struct VerificationVerdict {
             title = "Inconclusive"
             symbol = "questionmark.circle"
             color = .secondary
-        }
-    }
-}
-
-private struct PriceHistoryChart: View {
-    var points: [PriceHistoryPoint]
-    var typical: Double?
-
-    private struct Point: Identifiable {
-        var id: Int
-        var date: Date
-        var price: Double
-    }
-
-    private var series: [Point] {
-        points.enumerated().compactMap { index, point in
-            point.date.map { Point(id: index, date: $0, price: point.price) }
-        }
-    }
-
-    var body: some View {
-        Chart {
-            ForEach(series) { point in
-                LineMark(x: .value("Date", point.date), y: .value("Price", point.price))
-                    .interpolationMethod(.stepEnd)
-                PointMark(x: .value("Date", point.date), y: .value("Price", point.price))
-                    .symbolSize(18)
-            }
-            if let typical {
-                RuleMark(y: .value("Typical", typical))
-                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
-                    .foregroundStyle(.secondary)
-                    .annotation(position: .top, alignment: .leading) {
-                        Text("typical").font(.caption2).foregroundStyle(.secondary)
-                    }
-            }
-        }
-        .chartYAxis {
-            AxisMarks { value in
-                AxisGridLine()
-                AxisValueLabel {
-                    if let price = value.as(Double.self) { Text(Format.pln(price)) }
-                }
-            }
         }
     }
 }

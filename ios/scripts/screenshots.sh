@@ -45,9 +45,12 @@ capture() {
 
 xcrun simctl ui "$UDID" appearance light
 capture connect
-for screen in deals listings listing watches watch settings; do
+for screen in deals search listing watches watch new-watch research analytics settings widgets; do
   capture "$screen" -ScoutDemo YES -ScoutScreen "$screen"
 done
 xcrun simctl ui "$UDID" appearance dark
 capture deals-dark -ScoutDemo YES -ScoutScreen deals
 capture listing-dark -ScoutDemo YES -ScoutScreen listing
+capture settings-dark -ScoutDemo YES -ScoutScreen settings
+capture widgets-dark -ScoutDemo YES -ScoutScreen widgets
+capture analytics-dark -ScoutDemo YES -ScoutScreen analytics

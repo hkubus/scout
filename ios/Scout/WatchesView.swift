@@ -7,6 +7,7 @@ struct WatchesView: View {
     @State private var includeArchived = false
     @State private var error: String?
     @State private var path = NavigationPath()
+    @State private var editor: WatchEditorRequest?
 
     private struct LoadKey: Hashable {
         var includeArchived: Bool
@@ -49,6 +50,13 @@ struct WatchesView: View {
             .navigationTitle("Watches")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        editor = .create()
+                    } label: {
+                        Label("New watch", systemImage: "plus")
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         Toggle("Show archived", isOn: $includeArchived)
                     } label: {
@@ -58,6 +66,20 @@ struct WatchesView: View {
             }
             .refreshable { await load() }
             .task(id: LoadKey(includeArchived: includeArchived, refreshToken: model.refreshToken)) { await load() }
+            .onChange(of: model.pendingWatchID) { _, id in
+                if id != nil { Task { @MainActor in await load() } }
+            }
+            .onAppear {
+                if model.pendingNewWatch {
+                    model.pendingNewWatch = false
+                    editor = .create(WatchDraft(name: "Nintendo Switch OLED", query: "nintendo switch oled", excluded: "joy-con, etui", maxPrice: 1100))
+                }
+            }
+            .sheet(item: $editor) { request in
+                WatchEditorView(request: request) { created in
+                    if let created { path.append(created) }
+                }
+            }
             .scoutDestinations()
         }
     }

@@ -22,7 +22,16 @@ struct DealsView: View {
                         }
                         .padding(.vertical, 4)
                     } footer: {
-                        Text("Last scan \(dashboard.lastScan). Prices are asking prices, not completed sales.")
+                        VStack(alignment: .leading, spacing: 4) {
+                            ConnectionIndicator()
+                            Text("Last scan \(dashboard.lastScan). Prices are asking prices, not completed sales.")
+                        }
+                    }
+
+                    Section {
+                        NavigationLink(value: AllListingsRoute()) {
+                            Label("All listings", systemImage: "list.bullet.rectangle")
+                        }
                     }
 
                     Section("Latest") {
@@ -43,9 +52,6 @@ struct DealsView: View {
             .overlay { LoadingOverlay(isLoaded: dashboard != nil, error: error, retry: load) }
             .navigationTitle("Deals")
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    ConnectionIndicator().labelStyle(.titleAndIcon).font(.caption)
-                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(action: scanAll) {
                         Label("Scan all watches", systemImage: "arrow.triangle.2.circlepath")
@@ -66,8 +72,10 @@ struct DealsView: View {
     private func load() async {
         guard let client = model.client else { return }
         do {
-            dashboard = try await client.dashboard()
+            let dashboard = try await client.dashboard()
+            self.dashboard = dashboard
             error = nil
+            model.publishWidgets(from: dashboard)
         } catch {
             if !error.isCancellation { self.error = error.localizedDescription }
         }

@@ -109,7 +109,8 @@ final class DemoTransportTests: XCTestCase {
     func testServesEveryScreen() async throws {
         let dashboard = try await client.dashboard()
         XCTAssertEqual(dashboard.listings.count, 6)
-        XCTAssertNotNil(dashboard.listings.first?.observedDate)
+        let newest = try XCTUnwrap(dashboard.listings.compactMap(\.observedDate).max())
+        XCTAssertEqual(newest.timeIntervalSinceNow, -60, accuracy: 5)
         let watches = try await client.watches()
         XCTAssertEqual(watches.count, 5)
         let analytics = try await client.watchAnalytics(id: watches[2].id)
@@ -142,11 +143,399 @@ final class DemoTransportTests: XCTestCase {
     }
 }
 
+final class SearchTests: XCTestCase {
+    func testValidatesLikeTheServer() {
+        XCTAssertFalse(SearchFilters(query: "  ").canSearch)
+        XCTAssertFalse(SearchFilters(query: "xm5", sources: []).canSearch)
+        XCTAssertFalse(SearchFilters(query: "xm5", minPrice: 500, maxPrice: 400).canSearch)
+        XCTAssertFalse(SearchFilters(query: "xm5", maxPrice: 0).canSearch)
+        XCTAssertTrue(SearchFilters(query: "xm5", minPrice: 0, maxPrice: 400).canSearch)
+    }
+
+    func testEncodesTheServerBody() throws {
+        let filters = SearchFilters(query: " sony xm5 ", sources: [.olx], maxPrice: 900, condition: .used, ownerType: .private, searchId: "s1").normalized()
+        let body = try JSONSerialization.jsonObject(with: JSONEncoder().encode(filters)) as? [String: Any]
+        XCTAssertEqual(body?["query"] as? String, "sony xm5")
+        XCTAssertEqual(body?["location"] as? String, "Polska")
+        XCTAssertEqual(body?["condition"] as? String, "Used")
+        XCTAssertEqual(body?["ownerType"] as? String, "private")
+        XCTAssertEqual(body?["sources"] as? [String], ["OLX"])
+        XCTAssertEqual(body?["maxPrice"] as? Double, 900)
+        XCTAssertNil(body?["minPrice"])
+    }
+
+    func testMergesResultsByIDCheapestFirst() throws {
+        let dashboard: DashboardData = DemoTransport.fixture("dashboard")
+        let first = Array(dashboard.listings.prefix(3))
+        var updated = first[0]
+        updated.price = 1
+        let merged = first.mergingSearchResults([updated] + dashboard.listings.suffix(2))
+        XCTAssertEqual(merged.count, 5)
+        XCTAssertEqual(merged.first?.price, 1)
+        XCTAssertEqual(merged.map(\.price), merged.map(\.price).sorted())
+    }
+
+    func testDemoSearch() async throws {
+        let client = ScoutClient(baseURL: DemoTransport.baseURL, transport: DemoTransport())
+        let result = try await client.search(SearchFilters(query: "steam deck", sources: [.olx, .vinted]))
+        XCTAssertEqual(result.listings.map(\.title), ["Steam Deck 64GB (LCD)", "Steam Deck OLED 512GB"])
+        XCTAssertEqual(result.sources.map(\.count), [2, 0])
+        XCTAssertNil(result.listings.first?.typical)
+    }
+
+    func testDecodesAProgressEvent() throws {
+        let json = #"{"searchId":"s1","page":1,"source":"Vinted","status":{"source":"Vinted","status":"ok","count":0,"pendingShipping":0,"durationMs":812,"message":"No matching listings"},"listings":[]}"#
+        let event = try JSONDecoder().decode(SearchProgressEvent.self, from: Data(json.utf8))
+        XCTAssertEqual(event.status.source, .vinted)
+    }
+}
+
+final class AuthTests: XCTestCase {
+    func testSendsTheAPITokenAsABearerHeader() async throws {
+        let transport = RoutingTransport { request in
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer secret-token")
+            return (200, #"{"authEnabled":true,"authenticated":true,"passwordLogin":false}"#)
+        }
+        try await ScoutClient(baseURL: URL(string: "https://host")!, apiToken: "  secret-token\n", transport: transport).verifyAccess()
+    }
+
+    func testOmitsTheHeaderWithoutAToken() async throws {
+        let transport = RoutingTransport { request in
+            XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+            return (200, #"{"authEnabled":false,"authenticated":true,"passwordLogin":false}"#)
+        }
+        try await ScoutClient(baseURL: URL(string: "https://host")!, apiToken: " ", transport: transport).verifyAccess()
+    }
+
+    func testRejectsAServerThatNeedsSignIn() async {
+        let transport = RoutingTransport { _ in (200, #"{"authEnabled":true,"authenticated":false,"passwordLogin":true}"#) }
+        do {
+            try await ScoutClient(baseURL: URL(string: "https://host")!, transport: transport).verifyAccess()
+            XCTFail("expected an error")
+        } catch {
+            XCTAssertEqual(error as? ScoutAPIError, .unauthorized(tokenProvided: false))
+        }
+    }
+
+    func testFallsBackToHealthOnServersWithoutSignIn() async throws {
+        let transport = RoutingTransport { request in
+            request.url?.path == "/api/auth/session" ? (404, #"{"error":"Not found"}"#) : (200, #"{"status":"ok"}"#)
+        }
+        try await ScoutClient(baseURL: URL(string: "https://host")!, transport: transport).verifyAccess()
+    }
+
+    func testMaps401ToARejectedToken() async {
+        let transport = RoutingTransport { _ in (401, #"{"error":"Authentication required"}"#) }
+        do {
+            _ = try await ScoutClient(baseURL: URL(string: "https://host")!, apiToken: "wrong", transport: transport).dashboard()
+            XCTFail("expected an error")
+        } catch {
+            XCTAssertEqual(error as? ScoutAPIError, .unauthorized(tokenProvided: true))
+        }
+    }
+
+    func testServerDataOnlySendsTheTokenToItsOwnServer() async throws {
+        let transport = RoutingTransport { request in
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer secret-token")
+            return (200, "jpeg")
+        }
+        let client = ScoutClient(baseURL: URL(string: "https://host/scout")!, apiToken: "secret-token", transport: transport)
+        let data = try await client.serverData(client.marketSnapshotImageURL(imageId: 7))
+        XCTAssertEqual(data, Data("jpeg".utf8))
+        do {
+            _ = try await client.serverData(URL(string: "https://host/scoutx/api/market-snapshot-images/7")!)
+            XCTFail("expected an error")
+        } catch {
+            XCTAssertEqual(error as? ScoutAPIError, .invalidResponse)
+        }
+    }
+}
+
+final class RedirectGuardTests: XCTestCase {
+    private func redirect(_ from: String, _ to: String) -> String? {
+        var request = URLRequest(url: URL(string: to)!)
+        request.setValue("Bearer secret", forHTTPHeaderField: "Authorization")
+        return RedirectGuard.redirect(request, from: URL(string: from)).value(forHTTPHeaderField: "Authorization")
+    }
+
+    func testKeepsTheTokenOnTheSameOrigin() {
+        XCTAssertEqual(redirect("https://scout.lan/api/dashboard", "https://SCOUT.lan:443/scout/api/dashboard"), "Bearer secret")
+        XCTAssertEqual(redirect("http://scout.lan:3001/api", "http://scout.lan:3001/other"), "Bearer secret")
+        // An upgrade to TLS on the same host.
+        XCTAssertEqual(redirect("http://scout.lan/api", "https://scout.lan/api"), "Bearer secret")
+        XCTAssertEqual(redirect("http://scout.lan:3001/api", "https://scout.lan/api"), "Bearer secret")
+    }
+
+    func testDropsTheTokenWhenTheOriginChanges() {
+        XCTAssertNil(redirect("https://scout.lan/api", "https://evil.example/api"))
+        XCTAssertNil(redirect("https://scout.lan/api", "https://scout.lan:8443/api"))
+        XCTAssertNil(redirect("https://scout.lan/api", "http://scout.lan/api"))
+        XCTAssertNil(redirect("http://scout.lan/api", "https://scout.lan:8443/api"))
+        XCTAssertNil(redirect("https://scout.lan/api", "https://sub.scout.lan/api"))
+        XCTAssertNil(RedirectGuard.redirect(URLRequest(url: URL(string: "https://scout.lan")!), from: nil).value(forHTTPHeaderField: "Authorization"))
+    }
+
+    func testLeavesOtherHeadersAlone() {
+        var request = URLRequest(url: URL(string: "https://cdn.example/image.jpg")!)
+        request.setValue("Bearer secret", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let redirected = RedirectGuard.redirect(request, from: URL(string: "https://scout.lan/api/market-snapshot-images/1"))
+        XCTAssertNil(redirected.value(forHTTPHeaderField: "Authorization"))
+        XCTAssertEqual(redirected.value(forHTTPHeaderField: "Accept"), "application/json")
+    }
+
+    func testTokenStorageErrorIsDescriptive() {
+        let message = TokenStorageError(operation: .save, status: -34018).localizedDescription
+        XCTAssertTrue(message.hasPrefix("Couldn't save the API token in the Keychain"), message)
+        XCTAssertTrue(message.contains("-34018"), message)
+    }
+}
+
+private struct RoutingTransport: HTTPTransport {
+    var respond: @Sendable (URLRequest) -> (Int, String)
+
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let (status, body) = respond(request)
+        return (Data(body.utf8), HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!)
+    }
+}
+
 private struct StubTransport: HTTPTransport {
     var status: Int
     var body: String
 
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         (Data(body.utf8), HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!)
+    }
+}
+
+final class WidgetSnapshotTests: XCTestCase {
+    func testNewestIgnoresSnapshotsFromOtherSources() {
+        let dashboard = DemoTransport.dashboard()
+        let older = WidgetSnapshot.make(from: dashboard, source: "https://a", now: Date(timeIntervalSince1970: 10))
+        let newer = WidgetSnapshot.make(from: dashboard, source: "https://a", now: Date(timeIntervalSince1970: 20))
+        let demo = WidgetSnapshot.make(from: dashboard, isDemo: true, source: WidgetSnapshot.source(serverURL: nil, isDemo: true), now: Date(timeIntervalSince1970: 30))
+        XCTAssertEqual(WidgetSnapshot.newest([older, nil, newer, demo], from: "https://a")?.generatedAt, Date(timeIntervalSince1970: 20))
+        XCTAssertEqual(WidgetSnapshot.newest([older, demo], from: "demo")?.isDemo, true)
+        XCTAssertNil(WidgetSnapshot.newest([older, newer], from: "https://b"))
+    }
+
+    func testPicksStrongestVisibleDealsFirst() {
+        var dashboard = DemoTransport.dashboard()
+        dashboard.listings[0].hidden = true
+        dashboard.listings[2].decision = .pass
+        let snapshot = WidgetSnapshot.make(from: dashboard, limit: 3)
+        XCTAssertEqual(snapshot.deals.map(\.title), ["Sony WH-1000XM5", "Steam Deck 64GB (LCD)", "Carhartt WIP Detroit Jacket"])
+        XCTAssertEqual(snapshot.stats, dashboard.stats)
+    }
+
+    func testDeepLinkRoundTrips() throws {
+        let deal = try XCTUnwrap(WidgetSnapshot.make(from: DemoTransport.dashboard()).deals.first { $0.marketplace == .allegroLokalnie })
+        XCTAssertEqual(deal.deepLink.absoluteString, "scout://listing?key=Allegro%20Lokalnie:344821&watchId=watch-sony")
+        let items = try XCTUnwrap(URLComponents(url: deal.deepLink, resolvingAgainstBaseURL: false)?.queryItems)
+        XCTAssertEqual(items.first { $0.name == "key" }?.value, "Allegro Lokalnie:344821")
+    }
+
+    func testContentComparisonIgnoresTimeAndThumbnails() {
+        let first = WidgetSnapshot.make(from: DemoTransport.dashboard(), now: Date(timeIntervalSince1970: 0))
+        var second = first
+        second.generatedAt = Date()
+        second.deals[0].thumbnail = Data([1, 2, 3])
+        XCTAssertTrue(first.hasSameContent(as: second))
+        second.deals[0].price += 1
+        XCTAssertFalse(first.hasSameContent(as: second))
+    }
+
+    func testDefaultGroupIsAlwaysACandidate() {
+        XCTAssertEqual(SharedStore.candidateGroups().last, SharedStore.defaultAppGroup)
+        XCTAssertNil(SharedStore.appGroup)
+    }
+}
+
+final class WatchDraftTests: XCTestCase {
+    func testTitleQueryDropsPricesSaleWordsAndCities() {
+        XCTAssertEqual(WatchDraft.titleQuery(from: "Sprzedam Steam Deck OLED 512GB · 1 899 zł Warszawa"), "Steam Deck OLED 512GB")
+        XCTAssertEqual(WatchDraft.titleQuery(from: "LEGO 10316 Rivendell, okazja! Kraków."), "LEGO 10316 Rivendell okazja!")
+    }
+
+    func testPrefillFromListingUsesAPriceBand() throws {
+        let listing = try XCTUnwrap(DemoTransport.dashboard().listings.first { $0.key == "OLX:890231" })
+        let draft = WatchDraft(listing: listing)
+        XCTAssertEqual(draft.query, "Steam Deck OLED 512GB")
+        XCTAssertEqual(draft.name, "Steam Deck OLED 512GB watch")
+        XCTAssertEqual(draft.sources, [.olx])
+        XCTAssertEqual(draft.location, "Warszawa")
+        XCTAssertEqual(draft.minPrice, 1425)
+        XCTAssertEqual(draft.maxPrice, 2375)
+        XCTAssertTrue(draft.shippingOnly)
+        XCTAssertNil(draft.validationError)
+    }
+
+    func testPrefillFromSearch() {
+        let draft = WatchDraft(search: SearchFilters(query: " xm5 ", sources: [.vinted], maxPrice: 900, condition: .used, aiRelevance: false))
+        XCTAssertEqual(draft.name, "xm5 watch")
+        XCTAssertEqual(draft.condition, "Used")
+        XCTAssertEqual(draft.location, "Polska")
+        XCTAssertFalse(draft.aiRelevance)
+    }
+
+    func testValidation() {
+        XCTAssertEqual(WatchDraft(query: "x").validationError, "Give the watch a name.")
+        XCTAssertEqual(WatchDraft(name: "x", query: "x", sources: []).validationError, "Pick at least one marketplace.")
+        XCTAssertEqual(WatchDraft(name: "x", query: "x", interval: 2).validationError, "The scan interval must be between 5 and 1440 minutes.")
+        XCTAssertEqual(WatchDraft(name: "x", query: "x", minPrice: 10, maxPrice: 5).validationError, "The minimum price can't exceed the maximum.")
+    }
+
+    func testEncodesNullPricesSoEditsCanClearThem() throws {
+        let body = try JSONSerialization.jsonObject(with: JSONEncoder().encode(WatchDraft(name: "a", query: "b"))) as? [String: Any]
+        XCTAssertTrue(body?["minPrice"] is NSNull)
+        XCTAssertEqual(body?["interval"] as? Int, 5)
+    }
+
+    func testDemoCreateEditArchive() async throws {
+        let client = ScoutClient(baseURL: DemoTransport.baseURL, transport: DemoTransport())
+        let created = try await client.createWatch(WatchDraft(name: " Switch OLED ", query: "switch oled", maxPrice: 900))
+        XCTAssertEqual(created.name, "Switch OLED")
+        XCTAssertEqual(created.status, "Learning")
+
+        var draft = WatchDraft(watch: created)
+        draft.maxPrice = nil
+        draft.interval = 30
+        try await client.updateWatch(id: created.id, draft: draft)
+        var watches = try await client.watches()
+        let edited = try XCTUnwrap(watches.first { $0.id == created.id })
+        XCTAssertNil(edited.maxPrice)
+        XCTAssertEqual(edited.interval, 30)
+
+        try await client.updateWatch(id: created.id, patch: WatchPatch(archived: true))
+        watches = try await client.watches()
+        XCTAssertFalse(watches.contains { $0.id == created.id })
+        let all = try await client.watches(includeArchived: true)
+        XCTAssertEqual(all.first { $0.id == created.id }?.status, "Archived")
+    }
+}
+
+final class MarketTests: XCTestCase {
+    private let client = ScoutClient(baseURL: DemoTransport.baseURL, transport: DemoTransport())
+
+    func testDecodesARealResearchWatch() throws {
+        let json = #"{"watches":[{"id":"m1","name":"Deck","query":"deck","terms":"","excluded":"","location":"Polska","condition":"Any","sources":["OLX"],"intervalHours":24,"minPrice":null,"maxPrice":null,"shippingOnly":false,"typoVariants":false,"enabled":true,"nextScan":"in 3h","lastScan":"Never","totalListings":0,"activeListings":0,"endedListings":0,"estimatedMedianPrice":null,"saleBand":null,"activeVersionId":"v1"}],"listings":[],"aggregates":{"overallMedianPrice":null,"endedCount":0,"activeCount":0,"saleBand":null},"pagination":{"page":1,"pageSize":50,"total":0,"hasNext":false}}"#
+        let data = try JSONDecoder().decode(MarketResearchData.self, from: Data(json.utf8))
+        XCTAssertEqual(data.watches.first?.intervalHours, 24)
+    }
+
+    func testResearchFlowInDemo() async throws {
+        let research = try await client.marketResearch()
+        XCTAssertEqual(research.watches.count, 3)
+        XCTAssertFalse(research.listings.isEmpty)
+        let ended = try await client.marketResearch(status: .ended)
+        XCTAssertTrue(ended.listings.allSatisfy { $0.status == "ended" && $0.statusTitle == "No longer available" })
+
+        let trend = try await client.marketWatchTrend(id: "market-xm5", days: 30)
+        XCTAssertEqual(trend.points.count, 30)
+        XCTAssertEqual(trend.probableSaleMedian, 990)
+
+        let listing = try XCTUnwrap(research.listings.first { $0.snapshotStatus == nil })
+        let before = try await client.marketListingSnapshot(id: listing.id)
+        XCTAssertNil(before)
+        let captured = try await client.captureMarketListingSnapshot(id: listing.id)
+        XCTAssertEqual(captured?.title, listing.title)
+        let history = try await client.marketListingHistory(id: listing.id)
+        XCTAssertEqual(history.count, listing.observations)
+        XCTAssertEqual(history.last?.price, listing.lastPrice)
+    }
+
+    func testResearchWatchCrudInDemo() async throws {
+        let created = try await client.createMarketWatch(MarketWatchDraft(name: "Switch market", query: "switch oled", intervalHours: 12))
+        XCTAssertEqual(created.intervalHours, 12)
+        let original = MarketWatchDraft(watch: created)
+        var draft = original
+        draft.maxPrice = 900
+        try await client.updateMarketWatch(id: created.id, draft: draft, original: original)
+        try await client.setMarketWatchEnabled(id: created.id, enabled: false)
+        var research = try await client.marketResearch()
+        let updated = try XCTUnwrap(research.watches.first { $0.id == created.id })
+        XCTAssertEqual(updated.maxPrice, 900)
+        XCTAssertFalse(updated.enabled)
+        _ = try await client.scanMarketWatch(id: created.id)
+        try await client.deleteMarketWatch(id: created.id)
+        research = try await client.marketResearch()
+        XCTAssertFalse(research.watches.contains { $0.id == created.id })
+    }
+
+    func testRenameSendsOnlyTheName() async throws {
+        let original = MarketWatchDraft(name: "Deck", query: "steam deck", terms: "oled", minPrice: 1000)
+        var draft = original
+        draft.name = "  Deck OLED "
+        let patch = draft.patch(from: original)
+        XCTAssertFalse(patch.changesCriteria)
+        let body = try JSONSerialization.jsonObject(with: JSONEncoder().encode(patch)) as? [String: Any]
+        XCTAssertEqual(body?.keys.sorted(), ["name"])
+        XCTAssertEqual(body?["name"] as? String, "Deck OLED")
+
+        let transport = RoutingTransport { request in
+            XCTAssertEqual(request.httpMethod, "PATCH")
+            XCTAssertEqual(String(decoding: request.httpBody ?? Data(), as: UTF8.self), #"{"name":"Deck OLED"}"#)
+            return (200, #"{"ok":true}"#)
+        }
+        try await ScoutClient(baseURL: URL(string: "https://host")!, transport: transport).updateMarketWatch(id: "m1", draft: draft, original: original)
+    }
+
+    func testPatchIgnoresWhitespaceAndSendsClearedPricesAsNull() throws {
+        let original = MarketWatchDraft(name: "Deck", query: "steam deck", location: "", minPrice: 1000)
+        var draft = original
+        draft.query = " steam deck "
+        draft.location = "Polska"
+        XCTAssertTrue(draft.patch(from: original).isEmpty)
+
+        draft.minPrice = nil
+        draft.intervalHours = 48
+        let patch = draft.patch(from: original)
+        XCTAssertTrue(patch.changesCriteria)
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(patch)) as? [String: Any])
+        XCTAssertEqual(body.keys.sorted(), ["intervalHours", "minPrice"])
+        XCTAssertTrue(body["minPrice"] is NSNull)
+        XCTAssertEqual(try JSONDecoder().decode(MarketWatchPatch.self, from: JSONEncoder().encode(patch)), patch)
+    }
+
+    func testUnchangedEditStillSendsAValidBody() async throws {
+        let original = MarketWatchDraft(name: "Deck", query: "steam deck")
+        let transport = RoutingTransport { request in
+            XCTAssertEqual(String(decoding: request.httpBody ?? Data(), as: UTF8.self), #"{"name":"Deck"}"#)
+            return (200, #"{"ok":true}"#)
+        }
+        try await ScoutClient(baseURL: URL(string: "https://host")!, transport: transport).updateMarketWatch(id: "m1", draft: original, original: original)
+    }
+
+    func testDemoRenameKeepsTheCriteria() async throws {
+        let created = try await client.createMarketWatch(MarketWatchDraft(name: "Switch market", query: "switch oled", minPrice: 500))
+        var draft = MarketWatchDraft(watch: created)
+        draft.name = "Switch OLED market"
+        try await client.updateMarketWatch(id: created.id, draft: draft, original: MarketWatchDraft(watch: created))
+        let research = try await client.marketResearch()
+        let updated = try XCTUnwrap(research.watches.first { $0.id == created.id })
+        XCTAssertEqual(updated.name, "Switch OLED market")
+        XCTAssertEqual(updated.query, "switch oled")
+        XCTAssertEqual(updated.minPrice, 500)
+    }
+
+    func testMarketDraftValidation() {
+        XCTAssertEqual(MarketWatchDraft(name: "a", query: "b", intervalHours: 3).validationError, "The snapshot interval must be between 6 and 168 hours.")
+        XCTAssertNil(MarketWatchDraft(name: "a", query: "b").validationError)
+    }
+
+    func testAnalyticsAndSettingsInDemo() async throws {
+        let analytics = try await client.analytics(days: 7, marketplace: .vinted)
+        XCTAssertEqual(analytics.trend.count, 7)
+        XCTAssertEqual(analytics.marketplaceComparison.map(\.marketplace), [.vinted])
+        let settings = try await client.settings()
+        XCTAssertEqual(settings.ntfy.openInApp, false)
+        let updated = try await client.setNtfyOpenInApp(true)
+        XCTAssertEqual(updated.ntfy.openInApp, true)
+    }
+
+    func testSnapshotImageURLUsesTheServer() {
+        let client = ScoutClient(baseURL: URL(string: "https://host/scout")!)
+        XCTAssertEqual(client.marketSnapshotImageURL(imageId: 7).absoluteString, "https://host/scout/api/market-snapshot-images/7")
     }
 }

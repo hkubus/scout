@@ -2,7 +2,7 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:
 import { existsSync } from 'node:fs';
 import { connect as connectHttp2 } from 'node:http2';
 import { chromium, type Browser, type BrowserContext } from 'playwright-core';
-import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, validateNtfyConfig, type NtfyConfig } from './notifications';
+import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext } from './ai';
@@ -1850,7 +1850,7 @@ export class ScoutService {
     const encrypted = this.getSetting('ntfy_config');
     if (!encrypted) return null;
     try {
-      const parsed = JSON.parse(decryptSecret(encrypted)) as { serverUrl?: string; topic?: string; token?: string; minimumPriority?: unknown };
+      const parsed = JSON.parse(decryptSecret(encrypted)) as { serverUrl?: string; topic?: string; token?: string; minimumPriority?: unknown; openInApp?: unknown };
       return validateNtfyConfig(parsed);
     } catch {
       return null;
@@ -3455,6 +3455,7 @@ export class ScoutService {
         topicMasked: ntfy ? '••••••••••••••••' : null,
         tokenConfigured: Boolean(ntfy?.token),
         minimumPriority: ntfy?.minimumPriority ?? 'exceptional',
+        openInApp: ntfy?.openInApp ?? false,
       },
       ai: (() => {
         // One config read: each call decrypts the stored API key.
@@ -3479,7 +3480,7 @@ export class ScoutService {
     discordMinimumPriority?: NotificationPriority;
     dailyDigest?: { enabled?: boolean; time?: string; discord?: boolean; ntfy?: boolean };
     clearNtfy?: boolean;
-    ntfy?: { serverUrl?: string; topic?: string; token?: string; minimumPriority?: NotificationPriority };
+    ntfy?: { serverUrl?: string; topic?: string; token?: string; minimumPriority?: NotificationPriority; openInApp?: boolean };
     ai?: { apiKey?: string; clearApiKey?: boolean; model?: string };
   }) {
     if (input.interval !== undefined) {
@@ -3514,6 +3515,7 @@ export class ScoutService {
           topic: input.ntfy.topic?.trim() || current?.topic,
           token: input.ntfy.token?.trim() || current?.token,
           minimumPriority: input.ntfy.minimumPriority ?? current?.minimumPriority ?? 'exceptional',
+          openInApp: input.ntfy.openInApp ?? current?.openInApp ?? false,
         });
         this.setSetting('ntfy_config', encryptSecret(JSON.stringify(config)));
       } catch (error) {
@@ -3607,10 +3609,10 @@ export class ScoutService {
     const payload = {
       topic: config.topic,
       title: 'Scout is connected',
-      message: 'Your important deal alerts will be delivered here.',
+      message: config.openInApp ? 'Your important deal alerts will be delivered here. Tap to open the Scout app.' : 'Your important deal alerts will be delivered here.',
       priority: 3,
       tags: ['white_check_mark'],
-      click: config.serverUrl,
+      click: config.openInApp ? SCOUT_APP_DEALS_LINK : config.serverUrl,
     };
     const key = `test-ntfy-${Date.now()}`;
     try {
@@ -4382,7 +4384,8 @@ export class ScoutService {
       ].join('\n\n'),
       priority: 3,
       tags: ['moneybag', 'calendar'],
-      click: shown[0]?.url ?? config.serverUrl,
+      click: config.openInApp ? SCOUT_APP_DEALS_LINK : shown[0]?.url ?? config.serverUrl,
+      ...(config.openInApp && shown[0] ? { actions: [{ action: 'view' as const, label: 'Open top deal', url: shown[0].url, clear: true }] } : {}),
     };
   }
 
@@ -4557,7 +4560,7 @@ export class ScoutService {
         if (!response.ok) throw new Error(`Discord returned ${response.status}`);
       } else {
         if (!input.ntfy) throw new Error('ntfy is not configured');
-        await publishNtfy(input.ntfy, buildNtfyPayload({ listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence, variantLabel: input.variantLabel }, input.ntfy.topic, input.priority));
+        await publishNtfy(input.ntfy, buildNtfyPayload({ listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence, variantLabel: input.variantLabel }, input.ntfy.topic, input.priority, { openInApp: input.ntfy.openInApp, watchId: input.watchId }));
       }
       const finished = nowIso();
       this.transaction(() => {

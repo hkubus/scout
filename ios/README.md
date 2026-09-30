@@ -1,8 +1,20 @@
 # Scout for iOS
 
-A native SwiftUI client for a self-hosted Scout server. It covers the deal feed, the paginated listing history with triage (buy / watch / pass / hide), listing detail with price history and the AI description check, watches with asking-price analytics, pause/resume and scan-now, and connector health. Live updates come from the server's `/events` stream. Notifications stay with ntfy.
+A native SwiftUI client for a self-hosted Scout server. It covers:
 
-Like the web UI, the app talks to the unauthenticated API, so the phone must reach Scout over your LAN or VPN (for example Tailscale).
+- the deal feed;
+- live marketplace search, like the web Search page, with "Save as watch";
+- the paginated listing history with triage (buy / watch / pass / hide);
+- listing detail with price history and the AI description check;
+- creating, editing, archiving, pausing, and scanning watches, plus asking-price analytics;
+- market research watches with probable-sale estimates, saved listings, and saved copies;
+- deal analytics (Market tab → Analytics);
+- connector health, and a switch that makes ntfy alerts open in the app;
+- Home Screen and Lock Screen widgets.
+
+Live updates come from the server's `/events` stream. Notifications stay with ntfy.
+
+The app talks to the same API as the web UI. If the server has sign-in enabled, enter one of its `SCOUT_API_TOKENS` on the connect screen; the app sends it as a bearer token and keeps it in the Keychain under the App Group, so the widgets can use it too (widgets only send it to the server the app is connected to). Replace or remove it later in Settings → API token. Without sign-in, keep Scout reachable only over your LAN or VPN (for example Tailscale).
 
 ## Layout
 
@@ -10,6 +22,8 @@ Like the web UI, the app talks to the unauthenticated API, so the phone must rea
 | --- | --- |
 | `project.yml` | XcodeGen spec; `Scout.xcodeproj` and `Scout/Info.plist` are generated and not committed. |
 | `Scout/` | SwiftUI app (iOS 17+). |
+| `ScoutWidgets/` | WidgetKit extension: "Top deals" (small, medium, large) and "Scout summary" (small plus Lock Screen). |
+| `Shared/` | Widget views, compiled into both the extension and the app's widget preview screen. |
 | `ScoutKit/` | Swift package with the API models, HTTP client, server-sent-event parser, and demo fixtures. It builds and tests on Linux. |
 | `scripts/screenshots.sh` | CI helper that captures simulator screenshots on demo data. |
 | `scripts/sidestore_site.py` | Builds the GitHub Pages site with the IPA and the SideStore source. |
@@ -44,6 +58,16 @@ The SwiftUI views only compile on macOS, so the first place view errors show up 
 
 Free Apple ID limits: apps must be refreshed every 7 days, and SideStore's refresh VPN can't run at the same time as another VPN such as Tailscale. Refresh while Tailscale is off, or while you're on your home LAN.
 
+## Widgets
+
+To add a widget, long-press the Home Screen, tap **Edit → Add Widget**, and search for Scout. The widgets fetch `/api/dashboard` about every 15 minutes, and the app refreshes them whenever it loads new data. They show the last saved data, marked "Offline", when the server can't be reached, for example when the VPN is off.
+
+The widgets find your server through an App Group they share with the app. CI signs the IPA ad hoc with that entitlement so SideStore registers the group. SideStore renames the group for your Apple ID, and ScoutKit's `SharedStore` finds the renamed ID through the `ALTAppGroups` key that SideStore writes into Info.plist. If the group isn't available anyway (Settings → Widgets says so), long-press the widget, choose **Edit Widget**, and enter the server address there.
+
+**Settings → Widgets → Preview widgets** shows every widget size with current data.
+
 ## Deep links
 
-`scout://listing?key=<marketplace>:<listing id>&watchId=<watch id>` opens a listing. A future server change can point ntfy's click action at this link so notifications open in the app.
+`scout://listing?key=<marketplace>:<listing id>&watchId=<watch id>` opens a listing, and `scout://deals` opens the Deals tab. The widgets use both.
+
+To make ntfy alerts open in the app, turn on **Open alerts in the Scout iOS app**: in the web app it's under Settings → ntfy notifications, and in the iOS app under Settings → Notifications. Tapping an alert then opens the listing in Scout, and the alert's **Open listing** action button still goes to the marketplace page. The setting applies to every device subscribed to the topic, so leave it off if you also read alerts on a computer or Android.

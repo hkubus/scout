@@ -3,6 +3,7 @@ import SwiftUI
 struct ConnectView: View {
     @Environment(AppModel.self) private var model
     @State private var address = ""
+    @State private var apiToken = ""
     @State private var connecting = false
     @State private var error: String?
 
@@ -34,6 +35,11 @@ struct ConnectView: View {
                         .autocorrectionDisabled()
                         .submitLabel(.go)
                         .onSubmit(connect)
+                    SecureField("API token (if the server requires sign-in)", text: $apiToken)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .submitLabel(.go)
+                        .onSubmit(connect)
                     Button(action: connect) {
                         HStack {
                             Text("Connect")
@@ -48,7 +54,7 @@ struct ConnectView: View {
                     if let error {
                         Text(error).foregroundStyle(.red)
                     } else {
-                        Text("Addresses without a scheme use https://. Type http:// for a plain LAN address. Scout has no login, so keep it reachable only over your LAN or VPN.")
+                        Text("Addresses without a scheme use https://. Type http:// for a plain LAN address. If the server has sign-in enabled, paste one of its SCOUT_API_TOKENS; it's kept in the Keychain.")
                     }
                 }
 
@@ -69,7 +75,7 @@ struct ConnectView: View {
         Task { @MainActor in
             defer { connecting = false }
             do {
-                try await model.connect(to: address)
+                try await model.connect(to: address, apiToken: apiToken)
             } catch {
                 self.error = error.localizedDescription
             }
