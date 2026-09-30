@@ -19,6 +19,7 @@ import { apiTokenCredentialId, bearerToken, clearedSessionCookie, isProtectedRou
 import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
 import { normalizeSourceIntervals, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
+import { parseVariantGroups } from './variants';
 
 const port = Number(process.env.PORT ?? 3001);
 if (!Number.isInteger(port) || port < 1 || port > 65_535) {
@@ -356,6 +357,11 @@ app.get('/api/watches', async (request, reply) => {
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid watch filters' });
   return { watches: parsed.data.includeArchived ? service.allWatches() : service.getWatches() };
 });
+app.post('/api/watches/:id/variant-suggestions', async (request, reply) => {
+  const params = resourceIdParams.safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid watch id is required' });
+  return service.suggestWatchVariantGroups(params.data.id);
+});
 app.get('/api/watches/:id/analytics', async (request, reply) => {
   const params = resourceIdParams.safeParse(request.params);
   if (!params.success) return reply.code(400).send({ error: 'A valid watch id is required' });
@@ -428,6 +434,7 @@ const watchInput = z.object({
   typoVariants: z.boolean().optional().default(false),
   aiRelevance: z.boolean().optional().default(true),
   variantGroups: variantGroupsInput.optional().default([]),
+  variantGroupsAuto: z.boolean().optional().default(true),
   referenceMarketWatchId: z.string().trim().max(160).nullable().optional().default(null),
   minPrice: z.number().nonnegative().nullable().optional().default(null),
   maxPrice: z.number().positive().nullable().optional().default(null),
@@ -448,7 +455,7 @@ app.post('/api/watches', async (request, reply) => {
   const now = nowIso();
   const sourceIntervals = normalizeSourceIntervals(value.sources, value.sourceIntervals);
   try {
-    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, source_intervals_json, sensitivity, shipping_only, typo_variants, ai_relevance, variant_groups_json, reference_market_watch_id, min_price_pln, max_price_pln, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, JSON.stringify(sourceIntervals), value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, JSON.stringify(value.variantGroups), value.referenceMarketWatchId, value.minPrice, value.maxPrice, 1, now, now, now);
+    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, source_intervals_json, sensitivity, shipping_only, typo_variants, ai_relevance, variant_groups_json, variant_groups_auto, reference_market_watch_id, min_price_pln, max_price_pln, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, JSON.stringify(sourceIntervals), value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, JSON.stringify(value.variantGroups), value.variantGroupsAuto && !value.variantGroups.length ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, 1, now, now, now);
   } catch (error) {
     if (error instanceof Error && /UNIQUE|PRIMARY KEY|constraint/i.test(error.message)) {
       return reply.code(409).send({ error: 'A watch with this id already exists' });
@@ -473,6 +480,7 @@ app.patch('/api/watches/:id', async (request, reply) => {
     aiRelevance: z.boolean().optional(),
     typoVariants: z.boolean().optional(),
     variantGroups: variantGroupsInput.optional(),
+    variantGroupsAuto: z.boolean().optional(),
     referenceMarketWatchId: z.string().trim().max(160).nullable().optional(),
     archived: z.boolean().optional(),
     minPrice: z.number().nonnegative().nullable().optional(), maxPrice: z.number().positive().nullable().optional(),
@@ -480,7 +488,7 @@ app.patch('/api/watches/:id', async (request, reply) => {
   if (!patchInput.success) return reply.code(400).send({ error: 'Invalid watch update', details: patchInput.error.flatten() });
   const body = patchInput.data;
   if (body.interval !== undefined && (!Number.isInteger(body.interval) || body.interval < 5 || body.interval > 1440)) return reply.code(400).send({ error: 'Interval must be between 5 and 1440 minutes' });
-  const current = db.prepare('SELECT min_price_pln, max_price_pln, sources_json, exact_urls_json FROM watches WHERE id = ?').get(params.data.id) as { min_price_pln: number | null; max_price_pln: number | null; sources_json: string; exact_urls_json: string } | undefined;
+  const current = db.prepare('SELECT min_price_pln, max_price_pln, sources_json, exact_urls_json, variant_groups_json FROM watches WHERE id = ?').get(params.data.id) as { min_price_pln: number | null; max_price_pln: number | null; sources_json: string; exact_urls_json: string; variant_groups_json: string } | undefined;
   if (!current) return reply.code(404).send({ error: 'Watch not found' });
   const sources = body.sources ?? JSON.parse(current.sources_json || '[]') as Marketplace[];
   const exactUrls = body.exactUrls ?? JSON.parse(current.exact_urls_json || '[]') as string[];
@@ -508,7 +516,17 @@ app.patch('/api/watches/:id', async (request, reply) => {
   if (typeof body.shippingOnly === 'boolean') { fields.push('shipping_only = ?'); values.push(body.shippingOnly ? 1 : 0); }
   if (typeof body.aiRelevance === 'boolean') { fields.push('ai_relevance = ?'); values.push(body.aiRelevance ? 1 : 0); }
   if (typeof body.typoVariants === 'boolean') { fields.push('typo_variants = ?'); values.push(body.typoVariants ? 1 : 0); }
-  if (body.variantGroups !== undefined) { fields.push('variant_groups_json = ?'); values.push(JSON.stringify(body.variantGroups)); }
+  // The edit dialog always resends the groups, so only a real change counts
+  // as the user taking over from automatic generation.
+  const groupsChanged = body.variantGroups !== undefined && JSON.stringify(body.variantGroups) !== JSON.stringify(parseVariantGroups(current.variant_groups_json));
+  if (groupsChanged) { fields.push('variant_groups_json = ?'); values.push(JSON.stringify(body.variantGroups)); }
+  if (body.variantGroupsAuto !== undefined || groupsChanged) {
+    const groupsAfter = groupsChanged ? body.variantGroups! : parseVariantGroups(current.variant_groups_json);
+    fields.push('variant_groups_auto = ?');
+    values.push(body.variantGroupsAuto && !groupsAfter.length ? 1 : 0);
+    // A fresh opt-in starts over rather than waiting for the watch to grow.
+    if (body.variantGroupsAuto) fields.push('variant_groups_auto_checked = 0');
+  }
   if (body.referenceMarketWatchId !== undefined) {
     if (body.referenceMarketWatchId && !db.prepare('SELECT 1 FROM market_watches WHERE id = ?').get(body.referenceMarketWatchId)) {
       return reply.code(400).send({ error: 'Reference research watch not found' });
@@ -526,13 +544,17 @@ app.patch('/api/watches/:id', async (request, reply) => {
       values.push(body.archived ? 0 : 1);
     }
   }
-  if (!fields.length) return reply.code(400).send({ error: 'No supported fields' });
+  if (!fields.length) {
+    // Resending the current groups unchanged is a valid no-op.
+    if (body.variantGroups !== undefined) return { ok: true };
+    return reply.code(400).send({ error: 'No supported fields' });
+  }
   values.push(nowIso(), params.data.id);
   const result = db.prepare(`UPDATE watches SET ${fields.join(', ')}, updated_at = ? WHERE id = ?`).run(...(values as any[]));
   if (!result.changes) return reply.code(404).send({ error: 'Watch not found' });
   // Repartition the watch's saved listings immediately when the model groups
   // change; otherwise the new keys would only converge one scan at a time.
-  if (body.variantGroups !== undefined) service.retagWatchVariants(params.data.id);
+  if (groupsChanged) service.retagWatchVariants(params.data.id);
   emit('watch', { id: params.data.id, archived: body.archived });
   return { ok: true };
 });

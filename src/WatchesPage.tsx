@@ -300,6 +300,13 @@ function WatchRow({
             );
           })}
         </div>
+      ) : watch.variantGroupsAuto ? (
+        <div className="watch-variants" aria-label="Model variants">
+          <span className="variant-chip variant-chip--pending" title="Scout groups this watch's listings by model once it has enough of them; edit the watch to change or suggest them now.">
+            <strong>Model variants</strong>
+            <small>auto · waiting for listings</small>
+          </span>
+        </div>
       ) : null}
       <div className="watch-actions">
         <span className="next-scan">
