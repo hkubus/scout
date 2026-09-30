@@ -450,7 +450,7 @@ export default function ListingDetailDrawer({
               <label className="field-label">Shipping / fees <span>PLN</span><input type="number" min="0" step="1" value={shippingCost} onChange={(event) => setShippingCost(event.target.value)} placeholder="0" /></label>
               <label className="field-label">Other cost <span>PLN</span><input type="number" min="0" step="1" value={extraCost} onChange={(event) => setExtraCost(event.target.value)} placeholder="0" /></label>
               <label className="field-label">Expected resale <span>PLN</span><input type="number" min="0" step="1" value={resalePrice} onChange={(event) => setResalePrice(event.target.value)} placeholder="Add estimate" /></label>
-              <label className="field-label">Sell on <span>{resaleFee ? `fee ${formatPln(Math.round(resaleFee))}` : "no seller fee"}</span><select value={sellOn} onChange={(event) => setSellOn(event.target.value as FlipChannel)}>{FLIP_CHANNELS.map((channel) => <option key={channel}>{channel}</option>)}</select></label>
+              <label className="field-label">Sell on <span>{resaleFee ? `fee ${formatPln(Math.round(resaleFee))}` : feePresets[sellOn].percent || feePresets[sellOn].fixed ? `${feePresets[sellOn].percent.toLocaleString("pl-PL")}% seller fee` : "no seller fee"}</span><select value={sellOn} onChange={(event) => setSellOn(event.target.value as FlipChannel)}>{FLIP_CHANNELS.map((channel) => <option key={channel}>{channel}</option>)}</select></label>
             </div>
             <div className="calculator-results">
               <div><span>Total cost</span><strong>{formatPln(totalCost)}</strong></div>
