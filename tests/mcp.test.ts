@@ -51,7 +51,9 @@ test('scout_readiness and scout_dashboard report the empty database truthfully',
   try {
     const { server, client } = await connectedClient(context.service);
     try {
-      const readiness = JSON.parse(toolText(await client.callTool({ name: 'scout_readiness', arguments: {} }) as never));
+      const readinessText = toolText(await client.callTool({ name: 'scout_readiness', arguments: {} }) as never);
+      const readiness = JSON.parse(readinessText);
+      assert.equal(readinessText, JSON.stringify(readiness), 'tool text is compact JSON');
       assert.equal(readiness.database.ok, true);
       assert.ok(readiness.status === 'ready' || readiness.status === 'not-ready');
 

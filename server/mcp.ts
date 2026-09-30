@@ -7,7 +7,8 @@ import { ServiceError } from './service';
 const marketplace = z.enum(['OLX', 'Allegro Lokalnie', 'Vinted']);
 
 function text(payload: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(payload, null, 2) }] };
+  // Compact JSON: indentation only costs the agent context tokens.
+  return { content: [{ type: 'text' as const, text: JSON.stringify(payload) }] };
 }
 
 function toolError(error: unknown) {
