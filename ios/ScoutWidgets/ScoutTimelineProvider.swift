@@ -7,6 +7,12 @@ import ScoutKit
 struct ScoutTimelineProvider: AppIntentTimelineProvider {
     /// WidgetKit rations reloads; the app also reloads widgets when its data changes.
     private static let refreshInterval: TimeInterval = 15 * 60
+    /// The widget shows 6 deals at most; asking the server for a few more
+    /// keeps its ties in the same order as `WidgetSnapshot.make`'s re-sort.
+    private static let dashboardTop = 12
+    /// Shorter than the app's 20 s: an unreachable LAN or VPN server
+    /// otherwise keeps the extension and radio busy for each timeline.
+    private static let dashboardTimeout: TimeInterval = 10
 
     func placeholder(in context: Context) -> ScoutWidgetEntry {
         ScoutWidgetEntry(date: Date(), snapshot: .demo, state: .ready)
@@ -54,7 +60,7 @@ struct ScoutTimelineProvider: AppIntentTimelineProvider {
 
         let source = WidgetSnapshot.source(serverURL: client.baseURL, isDemo: isDemo)
         do {
-            var snapshot = WidgetSnapshot.make(from: try await client.dashboard(), isDemo: isDemo, source: source)
+            var snapshot = WidgetSnapshot.make(from: try await client.dashboard(top: Self.dashboardTop, timeout: Self.dashboardTimeout), isDemo: isDemo, source: source)
             snapshot.deals = await Thumbnails.attach(to: snapshot.deals)
             LocalCache.save(snapshot)
             return ScoutWidgetEntry(date: Date(), snapshot: snapshot, state: .ready)
