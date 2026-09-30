@@ -182,6 +182,10 @@ curl -s -X POST http://127.0.0.1:3001/mcp \
 
 It is stateless (one fresh server per request, no session ids) and offers twelve tools (plus the four read-only `scout_debug_*` tools from the [Debug API](#debug-api) unless `SCOUT_DEBUG_API=false`): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail`, `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_queue_scan`, and `scout_connectors`. `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. With auth enabled, MCP clients must send `Authorization: Bearer <token>` using a value from `SCOUT_API_TOKENS`.
 
+## iOS app
+
+`ios/` contains a native SwiftUI client covering the deal feed, listing triage, watches, and analytics. It is built on GitHub's macOS runners from the push mirror and installed with SideStore. See [`ios/README.md`](ios/README.md).
+
 ## Debug API
 
 For development and troubleshooting, Scout exposes read-only access to the live database under `/api/debug/*` (enabled by default; set `SCOUT_DEBUG_API=false` to disable it):

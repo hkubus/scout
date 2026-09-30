@@ -1,0 +1,187 @@
+import SwiftUI
+import ScoutKit
+
+struct WatchesView: View {
+    @Environment(AppModel.self) private var model
+    @State private var watches: [Watch]?
+    @State private var includeArchived = false
+    @State private var error: String?
+    @State private var path = NavigationPath()
+
+    private struct LoadKey: Hashable {
+        var includeArchived: Bool
+        var refreshToken: Int
+    }
+
+    var body: some View {
+        NavigationStack(path: $path) {
+            List {
+                if let watches {
+                    if watches.isEmpty {
+                        ContentUnavailableView("No watches", systemImage: "binoculars", description: Text("Create watches in the Scout web app."))
+                    }
+                    ForEach(watches) { watch in
+                        NavigationLink(value: watch) {
+                            WatchRow(watch: watch)
+                        }
+                        .swipeActions(edge: .leading) {
+                            Button {
+                                scan(watch)
+                            } label: {
+                                Label("Scan now", systemImage: "arrow.triangle.2.circlepath")
+                            }
+                            .tint(.scoutBlue)
+                        }
+                        .swipeActions(edge: .trailing) {
+                            if !watch.isArchived {
+                                Button {
+                                    setEnabled(!watch.enabled, for: watch)
+                                } label: {
+                                    Label(watch.enabled ? "Pause" : "Resume", systemImage: watch.enabled ? "pause.fill" : "play.fill")
+                                }
+                                .tint(watch.enabled ? Color.orange : Color.scoutGreen)
+                            }
+                        }
+                    }
+                }
+            }
+            .overlay { LoadingOverlay(isLoaded: watches != nil, error: error, retry: load) }
+            .navigationTitle("Watches")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Toggle("Show archived", isOn: $includeArchived)
+                    } label: {
+                        Label("Options", systemImage: "ellipsis.circle")
+                    }
+                }
+            }
+            .refreshable { await load() }
+            .task(id: LoadKey(includeArchived: includeArchived, refreshToken: model.refreshToken)) { await load() }
+            .scoutDestinations()
+        }
+    }
+
+    private func load() async {
+        guard let client = model.client else { return }
+        do {
+            let loaded = try await client.watches(includeArchived: includeArchived)
+            watches = loaded
+            error = nil
+            if let id = model.pendingWatchID, let watch = loaded.first(where: { $0.id == id }) {
+                model.pendingWatchID = nil
+                path.append(watch)
+            }
+        } catch {
+            if !error.isCancellation { self.error = error.localizedDescription }
+        }
+    }
+
+    private func setEnabled(_ enabled: Bool, for watch: Watch) {
+        guard let client = model.client else { return }
+        Task { @MainActor in
+            do {
+                try await client.updateWatch(id: watch.id, patch: WatchPatch(enabled: enabled))
+                await load()
+            } catch {
+                model.report(error)
+            }
+        }
+    }
+
+    private func scan(_ watch: Watch) {
+        guard let client = model.client else { return }
+        Task { @MainActor in
+            do {
+                _ = try await client.queueScan(watchId: watch.id)
+            } catch {
+                model.report(error)
+            }
+        }
+    }
+}
+
+struct WatchStatusBadge: View {
+    var status: String
+
+    private var color: Color {
+        switch status {
+        case "Ready": .scoutGreen
+        case "Learning": .scoutBlue
+        case "Paused": .orange
+        default: .secondary
+        }
+    }
+
+    var body: some View {
+        Text(status)
+            .font(.caption.weight(.semibold))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .foregroundStyle(color)
+            .background(color.opacity(0.14), in: Capsule())
+    }
+}
+
+private struct WatchRow: View {
+    var watch: Watch
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(watch.name)
+                    .font(.headline)
+                    .lineLimit(1)
+                Spacer()
+                WatchStatusBadge(status: watch.status)
+            }
+            if watch.status == "Learning" {
+                ProgressView(value: min(watch.readiness, 100), total: 100) {
+                    EmptyView()
+                } currentValueLabel: {
+                    Text("Learning prices · \(watch.samples)/\(watch.targetSamples) samples")
+                }
+                .font(.caption)
+            }
+            HStack(spacing: 10) {
+                DealCountChips(counts: watch.dealCounts)
+                Spacer(minLength: 0)
+                Text(verbatim: watch.enabled ? "Every \(Format.minutes(watch.interval)) · \(watch.nextScan)" : "Paused")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 10) {
+                ForEach(watch.sources, id: \.self) { MarketplaceTag(marketplace: $0) }
+            }
+        }
+        .padding(.vertical, 2)
+        .opacity(watch.enabled ? 1 : 0.6)
+    }
+}
+
+struct DealCountChips: View {
+    var counts: WatchDealCounts
+
+    var body: some View {
+        if counts.total == 0 {
+            Text("No deals right now")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } else {
+            HStack(spacing: 6) {
+                chip(counts.exceptional, label: .exceptional)
+                chip(counts.veryStrong, label: .veryStrong)
+                chip(counts.strong, label: .strong)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func chip(_ count: Int, label: DealLabel) -> some View {
+        if count > 0 {
+            Text("\(count) \(label.rawValue.lowercased())")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(label.color)
+        }
+    }
+}

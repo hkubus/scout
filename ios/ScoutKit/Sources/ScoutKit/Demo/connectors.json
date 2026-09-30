@@ -1,0 +1,44 @@
+{
+  "connectors": [
+    {
+      "name": "OLX",
+      "kind": "marketplace",
+      "color": "#159b96",
+      "status": "OK",
+      "detail": "42 listings in the last scan",
+      "lastSuccess": "1m ago",
+      "requests": 318,
+      "latency": "640 ms"
+    },
+    {
+      "name": "Allegro Lokalnie",
+      "kind": "marketplace",
+      "color": "#f27526",
+      "status": "OK",
+      "detail": "18 listings in the last scan",
+      "lastSuccess": "3m ago",
+      "requests": 204,
+      "latency": "910 ms"
+    },
+    {
+      "name": "Vinted",
+      "kind": "marketplace",
+      "color": "#55a9b0",
+      "status": "Warning",
+      "detail": "Rate limited once in the last hour",
+      "lastSuccess": "9m ago",
+      "requests": 156,
+      "latency": "1.2 s"
+    },
+    {
+      "name": "ntfy",
+      "kind": "ntfy",
+      "color": "#338574",
+      "status": "OK",
+      "detail": "Exceptional deals only",
+      "lastSuccess": "1h ago",
+      "requests": 12,
+      "latency": "120 ms"
+    }
+  ]
+}

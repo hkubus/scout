@@ -1,0 +1,245 @@
+{
+  "watchId": "watch-deck",
+  "watchName": "Steam Deck OLED 512GB",
+  "rangeDays": 30,
+  "firstObservedAt": "2026-08-30T08:30:00.000Z",
+  "lastObservedAt": "2026-09-30T08:29:00.000Z",
+  "totalObservations": 412,
+  "current": {
+    "medianPrice": 2740,
+    "lowerPrice": 2460,
+    "upperPrice": 2980,
+    "minPrice": 1899,
+    "maxPrice": 3499,
+    "listingCount": 37,
+    "strongDealCount": 3,
+    "strongDealRate": 0.081
+  },
+  "medianChangePercent": -8.6,
+  "points": [
+    {
+      "date": "2026-09-01",
+      "medianPrice": 2999,
+      "lowerPrice": 2719,
+      "upperPrice": 3239,
+      "listingCount": 4
+    },
+    {
+      "date": "2026-09-02",
+      "medianPrice": 3010,
+      "lowerPrice": 2730,
+      "upperPrice": 3250,
+      "listingCount": 11
+    },
+    {
+      "date": "2026-09-03",
+      "medianPrice": 3018,
+      "lowerPrice": 2738,
+      "upperPrice": 3258,
+      "listingCount": 9
+    },
+    {
+      "date": "2026-09-04",
+      "medianPrice": 3022,
+      "lowerPrice": 2742,
+      "upperPrice": 3262,
+      "listingCount": 7
+    },
+    {
+      "date": "2026-09-05",
+      "medianPrice": 3021,
+      "lowerPrice": 2741,
+      "upperPrice": 3261,
+      "listingCount": 5
+    },
+    {
+      "date": "2026-09-06",
+      "medianPrice": 3014,
+      "lowerPrice": 2734,
+      "upperPrice": 3254,
+      "listingCount": 12
+    },
+    {
+      "date": "2026-09-07",
+      "medianPrice": 3000,
+      "lowerPrice": 2720,
+      "upperPrice": 3240,
+      "listingCount": 10
+    },
+    {
+      "date": "2026-09-08",
+      "medianPrice": 2979,
+      "lowerPrice": 2699,
+      "upperPrice": 3219,
+      "listingCount": 8
+    },
+    {
+      "date": "2026-09-09",
+      "medianPrice": 2954,
+      "lowerPrice": 2674,
+      "upperPrice": 3194,
+      "listingCount": 6
+    },
+    {
+      "date": "2026-09-10",
+      "medianPrice": 2926,
+      "lowerPrice": 2646,
+      "upperPrice": 3166,
+      "listingCount": 4
+    },
+    {
+      "date": "2026-09-11",
+      "medianPrice": 2898,
+      "lowerPrice": 2618,
+      "upperPrice": 3138,
+      "listingCount": 11
+    },
+    {
+      "date": "2026-09-12",
+      "medianPrice": 2870,
+      "lowerPrice": 2590,
+      "upperPrice": 3110,
+      "listingCount": 9
+    },
+    {
+      "date": "2026-09-13",
+      "medianPrice": 2846,
+      "lowerPrice": 2566,
+      "upperPrice": 3086,
+      "listingCount": 7
+    },
+    {
+      "date": "2026-09-14",
+      "medianPrice": 2826,
+      "lowerPrice": 2546,
+      "upperPrice": 3066,
+      "listingCount": 5
+    },
+    {
+      "date": "2026-09-15",
+      "medianPrice": 2813,
+      "lowerPrice": 2533,
+      "upperPrice": 3053,
+      "listingCount": 12
+    },
+    {
+      "date": "2026-09-16",
+      "medianPrice": 2806,
+      "lowerPrice": 2526,
+      "upperPrice": 3046,
+      "listingCount": 10
+    },
+    {
+      "date": "2026-09-17",
+      "medianPrice": 2806,
+      "lowerPrice": 2526,
+      "upperPrice": 3046,
+      "listingCount": 8
+    },
+    {
+      "date": "2026-09-18",
+      "medianPrice": 2811,
+      "lowerPrice": 2531,
+      "upperPrice": 3051,
+      "listingCount": 6
+    },
+    {
+      "date": "2026-09-19",
+      "medianPrice": 2820,
+      "lowerPrice": 2540,
+      "upperPrice": 3060,
+      "listingCount": 4
+    },
+    {
+      "date": "2026-09-20",
+      "medianPrice": 2831,
+      "lowerPrice": 2551,
+      "upperPrice": 3071,
+      "listingCount": 11
+    },
+    {
+      "date": "2026-09-21",
+      "medianPrice": 2841,
+      "lowerPrice": 2561,
+      "upperPrice": 3081,
+      "listingCount": 9
+    },
+    {
+      "date": "2026-09-22",
+      "medianPrice": 2849,
+      "lowerPrice": 2569,
+      "upperPrice": 3089,
+      "listingCount": 7
+    },
+    {
+      "date": "2026-09-23",
+      "medianPrice": 2853,
+      "lowerPrice": 2573,
+      "upperPrice": 3093,
+      "listingCount": 5
+    },
+    {
+      "date": "2026-09-24",
+      "medianPrice": 2851,
+      "lowerPrice": 2571,
+      "upperPrice": 3091,
+      "listingCount": 12
+    },
+    {
+      "date": "2026-09-25",
+      "medianPrice": 2842,
+      "lowerPrice": 2562,
+      "upperPrice": 3082,
+      "listingCount": 10
+    },
+    {
+      "date": "2026-09-26",
+      "medianPrice": 2827,
+      "lowerPrice": 2547,
+      "upperPrice": 3067,
+      "listingCount": 8
+    },
+    {
+      "date": "2026-09-27",
+      "medianPrice": 2806,
+      "lowerPrice": 2526,
+      "upperPrice": 3046,
+      "listingCount": 6
+    },
+    {
+      "date": "2026-09-28",
+      "medianPrice": 2781,
+      "lowerPrice": 2501,
+      "upperPrice": 3021,
+      "listingCount": 4
+    },
+    {
+      "date": "2026-09-29",
+      "medianPrice": 2752,
+      "lowerPrice": 2472,
+      "upperPrice": 2992,
+      "listingCount": 11
+    },
+    {
+      "date": "2026-09-30",
+      "medianPrice": 2724,
+      "lowerPrice": 2444,
+      "upperPrice": 2964,
+      "listingCount": 9
+    }
+  ],
+  "sources": [
+    {
+      "source": "OLX",
+      "medianPrice": 2690,
+      "listingCount": 24,
+      "strongDealCount": 2
+    },
+    {
+      "source": "Allegro Lokalnie",
+      "medianPrice": 2820,
+      "listingCount": 13,
+      "strongDealCount": 1
+    }
+  ]
+}
