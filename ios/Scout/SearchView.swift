@@ -331,7 +331,6 @@ private struct SearchFiltersSheet: View {
                         Text("Private").tag(SellerType?.some(SellerType.private))
                         Text("Business").tag(SellerType?.some(SellerType.business))
                     }
-                    TextField("Location (anywhere)", text: $filters.location)
                     Toggle("Shipping only", isOn: $filters.shippingOnly)
                 }
 

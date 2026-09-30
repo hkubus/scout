@@ -44,7 +44,6 @@ export interface MarketplaceSearchFilters {
   maxPrice?: number | null;
   condition?: string;
   shippingOnly?: boolean;
-  location?: string;
   sort?: MarketplaceSearchSort;
   page?: number;
   /**

@@ -1505,7 +1505,7 @@ export class ScoutService {
   private async fuzzyRescueForSearch(
     fetched: NormalizedListing[],
     search: { query: string; includedTerms: string; excludedTerms: string; condition?: string },
-    finalFilters: { minPrice?: number | null; maxPrice?: number | null; condition?: string; location?: string; shippingOnly: boolean },
+    finalFilters: { minPrice?: number | null; maxPrice?: number | null; condition?: string; shippingOnly: boolean },
     source: Marketplace,
     gate?: (listing: NormalizedListing) => boolean,
   ): Promise<NormalizedListing[]> {
@@ -1520,7 +1520,7 @@ export class ScoutService {
       const shippable = pool.filter((listing) => listing.shippingAvailable === true);
       if (!shippable.length) return [];
       const rechecked = findFuzzyRescueCandidates(shippable, search.query, search.includedTerms, search.excludedTerms, finalFilters);
-      // Candidates that no longer qualify (e.g. price/location edge) stay dropped.
+      // Candidates that no longer qualify (e.g. a price edge) stay dropped.
       const rescue = await this.rescueFuzzyMisses(rechecked, search, live, gate);
       return rescue.rescued;
     }
@@ -1994,7 +1994,7 @@ export class ScoutService {
       terms: row.included_terms,
       excluded: row.excluded_terms,
       sources,
-      location: row.location,
+      location: NO_LOCATION_FILTER,
       condition: row.condition,
       samples,
       targetSamples: BASELINE_MIN_SAMPLES,
@@ -2819,7 +2819,7 @@ export class ScoutService {
       const started = Date.now();
       try {
         const fetched = await this.fetchSearchPages(source, input.query, { ...input, olxCategoryId: input.olxCategory?.id ?? null, page });
-        const deterministicFilters = { minPrice: input.minPrice, maxPrice: input.maxPrice, condition: input.condition, location: input.location, shippingOnly: false };
+        const deterministicFilters = { minPrice: input.minPrice, maxPrice: input.maxPrice, condition: input.condition, shippingOnly: false };
         const comparable = filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters);
         // Cache-first like watch scans: only a few cold listings fetch an item
         // page per search; the rest surface as pending delivery checks.
@@ -2981,7 +2981,7 @@ export class ScoutService {
       const counts = statsByWatch.get(row.id) ?? { total: 0, active: null, ended: null };
       const endedPrices = endedPricesByWatch.get(row.id) ?? [];
       return {
-        id: row.id, name: row.name, query: version.query, terms: version.included_terms ?? '', excluded: version.excluded_terms ?? '', location: version.location ?? 'Polska', condition: version.condition ?? 'Any', sources: parseJson<Marketplace[]>(version.sources_json, []),
+        id: row.id, name: row.name, query: version.query, terms: version.included_terms ?? '', excluded: version.excluded_terms ?? '', location: NO_LOCATION_FILTER, condition: version.condition ?? 'Any', sources: parseJson<Marketplace[]>(version.sources_json, []),
         intervalHours: Number(row.interval_hours), minPrice: version.min_price_pln === null || version.min_price_pln === undefined ? null : Number(version.min_price_pln), maxPrice: version.max_price_pln === null || version.max_price_pln === undefined ? null : Number(version.max_price_pln), shippingOnly: Boolean(version.shipping_only), typoVariants: Boolean(version.typo_variants), olxCategory: olxCategoryFromJson(version.olx_category_json), enabled: Boolean(row.enabled), nextScan: Boolean(row.enabled) ? relativeTimeFuture(row.next_scan_at) : 'Paused',
         lastScan: relativeTime(row.last_scan_at), totalListings: Number(counts.total ?? 0), activeListings: Number(counts.active ?? 0), endedListings: Number(counts.ended ?? 0),
         estimatedMedianPrice: endedPrices.length ? median(endedPrices) : null,
@@ -3099,7 +3099,6 @@ export class ScoutService {
     query: string;
     terms: string;
     excluded: string;
-    location: string;
     condition: string;
     sources: Marketplace[];
     intervalHours: number;
@@ -3113,8 +3112,8 @@ export class ScoutService {
     const versionId = `${input.id}:v1`;
     const olxCategory = olxCategoryToJson(input.olxCategory);
     this.transaction(() => {
-      this.stmt('INSERT INTO market_watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, interval_hours, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, enabled, active_version_id, next_scan_at, last_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?)').run(input.id, input.name, input.query, input.terms, input.excluded, input.location, input.condition, JSON.stringify(input.sources), input.intervalHours, input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, input.typoVariants ? 1 : 0, olxCategory, versionId, now, now, now);
-      this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, input.id, input.query, input.terms, input.excluded, input.location, input.condition, JSON.stringify(input.sources), input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, input.typoVariants ? 1 : 0, olxCategory, now);
+      this.stmt('INSERT INTO market_watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, interval_hours, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, enabled, active_version_id, next_scan_at, last_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?)').run(input.id, input.name, input.query, input.terms, input.excluded, NO_LOCATION_FILTER, input.condition, JSON.stringify(input.sources), input.intervalHours, input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, input.typoVariants ? 1 : 0, olxCategory, versionId, now, now, now);
+      this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, input.id, input.query, input.terms, input.excluded, NO_LOCATION_FILTER, input.condition, JSON.stringify(input.sources), input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, input.typoVariants ? 1 : 0, olxCategory, now);
     });
     return this.marketResearch().watches.find((watch) => watch.id === input.id)!;
   }
@@ -3126,7 +3125,6 @@ export class ScoutService {
     intervalHours?: number;
     terms?: string;
     excluded?: string;
-    location?: string;
     condition?: string;
     sources?: Marketplace[];
     minPrice?: number | null;
@@ -3138,7 +3136,7 @@ export class ScoutService {
     const row = this.stmt('SELECT * FROM market_watches WHERE id = ?').get(id) as WatchRow | undefined;
     if (!row) throw new ServiceError('Market watch not found', 404);
     const currentVersion = this.marketWatchVersion(row);
-    const criteriaChanged = patch.query !== undefined || patch.terms !== undefined || patch.excluded !== undefined || patch.location !== undefined || patch.condition !== undefined || patch.sources !== undefined || patch.minPrice !== undefined || patch.maxPrice !== undefined || patch.shippingOnly !== undefined || patch.typoVariants !== undefined || patch.olxCategory !== undefined;
+    const criteriaChanged = patch.query !== undefined || patch.terms !== undefined || patch.excluded !== undefined || patch.condition !== undefined || patch.sources !== undefined || patch.minPrice !== undefined || patch.maxPrice !== undefined || patch.shippingOnly !== undefined || patch.typoVariants !== undefined || patch.olxCategory !== undefined;
     const now = nowIso();
     this.transaction(() => {
       const directFields: string[] = [];
@@ -3152,7 +3150,6 @@ export class ScoutService {
           query: patch.query ?? String(currentVersion.query),
           terms: patch.terms ?? String(currentVersion.included_terms ?? ''),
           excluded: patch.excluded ?? String(currentVersion.excluded_terms ?? ''),
-          location: patch.location ?? String(currentVersion.location ?? 'Polska'),
           condition: patch.condition ?? String(currentVersion.condition ?? 'Any'),
           sources: patch.sources ?? parseJson<Marketplace[]>(currentVersion.sources_json, []),
           minPrice: patch.minPrice === undefined ? (currentVersion.min_price_pln === null || currentVersion.min_price_pln === undefined ? null : Number(currentVersion.min_price_pln)) : patch.minPrice,
@@ -3161,14 +3158,14 @@ export class ScoutService {
           typoVariants: patch.typoVariants === undefined ? Boolean(currentVersion.typo_variants) : patch.typoVariants,
           olxCategory: patch.olxCategory === undefined ? olxCategoryToJson(olxCategoryFromJson(currentVersion.olx_category_json)) : olxCategoryToJson(patch.olxCategory),
         };
-        const changed = next.query !== currentVersion.query || next.terms !== (currentVersion.included_terms ?? '') || next.excluded !== (currentVersion.excluded_terms ?? '') || next.location !== (currentVersion.location ?? 'Polska') || next.condition !== (currentVersion.condition ?? 'Any') || JSON.stringify(next.sources) !== String(currentVersion.sources_json) || next.minPrice !== (currentVersion.min_price_pln ?? null) || next.maxPrice !== (currentVersion.max_price_pln ?? null) || next.shippingOnly !== Boolean(currentVersion.shipping_only) || next.typoVariants !== Boolean(currentVersion.typo_variants) || olxCategoryFromJson(next.olxCategory)?.id !== olxCategoryFromJson(currentVersion.olx_category_json)?.id;
+        const changed = next.query !== currentVersion.query || next.terms !== (currentVersion.included_terms ?? '') || next.excluded !== (currentVersion.excluded_terms ?? '') || next.condition !== (currentVersion.condition ?? 'Any') || JSON.stringify(next.sources) !== String(currentVersion.sources_json) || next.minPrice !== (currentVersion.min_price_pln ?? null) || next.maxPrice !== (currentVersion.max_price_pln ?? null) || next.shippingOnly !== Boolean(currentVersion.shipping_only) || next.typoVariants !== Boolean(currentVersion.typo_variants) || olxCategoryFromJson(next.olxCategory)?.id !== olxCategoryFromJson(currentVersion.olx_category_json)?.id;
         if (changed) {
           const versionId = `${id}:v${Date.now()}-${randomBytes(3).toString('hex')}`;
           if (row.active_version_id) this.stmt('UPDATE market_watch_versions SET closed_at = ? WHERE id = ? AND closed_at IS NULL').run(now, row.active_version_id);
-          this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, id, next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, next.typoVariants ? 1 : 0, next.olxCategory, now);
+          this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, id, next.query, next.terms, next.excluded, NO_LOCATION_FILTER, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, next.typoVariants ? 1 : 0, next.olxCategory, now);
           this.stmt("UPDATE market_listings SET status = 'superseded', ended_at = COALESCE(ended_at, ?), ended_reason = COALESCE(ended_reason, 'Research criteria changed') WHERE market_watch_id = ? AND (version_id = ? OR version_id IS NULL) AND status <> 'superseded'").run(now, id, row.active_version_id ?? currentVersion.id);
           directFields.push('query = ?', 'included_terms = ?', 'excluded_terms = ?', 'location = ?', 'condition = ?', 'sources_json = ?', 'min_price_pln = ?', 'max_price_pln = ?', 'shipping_only = ?', 'typo_variants = ?', 'olx_category_json = ?', 'active_version_id = ?', 'next_scan_at = ?');
-          directValues.push(next.query, next.terms, next.excluded, next.location, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, next.typoVariants ? 1 : 0, next.olxCategory, versionId, now);
+          directValues.push(next.query, next.terms, next.excluded, NO_LOCATION_FILTER, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, next.typoVariants ? 1 : 0, next.olxCategory, versionId, now);
         }
       }
       if (!directFields.length) throw new ServiceError('No supported fields', 400);
@@ -3207,7 +3204,7 @@ export class ScoutService {
         }
         try {
           const adapter = this.createConnectorAdapter(source, onPath);
-          const searchFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, olxCategoryId: olxCategoryFromJson(row.olx_category_json)?.id ?? null, sort: 'newest' as const };
+          const searchFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), olxCategoryId: olxCategoryFromJson(row.olx_category_json)?.id ?? null, sort: 'newest' as const };
           const mainListings = await this.fetchSearchPages(source, row.query, searchFilters, onPath);
           // Typo variants come from the immutable criteria version, like every
           // other research criterion, and append one page per variant query.
@@ -3221,7 +3218,7 @@ export class ScoutService {
           }
           const fetched = [...new Map(mainListings.map((listing) => [`${listing.marketplace}:${listing.listingId}`, listing])).values()];
           this.log('info', 'research', `${row.name} · ${source}: query-search${variantFetches.length ? ` + typo-variants (${variantFetches.join(', ')})` : ''} → ${paths.join(' → ') || 'no fetch'} · fetched=${fetched.length}`);
-          const filters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, location: row.location, shippingOnly: false };
+          const filters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: false };
           const comparable = filterListings(fetched, row.query, row.included_terms ?? '', row.excluded_terms ?? '', filters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
           const filtered = filterListings(comparable, row.query, row.included_terms ?? '', row.excluded_terms ?? '', { ...filters, shippingOnly: Boolean(row.shipping_only) });
@@ -3810,7 +3807,7 @@ export class ScoutService {
         }
         try {
           const matchingExact = exactUrls.filter((url) => validateSearchUrl(url, source).valid);
-          const searchFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), location: row.location, olxCategoryId: olxCategoryFromJson(row.olx_category_json)?.id ?? null, sort: 'newest' as const };
+          const searchFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: Boolean(row.shipping_only), olxCategoryId: olxCategoryFromJson(row.olx_category_json)?.id ?? null, sort: 'newest' as const };
           const urls = matchingExact.length
             ? matchingExact
             : [this.marketplaceSearchRequestUrl(source, row.query, searchFilters)];
@@ -3830,7 +3827,7 @@ export class ScoutService {
           }
           const fetched = [...new Map(mainListings.map((listing) => [`${listing.marketplace}:${listing.listingId}`, listing])).values()];
           this.log('info', 'watch', `${row.name} · ${source}: ${matchingExact.length ? `exact-urls (${matchingExact.length})` : 'query-search'}${variantFetches.length ? ` + typo-variants (${variantFetches.join(', ')})` : ''} → ${paths.join(' → ') || 'no fetch'} · fetched=${fetched.length}`);
-          const deterministicFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, location: row.location, shippingOnly: false };
+          const deterministicFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: false };
           const comparable = filterListings(fetched, row.query, row.included_terms, row.excluded_terms, deterministicFilters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
           let filtered = filterListings(comparable, row.query, row.included_terms, row.excluded_terms, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) });
@@ -4929,6 +4926,13 @@ export class ScoutService {
   }
 }
 
+/**
+ * Scout no longer filters by location: shipped listings from anywhere count.
+ * The API still reports this value (and the columns keep it) because older
+ * iOS builds decode `location` as a required field.
+ */
+export const NO_LOCATION_FILTER = 'Polska';
+
 /** Read a stored OLX category, dropping anything malformed rather than scanning with a bad id. */
 export function olxCategoryFromJson(value: unknown): OlxCategory | null {
   const parsed = typeof value === 'string' && value ? parseJson<unknown>(value, null) : null;
@@ -4955,7 +4959,6 @@ export type ListingFilters = {
   minPrice?: number | null;
   maxPrice?: number | null;
   condition?: string;
-  location?: string;
   /**
    * Manual search only: when the strict all-terms match returns nothing, accept
    * listings that match a majority of the implicit query tokens instead of
@@ -5029,11 +5032,9 @@ function evaluateDeterministic(
   listing: NormalizedListing,
   title: string,
   condition: string,
-  location: string,
   included: string[],
   excluded: string[],
   requestedCondition: string,
-  requestedLocation: string,
   options: ListingFilters,
   relaxed = false,
 ) {
@@ -5045,13 +5046,10 @@ function evaluateDeterministic(
   // majority of the query tokens rather than returning an empty page.
   if (!termOk && relaxed && !excludedHit && included.length > 1 && matchedTerms >= Math.ceil(included.length / 2)) termOk = true;
   const conditionOk = matchesRequestedCondition(requestedCondition, condition);
-  // Vinted listings carry no location and always ship, so a location filter
-  // would otherwise drop every one of them.
-  const locationOk = !requestedLocation || requestedLocation === 'polska' || listing.marketplace === 'Vinted' || location.includes(requestedLocation);
   const priceOk = (options.minPrice === null || options.minPrice === undefined || listing.price >= options.minPrice)
     && (options.maxPrice === null || options.maxPrice === undefined || listing.price <= options.maxPrice);
   const shippingOk = !options.shippingOnly || listing.marketplace === 'Vinted' || listing.shippingAvailable === true;
-  return { termOk, conditionOk, locationOk, priceOk, shippingOk };
+  return { termOk, conditionOk, priceOk, shippingOk };
 }
 
 export function filterListings(listings: NormalizedListing[], query: string, includedRaw: string, excludedRaw: string, filters: ListingFilters | boolean = {}) {
@@ -5059,14 +5057,12 @@ export function filterListings(listings: NormalizedListing[], query: string, inc
   const { included, excluded, explicitTerms } = parseIncludedExcluded(query, includedRaw, excludedRaw);
   // Request-level values are identical for every listing: normalize them and
   // the alias table once instead of per filter pass.
-  const requestedLocation = normalizeFilterText(options.location ?? '');
   const requestedCondition = normalizeFilterText(options.condition ?? '');
   const evaluate = (relaxed: boolean) => listings.filter((listing) => {
     const title = normalizeFilterText(listing.title);
     const condition = normalizeFilterText(listing.condition ?? '');
-    const location = normalizeFilterText(listing.location ?? '');
-    const evaluated = evaluateDeterministic(listing, title, condition, location, included, excluded, requestedCondition, requestedLocation, options, relaxed);
-    return evaluated.termOk && evaluated.conditionOk && evaluated.locationOk && evaluated.priceOk && evaluated.shippingOk;
+    const evaluated = evaluateDeterministic(listing, title, condition, included, excluded, requestedCondition, options, relaxed);
+    return evaluated.termOk && evaluated.conditionOk && evaluated.priceOk && evaluated.shippingOk;
   });
   const strict = evaluate(false);
   // Only manual search opts into the relaxed retry, and never when the user
@@ -5090,7 +5086,6 @@ export function findFuzzyRescueCandidates(
 ) {
   const options = typeof filters === 'boolean' ? { shippingOnly: filters } : filters;
   const { included, excluded } = parseIncludedExcluded(query, includedRaw, excludedRaw);
-  const requestedLocation = normalizeFilterText(options.location ?? '');
   const requestedCondition = normalizeFilterText(options.condition ?? '');
   const hasTermFilter = included.length > 0 || excluded.length > 0;
   const hasConditionFilter = Boolean(requestedCondition) && requestedCondition !== 'any';
@@ -5099,9 +5094,8 @@ export function findFuzzyRescueCandidates(
   for (const listing of listings) {
     const title = normalizeFilterText(listing.title);
     const condition = normalizeFilterText(listing.condition ?? '');
-    const location = normalizeFilterText(listing.location ?? '');
-    const evaluated = evaluateDeterministic(listing, title, condition, location, included, excluded, requestedCondition, requestedLocation, options);
-    if (!evaluated.locationOk || !evaluated.priceOk || !evaluated.shippingOk) continue;
+    const evaluated = evaluateDeterministic(listing, title, condition, included, excluded, requestedCondition, options);
+    if (!evaluated.priceOk || !evaluated.shippingOk) continue;
     if (!evaluated.termOk && evaluated.conditionOk && hasTermFilter) termCandidates.push(listing);
     else if (!evaluated.conditionOk && evaluated.termOk && hasConditionFilter) conditionCandidates.push(listing);
   }

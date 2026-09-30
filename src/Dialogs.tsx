@@ -41,7 +41,6 @@ export function WatchDialog({
   const [query, setQuery] = useState(initialWatch?.query ?? preset?.query ?? "");
   const [terms, setTerms] = useState(initialWatch?.terms ?? preset?.terms ?? "");
   const [excluded, setExcluded] = useState(initialWatch?.excluded ?? preset?.excluded ?? "");
-  const [location, setLocation] = useState(initialWatch?.location?.trim() || preset?.location?.trim() || "Polska");
   const [condition, setCondition] = useState(initialWatch?.condition ?? preset?.condition ?? "Any");
   const [interval, setIntervalValue] = useState(String(initialWatch?.interval ?? 5));
   const [sourceIntervals, setSourceIntervals] = useState<Record<string, string>>(() => {
@@ -131,7 +130,7 @@ export function WatchDialog({
         terms: terms.trim(),
         excluded: excluded.trim(),
         sources,
-        location: location.trim() || "Polska",
+        location: "Polska",
         condition,
         samples: initialWatch?.samples ?? 0,
         targetSamples: initialWatch?.targetSamples ?? 30,
@@ -276,28 +275,19 @@ export function WatchDialog({
               />
             </label>
           </div>
-          <div className="field-row">
-            <label className="field-label">
-              Location
-              <input
-                value={location}
-                onChange={(event) => setLocation(event.target.value)}
-              />
-            </label>
-            <label className="field-label">
-              Condition
-              <select
-                value={condition}
-                onChange={(event) => setCondition(event.target.value)}
-              >
-                <option>Any</option>
-                <option>New</option>
-                <option>Like new</option>
-                <option>Very good</option>
-                <option>Good</option>
-              </select>
-            </label>
-          </div>
+          <label className="field-label">
+            Condition
+            <select
+              value={condition}
+              onChange={(event) => setCondition(event.target.value)}
+            >
+              <option>Any</option>
+              <option>New</option>
+              <option>Like new</option>
+              <option>Very good</option>
+              <option>Good</option>
+            </select>
+          </label>
           {sources.includes("OLX") ? (
             <OlxCategoryPicker query={query} value={olxCategory} onChange={setOlxCategory} />
           ) : null}

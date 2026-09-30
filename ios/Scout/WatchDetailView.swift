@@ -107,7 +107,6 @@ struct WatchDetailView: View {
                 if !watch.terms.isEmpty { LabeledContent("Must include", value: watch.terms) }
                 if !watch.excluded.isEmpty { LabeledContent("Excludes", value: watch.excluded) }
                 LabeledContent("Marketplaces", value: watch.sources.map(\.rawValue).joined(separator: ", "))
-                LabeledContent("Location", value: watch.location)
                 LabeledContent("Condition", value: watch.condition)
                 if watch.minPrice != nil || watch.maxPrice != nil {
                     LabeledContent("Price", value: "\(watch.minPrice.map(Format.pln) ?? "any") – \(watch.maxPrice.map(Format.pln) ?? "any")")

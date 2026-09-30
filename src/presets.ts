@@ -5,7 +5,6 @@ export type WatchPreset = {
   terms: string;
   excluded: string;
   sources: Marketplace[];
-  location: string;
   condition: string;
   minPrice: number | null;
   maxPrice: number | null;
@@ -70,9 +69,6 @@ export function watchPresetFromListing(listing: Listing): WatchPreset {
     terms: "",
     excluded: "",
     sources: [listing.marketplace],
-    // The stored location is region, city, and district; pinning a new watch to
-    // one district would starve its baseline, so start country-wide.
-    location: "Polska",
     condition: "Any",
     minPrice: price === null ? null : priceBand(price).minPrice,
     maxPrice: price === null ? null : priceBand(price).maxPrice,
@@ -90,7 +86,6 @@ export function marketWatchInputFromListing(listing: MarketTrackedListing): Mark
     query,
     terms: "",
     excluded: "",
-    location: "Polska",
     condition: "Any",
     sources: [listing.marketplace],
     intervalHours: 24,
