@@ -21,6 +21,17 @@ enum Format {
         return relative(date)
     }
 
+    /// Values that are already percentages (0–100), as the server sends them.
+    static func percent(_ value: Double?, digits: Int = 1) -> String {
+        guard let value, value.isFinite else { return "—" }
+        return String(format: "%.\(digits)f%%", value)
+    }
+
+    static func day(_ iso: String?) -> String {
+        guard let date = ScoutDate.parse(iso) else { return "—" }
+        return date.formatted(date: .abbreviated, time: .omitted)
+    }
+
     static func minutes(_ value: Double) -> String {
         value >= 60 && value.truncatingRemainder(dividingBy: 60) == 0 ? "\(Int(value / 60)) h" : "\(Int(value)) min"
     }
@@ -156,6 +167,36 @@ struct ListingThumbnail: View {
     }
 }
 
+/// An image Scout serves itself (saved listing photos). Loaded through the
+/// client so the API token is sent, which `AsyncImage` can't do.
+struct ServerImage<Placeholder: View>: View {
+    var client: ScoutClient
+    var url: URL
+    var contentMode: ContentMode
+    var placeholder: () -> Placeholder
+    @State private var image: UIImage?
+
+    init(client: ScoutClient, url: URL, contentMode: ContentMode = .fill, @ViewBuilder placeholder: @escaping () -> Placeholder) {
+        self.client = client
+        self.url = url
+        self.contentMode = contentMode
+        self.placeholder = placeholder
+    }
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image).resizable().aspectRatio(contentMode: contentMode)
+            } else {
+                placeholder()
+            }
+        }
+        .task(id: url) {
+            image = (try? await client.serverData(url)).flatMap(UIImage.init(data:))
+        }
+    }
+}
+
 struct ListingRow: View {
     var listing: Listing
 
@@ -264,6 +305,10 @@ extension View {
         navigationDestination(for: ListingLink.self) { ListingDetailView(link: $0) }
             .navigationDestination(for: Watch.self) { WatchDetailView(watch: $0) }
             .navigationDestination(for: WatchListingsRoute.self) { ListingsView(watch: $0) }
+            .navigationDestination(for: AllListingsRoute.self) { _ in ListingsView() }
+            .navigationDestination(for: MarketWatch.self) { ResearchWatchDetailView(watch: $0) }
+            .navigationDestination(for: MarketTrackedListing.self) { ResearchListingDetailView(listing: $0) }
+            .navigationDestination(for: ResearchListingsRoute.self) { ResearchListingsView(route: $0) }
     }
 }
 
@@ -271,15 +316,30 @@ struct ConnectionIndicator: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+            Text(verbatim: title)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var title: String {
         switch model.connection {
-        case .demo:
-            Label("Demo", systemImage: "play.rectangle").foregroundStyle(.orange)
-        case .live:
-            Label("Live", systemImage: "dot.radiowaves.left.and.right").foregroundStyle(Color.scoutGreen)
-        case .connecting:
-            Label("Connecting", systemImage: "ellipsis").foregroundStyle(.secondary)
-        case .offline:
-            Label("Offline", systemImage: "wifi.slash").foregroundStyle(.red)
+        case .demo: "Demo data"
+        case .live: "Live"
+        case .connecting: "Connecting…"
+        case .offline: "Offline"
+        }
+    }
+
+    private var color: Color {
+        switch model.connection {
+        case .demo: .orange
+        case .live: .scoutGreen
+        case .connecting: .secondary
+        case .offline: .red
         }
     }
 }

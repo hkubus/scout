@@ -13,15 +13,15 @@ struct RootView: View {
                     DealsView()
                         .tabItem { Label("Deals", systemImage: "flame") }
                         .tag(AppTab.deals)
-                    NavigationStack {
-                        ListingsView()
-                            .scoutDestinations()
-                    }
-                    .tabItem { Label("Listings", systemImage: "list.bullet.rectangle") }
-                    .tag(AppTab.listings)
+                    SearchView()
+                        .tabItem { Label("Search", systemImage: "magnifyingglass") }
+                        .tag(AppTab.search)
                     WatchesView()
                         .tabItem { Label("Watches", systemImage: "binoculars") }
                         .tag(AppTab.watches)
+                    MarketView()
+                        .tabItem { Label("Market", systemImage: "chart.xyaxis.line") }
+                        .tag(AppTab.market)
                     SettingsView()
                         .tabItem { Label("Settings", systemImage: "gearshape") }
                         .tag(AppTab.settings)

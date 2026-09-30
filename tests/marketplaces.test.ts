@@ -652,6 +652,21 @@ test('maps deal tiers to independent notification thresholds and ntfy payloads',
   assert.equal(JSON.parse(String(requestedInit?.body)).click, listing.url);
 });
 
+test('ntfy alerts can open the Scout iOS app with the marketplace page as an action', () => {
+  const listing = { marketplace: 'Allegro Lokalnie' as const, listingId: 'a b/1', title: 'Deck', price: 900, currency: 'PLN' as const, url: 'https://allegrolokalnie.pl/oferta/deck', observedAt: '2026-08-22T00:00:00.000Z' };
+  const config = validateNtfyConfig({ serverUrl: 'https://ntfy.sh', topic: 'scout-deals', openInApp: true });
+  assert.equal(config.openInApp, true);
+  assert.equal(validateNtfyConfig({ serverUrl: 'https://ntfy.sh', topic: 'scout-deals', openInApp: 'yes' }).openInApp, false);
+
+  const inApp = buildNtfyPayload({ listing, typical: 1400, discountPercent: 35.7, confidence: 94 }, config.topic, 'exceptional', { openInApp: true, watchId: 'watch 1' });
+  assert.equal(inApp.click, 'scout://listing?key=Allegro%20Lokalnie%3Aa%20b%2F1&watchId=watch%201');
+  assert.deepEqual(inApp.actions, [{ action: 'view', label: 'Open listing', url: listing.url, clear: true }]);
+
+  const web = buildNtfyPayload({ listing, typical: 1400, discountPercent: 35.7, confidence: 94 }, config.topic);
+  assert.equal(web.click, listing.url);
+  assert.equal(web.actions, undefined);
+});
+
 test('rejects unsafe ntfy endpoints and invalid topics', () => {
   assert.throws(() => validateNtfyConfig({ serverUrl: 'https://example.com?token=secret', topic: 'scout-deals' }), /credentials or query/);
   assert.throws(() => validateNtfyConfig({ serverUrl: 'http://example.com', topic: 'scout-deals' }), /HTTPS/);

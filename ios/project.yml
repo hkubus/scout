@@ -20,8 +20,10 @@ targets:
     platform: iOS
     sources:
       - path: Scout
+      - path: Shared
     dependencies:
       - package: ScoutKit
+      - target: ScoutWidgets
     info:
       path: Scout/Info.plist
       properties:
@@ -53,10 +55,39 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.hkubus.scout
+        CODE_SIGN_ENTITLEMENTS: Scout/Scout.entitlements
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         ENABLE_PREVIEWS: YES
+  # Home Screen and Lock Screen widgets. Shares settings with the app through
+  # the App Group; see SharedStore in ScoutKit for how SideStore renames it.
+  ScoutWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ScoutWidgets
+      - path: Shared
+    dependencies:
+      - package: ScoutKit
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework
+    info:
+      path: ScoutWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: Scout
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.hkubus.scout.widgets
+        CODE_SIGN_ENTITLEMENTS: ScoutWidgets/ScoutWidgets.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SKIP_INSTALL: YES
 schemes:
   Scout:
     build:

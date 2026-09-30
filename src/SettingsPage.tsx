@@ -65,6 +65,7 @@ export default function SettingsPage({
   const [ntfyTopic, setNtfyTopic] = useState("");
   const [ntfyToken, setNtfyToken] = useState("");
   const [ntfyMinimumPriority, setNtfyMinimumPriority] = useState<NotificationPriority>("exceptional");
+  const [ntfyOpenInApp, setNtfyOpenInApp] = useState(false);
   const [sessionMarketplace, setSessionMarketplace] = useState<Marketplace>("OLX");
   const [sessionLabel, setSessionLabel] = useState("");
   const [storageStateInput, setStorageStateInput] = useState("");
@@ -88,6 +89,7 @@ export default function SettingsPage({
       setDailyDigestNtfy(result.dailyDigest?.ntfy ?? false);
       setNtfyServerUrl(result.ntfy?.serverUrl ?? "https://ntfy.sh");
       setNtfyMinimumPriority(result.ntfy?.minimumPriority ?? "exceptional");
+      setNtfyOpenInApp(result.ntfy?.openInApp ?? false);
     } catch (error) {
       onToast(errorMessage(error), "error");
     }
@@ -129,7 +131,8 @@ export default function SettingsPage({
         ntfyTopic.trim() ||
         ntfyToken.trim() ||
         ntfyServerUrl.trim() !== "https://ntfy.sh" ||
-        ntfyMinimumPriority !== (settings?.ntfy?.minimumPriority ?? "exceptional"),
+        ntfyMinimumPriority !== (settings?.ntfy?.minimumPriority ?? "exceptional") ||
+        ntfyOpenInApp !== (settings?.ntfy?.openInApp ?? false),
       );
       const result = await api.saveSettings({
         interval: numericInterval,
@@ -152,6 +155,7 @@ export default function SettingsPage({
               topic: ntfyTopic.trim() || undefined,
               token: ntfyToken.trim() || undefined,
               minimumPriority: ntfyMinimumPriority,
+              openInApp: ntfyOpenInApp,
             }
           : undefined,
       });
@@ -226,6 +230,7 @@ export default function SettingsPage({
       setNtfyTopic("");
       setNtfyToken("");
       setNtfyMinimumPriority(result.ntfy?.minimumPriority ?? "exceptional");
+      setNtfyOpenInApp(result.ntfy?.openInApp ?? false);
       onToast("ntfy configuration removed.");
     } catch (error) {
       onToast(errorMessage(error), "error");
@@ -763,6 +768,13 @@ export default function SettingsPage({
               </select>
             </label>
           </div>
+          <label className="check-option">
+            <input type="checkbox" checked={ntfyOpenInApp} onChange={(event) => setNtfyOpenInApp(event.target.checked)} />
+            <span>
+              <strong>Open alerts in the Scout iOS app</strong>
+              <small>Tapping an alert opens the listing in the app; an "Open listing" button still goes to the marketplace. Leave off if you read ntfy on desktop or Android.</small>
+            </span>
+          </label>
           <div className="settings-actions">
             <button className="outline-button" disabled={testingNtfy || !ntfyConfigured} onClick={testNtfy}>
               {testingNtfy ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}

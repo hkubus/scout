@@ -14,7 +14,7 @@ from pathlib import Path
 BUNDLE_ID = "io.github.hkubus.scout"
 TINT = "#1d61e8"
 MIN_OS = "17.0"
-SCREENS = ["deals", "listings", "listing", "watches", "watch", "settings"]
+SCREENS = ["deals", "search", "listing", "watches", "watch", "new-watch", "research", "analytics", "settings", "widgets"]
 
 
 def main() -> None:
@@ -83,7 +83,8 @@ def main() -> None:
                 "downloadURL": download,
                 "size": size,
                 "appPermissions": {
-                    "entitlements": [],
+                    # Must match the signed entitlements (see ios.yml).
+                    "entitlements": ["com.apple.security.application-groups"],
                     "privacy": {"NSLocalNetworkUsageDescription": "Scout connects to your Scout server on your local network."},
                 },
             }

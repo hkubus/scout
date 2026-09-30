@@ -542,6 +542,8 @@ export interface NtfySettings {
   topicMasked: string | null;
   tokenConfigured: boolean;
   minimumPriority: NotificationPriority;
+  /** Alerts open the Scout iOS app; the marketplace page becomes an action button. */
+  openInApp: boolean;
 }
 
 export interface MarketplaceSession {

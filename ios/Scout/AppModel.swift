@@ -1,9 +1,10 @@
 import Foundation
 import Observation
 import ScoutKit
+import WidgetKit
 
 enum AppTab: String, Hashable {
-    case deals, listings, watches, settings
+    case deals, search, watches, market, settings
 }
 
 enum ConnectionState: Equatable {
@@ -17,18 +18,24 @@ enum ConnectionState: Equatable {
 struct ListingLink: Hashable, Identifiable {
     var key: String
     var watchId: String?
+    /// Row data shown if the server has no stored detail for the listing.
+    var preview: Listing?
 
     var id: String { "\(watchId ?? ""):\(key)" }
 
-    init(key: String, watchId: String?) {
+    init(key: String, watchId: String?, preview: Listing? = nil) {
         self.key = key
         self.watchId = watchId
+        self.preview = preview
     }
 
     init(_ listing: Listing) {
-        self.init(key: listing.key, watchId: listing.watchId)
+        self.init(key: listing.key, watchId: listing.watchId, preview: listing)
     }
 }
+
+/// The full, filterable listing history (reached from Deals).
+struct AllListingsRoute: Hashable {}
 
 struct WatchListingsRoute: Hashable {
     var watchId: String
@@ -45,9 +52,19 @@ final class AppModel {
     /// also bumps it to reconcile anything missed.
     private(set) var refreshToken = 0
     var selectedTab: AppTab = .deals
+    var marketSection: MarketSection = .research
     var openedListing: ListingLink?
     /// Watch to push once the Watches tab has loaded (screenshots).
     var pendingWatchID: String?
+    /// Opens the new-watch form when the Watches tab appears (screenshots).
+    var pendingNewWatch = false
+    /// Query the Search tab runs when it appears (screenshots).
+    var pendingSearchQuery: String?
+    /// Latest per-marketplace result streamed while a manual search runs.
+    private(set) var searchProgress: SearchProgressEvent?
+    /// What the widgets show, for the in-app widget preview.
+    private(set) var widgetSnapshot: WidgetSnapshot?
+    var showWidgetGallery = false
     var alertMessage: String?
 
     @ObservationIgnored private var eventsTask: Task<Void, Never>?
@@ -55,38 +72,55 @@ final class AppModel {
     @ObservationIgnored private let defaults = UserDefaults.standard
 
     private static let serverURLKey = "serverURL"
-    private static let refreshEvents: Set<String> = ["scan", "watch", "notification", "listing-action", "ai-description-verification"]
+    private static let refreshEvents: Set<String> = ["scan", "watch", "notification", "listing-action", "ai-description-verification", "market-watch"]
 
     init() {
         // `-ScoutDemo YES -ScoutScreen <screen>` launch arguments drive the CI screenshots.
         if defaults.bool(forKey: "ScoutDemo") {
             useDemo()
         } else if let saved = defaults.string(forKey: Self.serverURLKey), let url = URL(string: saved) {
-            client = ScoutClient(baseURL: url)
+            client = ScoutClient(baseURL: url, apiToken: SharedStore.apiToken)
         }
         switch defaults.string(forKey: "ScoutScreen") {
-        case "listings": selectedTab = .listings
+        case "search":
+            selectedTab = .search
+            pendingSearchQuery = "steam deck"
+        case "research":
+            selectedTab = .market
+            marketSection = .research
+        case "analytics":
+            selectedTab = .market
+            marketSection = .analytics
         case "watches": selectedTab = .watches
         case "settings": selectedTab = .settings
         case "watch":
             selectedTab = .watches
             pendingWatchID = "watch-deck"
         case "listing": openedListing = ListingLink(key: "OLX:890231", watchId: "watch-deck")
+        case "new-watch":
+            selectedTab = .watches
+            pendingNewWatch = true
+        case "widgets":
+            selectedTab = .settings
+            showWidgetGallery = true
         default: break
         }
+        syncWidgetConnection()
     }
 
     var isDemo: Bool { connection == .demo }
     var serverURL: URL? { isDemo ? nil : client?.baseURL }
     var lastServerAddress: String { defaults.string(forKey: Self.serverURLKey) ?? "" }
 
-    func connect(to address: String) async throws {
+    func connect(to address: String, apiToken: String = "") async throws {
         let url = try ServerAddress.normalize(address)
-        let candidate = ScoutClient(baseURL: url)
-        _ = try await candidate.health()
+        let candidate = ScoutClient(baseURL: url, apiToken: apiToken)
+        try await candidate.verifyAccess()
         defaults.set(url.absoluteString, forKey: Self.serverURLKey)
+        SharedStore.saveAPIToken(candidate.apiToken)
         client = candidate
         connection = .connecting
+        syncWidgetConnection()
         startLiveUpdates()
     }
 
@@ -94,6 +128,7 @@ final class AppModel {
         stopLiveUpdates()
         client = ScoutClient(baseURL: DemoTransport.baseURL, transport: DemoTransport())
         connection = .demo
+        syncWidgetConnection()
     }
 
     func disconnect() {
@@ -102,6 +137,9 @@ final class AppModel {
         connection = .connecting
         openedListing = nil
         selectedTab = .deals
+        widgetSnapshot = nil
+        SharedStore.saveAPIToken(nil)
+        syncWidgetConnection()
     }
 
     func refresh() {
@@ -109,11 +147,41 @@ final class AppModel {
     }
 
     func open(_ url: URL) {
-        guard url.scheme == "scout", url.host == "listing",
+        guard url.scheme == "scout" else { return }
+        if url.host == "deals" {
+            openedListing = nil
+            selectedTab = .deals
+            return
+        }
+        guard url.host == "listing",
               let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
               let key = items.first(where: { $0.name == "key" })?.value, !key.isEmpty
         else { return }
         openedListing = ListingLink(key: key, watchId: items.first(where: { $0.name == "watchId" })?.value)
+    }
+
+    /// Switches to the Watches tab and opens the watch (after creating one).
+    func showWatch(_ watch: Watch) {
+        openedListing = nil
+        pendingWatchID = watch.id
+        selectedTab = .watches
+    }
+
+    // MARK: - Widgets
+
+    /// Called after each dashboard load; reloads widgets only when what they
+    /// show has changed.
+    func publishWidgets(from dashboard: DashboardData) {
+        let snapshot = WidgetSnapshot.make(from: dashboard, isDemo: isDemo, source: WidgetSnapshot.source(serverURL: serverURL, isDemo: isDemo))
+        widgetSnapshot = snapshot
+        if SharedStore.saveSnapshot(snapshot) {
+            WidgetCenter.shared.reloadAllTimelines()
+        }
+    }
+
+    private func syncWidgetConnection() {
+        SharedStore.saveConnection(serverURL: serverURL, isDemo: isDemo)
+        WidgetCenter.shared.reloadAllTimelines()
     }
 
     func report(_ error: Error) {
@@ -157,6 +225,10 @@ final class AppModel {
             if connection != .live {
                 connection = .live
                 scheduleRefresh()
+            }
+        } else if event.event == "search" {
+            if let progress = try? JSONDecoder().decode(SearchProgressEvent.self, from: Data(event.data.utf8)) {
+                searchProgress = progress
             }
         } else if Self.refreshEvents.contains(event.event) {
             scheduleRefresh()

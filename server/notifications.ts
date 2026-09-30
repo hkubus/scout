@@ -47,6 +47,15 @@ export interface NtfyConfig {
   topic: string;
   token?: string;
   minimumPriority: NotificationPriority;
+  /** Tapping an alert opens the Scout iOS app (`scout://`) instead of the marketplace page. */
+  openInApp: boolean;
+}
+
+export interface NtfyAction {
+  action: 'view';
+  label: string;
+  url: string;
+  clear?: boolean;
 }
 
 export interface NtfyPayload {
@@ -56,6 +65,20 @@ export interface NtfyPayload {
   priority: number;
   tags: string[];
   click: string;
+  actions?: NtfyAction[];
+}
+
+/** Opens the Deals tab of the Scout iOS app. */
+export const SCOUT_APP_DEALS_LINK = 'scout://deals';
+
+/**
+ * Opens one listing in the Scout iOS app. Built with encodeURIComponent, not
+ * URLSearchParams: the app decodes `+` literally, so spaces (as in
+ * "Allegro Lokalnie") must be `%20`.
+ */
+export function scoutAppListingLink(listing: Pick<NormalizedListing, 'marketplace' | 'listingId'>, watchId?: string | null) {
+  const key = encodeURIComponent(`${listing.marketplace}:${listing.listingId}`);
+  return `scout://listing?key=${key}${watchId ? `&watchId=${encodeURIComponent(watchId)}` : ''}`;
 }
 
 export function validateNtfyConfig(input: {
@@ -63,6 +86,7 @@ export function validateNtfyConfig(input: {
   topic?: string | null;
   token?: string | null;
   minimumPriority?: unknown;
+  openInApp?: unknown;
 }): NtfyConfig {
   const serverValue = (input.serverUrl ?? 'https://ntfy.sh').trim();
   let server: URL;
@@ -75,7 +99,7 @@ export function validateNtfyConfig(input: {
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(topic)) throw new Error('ntfy topic must be 1–64 letters, numbers, hyphens, or underscores');
   const token = (input.token ?? '').trim() || undefined;
   if (token && token.length > 512) throw new Error('ntfy access token is too long');
-  return { serverUrl, topic, token, minimumPriority: parseNotificationPriority(input.minimumPriority, 'exceptional') };
+  return { serverUrl, topic, token, minimumPriority: parseNotificationPriority(input.minimumPriority, 'exceptional'), openInApp: input.openInApp === true };
 }
 
 function isPrivateAddress(hostname: string) {
@@ -123,7 +147,12 @@ export interface DealNotificationInput {
   variantLabel?: string | null;
 }
 
-export function buildNtfyPayload(input: DealNotificationInput, topic: string, priority = priorityFromDiscount(input.discountPercent)): NtfyPayload {
+export function buildNtfyPayload(
+  input: DealNotificationInput,
+  topic: string,
+  priority = priorityFromDiscount(input.discountPercent),
+  options: { openInApp?: boolean; watchId?: string | null } = {},
+): NtfyPayload {
   const { listing } = input;
   const tags = priority === 'exceptional' ? ['rotating_light', 'moneybag'] : priority === 'very-strong' ? ['warning', 'moneybag'] : ['moneybag'];
   return {
@@ -137,7 +166,9 @@ export function buildNtfyPayload(input: DealNotificationInput, topic: string, pr
     ].join('\n'),
     priority: ntfyPriorityNumber(priority),
     tags,
-    click: listing.url,
+    // In app mode the marketplace page stays one tap away as an action button.
+    click: options.openInApp ? scoutAppListingLink(listing, options.watchId) : listing.url,
+    ...(options.openInApp ? { actions: [{ action: 'view' as const, label: 'Open listing', url: listing.url, clear: true }] } : {}),
   };
 }
 
