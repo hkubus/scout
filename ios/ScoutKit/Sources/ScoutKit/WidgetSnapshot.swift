@@ -50,15 +50,71 @@ public struct WidgetSnapshot: Codable, Hashable, Sendable {
         return WidgetSnapshot(generatedAt: now, stats: dashboard.stats, lastScan: dashboard.lastScan, deals: Array(deals), isDemo: isDemo, source: source)
     }
 
-    /// Same content, ignoring when it was generated and any thumbnails.
+    /// Same content as the widgets draw it. Ignores when it was generated,
+    /// thumbnails (they follow `imageURL`) and fields no widget shows, such as
+    /// `lastScan` and each deal's `observedAt`, `typical` and `dealStrength`,
+    /// which change on nearly every scan.
     public func hasSameContent(as other: WidgetSnapshot) -> Bool {
-        var left = self
-        var right = other
-        left.generatedAt = .distantPast
-        right.generatedAt = .distantPast
-        left.deals = left.deals.map { $0.withoutThumbnail }
-        right.deals = right.deals.map { $0.withoutThumbnail }
-        return left == right
+        rendered == other.rendered
+    }
+
+    /// Whether `snapshot` should replace `current` in the App Group, which
+    /// reloads every widget: when what they draw changed, or when the saved
+    /// copy is `refreshAfter` older so the "Updated" time and an offline
+    /// widget still catch up while the app stays open.
+    public static func shouldReplace(_ current: WidgetSnapshot?, with snapshot: WidgetSnapshot, refreshAfter: TimeInterval = 15 * 60) -> Bool {
+        guard let current, current.hasSameContent(as: snapshot) else { return true }
+        return snapshot.generatedAt.timeIntervalSince(current.generatedAt) >= refreshAfter
+    }
+
+    private struct Rendered: Equatable {
+        var isDemo: Bool
+        var source: String?
+        var watching: Int
+        var newToday: Int
+        var strongDeals: Int
+        var deals: [RenderedDeal]
+    }
+
+    private struct RenderedDeal: Equatable {
+        var key: String
+        var watchId: String?
+        var title: String
+        var price: String
+        var discount: String?
+        var dealLabel: DealLabel
+        var marketplace: Marketplace
+        var imageURL: String
+    }
+
+    private var rendered: Rendered {
+        Rendered(
+            isDemo: isDemo,
+            source: source,
+            watching: stats.watching,
+            newToday: stats.newToday,
+            strongDeals: stats.strongDeals,
+            deals: deals.map {
+                RenderedDeal(
+                    key: $0.key, watchId: $0.watchId, title: $0.title,
+                    price: WidgetFormat.pln($0.price), discount: WidgetFormat.discount($0.belowTypical),
+                    dealLabel: $0.dealLabel, marketplace: $0.marketplace, imageURL: $0.imageURL
+                )
+            }
+        )
+    }
+}
+
+/// How widgets write prices and discounts. The content comparison uses the
+/// same text, so a change that doesn't show never reloads the widgets.
+public enum WidgetFormat {
+    public static func pln(_ value: Double) -> String {
+        value.formatted(.currency(code: "PLN").precision(.fractionLength(0)).locale(Locale(identifier: "pl_PL")))
+    }
+
+    public static func discount(_ belowTypical: Double?) -> String? {
+        guard let belowTypical, belowTypical < 0 else { return nil }
+        return "−\(Int(abs(belowTypical).rounded()))%"
     }
 }
 
@@ -101,12 +157,6 @@ public struct WidgetDeal: Codable, Hashable, Sendable, Identifiable {
         components.host = "listing"
         components.queryItems = [URLQueryItem(name: "key", value: key)] + (watchId.map { [URLQueryItem(name: "watchId", value: $0)] } ?? [])
         return components.url!
-    }
-
-    var withoutThumbnail: WidgetDeal {
-        var copy = self
-        copy.thumbnail = nil
-        return copy
     }
 }
 
@@ -158,14 +208,24 @@ public enum SharedStore {
         appGroup.flatMap(UserDefaults.init(suiteName:))
     }
 
-    public static func saveConnection(serverURL: URL?, isDemo: Bool) {
-        guard let defaults else { return }
+    /// Saves which server (or the demo) widgets should use. Returns whether
+    /// that changed, so the app can skip reloading widgets when it didn't;
+    /// without an App Group nothing can be compared and it returns true.
+    @discardableResult
+    public static func saveConnection(serverURL: URL?, isDemo: Bool) -> Bool {
+        guard let defaults else { return true }
+        return saveConnection(serverURL: serverURL, isDemo: isDemo, in: defaults)
+    }
+
+    static func saveConnection(serverURL: URL?, isDemo: Bool, in defaults: UserDefaults) -> Bool {
         // Another server (or leaving the demo) makes the saved snapshot wrong.
-        if defaults.string(forKey: serverURLKey) != serverURL?.absoluteString || defaults.bool(forKey: demoKey) != isDemo {
+        let changed = defaults.string(forKey: serverURLKey) != serverURL?.absoluteString || defaults.bool(forKey: demoKey) != isDemo
+        if changed {
             defaults.removeObject(forKey: snapshotKey)
         }
         defaults.set(serverURL?.absoluteString, forKey: serverURLKey)
         defaults.set(isDemo, forKey: demoKey)
+        return changed
     }
 
     /// The API token for `serverURL`. It lives in the Keychain under the App
@@ -195,18 +255,27 @@ public enum SharedStore {
         defaults?.bool(forKey: demoKey) ?? false
     }
 
-    /// Saves the snapshot; returns false when the content was unchanged.
+    /// Saves the snapshot; returns false when it didn't replace the saved one
+    /// (see `WidgetSnapshot.shouldReplace`), so widgets needn't reload.
     @discardableResult
-    public static func saveSnapshot(_ snapshot: WidgetSnapshot) -> Bool {
+    public static func saveSnapshot(_ snapshot: WidgetSnapshot, refreshAfter: TimeInterval = 15 * 60) -> Bool {
         guard let defaults else { return false }
-        if let current = loadSnapshot(), current.hasSameContent(as: snapshot) { return false }
+        return saveSnapshot(snapshot, refreshAfter: refreshAfter, in: defaults)
+    }
+
+    static func saveSnapshot(_ snapshot: WidgetSnapshot, refreshAfter: TimeInterval, in defaults: UserDefaults) -> Bool {
+        guard WidgetSnapshot.shouldReplace(loadSnapshot(from: defaults), with: snapshot, refreshAfter: refreshAfter) else { return false }
         guard let data = try? JSONEncoder().encode(snapshot) else { return false }
         defaults.set(data, forKey: snapshotKey)
         return true
     }
 
     public static func loadSnapshot() -> WidgetSnapshot? {
-        guard let data = defaults?.data(forKey: snapshotKey) else { return nil }
+        defaults.flatMap(loadSnapshot(from:))
+    }
+
+    static func loadSnapshot(from defaults: UserDefaults) -> WidgetSnapshot? {
+        guard let data = defaults.data(forKey: snapshotKey) else { return nil }
         return try? JSONDecoder().decode(WidgetSnapshot.self, from: data)
     }
 }

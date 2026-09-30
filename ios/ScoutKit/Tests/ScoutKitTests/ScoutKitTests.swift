@@ -371,6 +371,113 @@ final class WidgetSnapshotTests: XCTestCase {
         XCTAssertFalse(first.hasSameContent(as: second))
     }
 
+    func testContentComparisonIgnoresFieldsWidgetsDontDraw() {
+        let first = WidgetSnapshot.make(from: DemoTransport.dashboard(), now: Date(timeIntervalSince1970: 0))
+        var second = first
+        // A scan re-seeing the listings bumps these on every deal.
+        second.lastScan = "just now"
+        for index in second.deals.indices {
+            second.deals[index].observedAt = "2030-01-01T00:00:00.000Z"
+            second.deals[index].typical = (second.deals[index].typical ?? 100) + 7
+            second.deals[index].dealStrength += 0.3
+        }
+        XCTAssertTrue(first.hasSameContent(as: second))
+
+        // Only the rounded text is drawn: "−20%" and "2000 zł" (half-even, like the widgets).
+        var shown = first
+        shown.deals[0].belowTypical = -20.2
+        shown.deals[0].price = 1999.6
+        var same = shown
+        same.deals[0].belowTypical = -20.4
+        same.deals[0].price = 2000.4
+        XCTAssertTrue(shown.hasSameContent(as: same))
+        same.deals[0].belowTypical = -20.6
+        XCTAssertFalse(shown.hasSameContent(as: same))
+        same = shown
+        same.deals[0].price = 10.5
+        var other = shown
+        other.deals[0].price = 11.4
+        XCTAssertEqual(WidgetFormat.pln(10.5), WidgetFormat.pln(10.4))
+        XCTAssertFalse(same.hasSameContent(as: other))
+        same = shown
+        same.deals[0].belowTypical = 3
+        other = shown
+        other.deals[0].belowTypical = nil
+        XCTAssertTrue(same.hasSameContent(as: other))
+    }
+
+    func testContentComparisonCatchesEveryDrawnChange() {
+        let first = WidgetSnapshot.make(from: DemoTransport.dashboard(), source: "https://a", now: Date(timeIntervalSince1970: 0))
+        let changes: [(String, (inout WidgetSnapshot) -> Void)] = [
+            ("order", { $0.deals.swapAt(0, 1) }),
+            ("dropped deal", { $0.deals.removeLast() }),
+            ("title", { $0.deals[1].title += "!" }),
+            ("price", { $0.deals[1].price += 1 }),
+            ("discount appears", { $0.deals[1].belowTypical = -50 }),
+            ("label", { $0.deals[1].dealLabel = $0.deals[1].dealLabel == .exceptional ? .strong : .exceptional }),
+            ("marketplace", { $0.deals[1].marketplace = $0.deals[1].marketplace == .olx ? .vinted : .olx }),
+            ("photo", { $0.deals[1].imageURL += "?v=2" }),
+            ("link", { $0.deals[1].watchId = "watch-other" }),
+            ("key", { $0.deals[1].key += "-2" }),
+            ("watching", { $0.stats.watching += 1 }),
+            ("new today", { $0.stats.newToday += 1 }),
+            ("strong deals", { $0.stats.strongDeals += 1 }),
+            ("demo", { $0.isDemo.toggle() }),
+            ("source", { $0.source = "https://b" }),
+        ]
+        for (name, change) in changes {
+            var second = first
+            change(&second)
+            XCTAssertFalse(first.hasSameContent(as: second), name)
+        }
+    }
+
+    func testReplacesTheSavedSnapshotOnDrawnChangesOrAfterTheRefreshFloor() {
+        let saved = WidgetSnapshot.make(from: DemoTransport.dashboard(), now: Date(timeIntervalSince1970: 1_000))
+        func rescan(after seconds: TimeInterval) -> WidgetSnapshot {
+            var next = saved
+            next.generatedAt = saved.generatedAt.addingTimeInterval(seconds)
+            next.lastScan = "just now"
+            next.deals[0].observedAt = "2030-01-01T00:00:00.000Z"
+            return next
+        }
+        XCTAssertTrue(WidgetSnapshot.shouldReplace(nil, with: saved))
+        XCTAssertFalse(WidgetSnapshot.shouldReplace(saved, with: rescan(after: 60)))
+        XCTAssertFalse(WidgetSnapshot.shouldReplace(saved, with: rescan(after: 15 * 60 - 1)))
+        XCTAssertTrue(WidgetSnapshot.shouldReplace(saved, with: rescan(after: 15 * 60)))
+        XCTAssertTrue(WidgetSnapshot.shouldReplace(saved, with: rescan(after: 60), refreshAfter: 30))
+        var changed = rescan(after: 1)
+        changed.deals[0].price += 5
+        XCTAssertTrue(WidgetSnapshot.shouldReplace(saved, with: changed))
+    }
+
+    func testSavesSnapshotsAndConnectionsOnlyWhenTheyChange() throws {
+        let suite = "scout-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let snapshot = WidgetSnapshot.make(from: DemoTransport.dashboard(), source: "https://a", now: Date(timeIntervalSince1970: 1_000))
+        XCTAssertTrue(SharedStore.saveSnapshot(snapshot, refreshAfter: 900, in: defaults))
+        var rescanned = snapshot
+        rescanned.generatedAt.addTimeInterval(60)
+        rescanned.lastScan = "just now"
+        XCTAssertFalse(SharedStore.saveSnapshot(rescanned, refreshAfter: 900, in: defaults))
+        XCTAssertEqual(SharedStore.loadSnapshot(from: defaults)?.generatedAt, snapshot.generatedAt)
+        rescanned.generatedAt.addTimeInterval(900)
+        XCTAssertTrue(SharedStore.saveSnapshot(rescanned, refreshAfter: 900, in: defaults))
+        XCTAssertEqual(SharedStore.loadSnapshot(from: defaults)?.generatedAt, rescanned.generatedAt)
+
+        let server = URL(string: "https://a")!
+        XCTAssertFalse(SharedStore.saveConnection(serverURL: nil, isDemo: false, in: defaults))
+        XCTAssertTrue(SharedStore.saveConnection(serverURL: server, isDemo: false, in: defaults))
+        // Switching servers drops the old server's snapshot.
+        XCTAssertNil(SharedStore.loadSnapshot(from: defaults))
+        XCTAssertTrue(SharedStore.saveSnapshot(snapshot, refreshAfter: 900, in: defaults))
+        XCTAssertFalse(SharedStore.saveConnection(serverURL: server, isDemo: false, in: defaults))
+        XCTAssertNotNil(SharedStore.loadSnapshot(from: defaults))
+        XCTAssertTrue(SharedStore.saveConnection(serverURL: server, isDemo: true, in: defaults))
+        XCTAssertTrue(SharedStore.saveConnection(serverURL: URL(string: "https://b")!, isDemo: true, in: defaults))
+    }
+
     func testDefaultGroupIsAlwaysACandidate() {
         XCTAssertEqual(SharedStore.candidateGroups().last, SharedStore.defaultAppGroup)
         XCTAssertNil(SharedStore.appGroup)
