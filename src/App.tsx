@@ -28,6 +28,7 @@ import {
 import { api, UNAUTHORIZED_EVENT, type AuthSession } from "./api";
 import { emptyDashboard } from "./data";
 import { subscribe, subscribeStatus } from "./events";
+import { isListingActionEvent, patchListingRows } from "./listingActions";
 import { allLiveResources, dashboardResources, eventResources, planFlush, type LiveResource } from "./liveRefresh";
 import ListingTable from "./ListingTable";
 import type { WatchPreset } from "./presets";
@@ -325,17 +326,37 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
       for (const resource of resources) dirty.current.add(resource);
       scheduleFlush();
     };
+    // Triage clicks (in any tab) patch the loaded rows at once and reconcile
+    // stats and pages once, 2 s after the last click of a burst.
+    let triageTimer: number | null = null;
+    const onListingAction = (payload: unknown) => {
+      if (!isListingActionEvent(payload)) return;
+      setData((previous) => {
+        const listings = patchListingRows(previous.listings, payload);
+        return listings === previous.listings ? previous : { ...previous, listings };
+      });
+      for (const resource of eventResources["listing-action"]) dirty.current.add(resource);
+      if (triageTimer !== null) window.clearTimeout(triageTimer);
+      triageTimer = window.setTimeout(() => {
+        triageTimer = null;
+        void flushRef.current();
+      }, 2000);
+    };
     const unsubscribers = [
       // A stream that comes back after a gap (server restart, hidden tab) may have missed events.
       subscribeStatus((status, reconnected) => {
         setConnection(status);
         if (reconnected) markDirty(allLiveResources);
       }),
-      ...Object.entries(eventResources).map(([event, resources]) => subscribe(event, () => markDirty(resources))),
+      ...Object.entries(eventResources)
+        .filter(([event]) => event !== "listing-action")
+        .map(([event, resources]) => subscribe(event, () => markDirty(resources))),
+      subscribe("listing-action", onListingAction),
       subscribe("log", () => setLogsRefreshKey((value) => value + 1)),
     ];
     return () => {
       if (flushTimer.current !== null) window.clearTimeout(flushTimer.current);
+      if (triageTimer !== null) window.clearTimeout(triageTimer);
       flushTimer.current = null;
       for (const unsubscribe of unsubscribers) unsubscribe();
     };
@@ -578,8 +599,10 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
       const result = await api.updateListingAction(listing.marketplaceListingKey ?? listing.id, { hidden: nextHidden });
       updateListingAction({ ...listing, decision: result.action.decision, note: result.action.note, hidden: result.action.hidden });
       notify(nextHidden ? "Listing hidden from the overview and alerts." : "Listing unhidden.");
+      return result.action;
     } catch (error) {
       notify(errorMessage(error), "error");
+      return null;
     }
   }, [notify, updateListingAction]);
 
