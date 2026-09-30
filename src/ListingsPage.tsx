@@ -3,6 +3,7 @@ import { ChevronDown, Database, Search, X } from "lucide-react";
 import { api } from "./api";
 import { subscribe } from "./events";
 import { applyListingActionToPage, isListingActionEvent, listingActionKey, type ListingActionEvent } from "./listingActions";
+import { reuseUnchangedListings } from "./listingRows";
 import ListingTable from "./ListingTable";
 import type { Listing, ListingAction, ListingDecision, Marketplace } from "./types";
 
@@ -84,7 +85,8 @@ export default function ListingsPage({
       decision: decision === "All" ? undefined : decision,
       visibility: visibilityKey,
     }, controller.signal)
-      .then((result) => setRemote({ listings: result.listings, pagination: result.pagination }))
+      // Unchanged rows keep their identity, so their memoized rows skip.
+      .then((result) => setRemote((current) => ({ listings: current ? reuseUnchangedListings(current.listings, result.listings) : result.listings, pagination: result.pagination })))
       .catch(() => {
         if (controller.signal.aborted) return;
         setRemote(null);

@@ -29,6 +29,7 @@ import { api, UNAUTHORIZED_EVENT, type AuthSession } from "./api";
 import { emptyDashboard } from "./data";
 import { subscribe, subscribeStatus } from "./events";
 import { isListingActionEvent, patchListingRows } from "./listingActions";
+import { reuseUnchangedListings } from "./listingRows";
 import { allLiveResources, dashboardResources, eventResources, planFlush, type LiveResource } from "./liveRefresh";
 import ListingTable from "./ListingTable";
 import type { WatchPreset } from "./presets";
@@ -272,7 +273,11 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         const next = await api.dashboard();
         if (sequence !== refreshSequence.current) return;
         dashboardLoaded.current = true;
-        setData(next);
+        // Unchanged rows keep their identity, so Overview's filtered list and rows skip.
+        setData((previous) => {
+          const listings = reuseUnchangedListings(previous.listings, next.listings);
+          return listings === next.listings ? next : { ...next, listings };
+        });
         setConnection("online");
         // Events that arrived while this request was in flight need a fresh one.
         if (dirty.current.has("dashboard")) scheduleFlush();
