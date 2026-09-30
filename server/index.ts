@@ -4,7 +4,7 @@ import fastifyStatic from '@fastify/static';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createReadStream, existsSync } from 'node:fs';
-import { basename, resolve } from 'node:path';
+import { basename, join, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { listings as seedListings, watches as seedWatches } from '../src/data';
@@ -925,7 +925,20 @@ app.delete('/mcp', async (_request, reply) => reply.code(405).send({ jsonrpc: '2
 
 const distPath = process.env.SCOUT_DIST_PATH?.trim() || resolve(process.cwd(), 'dist');
 if (existsSync(distPath)) {
-  await app.register(fastifyStatic, { root: distPath, wildcard: false });
+  // Vite's content-hashed /assets files are safe to cache for a year; index.html,
+  // favicon.svg and the SPA fallback keep revalidating. Build-time .br/.gz
+  // siblings (scripts/precompress.mjs) are served in place of the originals and
+  // are not exposed as routes of their own.
+  const assetsDir = join(resolve(distPath), 'assets') + sep;
+  await app.register(fastifyStatic, {
+    root: distPath,
+    wildcard: false,
+    preCompressed: true,
+    globIgnore: ['**/*.br', '**/*.gz'],
+    setHeaders: (reply, filePath) => {
+      if (filePath.startsWith(assetsDir)) reply.header('cache-control', 'public, max-age=31536000, immutable');
+    },
+  });
   app.setNotFoundHandler((request, reply) => {
     if (request.url.startsWith('/api') || request.url === '/events' || request.url === '/mcp') return reply.code(404).send({ error: 'Not found' });
     if (request.method !== 'GET' && request.method !== 'HEAD') return reply.code(404).send({ error: 'Not found' });
