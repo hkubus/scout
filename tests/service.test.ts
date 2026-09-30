@@ -1356,6 +1356,87 @@ test('watch analytics daily rows and bounds match the observation-driven queries
   } finally { context.close(); }
 });
 
+// The pre-rewrite per-observation baseline queries and bucketing, kept as the
+// oracle for the association-driven watchBaselines.
+function legacyWatchBaselines(db: any, row: Record<string, any>) {
+  const filters = `
+      JOIN listings l ON l.id = o.listing_id
+      LEFT JOIN watch_listings wl ON wl.id = o.watch_listing_id
+      WHERE o.watch_id = ?
+        AND (? = 0 OR NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))))
+        AND (? = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
+        AND (? IS NULL OR o.price_pln >= ?)
+        AND (? IS NULL OR o.price_pln <= ?)`;
+  const params = [row.id, row.ai_relevance === 0 ? 0 : 1, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln];
+  const latest = db.prepare(`SELECT price_pln, variant_key FROM (
+      SELECT o.price_pln, o.observed_at, o.id, COALESCE(wl.variant_key, ?) AS variant_key, ROW_NUMBER() OVER (PARTITION BY o.listing_id ORDER BY o.observed_at DESC, o.id DESC) AS rank
+      FROM observations o INDEXED BY observations_watch_listing ${filters}
+    ) WHERE rank <= 1 ORDER BY observed_at DESC, id DESC`).all(OTHER_VARIANT_KEY, ...params) as Array<{ price_pln: number; variant_key: string }>;
+  const firstByVariant = db.prepare(`SELECT COALESCE(wl.variant_key, ?) AS variant_key, MIN(o.observed_at) AS first
+    FROM observations o INDEXED BY observations_watch_listing ${filters}
+    GROUP BY COALESCE(wl.variant_key, ?)`).all(OTHER_VARIANT_KEY, ...params, OTHER_VARIANT_KEY) as Array<{ variant_key: string; first: string | null }>;
+  const buckets = new Map<string, { prices: number[]; firstObservedAt: string | null }>();
+  const bucketFor = (key: string) => {
+    let bucket = buckets.get(key);
+    if (!bucket) { bucket = { prices: [], firstObservedAt: null }; buckets.set(key, bucket); }
+    return bucket;
+  };
+  for (const item of latest) {
+    const price = Number(item.price_pln);
+    if (!Number.isFinite(price) || price <= 0) continue;
+    const bucket = bucketFor(item.variant_key ?? OTHER_VARIANT_KEY);
+    if (bucket.prices.length < 400) bucket.prices.push(price);
+  }
+  for (const item of firstByVariant) bucketFor(item.variant_key ?? OTHER_VARIANT_KEY).firstObservedAt = item.first ?? null;
+  return buckets;
+}
+
+test('association-driven watch baselines match the per-observation queries', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const hoursAgo = (hours: number) => new Date(Date.now() - hours * 3_600_000).toISOString();
+    // A full bucket (more than 400 priced listings, so the cap and newest-first order
+    // matter), plus non-positive prices that must be skipped while still
+    // counting towards a variant's first observation.
+    seedWatch(context.db, 'stats-full');
+    context.db.prepare('UPDATE watches SET variant_groups_json = ? WHERE id = ?').run(JSON.stringify([{ id: 'a', label: 'A', terms: 'a', exclude: '' }]), 'stats-full');
+    const insertListing = context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, shipping_available, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    const findListing = context.db.prepare('SELECT id FROM listings WHERE listing_id = ?');
+    const setVariant = context.db.prepare('UPDATE watch_listings SET variant_key = ? WHERE watch_id = ? AND listing_id = ?');
+    context.db.exec('BEGIN');
+    for (let index = 0; index < 560; index += 1) {
+      const listingId = `full-${index}`;
+      insertListing.run('OLX', listingId, `GPU ${index}`, 100 + index, 1, `https://example.test/${listingId}`, hoursAgo(90), hoursAgo(1));
+      const listing = findListing.get(listingId) as { id: number };
+      // Same-timestamp rows across listings exercise the id tie-break.
+      insertObservation.run(listing.id, 'stats-full', index % 9 === 0 ? 0 : 100 + index, hoursAgo(80 - (index % 50)));
+      insertObservation.run(listing.id, 'stats-full', index % 11 === 0 ? 0 : 90 + (index % 40), hoursAgo(20 - (index % 17)));
+      setVariant.run(index % 10 === 0 ? 'a' : null, 'stats-full', listing.id);
+    }
+    context.db.exec('COMMIT');
+    context.db.prepare('UPDATE observations SET watch_listing_id = (SELECT id FROM watch_listings WHERE watch_id = observations.watch_id AND listing_id = observations.listing_id) WHERE watch_listing_id IS NULL').run();
+    const service = context.service as any;
+    const rows = context.db.prepare('SELECT * FROM watches ORDER BY id').all() as Array<Record<string, any>>;
+    const variants: Array<Record<string, unknown>> = [{}, { min_price_pln: 150 }, { max_price_pln: 250 }, { min_price_pln: 120, max_price_pln: 260 }, { shipping_only: 1 }, { ai_relevance: 0 }, { min_price_pln: 100000 }];
+    let compared = 0;
+    for (const base of rows) {
+      for (const override of variants) {
+        const row = { ...base, ...override };
+        const actual = service.watchBaselines(row).buckets as Map<string, { prices: number[]; firstObservedAt: string | null }>;
+        const expected = legacyWatchBaselines(context.db, row);
+        const normalize = (buckets: Map<string, { prices: number[]; firstObservedAt: string | null }>) => [...buckets.entries()].sort(([a], [b]) => a.localeCompare(b));
+        assert.deepEqual(normalize(actual), normalize(expected), `${row.id} ${JSON.stringify(override)}`);
+        compared += actual.size;
+      }
+    }
+    assert.ok(compared > 50);
+    const full = service.watchBaselines(rows.find((row) => row.id === 'stats-full')).buckets.get(OTHER_VARIANT_KEY);
+    assert.equal(full.prices.length, 400);
+  } finally { context.close(); }
+});
+
 test('market research filters match terms, price, condition, and shipping, from any town', () => {
   const listings = [
     { marketplace: 'OLX' as const, listingId: 'match', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/match', condition: 'New', location: 'Warszawa', shippingAvailable: true, observedAt: new Date().toISOString() },

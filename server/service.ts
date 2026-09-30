@@ -4461,10 +4461,15 @@ export class ScoutService {
    * Per-variant inputs every listing in a scan scores against: the latest
    * observed price per listing (the baseline distribution) bucketed by the
    * listing's assigned variant_key, plus each variant's first server-observed
-   * timestamp. Computed once per scan. The window function walks the
-   * (watch_id, listing_id, observed_at, id) index in one linear pass; INDEXED
-   * BY pins that covering index because the planner otherwise sometimes picked
-   * observations_watch_time and re-sorted the watch's full history.
+   * timestamp. Computed once per source scan.
+   *
+   * The query is driven by the watch's associations, so its cost follows the
+   * number of listings rather than the length of the observation history: for
+   * each association two LIMIT-1 seeks into the (watch_id, listing_id,
+   * observed_at, id) index find the newest and the oldest in-bounds
+   * observation. INDEXED BY pins that index for both probes. Each association
+   * is (watch_id, listing_id), which every observation's watch_listing_id
+   * points at, so the rows match the old per-observation window query.
    *
    * With no configured groups every row lands in the single OTHER bucket, so
    * the legacy watch-wide baseline is reproduced unchanged. Each bucket keeps
@@ -4473,42 +4478,52 @@ export class ScoutService {
    */
   private watchBaselines(row: WatchRow): WatchBaselines {
     const groups = parseVariantGroups(row.variant_groups_json);
-    const baselineFilters = `
-      JOIN listings l ON l.id = o.listing_id
-      LEFT JOIN watch_listings wl ON wl.id = o.watch_listing_id
-      WHERE o.watch_id = ?
-        AND (? = 0 OR NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))))
-        AND (? = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
-        AND (? IS NULL OR o.price_pln >= ?)
-        AND (? IS NULL OR o.price_pln <= ?)`;
-    const baselineParams = [
+    const rows = this.stmt(`SELECT o.price_pln, x.variant_key, x.first
+      FROM (
+        SELECT COALESCE(wl.variant_key, ?) AS variant_key,
+          (SELECT o2.id FROM observations o2 INDEXED BY observations_watch_listing
+            WHERE o2.watch_id = wl.watch_id AND o2.listing_id = wl.listing_id
+              AND (? IS NULL OR o2.price_pln >= ?) AND (? IS NULL OR o2.price_pln <= ?)
+            ORDER BY o2.observed_at DESC, o2.id DESC LIMIT 1) AS latest_id,
+          (SELECT o3.observed_at FROM observations o3 INDEXED BY observations_watch_listing
+            WHERE o3.watch_id = wl.watch_id AND o3.listing_id = wl.listing_id
+              AND (? IS NULL OR o3.price_pln >= ?) AND (? IS NULL OR o3.price_pln <= ?)
+            ORDER BY o3.observed_at ASC, o3.id ASC LIMIT 1) AS first
+        FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id
+        WHERE wl.watch_id = ?
+          AND (? = 0 OR NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))))
+          AND (? = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
+      ) x JOIN observations o ON o.id = x.latest_id
+      ORDER BY o.observed_at DESC, o.id DESC`).all(
+      OTHER_VARIANT_KEY,
+      row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln,
+      row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln,
       row.id,
       row.ai_relevance === false || row.ai_relevance === 0 ? 0 : 1,
       row.shipping_only ? 1 : 0,
-      row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln,
-    ] as unknown[];
-    const latest = this.stmt(`SELECT price_pln, variant_key FROM (
-        SELECT o.price_pln, o.observed_at, o.id, COALESCE(wl.variant_key, ?) AS variant_key, ROW_NUMBER() OVER (PARTITION BY o.listing_id ORDER BY o.observed_at DESC, o.id DESC) AS rank
-        FROM observations o INDEXED BY observations_watch_listing ${baselineFilters}
-      ) WHERE rank <= 1 ORDER BY observed_at DESC, id DESC`).all(OTHER_VARIANT_KEY, ...baselineParams) as Array<{ price_pln: number; variant_key: string }>;
-    const firstByVariant = this.stmt(`SELECT COALESCE(wl.variant_key, ?) AS variant_key, MIN(o.observed_at) AS first
-      FROM observations o INDEXED BY observations_watch_listing ${baselineFilters}
-      GROUP BY COALESCE(wl.variant_key, ?)`).all(OTHER_VARIANT_KEY, ...baselineParams, OTHER_VARIANT_KEY) as Array<{ variant_key: string; first: string | null }>;
+    ) as Array<{ price_pln: number; variant_key: string; first: string | null }>;
     const buckets = new Map<string, WatchVariantBucket>();
     const bucketFor = (key: string) => {
       let bucket = buckets.get(key);
       if (!bucket) { bucket = { prices: [], firstObservedAt: null }; buckets.set(key, bucket); }
       return bucket;
     };
-    for (const item of latest) {
+    const firstByVariant = new Map<string, string>();
+    for (const item of rows) {
+      const key = item.variant_key ?? OTHER_VARIANT_KEY;
+      const first = item.first;
+      if (first !== null && first !== undefined) {
+        const known = firstByVariant.get(key);
+        if (known === undefined || first < known) firstByVariant.set(key, first);
+      }
       const price = Number(item.price_pln);
       if (!Number.isFinite(price) || price <= 0) continue;
-      const bucket = bucketFor(item.variant_key ?? OTHER_VARIANT_KEY);
+      const bucket = bucketFor(key);
       // Rows arrive newest-first; 400 preserves the per-model ceiling the
       // watch-wide query used to apply globally.
       if (bucket.prices.length < 400) bucket.prices.push(price);
     }
-    for (const item of firstByVariant) bucketFor(item.variant_key ?? OTHER_VARIANT_KEY).firstObservedAt = item.first ?? null;
+    for (const [key, first] of firstByVariant) bucketFor(key).firstObservedAt = first;
     // Other / unclassified is a mix by definition, so only named variants
     // feed the pooled spread.
     const pooled = groups.length
