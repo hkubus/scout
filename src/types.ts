@@ -20,6 +20,15 @@ export interface VariantGroup {
   exclude?: string;
 }
 
+/** Groups proposed from a watch's saved listings; nothing is stored until the watch is saved. */
+export interface VariantSuggestions {
+  groups: VariantGroup[];
+  /** Listings the proposal was drawn from. */
+  listings: number;
+  /** 'ai' when OpenRouter proposed them, 'titles' for the built-in title analysis. */
+  method: 'ai' | 'titles';
+}
+
 /** Per-model progress shown on the watch card once variant groups exist. */
 export interface WatchVariantStat {
   key: string;
@@ -187,6 +196,8 @@ export interface Watch {
   typoVariants: boolean;
   aiRelevance: boolean;
   variantGroups: VariantGroup[];
+  /** No groups yet and Scout will propose them from listing titles once enough are saved. */
+  variantGroupsAuto?: boolean;
   /** Per-model sample/readiness/typical breakdown; empty without configured groups. */
   variants: WatchVariantStat[];
   /** How many Exceptional/Very strong/Strong findings this watch currently has. */

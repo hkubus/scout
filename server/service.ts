@@ -5,7 +5,7 @@ import { chromium, type Browser, type BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
-import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext } from './ai';
+import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext } from './ai';
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchVariantWithJev, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
 import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, verifyListingDescriptionWithVision, visionToVerification } from './vision';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
@@ -13,7 +13,7 @@ import { Limiter } from './limiter';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, median, pooledVariantSpread, scoreDeal, type PooledSpread } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
 import { normalizeFilterText } from './text';
-import { OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assignVariant, parseVariantGroups, variantLabelFor, type VariantGroup } from './variants';
+import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assignVariant, finalizeVariantSuggestions, parseVariantGroups, suggestVariantGroupsFromTitles, variantLabelFor, type VariantGroup, type VariantSample } from './variants';
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
@@ -189,6 +189,7 @@ export interface ScoutServiceDependencies {
   classifyNegotiabilityWithJev?: typeof classifyNegotiabilityWithJev;
   classifyConditionMatchWithJev?: typeof classifyConditionMatchWithJev;
   classifyWatchVariantWithJev?: typeof classifyWatchVariantWithJev;
+  suggestVariantGroups?: typeof suggestVariantGroupsWithDeepSeek;
   classifyListingRelevanceWithVision?: typeof classifyListingRelevanceWithVision;
   verifyListingDescriptionWithVision?: typeof verifyListingDescriptionWithVision;
   fetchListingDetailHtml?: (url: string, marketplace: Marketplace) => Promise<string>;
@@ -529,6 +530,7 @@ export class ScoutService {
   private readonly jevNegotiability: typeof classifyNegotiabilityWithJev;
   private readonly jevConditionMatch: typeof classifyConditionMatchWithJev;
   private readonly jevVariant: typeof classifyWatchVariantWithJev;
+  private readonly aiVariantSuggestions: typeof suggestVariantGroupsWithDeepSeek;
   private readonly visionRelevance: typeof classifyListingRelevanceWithVision;
   private readonly visionVerification: typeof verifyListingDescriptionWithVision;
   private readonly detailHtml: (url: string, marketplace: Marketplace) => Promise<string>;
@@ -550,6 +552,7 @@ export class ScoutService {
     this.jevNegotiability = dependencies.classifyNegotiabilityWithJev ?? classifyNegotiabilityWithJev;
     this.jevConditionMatch = dependencies.classifyConditionMatchWithJev ?? classifyConditionMatchWithJev;
     this.jevVariant = dependencies.classifyWatchVariantWithJev ?? classifyWatchVariantWithJev;
+    this.aiVariantSuggestions = dependencies.suggestVariantGroups ?? suggestVariantGroupsWithDeepSeek;
     this.visionRelevance = dependencies.classifyListingRelevanceWithVision ?? classifyListingRelevanceWithVision;
     this.visionVerification = dependencies.verifyListingDescriptionWithVision ?? verifyListingDescriptionWithVision;
     this.detailHtml = dependencies.fetchListingDetailHtml ?? ((url, marketplace) => this.fetchPublicPage(url, marketplace));
@@ -2009,6 +2012,7 @@ export class ScoutService {
       aiRelevance: row.ai_relevance === undefined ? true : Boolean(row.ai_relevance),
       referenceMarketWatchId: row.reference_market_watch_id ?? null,
       variantGroups,
+      variantGroupsAuto: !variantGroups.length && row.variant_groups_auto !== undefined && Boolean(row.variant_groups_auto),
       variants,
       dealCounts,
       minPrice: row.min_price_pln === null ? null : Number(row.min_price_pln),
@@ -2195,6 +2199,80 @@ export class ScoutService {
         update.run(groups.length ? assignVariant(association.title, groups) : null, groups.length ? 'rule' : null, association.association_id);
       }
     });
+  }
+
+  /**
+   * Saved listings a variant proposal is drawn from: this watch's matches that
+   * are neither hidden nor rejected by AI relevance (when the watch uses it),
+   * newest first, with their current asking price.
+   */
+  private variantSuggestionSamples(row: WatchRow, limit = 300): VariantSample[] {
+    const rows = this.stmt(`SELECT l.title, l.price_pln FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id
+      WHERE wl.watch_id = ? AND l.price_pln > 0
+        AND NOT EXISTS (SELECT 1 FROM listing_actions a WHERE a.marketplace = l.marketplace AND a.listing_id = l.listing_id AND a.hidden = 1)
+        AND (? = 0 OR NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))))
+      ORDER BY wl.last_seen_at DESC, wl.id DESC LIMIT ?`).all(row.id, row.ai_relevance === false || row.ai_relevance === 0 ? 0 : 1, limit) as Array<{ title: string; price_pln: number }>;
+    return rows.map((item) => ({ title: String(item.title ?? ''), price: Number(item.price_pln) }));
+  }
+
+  /**
+   * Propose model-variant groups from a watch's saved listings. The AI
+   * proposal is used when OpenRouter is configured and falls back to the
+   * title heuristic on any failure; either way every group is re-checked
+   * against the same titles by the deterministic matcher, and groups whose
+   * terms equal an existing group keep that group's id (and baseline).
+   */
+  async suggestWatchVariantGroups(watchId: string): Promise<{ groups: VariantGroup[]; listings: number; method: 'ai' | 'titles' }> {
+    const row = this.stmt('SELECT * FROM watches WHERE id = ?').get(watchId) as WatchRow | undefined;
+    if (!row) throw new ServiceError('Watch not found', 404);
+    const samples = this.variantSuggestionSamples(row);
+    const existing = parseVariantGroups(row.variant_groups_json);
+    const context = { query: String(row.query ?? ''), terms: String(row.included_terms ?? '') };
+    if (samples.length < 2) return { groups: [], listings: samples.length, method: 'titles' };
+    const { apiKey, model } = this.deepSeekConfig();
+    if (apiKey) {
+      try {
+        const proposed = await this.aiVariantSuggestions({
+          query: context.query,
+          includedTerms: context.terms,
+          excludedTerms: String(row.excluded_terms ?? ''),
+          listings: samples.slice(0, 150),
+        }, { apiKey, model });
+        return { groups: finalizeVariantSuggestions(proposed, samples, existing), listings: samples.length, method: 'ai' };
+      } catch (error) {
+        this.log('error', 'watch', `${row.name}: AI variant suggestions failed, using title analysis — ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return { groups: finalizeVariantSuggestions(suggestVariantGroupsFromTitles(samples, context), samples, existing), listings: samples.length, method: 'titles' };
+  }
+
+  /**
+   * After a scan, give a watch that is still waiting for automatic groups its
+   * first proposal once it has {@link AUTO_VARIANT_MIN_LISTINGS} listings.
+   * Found groups are stored like hand-made ones (and remain editable); the
+   * flag is cleared so later scans never overwrite them. When the listings
+   * look like a single product the attempt is recorded and retried only after
+   * the watch has grown by half again.
+   */
+  private async autoGenerateVariantGroups(watchId: string) {
+    const row = this.stmt('SELECT * FROM watches WHERE id = ?').get(watchId) as WatchRow | undefined;
+    if (!row || !row.variant_groups_auto || parseVariantGroups(row.variant_groups_json).length) return;
+    const available = this.variantSuggestionSamples(row, AUTO_VARIANT_MIN_LISTINGS * 40).length;
+    const checked = Number(row.variant_groups_auto_checked ?? 0);
+    if (available < AUTO_VARIANT_MIN_LISTINGS || (checked && available < checked * 1.5)) return;
+    const suggestion = await this.suggestWatchVariantGroups(watchId);
+    // The user may have edited the watch while the proposal was being made.
+    const current = this.stmt('SELECT variant_groups_auto, variant_groups_json FROM watches WHERE id = ?').get(watchId) as WatchRow | undefined;
+    if (!current?.variant_groups_auto || parseVariantGroups(current.variant_groups_json).length) return;
+    if (!suggestion.groups.length) {
+      this.stmt('UPDATE watches SET variant_groups_auto_checked = ? WHERE id = ?').run(available, watchId);
+      this.log('info', 'watch', `${row.name}: no model variants found in ${suggestion.listings} listings; will look again as more arrive`);
+      return;
+    }
+    this.stmt('UPDATE watches SET variant_groups_json = ?, variant_groups_auto = 0, variant_groups_auto_checked = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(suggestion.groups), available, nowIso(), watchId);
+    this.retagWatchVariants(watchId);
+    this.log('info', 'watch', `${row.name}: generated ${suggestion.groups.length} model variants from ${suggestion.listings} listings (${suggestion.method === 'ai' ? 'AI' : 'title analysis'}): ${suggestion.groups.map((group) => group.label).join(', ')}`);
+    this.emit('watch', { id: watchId });
   }
 
   /**
@@ -3835,6 +3913,11 @@ export class ScoutService {
       });
       this.stmt('UPDATE watches SET next_scan_at = ?, source_next_scan_json = ?, updated_at = ? WHERE id = ?').run(nextScanAt, JSON.stringify(nextBySource), finished, row.id);
       this.setSetting('last_scan', JSON.stringify({ at: finished }));
+      try {
+        await this.autoGenerateVariantGroups(String(row.id));
+      } catch (error) {
+        this.logBackgroundError(`Variant suggestions for ${row.name}`, error);
+      }
       this.emit('scan', { refresh: true, watchId: row.id });
     } finally {
       this.running.delete(row.id);

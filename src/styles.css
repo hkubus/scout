@@ -886,6 +886,8 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .ghost-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; justify-self: start; padding: 7px 11px; border: 1px dashed var(--line-strong); border-radius: 7px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; }
 .ghost-button:hover:not(:disabled) { border-color: var(--blue); color: var(--blue); }
 .ghost-button:disabled { opacity: .5; cursor: not-allowed; }
+.variant-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.variant-chip--pending { border-style: dashed; }
 .watch-variants { display: flex; flex-wrap: wrap; gap: 6px; padding-left: 49px; }
 .variant-chip { display: inline-flex; align-items: baseline; gap: 6px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-muted); font-size: 10px; }
 .variant-chip strong { color: var(--text); font-weight: 600; }
