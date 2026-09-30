@@ -16,7 +16,7 @@ import { debugApiEnabled, ScoutDebug } from './debug';
 import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
 import { bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
-import { isPubliclyBoundHost, RateLimiter, securityHeaders } from './security';
+import { isPubliclyBoundHost, RateLimiter, rateLimitKey, securityHeaders } from './security';
 import { normalizeSourceIntervals, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 
@@ -61,12 +61,15 @@ function configuredPublicOrigin() {
 
 const corsOrigins = configuredCorsOrigin();
 const publicOrigins = configuredPublicOrigin();
-// Origins, besides the request's own Host, allowed to make cookie-authenticated state changes.
-const trustedOrigins = [...corsOrigins.map((origin) => new URL(origin).origin), ...publicOrigins];
+// Origins, besides the request's own origin, allowed to make cookie-authenticated
+// state changes. SCOUT_CORS_ORIGIN is deliberately excluded: SameSite=Strict
+// cookies never reach a cross-site frontend, which must use a bearer token.
+const trustedOrigins = publicOrigins;
 // An https public origin means TLS terminates in front of Scout, so mark
 // cookies Secure and send HSTS even if the proxy hop is not trusted.
 const publicOriginIsHttps = publicOrigins.some((origin) => origin.startsWith('https:'));
 const isSecureRequest = (request: FastifyRequest) => request.protocol === 'https' || publicOriginIsHttps;
+const sameOrigin = (request: FastifyRequest) => isSameOriginRequest(request.headers, `${request.protocol}://${request.host}`, trustedOrigins);
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -89,11 +92,12 @@ app.addHook('onRequest', async (request, reply) => {
   }
   const route = request.routeOptions.url;
   if (!isProtectedRoute(route)) return;
-  const url = request.raw.url?.split('?', 1)[0] ?? '';
 
-  const expensive = route === '/mcp' || /\/search$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/snapshot-images\/|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route);
+  const expensive = route === '/mcp' || /\/search$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route);
   const limit = expensive ? 30 : 240;
-  const bucket = rateLimiter.consume(`${request.ip}:${expensive ? 'expensive' : url}`, limit);
+  // Snapshot images use the general limit so a screen of saved photos loads.
+  // Key on the route template, not the raw URL, so ids cannot mint new buckets.
+  const bucket = rateLimiter.consume(`${rateLimitKey(request.ip)}:${expensive ? 'expensive' : `${request.method} ${route}`}`, limit);
   reply.header('X-RateLimit-Limit', String(limit));
   reply.header('X-RateLimit-Remaining', String(bucket.remaining));
   if (!bucket.allowed) {
@@ -137,7 +141,7 @@ app.addHook('onRequest', async (request, reply) => {
     reply.header('WWW-Authenticate', 'Bearer realm="scout"');
     return reply.code(401).send({ error: 'Authentication required' });
   }
-  if (request.scoutAuth === 'session' && !safeMethods.has(request.method) && !isSameOriginRequest(request.headers, request.host, trustedOrigins)) {
+  if (request.scoutAuth === 'session' && !safeMethods.has(request.method) && !sameOrigin(request)) {
     return reply.code(403).send({ error: 'Cross-origin request rejected' });
   }
 });
@@ -186,10 +190,13 @@ app.get('/api/ready', async (request, reply) => {
   return reply.code(readiness.status === 'ready' ? 200 : 503).send(authenticated(request) ? readiness : { status: readiness.status });
 });
 
-const loginLimiter = new RateLimiter(15 * 60_000);
+// Once full of live buckets the login limiter refuses new addresses rather
+// than evicting (and so resetting) an attacker's active counter.
+const loginLimiter = new RateLimiter(15 * 60_000, 50_000, 'reject');
 // Bound concurrent scrypt work instead of a global attempt cap, which would
-// let anyone lock the operator out by spending it.
-const MAX_CONCURRENT_LOGINS = 4;
+// let anyone lock the operator out by spending it. Stay below libuv's default
+// four-thread pool so password checks cannot stall fs, dns, and zlib work.
+const MAX_CONCURRENT_LOGINS = 2;
 let loginsInFlight = 0;
 app.get('/api/auth/session', async (request) => ({
   authEnabled: auth.enabled,
@@ -198,8 +205,8 @@ app.get('/api/auth/session', async (request) => ({
 }));
 app.post('/api/auth/login', async (request, reply) => {
   if (!auth.passwordHash) return reply.code(404).send({ error: 'Password login is not configured' });
-  if (!isSameOriginRequest(request.headers, request.host, trustedOrigins)) return reply.code(403).send({ error: 'Cross-origin request rejected' });
-  const perIp = loginLimiter.consume(`ip:${request.ip}`, 10);
+  if (!sameOrigin(request)) return reply.code(403).send({ error: 'Cross-origin request rejected' });
+  const perIp = loginLimiter.consume(`ip:${rateLimitKey(request.ip)}`, 10);
   if (!perIp.allowed) {
     reply.header('Retry-After', String(perIp.retryAfterSeconds));
     return reply.code(429).send({ error: 'Too many sign-in attempts. Try again later.' });
@@ -224,6 +231,7 @@ app.post('/api/auth/login', async (request, reply) => {
 app.post('/api/auth/logout', async (request, reply) => {
   const token = parseCookies(request.headers.cookie).get(SESSION_COOKIE);
   if (token) {
+    if (!sameOrigin(request)) return reply.code(403).send({ error: 'Cross-origin request rejected' });
     sessions.revoke(token);
     closeSessionStreams((session) => session === token);
   }
@@ -813,6 +821,9 @@ const scheduler = setInterval(() => {
   service.schedulerTick();
 }, 30_000);
 const sseHeartbeat = setInterval(() => {
+  // Streams authenticate once at connect, so drop any whose session has since
+  // expired or been revoked. isActive() does not extend the idle window.
+  if (auth.enabled) closeSessionStreams((session) => !sessions.isActive(session));
   emit('ping', { now: nowIso() });
 }, 25_000);
 const sessionPurge = setInterval(() => {

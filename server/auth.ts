@@ -4,6 +4,7 @@
 // be unit tested directly.
 import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
 import type { ScryptOptions } from 'node:crypto';
+import { isIP } from 'node:net';
 
 type Db = { prepare: (sql: string) => { run: (...args: any[]) => unknown; get: (...args: any[]) => unknown } };
 
@@ -153,16 +154,20 @@ export function clearedSessionCookie(secure: boolean) {
 /**
  * CSRF guard for cookie-authenticated state changes. Browsers always attach
  * Origin to cross-origin and non-GET fetches and Sec-Fetch-Site to every
- * request, and neither can be set by page script.
+ * request, and neither can be set by page script. The source must match the
+ * full origin (scheme, host, and port) the request arrived on, or one of the
+ * configured public origins.
  */
-export function isSameOriginRequest(headers: { origin?: string; 'sec-fetch-site'?: string; referer?: string }, host: string, allowedOrigins: readonly string[] = []) {
+export function isSameOriginRequest(headers: { origin?: string; 'sec-fetch-site'?: string; referer?: string }, requestOrigin: string, allowedOrigins: readonly string[] = []) {
   const fetchSite = headers['sec-fetch-site'];
   if (fetchSite && fetchSite !== 'same-origin') return false;
   const source = headers.origin ?? headers.referer;
   if (!source || source === 'null') return fetchSite === 'same-origin';
   let parsed: URL;
   try { parsed = new URL(source); } catch { return false; }
-  return parsed.host.toLowerCase() === host.toLowerCase() || allowedOrigins.includes(parsed.origin);
+  let own: string | null = null;
+  try { own = new URL(requestOrigin).origin; } catch { /* malformed Host: rely on the allowlist */ }
+  return parsed.origin === own || allowedOrigins.includes(parsed.origin);
 }
 
 export class SessionStore {
@@ -178,17 +183,28 @@ export class SessionStore {
 
   /** Returns true for a live session and slides its idle window forward. */
   validate(token: string, now = Date.now()) {
-    if (!/^[A-Za-z0-9_-]{43}$/.test(token)) return false;
+    const session = this.lookup(token, now);
+    if (!session) return false;
+    if (now - session.lastSeen > SESSION_TOUCH_MS) this.db.prepare('UPDATE auth_sessions SET last_seen_at = ? WHERE token_hash = ?').run(new Date(now).toISOString(), session.tokenHash);
+    return true;
+  }
+
+  /** Like validate(), but never extends the idle window (for background checks such as live-stream heartbeats). */
+  isActive(token: string, now = Date.now()) {
+    return this.lookup(token, now) !== null;
+  }
+
+  private lookup(token: string, now: number) {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(token)) return null;
     const tokenHash = this.hash(token);
     const row = this.db.prepare('SELECT credential_id, last_seen_at, expires_at FROM auth_sessions WHERE token_hash = ?').get(tokenHash) as { credential_id: string; last_seen_at: string; expires_at: string } | undefined;
-    if (!row) return false;
+    if (!row) return null;
     const lastSeen = Date.parse(row.last_seen_at);
     if (row.credential_id !== this.credentialId || Date.parse(row.expires_at) <= now || lastSeen + SESSION_IDLE_MS <= now) {
       this.db.prepare('DELETE FROM auth_sessions WHERE token_hash = ?').run(tokenHash);
-      return false;
+      return null;
     }
-    if (now - lastSeen > SESSION_TOUCH_MS) this.db.prepare('UPDATE auth_sessions SET last_seen_at = ? WHERE token_hash = ?').run(new Date(now).toISOString(), tokenHash);
-    return true;
+    return { tokenHash, lastSeen };
   }
 
   revoke(token: string) {
@@ -209,7 +225,24 @@ export class SessionStore {
   }
 }
 
-/** Parse SCOUT_TRUST_PROXY into Fastify's trustProxy option. */
+const PROXY_ADDRESS_NAMES = new Set(['loopback', 'linklocal', 'uniquelocal']);
+
+function isProxyAddress(entry: string) {
+  if (PROXY_ADDRESS_NAMES.has(entry)) return true;
+  const [address, prefix, ...rest] = entry.split('/');
+  const family = isIP(address);
+  if (!family || rest.length > 0) return false;
+  if (prefix === undefined) return true;
+  // proxy-addr also accepts a dotted IPv4 netmask such as 255.255.255.0.
+  if (family === 4 && isIP(prefix) === 4) return true;
+  return /^\d{1,3}$/.test(prefix) && Number(prefix) <= (family === 4 ? 32 : 128);
+}
+
+/**
+ * Parse SCOUT_TRUST_PROXY into Fastify's trustProxy option: `true`/`false`, a
+ * hop count, or comma-separated proxy IPs/CIDRs (plus proxy-addr's
+ * `loopback`/`linklocal`/`uniquelocal`). Anything else fails startup clearly.
+ */
 export function trustProxySetting(value: string | undefined): boolean | string | ((address: string, hop: number) => boolean) {
   const raw = value?.trim() ?? '';
   if (!raw || raw.toLowerCase() === 'false') return false;
@@ -218,5 +251,10 @@ export function trustProxySetting(value: string | undefined): boolean | string |
     const hops = Number(raw);
     return (_address, hop) => hop < hops;
   }
-  return raw;
+  const entries = raw.split(',').map((entry) => entry.trim());
+  const invalid = entries.find((entry) => !isProxyAddress(entry));
+  if (invalid !== undefined) {
+    throw new Error(`SCOUT_TRUST_PROXY must be true, false, a hop count, or comma-separated proxy IPs/CIDRs (invalid entry: "${invalid}")`);
+  }
+  return entries.join(',');
 }

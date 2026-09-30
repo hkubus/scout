@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 // @ts-ignore node:sqlite is present in the supported Node 22+ runtime.
 import { DatabaseSync } from 'node:sqlite';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import Fastify from 'fastify';
 import {
   bearerToken,
@@ -17,6 +19,7 @@ import {
   SESSION_IDLE_MS,
   sessionCookie,
   SessionStore,
+  trustProxySetting,
   verifyPassword,
 } from '../server/auth';
 
@@ -69,13 +72,33 @@ test('matches bearer tokens and parses cookies', async () => {
 });
 
 test('accepts only same-origin cookie-authenticated state changes', () => {
-  assert.equal(isSameOriginRequest({ origin: 'https://scout.example', 'sec-fetch-site': 'same-origin' }, 'scout.example'), true);
-  assert.equal(isSameOriginRequest({ origin: 'https://evil.example' }, 'scout.example'), false);
-  assert.equal(isSameOriginRequest({ origin: 'https://scout.example', 'sec-fetch-site': 'cross-site' }, 'scout.example'), false);
-  assert.equal(isSameOriginRequest({ 'sec-fetch-site': 'same-origin' }, 'scout.example'), true);
-  assert.equal(isSameOriginRequest({}, 'scout.example'), false);
-  assert.equal(isSameOriginRequest({ origin: 'null' }, 'scout.example'), false);
-  assert.equal(isSameOriginRequest({ origin: 'https://app.example' }, 'internal:3001', ['https://app.example']), true);
+  assert.equal(isSameOriginRequest({ origin: 'https://scout.example', 'sec-fetch-site': 'same-origin' }, 'https://scout.example'), true);
+  assert.equal(isSameOriginRequest({ origin: 'https://scout.example:443' }, 'https://scout.example'), true);
+  assert.equal(isSameOriginRequest({ origin: 'https://evil.example' }, 'https://scout.example'), false);
+  assert.equal(isSameOriginRequest({ origin: 'https://scout.example', 'sec-fetch-site': 'cross-site' }, 'https://scout.example'), false);
+  assert.equal(isSameOriginRequest({ 'sec-fetch-site': 'same-origin' }, 'https://scout.example'), true);
+  assert.equal(isSameOriginRequest({}, 'https://scout.example'), false);
+  assert.equal(isSameOriginRequest({ origin: 'null' }, 'https://scout.example'), false);
+  assert.equal(isSameOriginRequest({ origin: 'http://scout.example' }, 'https://scout.example'), false, 'scheme must match');
+  assert.equal(isSameOriginRequest({ origin: 'https://scout.example:8443' }, 'https://scout.example'), false, 'port must match');
+  assert.equal(isSameOriginRequest({ referer: 'http://scout.example/settings' }, 'https://scout.example'), false);
+  assert.equal(isSameOriginRequest({ origin: 'https://app.example' }, 'http://internal:3001', ['https://app.example']), true);
+  assert.equal(isSameOriginRequest({ origin: 'https://app.example' }, 'http://[bad', []), false);
+});
+
+test('validates SCOUT_TRUST_PROXY at startup', () => {
+  assert.equal(trustProxySetting(undefined), false);
+  assert.equal(trustProxySetting('false'), false);
+  assert.equal(trustProxySetting('TRUE'), true);
+  const hops = trustProxySetting('1');
+  assert.equal(typeof hops, 'function');
+  assert.equal((hops as (address: string, hop: number) => boolean)('10.0.0.1', 0), true);
+  assert.equal((hops as (address: string, hop: number) => boolean)('10.0.0.1', 1), false);
+  assert.equal(trustProxySetting('127.0.0.1'), '127.0.0.1');
+  assert.equal(trustProxySetting('10.0.0.0/8, ::1, fd00::/8, loopback'), '10.0.0.0/8,::1,fd00::/8,loopback');
+  for (const invalid of ['yes', '10.0.0.0/33', '::1/129', '1.2.3', 'proxy.example', '127.0.0.1,', '10.0.0.1/8/1']) {
+    assert.throws(() => trustProxySetting(invalid), /SCOUT_TRUST_PROXY must be/, invalid);
+  }
 });
 
 test('session store enforces idle, absolute, and credential expiry', () => {
@@ -95,6 +118,11 @@ test('session store enforces idle, absolute, and credential expiry', () => {
   const active = store.create({}, start);
   for (let at = start; at < start + SESSION_ABSOLUTE_MS; at += SESSION_IDLE_MS / 2) assert.equal(store.validate(active, at), true);
   assert.equal(store.validate(active, start + SESSION_ABSOLUTE_MS + 1), false);
+
+  const watched = store.create({}, start);
+  assert.equal(store.isActive(watched, start + SESSION_IDLE_MS - 1), true);
+  assert.equal(store.validate(watched, start + SESSION_IDLE_MS + 1), false, 'isActive() never extends the idle window');
+  assert.equal(store.isActive(active, start + SESSION_ABSOLUTE_MS + 1), false);
 
   const revoked = store.create({}, start);
   store.revoke(revoked);
@@ -124,5 +152,27 @@ test('protects routes by their matched template, so percent-encoded paths cannot
     assert.equal(isProtectedRoute(undefined), false);
   } finally {
     await app.close();
+  }
+});
+
+test('restoring a backup drops its sign-in sessions', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'scout-restore-'));
+  try {
+    const backupPath = join(dir, 'backup.sqlite');
+    const backup = new DatabaseSync(backupPath);
+    backup.exec('CREATE TABLE migrations (id TEXT); CREATE TABLE settings (key TEXT); CREATE TABLE watches (id TEXT);');
+    backup.exec(readFileSync('migrations/026_auth_sessions.sql', 'utf8'));
+    new SessionStore(backup, 'cred').create({});
+    backup.close();
+    const databasePath = join(dir, 'scout.sqlite');
+    execFileSync(process.execPath, ['--import', 'tsx', 'scripts/restore.ts', '--backup', backupPath, '--database', databasePath, '--confirm'], { stdio: 'pipe' });
+    const restored = new DatabaseSync(databasePath);
+    try {
+      assert.deepEqual((restored.prepare('SELECT COUNT(*) AS count FROM auth_sessions').get() as { count: number }).count, 0);
+    } finally {
+      restored.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

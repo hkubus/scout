@@ -26,6 +26,7 @@ RUN npm ci --omit=dev --ignore-scripts \
 COPY --from=build --chown=scout:scout /app/dist ./dist
 COPY --from=build --chown=scout:scout /app/dist-server ./dist-server
 COPY --from=build --chown=scout:scout /app/migrations ./migrations
+COPY --from=build --chown=scout:scout /app/scripts/hash-password.mjs ./scripts/hash-password.mjs
 
 RUN chown -R scout:scout /app
 
