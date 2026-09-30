@@ -618,6 +618,30 @@ test('parses Vinted public card labels and uses item price rather than total pri
   assert.equal(listing.condition, 'Bardzo dobry');
 });
 
+test('reads the Vinted card price from the trailing segments, not digits in earlier fields', () => {
+  const card = (id: string, label: string) => `<div><a href="/items/${id}-item" data-testid="product-item-id-${id}--overlay-link" title="${label}"></a></div>`;
+  const html = [
+    card('1', 'Buty Nike, Marka: Nike, Rozmiar: 38, 89.00 zł, 95.35 zł'),
+    card('2', 'Kurtka, Rozmiar: 42,5, Stan: Dobry, 120.00 zł'),
+    card('3', 'GTX 1660, 450.00 zł, 475.40 zł'),
+    card('4', 'Karta graficzna, 1 299,00 zł'),
+    card('5', 'No price here, Stan: Dobry'),
+  ].join('');
+  const listings = parseVintedCards(html);
+  assert.deepEqual(listings.map((listing) => [listing.listingId, listing.title, listing.price]), [
+    ['1', 'Buty Nike', 89],
+    ['2', 'Kurtka', 120],
+    ['3', 'GTX 1660', 450],
+    ['4', 'Karta graficzna', 1299],
+  ]);
+});
+
+test('skips structured-data prices published in a currency other than PLN', () => {
+  const ld = (id: string, currency: string) => `<script type="application/ld+json">${JSON.stringify({ '@type': 'Product', name: `Item ${id}`, sku: id, url: `https://www.vinted.pl/items/${id}-item`, offers: { '@type': 'Offer', price: '600', priceCurrency: currency } })}</script>`;
+  const listings = parseStructuredListings(`<html>${ld('1', 'SEK')}${ld('2', 'PLN')}</html>`, 'Vinted');
+  assert.deepEqual(listings.map((listing) => listing.listingId), ['2']);
+});
+
 test('keeps cold-start deals silent until samples and hours are ready', () => {
   const cold = scoreDeal([100, 105, 110, 98], 40, { observedHours: 2 });
   assert.equal(cold.qualifies, false);

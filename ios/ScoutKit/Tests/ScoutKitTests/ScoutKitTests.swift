@@ -130,6 +130,10 @@ final class DemoTransportTests: XCTestCase {
         _ = try await client.updateListingAction(key: listing.key, action: ListingAction(decision: .buy, note: "offer 1700", hidden: false))
         let bought = try await client.listings(ListingsQuery(decision: .buy))
         XCTAssertEqual(bought.listings.map(\.key), [listing.key])
+        // A hide-only patch keeps the decision and note.
+        let hiddenOnly = try await client.patchListingAction(key: listing.key, hidden: true)
+        XCTAssertEqual(hiddenOnly.decision, .buy)
+        XCTAssertEqual(hiddenOnly.note, "offer 1700")
 
         _ = try await client.updateListingAction(key: listing.key, action: ListingAction(decision: nil, note: "", hidden: true))
         let dashboard = try await client.dashboard()

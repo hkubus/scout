@@ -251,7 +251,7 @@ struct ListingRow: View {
     }
 }
 
-/// Swipe right to triage, swipe left to hide; keeps the listing's note.
+/// Swipe right to triage, swipe left to hide; the server keeps the listing's note.
 struct TriageSwipeActions: ViewModifier {
     @Environment(AppModel.self) private var model
     var listing: Listing
@@ -262,7 +262,8 @@ struct TriageSwipeActions: ViewModifier {
             .swipeActions(edge: .leading, allowsFullSwipe: true) {
                 ForEach(ListingDecision.allCases, id: \.self) { decision in
                     Button {
-                        apply(decision: listing.decision == decision ? nil : decision, hidden: listing.hidden ?? false)
+                        let next: ListingDecision? = listing.decision == decision ? nil : decision
+                        apply(decision: .some(next))
                     } label: {
                         Label(decision.title, systemImage: decision.symbol)
                     }
@@ -271,7 +272,7 @@ struct TriageSwipeActions: ViewModifier {
             }
             .swipeActions(edge: .trailing) {
                 Button {
-                    apply(decision: listing.decision, hidden: !(listing.hidden ?? false))
+                    apply(hidden: !(listing.hidden ?? false))
                 } label: {
                     Label(listing.hidden == true ? "Unhide" : "Hide", systemImage: listing.hidden == true ? "eye" : "eye.slash")
                 }
@@ -279,13 +280,15 @@ struct TriageSwipeActions: ViewModifier {
             }
     }
 
-    private func apply(decision: ListingDecision?, hidden: Bool) {
+    /// Sends only the swiped field, so a stale copy of the note is never written back.
+    private func apply(decision: ListingDecision?? = .none, hidden: Bool? = nil) {
         guard let client = model.client else { return }
         Task { @MainActor in
             do {
-                let action = try await client.updateListingAction(key: listing.key, action: ListingAction(decision: decision, note: listing.note ?? "", hidden: hidden))
+                let action = try await client.patchListingAction(key: listing.key, decision: decision, hidden: hidden)
                 var updated = listing
                 updated.decision = action.decision
+                updated.note = action.note
                 updated.hidden = action.hidden
                 onChange(updated)
             } catch {

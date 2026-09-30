@@ -585,7 +585,7 @@ test('returns listing price history and persists Buy/Watch/Pass triage actions',
     // this direct-insert fixture mirrors that for the latest observation.
     context.db.prepare('UPDATE watch_listings SET last_seen_at = ? WHERE watch_id = ? AND listing_id = ?').run(lastSeen, 'triage-watch', listing.id);
 
-    const saved = context.service.updateListingAction('OLX:triage-listing', 'buy', 'Ask for a battery screenshot');
+    const saved = context.service.updateListingAction('OLX:triage-listing', { decision: 'buy', note: 'Ask for a battery screenshot' });
     assert.deepEqual(saved.decision, 'buy');
     assert.equal(saved.note, 'Ask for a battery screenshot');
     const feedListing = context.service.getListings()[0];
@@ -596,7 +596,17 @@ test('returns listing price history and persists Buy/Watch/Pass triage actions',
     assert.equal(detail.action.decision, 'buy');
     assert.equal(detail.action.note, 'Ask for a battery screenshot');
 
-    context.service.updateListingAction('OLX:triage-listing', null, '');
+    // Partial saves merge: a decision-only or hide-only save keeps the note.
+    context.service.updateListingAction('OLX:triage-listing', { decision: 'watch' });
+    assert.equal(context.service.listingAction('OLX:triage-listing').note, 'Ask for a battery screenshot');
+    context.service.updateListingAction('OLX:triage-listing', { hidden: true });
+    assert.deepEqual(
+      { ...context.service.listingAction('OLX:triage-listing'), updatedAt: null },
+      { decision: 'watch', note: 'Ask for a battery screenshot', hidden: true, updatedAt: null },
+    );
+    context.service.updateListingAction('OLX:triage-listing', { hidden: false });
+
+    context.service.updateListingAction('OLX:triage-listing', { decision: null, note: '' });
     assert.equal(context.service.listingDetail('OLX:triage-listing').action.decision, null);
     assert.equal(context.service.listingDetail('OLX:triage-listing').action.note, '');
   } finally { context.close(); }
@@ -615,7 +625,7 @@ test('hides and unhides a listing without deleting its history', () => {
     assert.equal(context.service.getListings()[0].hidden, false);
     assert.equal(context.service.dashboard().stats.newToday, 1);
 
-    const hiddenAction = context.service.updateListingAction('OLX:hidden-listing', null, '', true);
+    const hiddenAction = context.service.updateListingAction('OLX:hidden-listing', { decision: null, note: '', hidden: true });
     assert.equal(hiddenAction.hidden, true);
     assert.equal(context.service.listingAction('OLX:hidden-listing').hidden, true);
     assert.equal(context.service.getListings()[0].hidden, true);
@@ -623,7 +633,7 @@ test('hides and unhides a listing without deleting its history', () => {
     assert.equal(context.service.dashboard().stats.newToday, 0);
     assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM listing_actions WHERE marketplace = ? AND listing_id = ?').get('OLX', 'hidden-listing') as { count: number }).count, 1);
 
-    context.service.updateListingAction('OLX:hidden-listing', null, '', false);
+    context.service.updateListingAction('OLX:hidden-listing', { decision: null, note: '', hidden: false });
     assert.equal(context.service.listingAction('OLX:hidden-listing').hidden, false);
     assert.equal(context.service.getListings()[0].hidden, false);
     // Unhiding with no decision or note removes the empty action row.
@@ -646,8 +656,8 @@ test('filters and sorts the listings feed server-side across all rows', () => {
     add('feed-cheap', 'GPU RTX 4070', 1500, 'Używane', 'Warszawa');
     add('feed-mid', 'GPU RTX 4070 Ti', 2500, 'Nowe', 'Kraków');
     add('feed-pricey', 'Karta graficzna RTX 4070', 3500, 'Używane', 'Warszawa');
-    context.service.updateListingAction('OLX:feed-mid', 'buy', 'worth it');
-    context.service.updateListingAction('OLX:feed-pricey', null, '', true);
+    context.service.updateListingAction('OLX:feed-mid', { decision: 'buy', note: 'worth it' });
+    context.service.updateListingAction('OLX:feed-pricey', { hidden: true });
 
     // `q` covers title, condition, and location, and the total follows the filter.
     assert.deepEqual(context.service.listingsPage({ q: 'kraków' }).listings.map((listing) => listing.id), ['OLX:feed-mid']);
@@ -661,6 +671,29 @@ test('filters and sorts the listings feed server-side across all rows', () => {
     // Sorting happens before the page window, so it covers every matching row.
     assert.deepEqual(context.service.listingsPage({ sort: 'price' }).listings.map((listing) => listing.id), ['OLX:feed-cheap', 'OLX:feed-mid', 'OLX:feed-pricey']);
     assert.deepEqual(context.service.listingsPage({ sort: 'price', page: 2, pageSize: 2 }).listings.map((listing) => listing.id), ['OLX:feed-pricey']);
+  } finally { context.close(); }
+});
+
+test('marked and hidden listings stay reviewable after they leave the 12 h feed window', () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    const stale = new Date(Date.now() - 3 * 24 * 60 * 60_000).toISOString();
+    context.db.prepare('INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run('stale-watch', 'Stale watch', 'gpu', '["OLX"]', 1, now, stale, now);
+    const insertListing = context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    const insertLink = context.db.prepare('INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)');
+    for (const id of ['stale-buy', 'stale-hidden', 'stale-plain']) {
+      insertListing.run('OLX', id, `GPU ${id}`, 1000, `https://www.olx.pl/d/oferta/${id}`, stale, stale);
+      const listing = context.db.prepare('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get('OLX', id) as { id: number };
+      insertLink.run('stale-watch', listing.id, stale, stale);
+    }
+    context.service.updateListingAction('OLX:stale-buy', { decision: 'buy' });
+    context.service.updateListingAction('OLX:stale-hidden', { hidden: true });
+
+    // The default feed still only shows fresh matches.
+    assert.equal(context.service.listingsPage({}).listings.length, 0);
+    assert.deepEqual(context.service.listingsPage({ decision: 'buy' }).listings.map((listing) => listing.id), ['OLX:stale-buy']);
+    assert.deepEqual(context.service.listingsPage({ visibility: 'hidden' }).listings.map((listing) => listing.id), ['OLX:stale-hidden']);
   } finally { context.close(); }
 });
 
@@ -1016,8 +1049,10 @@ test('market research filters match terms, price, condition, location, and shipp
     { marketplace: 'OLX' as const, listingId: 'excluded', title: 'RTX 4070 12GB parts only', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/excluded', condition: 'New', location: 'Warszawa', shippingAvailable: true, observedAt: new Date().toISOString() },
     // Vinted's stale pickup flag must not exclude it from a shipping-only filter.
     { marketplace: 'Vinted' as const, listingId: 'vinted-ships', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.vinted.pl/items/vinted-ships', condition: 'New', location: 'Warszawa', shippingAvailable: false, observedAt: new Date().toISOString() },
+    // Vinted cards carry no location at all; a city filter must not drop them.
+    { marketplace: 'Vinted' as const, listingId: 'vinted-no-location', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.vinted.pl/items/vinted-no-location', condition: 'New', observedAt: new Date().toISOString() },
   ];
-  assert.deepEqual(filterListings(listings, 'rtx 4070', '12gb', 'parts', { minPrice: 1000, maxPrice: 2000, condition: 'New', location: 'Warszawa', shippingOnly: true }).map((listing) => listing.listingId), ['match', 'vinted-ships']);
+  assert.deepEqual(filterListings(listings, 'rtx 4070', '12gb', 'parts', { minPrice: 1000, maxPrice: 2000, condition: 'New', location: 'Warszawa', shippingOnly: true }).map((listing) => listing.listingId), ['match', 'vinted-ships', 'vinted-no-location']);
 });
 
 test('keeps market research separate and reports ended-listing price estimates', () => {

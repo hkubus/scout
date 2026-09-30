@@ -331,16 +331,19 @@ app.get('/api/listing-actions', async (request, reply) => {
   if (!parsed.success) return reply.code(400).send({ error: 'A listing key is required' });
   return service.listingAction(parsed.data.key);
 });
+// Every field is optional: omitted fields keep their stored value, so a
+// decision-only swipe cannot wipe the note or unhide the listing.
 const listingActionInput = z.object({
   key: z.string().min(3).max(500),
-  decision: z.enum(['buy', 'watch', 'pass']).nullable(),
-  note: z.string().max(2000).default(''),
-  hidden: z.boolean().optional().default(false),
+  decision: z.enum(['buy', 'watch', 'pass']).nullable().optional(),
+  note: z.string().max(2000).optional(),
+  hidden: z.boolean().optional(),
 }).strict();
 app.patch('/api/listing-actions', async (request, reply) => {
   const parsed = listingActionInput.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid listing action', details: parsed.error.flatten() });
-  return { action: service.updateListingAction(parsed.data.key, parsed.data.decision, parsed.data.note, parsed.data.hidden) };
+  const { key, ...patch } = parsed.data;
+  return { action: service.updateListingAction(key, patch) };
 });
 app.put('/api/listing-variant', async (request, reply) => {
   const parsed = z.object({

@@ -88,7 +88,9 @@ export default function ListingDetailDrawer({
   const totalCost = currentListing.price + toFiniteCost(shippingCost) + toFiniteCost(extraCost);
   const expectedResale = resalePrice === "" ? null : Number(resalePrice);
   const expectedProfit = expectedResale === null || !Number.isFinite(expectedResale) ? null : expectedResale - totalCost;
-  const expectedMargin = expectedProfit === null || totalCost <= 0 ? null : (expectedProfit / totalCost) * 100;
+  // ROI is profit relative to what you spend; margin is profit relative to the sale price.
+  const expectedRoi = expectedProfit === null || totalCost <= 0 ? null : (expectedProfit / totalCost) * 100;
+  const expectedMargin = expectedProfit === null || expectedResale === null || expectedResale <= 0 ? null : (expectedProfit / expectedResale) * 100;
   const typicalSavings = currentListing.typical === null ? null : currentListing.typical - totalCost;
   const showDescriptionSafeguard = currentListing.dealStrength >= 4 || Boolean(detail.descriptionSnapshot);
 
@@ -406,7 +408,8 @@ export default function ListingDetailDrawer({
             <div className="calculator-results">
               <div><span>Total cost</span><strong>{formatPln(totalCost)}</strong></div>
               <div><span>Expected profit</span><strong className={expectedProfit === null ? "" : expectedProfit >= 0 ? "result-positive" : "result-negative"}>{expectedProfit === null ? "Add resale" : formatPln(expectedProfit)}</strong></div>
-              <div><span>Margin</span><strong className={expectedMargin === null ? "" : expectedMargin >= 0 ? "result-positive" : "result-negative"}>{expectedMargin === null ? "—" : `${expectedMargin.toFixed(1)}%`}</strong></div>
+              <div><span>ROI on cost</span><strong className={expectedRoi === null ? "" : expectedRoi >= 0 ? "result-positive" : "result-negative"}>{expectedRoi === null ? "—" : `${expectedRoi.toFixed(1)}%`}</strong></div>
+              <div><span>Margin on sale</span><strong className={expectedMargin === null ? "" : expectedMargin >= 0 ? "result-positive" : "result-negative"}>{expectedMargin === null ? "—" : `${expectedMargin.toFixed(1)}%`}</strong></div>
             </div>
             {typicalSavings !== null ? <div className={`calculator-callout ${typicalSavings >= 0 ? "calculator-callout--positive" : "calculator-callout--negative"}`}><Info size={15} />{typicalSavings >= 0 ? `${formatPln(typicalSavings)} below the learned typical price after extra costs.` : `${formatPln(Math.abs(typicalSavings))} above the learned typical price after extra costs.`}</div> : null}
           </section>

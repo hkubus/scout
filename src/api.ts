@@ -124,7 +124,7 @@ export const api = {
   compareVerification: (key: string) => request<VerificationComparison>('/api/ai/compare-verification', json('POST', { key }), 60_000),
   listingAction: (key: string) => request<ListingAction>(`/api/listing-actions?key=${encodeURIComponent(key)}`),
   setListingVariant: (key: string, watchId: string, variantId: string | null) => request<ListingDetail>('/api/listing-variant', json('PUT', { key, watchId, variantId })),
-  updateListingAction: (key: string, action: { decision: ListingDecision | null; note: string; hidden?: boolean }) => request<{ action: ListingAction }>('/api/listing-actions', json('PATCH', { key, ...action })),
+  updateListingAction: (key: string, action: { decision?: ListingDecision | null; note?: string; hidden?: boolean }) => request<{ action: ListingAction }>('/api/listing-actions', json('PATCH', { key, ...action })),
   scan: (watchId?: string) => request<{ queued: boolean; message: string }>('/api/scans', json('POST', watchId ? { watchId } : {})),
   settings: () => request<SettingsData>('/api/settings'),
   saveSettings: (settings: { interval: number; nightInterval?: number; webhook?: string; clearWebhook?: boolean; discordMinimumPriority?: NotificationPriority; dailyDigest?: { enabled?: boolean; time?: string; discord?: boolean; ntfy?: boolean }; clearNtfy?: boolean; ntfy?: { serverUrl?: string; topic?: string; token?: string; minimumPriority?: NotificationPriority; openInApp?: boolean }; ai?: { apiKey?: string; clearApiKey?: boolean; model?: string } }) => request<SettingsData>('/api/settings', json('PATCH', settings)),
