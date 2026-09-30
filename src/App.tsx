@@ -25,7 +25,7 @@ import {
   TrendingUp,
   WifiOff,
 } from "lucide-react";
-import { api, UNAUTHORIZED_EVENT, type AuthSession } from "./api";
+import { api, ApiError, UNAUTHORIZED_EVENT, type AuthSession } from "./api";
 import { emptyDashboard } from "./data";
 import { subscribe, subscribeStatus } from "./events";
 import { isListingActionEvent, patchListingRows } from "./listingActions";
@@ -146,6 +146,20 @@ const initialViewNeedsDashboard = planFlush(initialView, new Set(allLiveResource
 // A deep-linked route's chunk loads alongside the session check, so it mounts without suspending.
 preloadView(initialView);
 
+// Boot requests start with the module, in parallel: the session check and,
+// when the first view shows it, the dashboard. ScoutApp's first refresh takes
+// the dashboard promise exactly once (in flight or already settled). A 401 on
+// a signed-out load is ignored while the session check decides (see App).
+const bootSession = api.authSession();
+bootSession.catch(() => {});
+let bootDashboard: Promise<DashboardData> | null = initialViewNeedsDashboard ? api.dashboard() : null;
+bootDashboard?.catch(() => {});
+function takeBootDashboard() {
+  const pending = bootDashboard;
+  bootDashboard = null;
+  return pending;
+}
+
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
 type Toast = { message: string; type: "success" | "error" | "info" };
@@ -177,18 +191,20 @@ function App() {
   const [auth, setAuth] = useState<"checking" | "login" | "ready">("checking");
   const [session, setSession] = useState<AuthSession | null>(null);
   useEffect(() => {
-    const controller = new AbortController();
-    api.authSession(controller.signal).then((value) => {
+    let active = true;
+    bootSession.then((value) => {
+      if (!active) return;
       setSession(value);
       setAuth(value.authenticated ? "ready" : "login");
     }).catch(() => {
       // Unreachable server: render the app so it shows its offline state.
-      if (!controller.signal.aborted) setAuth("ready");
+      if (active) setAuth("ready");
     });
-    const onUnauthorized = () => setAuth("login");
+    // The session check decides the first screen; a boot prefetch's 401 must not pre-empt it.
+    const onUnauthorized = () => setAuth((current) => (current === "checking" ? current : "login"));
     window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
     return () => {
-      controller.abort();
+      active = false;
       window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
     };
   }, []);
@@ -317,8 +333,9 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
       for (const resource of dashboardResources) dirty.current.delete(resource);
       dashboardFetches.current += 1;
       if (showLoader) setIsLoading(true);
+      const boot = takeBootDashboard();
       try {
-        const next = await api.dashboard();
+        const next = await (boot ?? api.dashboard());
         if (sequence !== refreshSequence.current) return;
         dashboardLoaded.current = true;
         // Unchanged rows keep their identity, so Overview's filtered list and rows skip.
@@ -330,6 +347,8 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         // Events that arrived while this request was in flight need a fresh one.
         if (dirty.current.has("dashboard")) scheduleFlush();
       } catch (error) {
+        // The boot request's 401 fired while the session check was still deciding.
+        if (boot && error instanceof ApiError && error.status === 401) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
         if (sequence !== refreshSequence.current) return;
         for (const resource of dashboardResources) dirty.current.add(resource);
         setConnection("offline");
