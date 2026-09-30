@@ -26,15 +26,48 @@ npm run build
 
 export NODE_ENV=production
 export SCOUT_SECRET='replace-with-a-random-value-at-least-32-characters-long'
+export SCOUT_PASSWORD_HASH='scrypt$32768$8$1$…'   # node scripts/hash-password.mjs
 export SCOUT_HOST=127.0.0.1
 export TZ=Europe/Warsaw
 export SCOUT_DB_PATH=./data/scout.sqlite
 npm start
 ```
 
-The compiled dashboard and API are served together on port 3001. `SCOUT_SECRET` encrypts stored credentials. Scout has no built-in authentication, so keep `SCOUT_HOST=127.0.0.1` unless the service is intentionally restricted to a trusted LAN/VPN; do not expose it directly to the public internet. `TZ` controls the server-local 22:00–08:00 overnight window, so set it explicitly for the deployment timezone. SQLite, migrations, encrypted Discord/ntfy settings, per-channel delivery records, and notification history live under `SCOUT_DB_PATH`.
+The compiled dashboard and API are served together on port 3001. `SCOUT_SECRET` encrypts stored credentials. See [Authentication and internet deployment](#authentication-and-internet-deployment) before exposing Scout beyond loopback. `TZ` controls the server-local 22:00–08:00 overnight window, so set it explicitly for the deployment timezone. SQLite, migrations, encrypted Discord/ntfy settings, per-channel delivery records, and notification history live under `SCOUT_DB_PATH`.
 
-Exposure warnings are based on the actual listening address, not a manually supplied flag. Do not expose Scout directly to the public internet. If a separately hosted frontend needs API access, set `SCOUT_CORS_ORIGIN` to an explicit comma-separated allowlist; CORS is disabled by default. `/api/health` is lightweight process liveness; `/api/ready` reports the SQLite probe, scheduler tick age, interrupted scans, migration state, and connector degradation.
+Exposure checks are based on the actual listening address, not a manually supplied flag. If a separately hosted frontend needs API access, set `SCOUT_CORS_ORIGIN` to an explicit comma-separated allowlist; CORS is disabled by default. With auth enabled such a frontend must send a bearer token from `SCOUT_API_TOKENS`: the `SameSite=Strict` session cookie is never sent cross-site, and CORS origins are not trusted for cookie-authenticated requests. `/api/health` is lightweight process liveness; `/api/ready` reports the SQLite probe, scheduler tick age, interrupted scans, migration state, and connector degradation (unauthenticated callers only see `status`).
+
+## Authentication and internet deployment
+
+Auth turns on as soon as any credential is configured, and protects every `/api/*` route, `/events`, and `/mcp`. Only the static dashboard shell, `/api/health`, `/api/ready`, and `/api/auth/*` are public.
+
+| Variable | Purpose |
+| --- | --- |
+| `SCOUT_PASSWORD_HASH` | scrypt hash of the dashboard password. Generate it with `node scripts/hash-password.mjs` (prompts without echo, or reads stdin). Preferred over `SCOUT_PASSWORD`. |
+| `SCOUT_PASSWORD` | Plaintext alternative (≥12 characters), hashed in memory at boot. |
+| `SCOUT_API_TOKENS` | Comma-separated bearer tokens (≥32 characters each, e.g. `openssl rand -base64 36`) for MCP clients and scripts: `Authorization: Bearer <token>`. |
+| `SCOUT_AUTH` | `on` requires credentials even on loopback; `off` explicitly keeps the old unauthenticated trusted-LAN mode. |
+| `SCOUT_TRUST_PROXY` | **Required behind a reverse proxy**: a hop count such as `1`, or a comma-separated list of proxy IPs/CIDRs (`loopback`, `linklocal`, and `uniquelocal` also work). Any other value stops startup with an error. Makes client IPs (rate limits) and `https` detection (Secure cookies, HSTS) come from `X-Forwarded-*`; without it every client shares the proxy's IP and one client can exhaust sign-in attempts for everyone. Avoid `true`: it trusts `X-Forwarded-For` from anyone, so per-IP limits can be spoofed. Leave unset when Scout is reached directly. |
+| `SCOUT_PUBLIC_ORIGIN` | Public origin (e.g. `https://scout.example.com`) when the proxy does not forward the original `Host`. An `https` origin also forces `Secure` cookies and HSTS. |
+
+Scout refuses to start on a non-loopback address without credentials unless `SCOUT_AUTH=off`.
+
+- **Browser sessions.** Signing in sets an `HttpOnly`, `SameSite=Strict` session cookie (`Secure` over HTTPS). Sessions expire after 7 idle days or 30 days total and are stored server-side as SHA-256 hashes. Changing the password revokes every session, and Settings → Access control has **Sign out everywhere**. Signing out also closes that session's open live-update stream.
+- **CSRF.** Cookie-authenticated `POST`/`PATCH`/`PUT`/`DELETE` requests, including login and sign-out, must come from the same origin (`Origin`/`Sec-Fetch-Site`): the scheme, host, and port the request arrived on, or `SCOUT_PUBLIC_ORIGIN`. Behind a TLS proxy this depends on `SCOUT_TRUST_PROXY` (so Scout sees `https`) or an `https` `SCOUT_PUBLIC_ORIGIN`. Bearer-token requests are not cookie-based and are not checked.
+- **Brute force.** Sign-in is limited to 10 attempts per client per 15 minutes, where a client is an IPv4 address or an IPv6 /64 (the per-IP API limits group IPv6 the same way). At most 2 password checks run at once, and extra attempts get a retryable `429`. There is no global attempt cap, so an attacker cannot use one up and block the correct password for the full window. An attacker who controls many addresses can still slow sign-in down by keeping those 2 slots busy. If more than 50,000 addresses are being tracked, new addresses get `429` until the oldest entries expire. Failed attempts are logged.
+- **Live updates.** The `/events` stream checks its session every 25 seconds and closes once that session expires or is revoked.
+- **Transport.** Terminate TLS in front of Scout (Caddy, nginx, Traefik) and keep Scout itself bound to loopback or a private network. Without HTTPS the password, cookie, and tokens travel in clear text.
+- **Blast radius.** An authenticated user is the operator: the read-only debug API (`SCOUT_DEBUG_API=false` disables it) and Settings → System update (`git pull`, build, restart) stay available. Disable the debug API if you do not need it on an internet-facing host.
+
+Minimal Caddy example:
+
+```
+scout.example.com {
+  reverse_proxy 127.0.0.1:3001
+}
+```
+
+…with `SCOUT_HOST=127.0.0.1` and `SCOUT_TRUST_PROXY=127.0.0.1` for Scout.
 
 For a source checkout, the deployment checks are:
 
@@ -118,7 +151,7 @@ docker compose up -d --build
 npm run test:compose
 ```
 
-The smoke test requests `http://127.0.0.1:3001/api/ready` from the host. Compose requires `SCOUT_SECRET`; keep the published port on a trusted LAN/VPN because Scout has no built-in authentication. Scout waits for the pinned Browserless container health check before starting. The container runs as a non-root user with a read-only application filesystem; `/app/data` is the writable SQLite volume.
+The smoke test requests `http://127.0.0.1:3001/api/ready` from the host. Compose requires `SCOUT_SECRET` plus either credentials (`SCOUT_PASSWORD_HASH`/`SCOUT_PASSWORD`/`SCOUT_API_TOKENS`) or an explicit `SCOUT_AUTH=off`, because the container listens on `0.0.0.0`. Compose substitutes `${SCOUT_PASSWORD_HASH}` from the project `.env` file, so put the hash in single quotes there (`SCOUT_PASSWORD_HASH='scrypt$32768$8$1$…'`). Compose reads single-quoted `.env` values literally, so the `$` separators are left alone. Do not write them as `$$`, because that escape only applies inside `compose.yaml`. To generate a hash with the image, run `docker compose run --rm --no-deps scout node scripts/hash-password.mjs`. The published port binds to `127.0.0.1` by default (`SCOUT_PUBLISH` overrides it), so put a TLS-terminating proxy in front for internet access. Scout waits for the pinned Browserless container health check before starting. The container runs as a non-root user with a read-only application filesystem; `/app/data` is the writable SQLite volume.
 
 ## AI listing intelligence
 
@@ -148,7 +181,7 @@ curl -s -X POST http://127.0.0.1:3001/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-It is stateless (one fresh server per request, no session ids) and offers twelve tools (plus the four read-only `scout_debug_*` tools from the [Debug API](#debug-api) unless `SCOUT_DEBUG_API=false`): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail`, `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_queue_scan`, and `scout_connectors`. `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. Like the REST API it has no built-in authentication — keep it on a trusted LAN/VPN and never expose it directly to the public internet.
+It is stateless (one fresh server per request, no session ids) and offers twelve tools (plus the four read-only `scout_debug_*` tools from the [Debug API](#debug-api) unless `SCOUT_DEBUG_API=false`): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail`, `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_queue_scan`, and `scout_connectors`. `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. With auth enabled, MCP clients must send `Authorization: Bearer <token>` using a value from `SCOUT_API_TOKENS`.
 
 ## iOS app
 
@@ -194,6 +227,6 @@ Scout only accepts HTTPS URLs from the approved marketplace domains. It does not
 
 Use Settings → Data recovery to download a redacted JSON export or create a SQLite backup beside the configured database. The backup uses SQLite's WAL-aware `VACUUM INTO` operation and is written with restrictive permissions where supported. Keep backups outside the application directory as well; a database backup contains private history and encrypted credentials. Retention cleanup runs daily and prunes operational history after 180 days while preserving active watch definitions and research series metadata. Watch price history is stored compactly: a scan that sees an unchanged price updates that day's latest observation instead of adding a new one, so each listing keeps its price changes plus at most two rows per unchanged day. Daily analytics are unaffected, and the observation count shown in watch analytics counts stored price points, not scans.
 
-To restore a verified backup, stop Scout first and run `npm run db:restore -- --backup /secure/path/scout.sqlite.backup.sqlite --confirm`. Add `--database /path/to/scout.sqlite` when `SCOUT_DB_PATH` is not the target. The command validates SQLite integrity, stages the replacement atomically, and keeps the previous database in a recoverable `.before-restore-*` file.
+To restore a verified backup, stop Scout first and run `npm run db:restore -- --backup /secure/path/scout.sqlite.backup.sqlite --confirm`. Add `--database /path/to/scout.sqlite` when `SCOUT_DB_PATH` is not the target. The command validates SQLite integrity, stages the replacement atomically, and keeps the previous database in a recoverable `.before-restore-*` file. Restored databases have no sign-in sessions, so sign in again afterwards.
 
-For systemd deployments, install the built `dist-server` artifact under `/opt/scout`, create the dedicated `scout` user, grant it ownership of `/var/lib/scout`, and place `SCOUT_SECRET` in `/etc/scout/scout.env` with mode `0600` before enabling `scout.service`.
+For systemd deployments, install the built `dist-server` artifact under `/opt/scout`, create the dedicated `scout` user, grant it ownership of `/var/lib/scout`, and place `SCOUT_SECRET` and `SCOUT_PASSWORD_HASH` (plus `SCOUT_TRUST_PROXY` behind a proxy) in `/etc/scout/scout.env` with mode `0600` before enabling `scout.service`. Single-quote the hash there too (`SCOUT_PASSWORD_HASH='scrypt$…'`).

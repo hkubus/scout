@@ -1,4 +1,4 @@
-import Fastify from 'fastify';
+import Fastify, { type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -15,7 +15,8 @@ import { createScoutMcpServer } from './mcp';
 import { debugApiEnabled, ScoutDebug } from './debug';
 import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
-import { isPubliclyBoundHost, RateLimiter, securityHeaders } from './security';
+import { bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
+import { isPubliclyBoundHost, RateLimiter, rateLimitKey, securityHeaders } from './security';
 import { normalizeSourceIntervals, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 
@@ -30,6 +31,7 @@ const configuredSecret = process.env.SCOUT_SECRET?.trim() ?? '';
 if ((process.env.NODE_ENV === 'production' || publicExposureWarning) && (configuredSecret.length < 32 || configuredSecret === 'change-me-in-production' || configuredSecret === 'local-development-secret')) {
   throw new Error('SCOUT_SECRET must be set to a random value of at least 32 characters before exposing Scout');
 }
+const auth = await loadAuthConfig(process.env, { publiclyBound: publicExposureWarning });
 
 function configuredCorsOrigin() {
   const origins = (process.env.SCOUT_CORS_ORIGIN ?? '')
@@ -43,24 +45,59 @@ function configuredCorsOrigin() {
       throw new Error('SCOUT_CORS_ORIGIN must contain explicit HTTP(S) origins without credentials or paths');
     }
   }
-  if (!origins.length) return false;
-  return origins.length === 1 ? origins[0] : origins;
+  return origins;
 }
 
-const app = Fastify({ logger: true, bodyLimit: 1_048_576 });
-await app.register(cors, { origin: configuredCorsOrigin() });
+function configuredPublicOrigin() {
+  const raw = process.env.SCOUT_PUBLIC_ORIGIN?.trim();
+  if (!raw) return [];
+  let parsed: URL;
+  try { parsed = new URL(raw); } catch { throw new Error('SCOUT_PUBLIC_ORIGIN must be a valid HTTP(S) origin'); }
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.pathname !== '/' || parsed.search || parsed.hash || parsed.username || parsed.password) {
+    throw new Error('SCOUT_PUBLIC_ORIGIN must be an HTTP(S) origin without credentials or paths');
+  }
+  return [parsed.origin];
+}
+
+const corsOrigins = configuredCorsOrigin();
+const publicOrigins = configuredPublicOrigin();
+// Origins, besides the request's own origin, allowed to make cookie-authenticated
+// state changes. SCOUT_CORS_ORIGIN is deliberately excluded: SameSite=Strict
+// cookies never reach a cross-site frontend, which must use a bearer token.
+const trustedOrigins = publicOrigins;
+// An https public origin means TLS terminates in front of Scout, so mark
+// cookies Secure and send HSTS even if the proxy hop is not trusted.
+const publicOriginIsHttps = publicOrigins.some((origin) => origin.startsWith('https:'));
+const isSecureRequest = (request: FastifyRequest) => request.protocol === 'https' || publicOriginIsHttps;
+const sameOrigin = (request: FastifyRequest) => isSameOriginRequest(request.headers, `${request.protocol}://${request.host}`, trustedOrigins);
+
+declare module 'fastify' {
+  interface FastifyRequest {
+    scoutAuth: 'disabled' | 'session' | 'token' | 'none';
+  }
+}
+
+const trustProxy = trustProxySetting(process.env.SCOUT_TRUST_PROXY);
+const app = Fastify({ logger: true, bodyLimit: 1_048_576, trustProxy });
+if (trustProxy === true) app.log.warn('SCOUT_TRUST_PROXY=true trusts X-Forwarded-For from any client, so per-IP limits can be spoofed; prefer a hop count or the proxy address');
+await app.register(cors, { origin: corsOrigins.length === 0 ? false : corsOrigins.length === 1 ? corsOrigins[0] : corsOrigins });
+app.decorateRequest('scoutAuth', 'none');
 
 const rateLimiter = new RateLimiter();
+let untrustedForwardWarned = false;
 app.addHook('onRequest', async (request, reply) => {
-  const url = request.raw.url?.split('?', 1)[0] ?? '';
-  const isApi = url.startsWith('/api/');
-  const isEvents = url === '/events';
-  const isMcp = url === '/mcp';
-  if (!isApi && !isEvents && !isMcp) return;
+  if (trustProxy === false && !untrustedForwardWarned && request.headers['x-forwarded-for']) {
+    untrustedForwardWarned = true;
+    app.log.warn('Received X-Forwarded-For but SCOUT_TRUST_PROXY is unset: every client shares the proxy address for rate limits and HTTPS is not detected');
+  }
+  const route = request.routeOptions.url;
+  if (!isProtectedRoute(route)) return;
 
-  const expensive = isMcp || /\/search$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/snapshot-images\/|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(url);
+  const expensive = route === '/mcp' || /\/search$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route);
   const limit = expensive ? 30 : 240;
-  const bucket = rateLimiter.consume(`${request.ip}:${expensive ? 'expensive' : url}`, limit);
+  // Snapshot images use the general limit so a screen of saved photos loads.
+  // Key on the route template, not the raw URL, so ids cannot mint new buckets.
+  const bucket = rateLimiter.consume(`${rateLimitKey(request.ip)}:${expensive ? 'expensive' : `${request.method} ${route}`}`, limit);
   reply.header('X-RateLimit-Limit', String(limit));
   reply.header('X-RateLimit-Remaining', String(bucket.remaining));
   if (!bucket.allowed) {
@@ -69,14 +106,58 @@ app.addHook('onRequest', async (request, reply) => {
   }
 });
 app.addHook('onSend', async (request, reply) => {
-  const secure = request.protocol === 'https' || request.headers['x-forwarded-proto'] === 'https';
-  for (const [name, value] of Object.entries(securityHeaders(secure))) reply.header(name, value);
+  // request.protocol honours X-Forwarded-Proto only from SCOUT_TRUST_PROXY hops.
+  for (const [name, value] of Object.entries(securityHeaders(isSecureRequest(request)))) reply.header(name, value);
+  if (request.routeOptions.url?.startsWith('/api/') && !reply.hasHeader('cache-control')) reply.header('cache-control', 'no-store');
 });
 
 const db = openDatabase();
 if (process.env.SCOUT_SEED_DEMO === 'true') seedDatabase(db, { watches: seedWatches, listings: seedListings });
+const sessions = new SessionStore(db, auth.credentialId);
+if (auth.enabled) sessions.purgeExpired();
 
-const clients = new Set<{ write: (chunk: string) => void; end: () => void }>();
+// Health/readiness stay public for container probes (details only when
+// authenticated); the auth endpoints must be reachable before login.
+const publicApiPaths = new Set(['/api/health', '/api/ready', '/api/auth/session', '/api/auth/login', '/api/auth/logout']);
+const safeMethods = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+function resolveAuth(request: FastifyRequest): FastifyRequest['scoutAuth'] {
+  const token = bearerToken(request.headers.authorization);
+  if (token !== null) return matchesApiToken(auth, token) ? 'token' : 'none';
+  const cookie = parseCookies(request.headers.cookie).get(SESSION_COOKIE);
+  return cookie && auth.passwordHash && sessions.validate(cookie) ? 'session' : 'none';
+}
+
+app.addHook('onRequest', async (request, reply) => {
+  if (!auth.enabled) { request.scoutAuth = 'disabled'; return; }
+  // Decide on the matched route template, never the raw URL: the router
+  // percent-decodes paths, so `/%61pi/...` still reaches `/api/...` handlers.
+  // The static SPA shell is public; it holds no data and renders the login form.
+  const route = request.routeOptions.url;
+  if (!isProtectedRoute(route)) return;
+  request.scoutAuth = resolveAuth(request);
+  if (publicApiPaths.has(route)) return;
+  if (request.scoutAuth === 'none') {
+    reply.header('WWW-Authenticate', 'Bearer realm="scout"');
+    return reply.code(401).send({ error: 'Authentication required' });
+  }
+  if (request.scoutAuth === 'session' && !safeMethods.has(request.method) && !sameOrigin(request)) {
+    return reply.code(403).send({ error: 'Cross-origin request rejected' });
+  }
+});
+const authenticated = (request: FastifyRequest) => request.scoutAuth !== 'none';
+
+// `session` is the cookie token a browser stream was opened with, so revoking
+// that session also closes its live stream.
+const clients = new Set<{ write: (chunk: string) => void; end: () => void; session?: string }>();
+function closeSessionStreams(matches: (session: string) => boolean) {
+  for (const client of clients) {
+    if (client.session !== undefined && matches(client.session)) {
+      clients.delete(client);
+      client.end();
+    }
+  }
+}
 const nowIso = () => new Date().toISOString();
 
 function emit(event: string, payload: unknown) {
@@ -85,7 +166,7 @@ function emit(event: string, payload: unknown) {
     try { client.write(message); } catch { clients.delete(client); }
   }
 }
-const service = new ScoutService(db, emit, { publicExposureWarning });
+const service = new ScoutService(db, emit, { publicExposureWarning: publicExposureWarning && !auth.enabled, authEnabled: auth.enabled });
 const debug = debugApiEnabled() ? new ScoutDebug(db, service) : null;
 const marketplaceParam = z.enum(['OLX', 'Allegro Lokalnie', 'Vinted']);
 const marketplaceSources = z.array(marketplaceParam).min(1).max(3).refine((sources) => new Set(sources).size === sources.length, { message: 'Marketplace sources must be unique' });
@@ -101,10 +182,65 @@ app.setErrorHandler((error, _request, reply) => {
   return reply.code(500).send({ error: 'Internal server error' });
 });
 
-app.get('/api/health', async () => ({ status: 'ok', service: 'scout', version: process.env.SCOUT_VERSION ?? '1.0.0', now: nowIso(), memory: process.memoryUsage() }));
-app.get('/api/ready', async (_request, reply) => {
+app.get('/api/health', async (request) => (authenticated(request)
+  ? { status: 'ok', service: 'scout', version: process.env.SCOUT_VERSION ?? '1.0.0', now: nowIso(), memory: process.memoryUsage() }
+  : { status: 'ok' }));
+app.get('/api/ready', async (request, reply) => {
   const readiness = service.readiness();
-  return reply.code(readiness.status === 'ready' ? 200 : 503).send(readiness);
+  return reply.code(readiness.status === 'ready' ? 200 : 503).send(authenticated(request) ? readiness : { status: readiness.status });
+});
+
+// Once full of live buckets the login limiter refuses new addresses rather
+// than evicting (and so resetting) an attacker's active counter.
+const loginLimiter = new RateLimiter(15 * 60_000, 50_000, 'reject');
+// Bound concurrent scrypt work instead of a global attempt cap, which would
+// let anyone lock the operator out by spending it. Stay below libuv's default
+// four-thread pool so password checks cannot stall fs, dns, and zlib work.
+const MAX_CONCURRENT_LOGINS = 2;
+let loginsInFlight = 0;
+app.get('/api/auth/session', async (request) => ({
+  authEnabled: auth.enabled,
+  authenticated: authenticated(request),
+  passwordLogin: Boolean(auth.passwordHash),
+}));
+app.post('/api/auth/login', async (request, reply) => {
+  if (!auth.passwordHash) return reply.code(404).send({ error: 'Password login is not configured' });
+  if (!sameOrigin(request)) return reply.code(403).send({ error: 'Cross-origin request rejected' });
+  const perIp = loginLimiter.consume(`ip:${rateLimitKey(request.ip)}`, 10);
+  if (!perIp.allowed) {
+    reply.header('Retry-After', String(perIp.retryAfterSeconds));
+    return reply.code(429).send({ error: 'Too many sign-in attempts. Try again later.' });
+  }
+  const parsed = z.object({ password: z.string().min(1).max(1024) }).strict().safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'A password is required' });
+  if (loginsInFlight >= MAX_CONCURRENT_LOGINS) {
+    reply.header('Retry-After', '1');
+    return reply.code(429).send({ error: 'Sign-in is busy. Try again in a moment.' });
+  }
+  loginsInFlight += 1;
+  let valid: boolean;
+  try { valid = await verifyPassword(parsed.data.password, auth.passwordHash); } finally { loginsInFlight -= 1; }
+  if (!valid) {
+    request.log.warn({ ip: request.ip }, 'Failed sign-in attempt');
+    return reply.code(401).send({ error: 'Incorrect password' });
+  }
+  const token = sessions.create({ ip: request.ip, userAgent: request.headers['user-agent'] });
+  request.log.info({ ip: request.ip }, 'Signed in');
+  return reply.header('set-cookie', sessionCookie(token, isSecureRequest(request))).send({ ok: true });
+});
+app.post('/api/auth/logout', async (request, reply) => {
+  const token = parseCookies(request.headers.cookie).get(SESSION_COOKIE);
+  if (token) {
+    if (!sameOrigin(request)) return reply.code(403).send({ error: 'Cross-origin request rejected' });
+    sessions.revoke(token);
+    closeSessionStreams((session) => session === token);
+  }
+  return reply.header('set-cookie', clearedSessionCookie(isSecureRequest(request))).send({ ok: true });
+});
+app.post('/api/auth/logout-all', async (request, reply) => {
+  sessions.revokeAll();
+  closeSessionStreams(() => true);
+  return reply.header('set-cookie', clearedSessionCookie(isSecureRequest(request))).send({ ok: true });
 });
 app.get('/api/dashboard', async () => service.dashboard());
 app.get('/api/listings', async (request, reply) => {
@@ -636,7 +772,8 @@ app.get('/events', async (request, reply) => {
   const response = reply.raw;
   response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
   response.write(`event: ready\ndata: ${JSON.stringify({ now: nowIso() })}\n\n`);
-  const client = { write: (chunk: string) => response.write(chunk), end: () => response.end() };
+  const session = request.scoutAuth === 'session' ? parseCookies(request.headers.cookie).get(SESSION_COOKIE) : undefined;
+  const client = { write: (chunk: string) => response.write(chunk), end: () => response.end(), session };
   clients.add(client);
   request.raw.on('close', () => clients.delete(client));
 });
@@ -644,8 +781,8 @@ app.get('/events', async (request, reply) => {
 // Scout's MCP server speaks Streamable HTTP (JSON-RPC over POST /mcp) so
 // MCP clients connect over HTTP instead of stdio. Stateless per-request
 // servers keep every request independent: no session ids, no resumability,
-// any replica can serve any call. Like the REST API, the endpoint is
-// unauthenticated by design — keep it on a trusted LAN/VPN.
+// any replica can serve any call. When auth is enabled, clients send an
+// `Authorization: Bearer` token from SCOUT_API_TOKENS.
 app.post('/mcp', async (request, reply) => {
   reply.hijack();
   const mcpServer = createScoutMcpServer(service, debug);
@@ -684,8 +821,14 @@ const scheduler = setInterval(() => {
   service.schedulerTick();
 }, 30_000);
 const sseHeartbeat = setInterval(() => {
+  // Streams authenticate once at connect, so drop any whose session has since
+  // expired or been revoked. isActive() does not extend the idle window.
+  if (auth.enabled) closeSessionStreams((session) => !sessions.isActive(session));
   emit('ping', { now: nowIso() });
 }, 25_000);
+const sessionPurge = setInterval(() => {
+  if (auth.enabled) sessions.purgeExpired();
+}, 60 * 60_000);
 
 // Periodic runtime diagnostics: RSS vs heapUsed distinguishes file-backed
 // growth (mmap/page cache) from real heap retention, and the discard counts
@@ -699,7 +842,7 @@ const diagnosticsInterval = setInterval(() => {
   service.logDiagnostic(formatMemoryLine());
 }, 30 * 60_000);
 
-app.addHook('onClose', async () => { debug?.close(); clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); for (const client of clients) client.end(); try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ } db.close(); });
+app.addHook('onClose', async () => { debug?.close(); clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); clearInterval(sessionPurge); for (const client of clients) client.end(); try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ } db.close(); });
 let shuttingDown = false;
 const shutdown = async (signal: string) => {
   if (shuttingDown) return;

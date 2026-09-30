@@ -7,6 +7,7 @@ import {
   Database,
   Info,
   LoaderCircle,
+  LogOut,
   Moon,
   Send,
   Settings2,
@@ -819,20 +820,34 @@ export default function SettingsPage({
               <AlertTriangle size={18} />
             </div>
             <div>
-              <h2>LAN/VPN access only</h2>
+              <h2>Access control</h2>
               <p>
                 {!settingsLoaded
                   ? "Checking exposure configuration…"
-                  : settings.publicExposureWarning
-                    ? "Scout is listening beyond loopback. Authentication is required for API access."
-                    : "Scout reports a loopback-only listening address."}
+                  : settings.authEnabled
+                    ? "Sign-in is required for the dashboard, API, live events, and MCP."
+                    : settings.publicExposureWarning
+                      ? "Scout is listening beyond loopback with authentication turned off (SCOUT_AUTH=off)."
+                      : "Authentication is off and Scout reports a loopback-only listening address."}
               </p>
             </div>
           </div>
           <div className="warning-copy">
-            Keep Scout behind your trusted LAN or VPN. Scout has no built-in
-            authentication, so do not expose it to the public internet.
+            {settings?.authEnabled
+              ? "Serve Scout over HTTPS (for example behind a reverse proxy with SCOUT_TRUST_PROXY set) so session cookies and API tokens are never sent in clear text."
+              : "Without SCOUT_PASSWORD_HASH or SCOUT_API_TOKENS, keep Scout behind your trusted LAN or VPN and do not expose it to the public internet."}
           </div>
+          {settings?.authEnabled ? (
+            <button
+              className="outline-button danger-outline"
+              onClick={() => {
+                if (!window.confirm("Sign out every browser session, including this one?")) return;
+                void api.logoutAll().finally(() => window.location.reload());
+              }}
+            >
+              <LogOut size={15} />Sign out everywhere
+            </button>
+          ) : null}
         </section>
       </div>
       <div className="settings-footer">

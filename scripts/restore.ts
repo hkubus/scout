@@ -41,6 +41,22 @@ const previousPath = `${databasePath}.before-restore-${stamp}`;
 copyFileSync(backupPath, stagedPath);
 try { chmodSync(stagedPath, 0o600); } catch { /* permissions are best-effort on non-POSIX filesystems */ }
 
+// Sign-in sessions from the backup's point in time must not come back to life
+// (they may have been signed out or revoked since), so restored databases
+// always start with no sessions.
+try {
+  // @ts-ignore node:sqlite is present in the supported Node 22+ runtime.
+  const stagedDb = new DatabaseSync(stagedPath);
+  try {
+    if (stagedDb.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'auth_sessions'").get()) stagedDb.exec('DELETE FROM auth_sessions');
+  } finally {
+    stagedDb.close();
+  }
+} catch (error) {
+  unlinkSync(stagedPath);
+  throw error;
+}
+
 let liveDatabaseMoved = false;
 const movedSidecars: string[] = [];
 try {

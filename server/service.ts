@@ -193,6 +193,7 @@ export interface ScoutServiceDependencies {
   verifyListingDescriptionWithVision?: typeof verifyListingDescriptionWithVision;
   fetchListingDetailHtml?: (url: string, marketplace: Marketplace) => Promise<string>;
   publicExposureWarning?: boolean;
+  authEnabled?: boolean;
 }
 
 export function marketStatusAfterMiss(currentMissingScans: number, threshold = 3) {
@@ -527,6 +528,7 @@ export class ScoutService {
   private readonly visionVerification: typeof verifyListingDescriptionWithVision;
   private readonly detailHtml: (url: string, marketplace: Marketplace) => Promise<string>;
   private readonly publicExposureWarning: boolean;
+  private readonly authEnabled: boolean;
   private readonly schedulerOwner = `scheduler-${process.pid}-${randomBytes(8).toString('hex')}`;
   private activeManualSearches = 0;
   private logSequence = 0;
@@ -547,6 +549,7 @@ export class ScoutService {
     this.visionVerification = dependencies.verifyListingDescriptionWithVision ?? verifyListingDescriptionWithVision;
     this.detailHtml = dependencies.fetchListingDetailHtml ?? ((url, marketplace) => this.fetchPublicPage(url, marketplace));
     this.publicExposureWarning = dependencies.publicExposureWarning ?? false;
+    this.authEnabled = dependencies.authEnabled ?? false;
   }
 
   private transaction<T>(callback: () => T, retries = 3): T {
@@ -3463,6 +3466,7 @@ export class ScoutService {
         };
       })(),
       publicExposureWarning: this.publicExposureWarning,
+      authEnabled: this.authEnabled,
       marketplaceSessions: this.marketplaceSessions(),
     };
   }

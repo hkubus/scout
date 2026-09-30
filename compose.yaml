@@ -4,12 +4,20 @@ services:
     restart: unless-stopped
     init: true
     ports:
-      - "3001:3001"
+      # Loopback by default: publish through a TLS-terminating reverse proxy.
+      - "${SCOUT_PUBLISH:-127.0.0.1:3001}:3001"
     environment:
       PORT: 3001
       SCOUT_HOST: 0.0.0.0
       SCOUT_DB_PATH: /app/data/scout.sqlite
       SCOUT_SECRET: ${SCOUT_SECRET:?Set SCOUT_SECRET in .env}
+      SCOUT_PASSWORD_HASH: ${SCOUT_PASSWORD_HASH:-}
+      SCOUT_PASSWORD: ${SCOUT_PASSWORD:-}
+      SCOUT_API_TOKENS: ${SCOUT_API_TOKENS:-}
+      SCOUT_AUTH: ${SCOUT_AUTH:-}
+      SCOUT_TRUST_PROXY: ${SCOUT_TRUST_PROXY:-}
+      SCOUT_PUBLIC_ORIGIN: ${SCOUT_PUBLIC_ORIGIN:-}
+      SCOUT_DEBUG_API: ${SCOUT_DEBUG_API:-}
       SCOUT_OPENROUTER_API_KEY: ${SCOUT_OPENROUTER_API_KEY:-}
       SCOUT_OPENROUTER_MODEL: ${SCOUT_OPENROUTER_MODEL:-deepseek/deepseek-v4-flash}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}

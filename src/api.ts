@@ -10,6 +10,10 @@ export class ApiError extends Error {
   }
 }
 
+export const UNAUTHORIZED_EVENT = 'scout:unauthorized';
+
+export type AuthSession = { authEnabled: boolean; authenticated: boolean; passwordLogin: boolean };
+
 const inFlightGets = new Map<string, Promise<unknown>>();
 
 function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -34,6 +38,8 @@ async function fetchJson<T>(path: string, init?: RequestInit, timeoutMs = 20_000
   try {
     const response = await fetch(path, { ...init, signal });
     const payload = await response.json().catch(() => ({})) as { error?: string };
+    // A lapsed or revoked session: let the app shell swap back to the sign-in screen.
+    if (response.status === 401 && !path.startsWith('/api/auth/')) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
     if (!response.ok) throw new ApiError(payload.error ?? `Request failed (${response.status})`, response.status);
     return payload as T;
   } finally {
@@ -65,6 +71,10 @@ const json = (method: string, body?: unknown): RequestInit => body === undefined
   : { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) };
 
 export const api = {
+  authSession: (signal?: AbortSignal) => request<AuthSession>('/api/auth/session', { signal }),
+  login: (password: string) => request<{ ok: true }>('/api/auth/login', json('POST', { password })),
+  logout: () => request<{ ok: true }>('/api/auth/logout', { method: 'POST' }),
+  logoutAll: () => request<{ ok: true }>('/api/auth/logout-all', { method: 'POST' }),
   dashboard: (signal?: AbortSignal) => request<DashboardData>('/api/dashboard', { signal }),
   listings: (options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string; sort?: 'newest' | 'strongest' | 'price'; decision?: ListingDecision; visibility?: 'visible' | 'hidden' | 'all' } = {}, signal?: AbortSignal) => {
     const params = new URLSearchParams();

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   AlertTriangle,
   ArrowRight,
@@ -9,6 +9,8 @@ import {
   Grid2X2,
   Info,
   LoaderCircle,
+  LogIn,
+  LogOut,
   Menu,
   PanelLeftClose,
   PanelLeftOpen,
@@ -23,7 +25,7 @@ import {
   TrendingUp,
   WifiOff,
 } from "lucide-react";
-import { api } from "./api";
+import { api, UNAUTHORIZED_EVENT, type AuthSession } from "./api";
 import { emptyDashboard } from "./data";
 import ListingTable from "./ListingTable";
 import type { WatchPreset } from "./presets";
@@ -120,6 +122,90 @@ function useTheme() {
 }
 
 function App() {
+  const [auth, setAuth] = useState<"checking" | "login" | "ready">("checking");
+  const [session, setSession] = useState<AuthSession | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    api.authSession(controller.signal).then((value) => {
+      setSession(value);
+      setAuth(value.authenticated ? "ready" : "login");
+    }).catch(() => {
+      // Unreachable server: render the app so it shows its offline state.
+      if (!controller.signal.aborted) setAuth("ready");
+    });
+    const onUnauthorized = () => setAuth("login");
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    return () => {
+      controller.abort();
+      window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    };
+  }, []);
+  if (auth === "checking") return null;
+  if (auth === "login") return <LoginScreen passwordLogin={session?.passwordLogin ?? true} />;
+  const logout = session?.authEnabled && session.passwordLogin
+    ? () => { void api.logout().finally(() => window.location.reload()); }
+    : null;
+  return <ScoutApp onLogout={logout} />;
+}
+
+function LoginScreen({ passwordLogin }: { passwordLogin: boolean }) {
+  useTheme();
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setSubmitting(true);
+    setError(null);
+    try {
+      await api.login(password);
+      // Reload so live events and every cached request start under the new session.
+      window.location.reload();
+    } catch (reason) {
+      setError(errorMessage(reason));
+      setSubmitting(false);
+    }
+  };
+  return (
+    <main className="login-shell">
+      <form className="login-card" onSubmit={submit}>
+        <div className="brand-row">
+          <div className="brand-mark" aria-hidden="true">
+            <Search size={24} strokeWidth={2.7} />
+            <span />
+          </div>
+          <span className="brand-name">Scout</span>
+        </div>
+        {passwordLogin ? (
+          <>
+            <label className="field-label">
+              <span>Password</span>
+              <input
+                type="password"
+                autoComplete="current-password"
+                autoFocus
+                required
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+              />
+            </label>
+            {error ? <p className="login-error" role="alert">{error}</p> : null}
+            <button className="primary-button" type="submit" disabled={submitting || !password}>
+              {submitting ? <LoaderCircle size={18} className="spin" /> : <LogIn size={18} />}
+              Sign in
+            </button>
+          </>
+        ) : (
+          <p className="login-error" role="alert">
+            Password sign-in is not configured. Set SCOUT_PASSWORD_HASH on the server, or use an API token.
+          </p>
+        )}
+      </form>
+    </main>
+  );
+}
+
+function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
   const { theme, setTheme } = useTheme();
   const [view, setView] = useState<View>(() => viewFromLocation());
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -457,6 +543,7 @@ function App() {
         collapsed={sidebarCollapsed}
         connection={connection}
         onCollapse={() => setSidebarCollapsed((value) => !value)}
+        onLogout={onLogout}
       />
       {sidebarOpen ? (
         <button
@@ -645,6 +732,7 @@ function Sidebar({
   collapsed,
   connection,
   onCollapse,
+  onLogout,
 }: {
   view: View;
   onNavigate: (view: View) => void;
@@ -652,6 +740,7 @@ function Sidebar({
   collapsed: boolean;
   connection: "loading" | "online" | "offline";
   onCollapse: () => void;
+  onLogout: (() => void) | null;
 }) {
   const sidebarRef = useRef<HTMLElement>(null);
   useEffect(() => {
@@ -711,6 +800,11 @@ function Sidebar({
             </div>
           </div>
         )}
+        {onLogout ? (
+          <button className="collapse-button" onClick={onLogout} aria-label="Sign out" title="Sign out">
+            <LogOut size={19} />
+          </button>
+        ) : null}
         <button
           className="collapse-button"
           onClick={onCollapse}

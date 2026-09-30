@@ -519,6 +519,7 @@ export interface SettingsData {
   ntfy: NtfySettings;
   ai: AiSettings;
   publicExposureWarning: boolean;
+  authEnabled: boolean;
   marketplaceSessions: MarketplaceSession[];
 }
 
