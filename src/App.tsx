@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ComponentProps, type ComponentType, type FormEvent } from "react";
 import {
   AlertTriangle,
   ArrowRight,
@@ -55,48 +55,96 @@ const navItems: Array<{ id: View; label: string; icon: typeof Grid2X2 }> = [
   { id: "settings", label: "Settings", icon: Settings2 },
 ];
 
-const loadMarketResearchPage = () => import("./MarketResearchPage");
-const loadAnalyticsPage = () => import("./AnalyticsPage");
-const loadSettingsPage = () => import("./SettingsPage");
-const loadConnectorsPage = () => import("./ConnectorsPage");
-const loadLogsPage = () => import("./LogsPage");
-const loadSearchPage = () => import("./SearchPage");
-const loadListingsPage = () => import("./ListingsPage");
-const LazyMarketResearchPage = lazy(loadMarketResearchPage);
-const LazyAnalyticsPage = lazy(loadAnalyticsPage);
-const LazySettingsPage = lazy(loadSettingsPage);
-const LazyConnectorsPage = lazy(loadConnectorsPage);
-const LazyLogsPage = lazy(loadLogsPage);
-const LazySearchPage = lazy(loadSearchPage);
-const LazyListingsPage = lazy(loadListingsPage);
-const LazyListingDetailDrawer = lazy(() => import("./ListingDetailDrawer"));
-const loadWatchesPage = () => import("./WatchesPage");
-const LazyWatchesPage = lazy(loadWatchesPage);
-const LazyWatchAnalyticsDialog = lazy(() => loadWatchesPage().then((module) => ({ default: module.WatchAnalyticsDialog })));
-const loadDialogs = () => import("./Dialogs");
-const LazyWatchDialog = lazy(() => loadDialogs().then((module) => ({ default: module.WatchDialog })));
-const LazyPriceFilterDialog = lazy(() => loadDialogs().then((module) => ({ default: module.PriceFilterDialog })));
-const LazyHistoryDialog = lazy(() => loadDialogs().then((module) => ({ default: module.HistoryDialog })));
+/**
+ * React.lazy suspends on its first render even when the chunk is already
+ * loaded, and React then holds the reveal ~300 ms after the fallback. Once
+ * preload() has resolved, this renders the module's component directly, so a
+ * preloaded route, drawer or dialog mounts in the same commit. The type is
+ * pinned per mounted instance: switching a mounted Lazy to the loaded
+ * component would remount it and lose its state.
+ */
+function lazyWithPreload<C extends ComponentType<any>>(loader: () => Promise<{ default: C }>) {
+  let Loaded: C | null = null;
+  let pending: Promise<{ default: C }> | null = null;
+  const preload = () => {
+    pending ??= loader().then((module) => {
+      Loaded = module.default;
+      return module;
+    });
+    // A failed chunk load can be retried by the next preload or render.
+    pending.catch(() => { pending = null; });
+    return pending;
+  };
+  const Lazy = lazy(preload);
+  function Preloadable(props: ComponentProps<C>) {
+    const [Impl] = useState(() => (Loaded ?? Lazy) as ComponentType<ComponentProps<C>>);
+    return <Impl {...props} />;
+  }
+  return Object.assign(Preloadable, { preload });
+}
 
-const routeLoaders: Partial<Record<View, () => Promise<unknown>>> = {
-  search: loadSearchPage,
-  watches: loadWatchesPage,
-  "market-research": loadMarketResearchPage,
-  analytics: loadAnalyticsPage,
-  listings: loadListingsPage,
-  connectors: loadConnectorsPage,
-  logs: loadLogsPage,
-  settings: loadSettingsPage,
+const LazyMarketResearchPage = lazyWithPreload(() => import("./MarketResearchPage"));
+const LazyAnalyticsPage = lazyWithPreload(() => import("./AnalyticsPage"));
+const LazySettingsPage = lazyWithPreload(() => import("./SettingsPage"));
+const LazyConnectorsPage = lazyWithPreload(() => import("./ConnectorsPage"));
+const LazyLogsPage = lazyWithPreload(() => import("./LogsPage"));
+const LazySearchPage = lazyWithPreload(() => import("./SearchPage"));
+const LazyListingsPage = lazyWithPreload(() => import("./ListingsPage"));
+const LazyListingDetailDrawer = lazyWithPreload(() => import("./ListingDetailDrawer"));
+const loadWatchesPage = () => import("./WatchesPage");
+const LazyWatchesPage = lazyWithPreload(loadWatchesPage);
+const LazyWatchAnalyticsDialog = lazyWithPreload(() => loadWatchesPage().then((module) => ({ default: module.WatchAnalyticsDialog })));
+const loadDialogs = () => import("./Dialogs");
+const LazyWatchDialog = lazyWithPreload(() => loadDialogs().then((module) => ({ default: module.WatchDialog })));
+const LazyPriceFilterDialog = lazyWithPreload(() => loadDialogs().then((module) => ({ default: module.PriceFilterDialog })));
+const LazyHistoryDialog = lazyWithPreload(() => loadDialogs().then((module) => ({ default: module.HistoryDialog })));
+
+const routePages: Partial<Record<View, { preload: () => Promise<unknown> }>> = {
+  search: LazySearchPage,
+  watches: LazyWatchesPage,
+  "market-research": LazyMarketResearchPage,
+  analytics: LazyAnalyticsPage,
+  listings: LazyListingsPage,
+  connectors: LazyConnectorsPage,
+  logs: LazyLogsPage,
+  settings: LazySettingsPage,
 };
 
 const preloadView = (view: View) => {
-  void routeLoaders[view]?.();
+  void routePages[view]?.preload().catch(() => {});
 };
+
+/**
+ * Fetch every remaining route, drawer and dialog chunk once the browser is
+ * idle after `delayMs` (skipped on Save-Data), so they do not compete with
+ * the first view's own data request.
+ */
+let idlePreloadScheduled = false;
+function preloadRestWhenIdle(delayMs: number) {
+  if (idlePreloadScheduled) return;
+  idlePreloadScheduled = true;
+  if ((navigator as Navigator & { connection?: { saveData?: boolean } }).connection?.saveData) return;
+  const run = () => {
+    for (const component of [...Object.values(routePages), LazyListingDetailDrawer, LazyWatchAnalyticsDialog, LazyWatchDialog, LazyPriceFilterDialog, LazyHistoryDialog]) {
+      void component?.preload().catch(() => {});
+    }
+  };
+  window.setTimeout(() => {
+    if (typeof window.requestIdleCallback === "function") window.requestIdleCallback(run, { timeout: 3000 });
+    else run();
+  }, delayMs);
+}
 
 function viewFromLocation(): View {
   const raw = window.location.pathname.split(/[?#]/)[0].replace(/\/+$/, "").replace(/^\//, "") as View;
   return navItems.some((item) => item.id === raw) ? raw : "overview";
 }
+
+const initialView = viewFromLocation();
+/** Whether the first view renders the dashboard (see planFlush). */
+const initialViewNeedsDashboard = planFlush(initialView, new Set(allLiveResources), false, false).dashboard;
+// A deep-linked route's chunk loads alongside the session check, so it mounts without suspending.
+preloadView(initialView);
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
@@ -318,6 +366,11 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     viewRef.current = view;
     void flush();
   }, [flush, view]);
+  // Once the first view has rendered its data, fetch the other chunks in the
+  // background. Pages that load their own data get a head start instead.
+  useEffect(() => {
+    if (initialViewNeedsDashboard ? !isLoading : true) preloadRestWhenIdle(initialViewNeedsDashboard ? 0 : 2500);
+  }, [isLoading]);
   useEffect(() => {
     const onVisibility = () => {
       if (!document.hidden) void flush();
