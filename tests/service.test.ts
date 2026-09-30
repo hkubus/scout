@@ -1073,6 +1073,40 @@ test('verifies a new strong deal once even with no notification channel', async 
   } finally { context.close(); }
 });
 
+test('verifies OLX deals from the offers-API description without fetching the offer page', async () => {
+  const descriptions: Array<string | null> = [];
+  const context = fixture({
+    classifyListingRelevance: async () => ({ relevant: true }),
+    verifyListingDescription: async (input) => { descriptions.push(input.description); return { decision: 'pass', confidence: 0.9, summary: 'Working.', issues: [], evidence: ['works'] }; },
+  });
+  try {
+    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' } });
+    const scenario = standingDealScenario(context, 'olx-hint-watch', [{ id: 'api-deal', price: 700 }, { id: 'page-deal', price: 720 }]);
+    const service = context.service as any;
+    const fetchOlx = service.fetchOlxApi;
+    let apiDescription = '<p>Procesor sprawny,<br>testowany &amp; z pudełkiem.</p>';
+    service.fetchOlxApi = async () => {
+      const response = await fetchOlx();
+      response.json.data[0].description = apiDescription;
+      response.json.data[0].photos = [{ link: 'https://ireland.apollo.olxcdn.com:443/v1/files/api-deal-PL/image;s={width}x{height}' }];
+      return response;
+    };
+    await scenario.scan();
+    // Only the offer without an API description falls back to its page.
+    assert.equal(scenario.state.fetches, 1);
+    assert.deepEqual([...descriptions].sort(), ['Fully working CPU, tested.', 'Procesor sprawny, testowany & z pudełkiem.'].sort());
+    const snapshot = context.db.prepare(`SELECT s.description FROM listing_detail_snapshots s JOIN listings l ON l.id = s.listing_id WHERE l.listing_id = 'api-deal'`).all() as Array<{ description: string }>;
+    assert.deepEqual(snapshot.map((row) => row.description), ['Procesor sprawny, testowany & z pudełkiem.']);
+
+    // An edited description with a retitle is a new state, still verified without a page fetch.
+    apiDescription = '<p>Procesor uszkodzony.</p>';
+    service.fetchOlxApi = ((inner: () => Promise<any>) => async () => { const response = await inner(); response.json.data[0].title = 'CPU api-deal, damaged'; return response; })(service.fetchOlxApi);
+    await scenario.scan();
+    assert.equal(scenario.state.fetches, 1);
+    assert.ok(descriptions.includes('Procesor uszkodzony.'));
+  } finally { context.close(); }
+});
+
 test('holds a high-priority alert when OpenRouter verification output is malformed', async () => {
   let verificationRequests = 0;
   const context = fixture({

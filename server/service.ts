@@ -4,7 +4,7 @@ import { connect as connectHttp2, type SecureClientSessionOptions } from 'node:h
 import { brotliDecompressSync, gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
 import { chromium, type Browser, type BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
-import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
+import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult, olxDetailHint } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext } from './ai';
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchVariantWithJev, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
@@ -1803,14 +1803,22 @@ export class ScoutService {
     // Read once: gallery parsing below must stay inert when both modes are off,
     // and this also avoids re-decrypting the OpenRouter key per candidate.
     const jevShadow = this.jevShadowConfig();
+    // The OLX offers API already returned this scan's description and photos,
+    // so the HTML offer page is fetched only when that text is missing.
+    const hint = marketplace === 'OLX' ? olxDetailHint(candidate.listing) : undefined;
     try {
-      const html = await this.fetchPublicPage(candidate.listing.url, marketplace);
-      description = parseListingDescription(html, marketplace);
-      if (jevShadow || jevLive) {
-        try {
-          galleryImageUrls = parseListingImageUrls(html, marketplace, 12).slice(0, 3);
-        } catch {
-          galleryImageUrls = [];
+      if (hint?.description) {
+        description = hint.description;
+        if (jevShadow || jevLive) galleryImageUrls = hint.imageUrls.slice(0, 3);
+      } else {
+        const html = await this.fetchPublicPage(candidate.listing.url, marketplace);
+        description = parseListingDescription(html, marketplace);
+        if (jevShadow || jevLive) {
+          try {
+            galleryImageUrls = parseListingImageUrls(html, marketplace, 12).slice(0, 3);
+          } catch {
+            galleryImageUrls = [];
+          }
         }
       }
     } catch (error) {
