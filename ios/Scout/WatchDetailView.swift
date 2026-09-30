@@ -15,6 +15,23 @@ struct WatchDetailView: View {
         _watch = State(initialValue: watch)
     }
 
+    /// Changes to this watch: its scans and edits, edits that name no watch
+    /// (deletes), and triage, which changes its deal counts.
+    private struct WatchVersion: Hashable {
+        var changes: Int
+        var allWatches: Int
+        var triage: Int
+    }
+
+    private struct LoadKey: Hashable {
+        var days: Int
+        var version: WatchVersion
+    }
+
+    private var version: WatchVersion {
+        WatchVersion(changes: model.watchChanges[watch.id, default: 0], allWatches: model.allWatchesToken, triage: model.triageToken)
+    }
+
     var body: some View {
         List {
             Section {
@@ -149,19 +166,22 @@ struct WatchDetailView: View {
             WatchEditorView(request: request) { _ in }
         }
         .refreshable { await load() }
-        .task(id: "\(days)-\(model.refreshToken)") { await load() }
+        .reloadOnChange(of: LoadKey(days: days, version: version)) { await load() }
     }
 
-    private func load() async {
-        guard let client = model.client else { return }
+    @discardableResult
+    private func load() async -> Bool {
+        guard let client = model.client else { return false }
         do {
             analytics = try await client.watchAnalytics(id: watch.id, days: days)
             if let fresh = try await client.watches(includeArchived: true).first(where: { $0.id == watch.id }) {
                 watch = fresh
             }
             error = nil
+            return true
         } catch {
             if !error.isCancellation { self.error = error.localizedDescription }
+            return false
         }
     }
 
@@ -183,7 +203,7 @@ struct WatchDetailView: View {
             do {
                 try await client.updateWatch(id: watch.id, patch: WatchPatch(archived: archived))
                 await load()
-                model.refresh()
+                model.refreshUnlessLive()
             } catch {
                 model.report(error)
             }

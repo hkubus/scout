@@ -765,3 +765,117 @@ final class MarketTests: XCTestCase {
         XCTAssertEqual(client.marketSnapshotImageURL(imageId: 7).absoluteString, "https://host/scout/api/market-snapshot-images/7")
     }
 }
+
+final class LiveUpdatesTests: XCTestCase {
+    private func event(_ name: String, _ data: String = "{}") -> ServerSentEvent {
+        ServerSentEvent(event: name, data: data)
+    }
+
+    func testEachEventInvalidatesOnlyWhatItChanges() {
+        let scan = LiveInvalidation(event: event("scan", #"{"refresh":true,"watchId":"w1"}"#))
+        XCTAssertEqual([scan.feed, scan.watches, scan.triage, scan.server, scan.research, scan.allWatches], [true, true, false, true, false, false])
+        XCTAssertEqual(scan.watchIDs, ["w1"])
+
+        let watch = LiveInvalidation(event: event("watch", #"{"id":"w2","archived":true}"#))
+        XCTAssertEqual([watch.feed, watch.watches, watch.triage, watch.server, watch.research, watch.allWatches], [true, true, false, false, false, false])
+        XCTAssertEqual(watch.watchIDs, ["w2"])
+
+        // A delete names no watch, so every watch detail is stale.
+        let deleted = LiveInvalidation(event: event("watch", #"{"refresh":true}"#))
+        XCTAssertTrue(deleted.allWatches)
+        XCTAssertTrue(deleted.watchIDs.isEmpty)
+
+        // Rows patch themselves; deal counts (hidden) and analytics reload.
+        let action = LiveInvalidation(event: event("listing-action", #"{"key":"OLX:1","decision":"buy","hidden":false}"#))
+        XCTAssertEqual([action.feed, action.watches, action.triage, action.server, action.research], [false, true, true, false, false])
+        XCTAssertTrue(LiveInvalidation(event: event("listing-action", "not json")).feed)
+
+        let notification = LiveInvalidation(event: event("notification", #"{"refresh":true}"#))
+        var serverOnly = LiveInvalidation()
+        serverOnly.server = true
+        XCTAssertEqual(notification, serverOnly)
+
+        let market = LiveInvalidation(event: event("market-watch", #"{"refresh":true,"id":"m1"}"#))
+        XCTAssertEqual([market.feed, market.watches, market.research, market.allMarketWatches], [false, false, true, false])
+        XCTAssertEqual(market.marketWatchIDs, ["m1"])
+        XCTAssertTrue(LiveInvalidation(event: event("market-watch", #"{"refresh":true}"#)).allMarketWatches)
+
+        XCTAssertTrue(LiveInvalidation(event: event("ai-description-verification", #"{"key":"OLX:1","status":"match"}"#)).isEmpty)
+        XCTAssertTrue(LiveInvalidation(event: event("search", "{}")).isEmpty)
+        XCTAssertTrue(LiveInvalidation(event: event("ready")).isEmpty)
+    }
+
+    func testMergesBurstsAndCoversEverythingOnReconnect() {
+        var pending = LiveInvalidation(event: event("scan", #"{"watchId":"w1"}"#))
+        pending.formUnion(LiveInvalidation(event: event("scan", #"{"watchId":"w2"}"#)))
+        pending.formUnion(LiveInvalidation(event: event("notification")))
+        XCTAssertEqual(pending.watchIDs, ["w1", "w2"])
+        XCTAssertTrue(pending.server && pending.feed && !pending.research)
+        var everything = pending
+        everything.formUnion(.everything)
+        XCTAssertEqual(everything.watchIDs, ["w1", "w2"])
+        XCTAssertTrue(everything.feed && everything.watches && everything.triage && everything.server && everything.research && everything.allWatches && everything.allMarketWatches)
+    }
+
+    func testDecodesListingActions() throws {
+        let action = try XCTUnwrap(ListingActionEvent(event: event("listing-action", #"{"key":"Allegro Lokalnie:344821","decision":null,"hidden":true}"#)))
+        XCTAssertEqual(action, ListingActionEvent(key: "Allegro Lokalnie:344821", decision: nil, hidden: true))
+        XCTAssertEqual(ListingActionEvent(event: event("listing-action", #"{"key":"OLX:1","decision":"pass","hidden":false}"#))?.decision, .pass)
+        XCTAssertNil(ListingActionEvent(event: event("scan", #"{"key":"OLX:1","decision":"pass","hidden":false}"#)))
+        XCTAssertNil(ListingActionEvent(event: event("listing-action", #"{"key":"OLX:1"}"#)))
+        XCTAssertNotEqual(action, ListingActionEvent(key: action.key, decision: action.decision, hidden: action.hidden, sequence: 1))
+    }
+
+    func testPatchesDecisionsInPlaceAndReloadsOnHiddenChanges() throws {
+        var rows = DemoTransport.dashboard().listings
+        // The same listing under a second watch.
+        var twin = rows[1]
+        twin.associationId = "twin"
+        rows.append(twin)
+        let key = rows[1].key
+
+        let buy = ListingActionEvent(key: key, decision: .buy, hidden: false)
+        let patched = try XCTUnwrap(buy.patched(rows))
+        XCTAssertEqual(patched.filter { $0.key == key }.map(\.decision), [.buy, .buy])
+        XCTAssertEqual(patched.map(\.rowID), rows.map(\.rowID))
+        for (before, after) in zip(rows, patched) where before.key != key {
+            XCTAssertEqual(before, after)
+        }
+        // Clearing the decision.
+        XCTAssertEqual(try XCTUnwrap(ListingActionEvent(key: key, decision: nil, hidden: false).patched(patched)).filter { $0.key == key }.map(\.decision), [nil, nil])
+
+        // Hiding or unhiding changes stats and deal counts, so reload.
+        XCTAssertNil(ListingActionEvent(key: key, decision: .buy, hidden: true).patched(rows))
+        var hiddenRows = rows
+        hiddenRows[1].hidden = true
+        XCTAssertNil(ListingActionEvent(key: key, decision: nil, hidden: false).patched(hiddenRows))
+        XCTAssertNotNil(ListingActionEvent(key: key, decision: .pass, hidden: true).patched(hiddenRows.filter { $0.rowID != "twin" }))
+        // A listing that isn't loaded may now belong in the list.
+        XCTAssertNil(ListingActionEvent(key: "OLX:unknown", decision: .buy, hidden: false).patched(rows))
+        XCTAssertNil(buy.patched([]))
+    }
+
+    func testReloadsOnlyWhenTheKeyChangedOrLiveDataMayBeStale() {
+        let loadedAt = Date(timeIntervalSince1970: 1_000)
+        func should(_ key: Int, visible: Bool = true, live: Bool = true, loaded: Int? = 1, at: Date? = loadedAt, now: TimeInterval = 1_060) -> Bool {
+            ReloadPolicy.shouldLoad(key: key, isVisible: visible, isLive: live, loadedKey: loaded, loadedAt: at, now: Date(timeIntervalSince1970: now))
+        }
+        XCTAssertFalse(should(1), "re-appearing with nothing new keeps the data")
+        XCTAssertTrue(should(2), "an event changed the key")
+        XCTAssertFalse(should(2, visible: false), "hidden screens never load")
+        XCTAssertTrue(should(1, loaded: nil, at: nil), "first appearance")
+        XCTAssertTrue(should(1, live: false), "without live updates changes are unknown")
+        XCTAssertFalse(should(1, now: 1_119))
+        XCTAssertTrue(should(1, now: 1_120), "at most two minutes old")
+        XCTAssertTrue(should(1, now: 900), "the clock moved back")
+    }
+
+    func testPagedRefreshKeepsTheLoadedWindow() {
+        XCTAssertEqual(ReloadPolicy.pagesToKeep(loadedRows: 0, maxRows: 500), 1)
+        XCTAssertEqual(ReloadPolicy.pagesToKeep(loadedRows: 50, maxRows: 500), 1)
+        XCTAssertEqual(ReloadPolicy.pagesToKeep(loadedRows: 51, maxRows: 500), 2)
+        XCTAssertEqual(ReloadPolicy.pagesToKeep(loadedRows: 150, maxRows: 500), 3)
+        XCTAssertEqual(ReloadPolicy.pagesToKeep(loadedRows: 900, maxRows: 500), 10)
+        XCTAssertEqual(ReloadPolicy.pagesToKeep(loadedRows: 900, maxRows: 400), 8)
+    }
+}

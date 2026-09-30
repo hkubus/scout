@@ -11,7 +11,7 @@ struct WatchesView: View {
 
     private struct LoadKey: Hashable {
         var includeArchived: Bool
-        var refreshToken: Int
+        var watchesToken: Int
     }
 
     var body: some View {
@@ -46,7 +46,7 @@ struct WatchesView: View {
                     }
                 }
             }
-            .overlay { LoadingOverlay(isLoaded: watches != nil, error: error, retry: load) }
+            .overlay { LoadingOverlay(isLoaded: watches != nil, error: error, retry: { await load() }) }
             .navigationTitle("Watches")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -65,7 +65,7 @@ struct WatchesView: View {
                 }
             }
             .refreshable { await load() }
-            .task(id: LoadKey(includeArchived: includeArchived, refreshToken: model.refreshToken)) { await load() }
+            .reloadOnChange(of: LoadKey(includeArchived: includeArchived, watchesToken: model.watchesToken)) { await load() }
             .onChange(of: model.pendingWatchID) { _, id in
                 if id != nil { Task { @MainActor in await load() } }
             }
@@ -84,8 +84,9 @@ struct WatchesView: View {
         }
     }
 
-    private func load() async {
-        guard let client = model.client else { return }
+    @discardableResult
+    private func load() async -> Bool {
+        guard let client = model.client else { return false }
         do {
             let loaded = try await client.watches(includeArchived: includeArchived)
             watches = loaded
@@ -94,8 +95,10 @@ struct WatchesView: View {
                 model.pendingWatchID = nil
                 path.append(watch)
             }
+            return true
         } catch {
             if !error.isCancellation { self.error = error.localizedDescription }
+            return false
         }
     }
 

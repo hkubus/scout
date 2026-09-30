@@ -58,10 +58,29 @@ struct WatchListingsRoute: Hashable {
 final class AppModel {
     private(set) var client: ScoutClient?
     private(set) var connection: ConnectionState = .connecting
-    /// Bumped when the server reports scans, triage, or watch changes; screens
-    /// reload with `.task(id:)` on it. The server has no replay, so a reconnect
-    /// also bumps it to reconcile anything missed.
+    // Counters bumped when the server reports a change; each screen keys its
+    // load on the ones for what it shows (`LiveInvalidation` maps events to
+    // them). The server has no replay, so a reconnect bumps them all to
+    // reconcile anything missed.
+    /// Deals and listing lists: scans and watch changes. Triage patches their
+    /// rows through `listingAction` instead.
     private(set) var refreshToken = 0
+    /// The watch list and analytics: scans, watch changes and triage.
+    private(set) var watchesToken = 0
+    /// Triage, which changes every watch's deal counts.
+    private(set) var triageToken = 0
+    /// Settings: scans and notifications (connector runs).
+    private(set) var serverToken = 0
+    /// Research watches and saved listings.
+    private(set) var researchToken = 0
+    /// Per watch, from scans and watch changes; `allWatchesToken` covers
+    /// changes that name no watch.
+    private(set) var watchChanges: [String: Int] = [:]
+    private(set) var allWatchesToken = 0
+    private(set) var marketWatchChanges: [String: Int] = [:]
+    private(set) var allMarketWatchesToken = 0
+    /// The latest triage from any client, for lists to patch their rows.
+    private(set) var listingAction: ListingActionEvent?
     var selectedTab: AppTab = .deals
     var marketSection: MarketSection = .research
     var openedListing: ListingLink?
@@ -82,11 +101,12 @@ final class AppModel {
 
     @ObservationIgnored private var eventsTask: Task<Void, Never>?
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingInvalidation = LiveInvalidation()
+    @ObservationIgnored private var listingActionCount = 0
     @ObservationIgnored private var pendingSearchProgress: [SearchProgressEvent] = []
     @ObservationIgnored private let defaults = UserDefaults.standard
 
     private static let serverURLKey = "serverURL"
-    private static let refreshEvents: Set<String> = ["scan", "watch", "notification", "listing-action", "ai-description-verification", "market-watch"]
 
     init() {
         // `-ScoutDemo YES -ScoutScreen <screen>` launch arguments drive the CI screenshots.
@@ -190,8 +210,28 @@ final class AppModel {
         syncWidgetConnection()
     }
 
+    /// Marks every screen stale: those on screen reload now, the others
+    /// when they next appear.
     func refresh() {
-        refreshToken += 1
+        invalidate(.everything)
+    }
+
+    /// After this device changed something: while live, the server's event
+    /// for the change refreshes the screens that show it.
+    func refreshUnlessLive() {
+        if connection != .live { refresh() }
+    }
+
+    private func invalidate(_ scope: LiveInvalidation) {
+        if scope.feed { refreshToken += 1 }
+        if scope.watches { watchesToken += 1 }
+        if scope.triage { triageToken += 1 }
+        if scope.server { serverToken += 1 }
+        if scope.research { researchToken += 1 }
+        if scope.allWatches { allWatchesToken += 1 }
+        if scope.allMarketWatches { allMarketWatchesToken += 1 }
+        for id in scope.watchIDs { watchChanges[id, default: 0] += 1 }
+        for id in scope.marketWatchIDs { marketWatchChanges[id, default: 0] += 1 }
     }
 
     func open(_ url: URL) {
@@ -275,7 +315,7 @@ final class AppModel {
         if event.event == "ready" || event.event == "ping" {
             if connection != .live {
                 connection = .live
-                scheduleRefresh()
+                scheduleRefresh(.everything)
             }
         } else if event.event == "search" {
             if let progress = try? JSONDecoder().decode(SearchProgressEvent.self, from: Data(event.data.utf8)) {
@@ -283,8 +323,14 @@ final class AppModel {
                 pendingSearchProgress = Array((pendingSearchProgress + [progress]).suffix(50))
                 searchProgressCount += 1
             }
-        } else if Self.refreshEvents.contains(event.event) {
-            scheduleRefresh()
+        } else {
+            if var action = ListingActionEvent(event: event) {
+                listingActionCount += 1
+                action.sequence = listingActionCount
+                listingAction = action
+            }
+            let scope = LiveInvalidation(event: event)
+            if !scope.isEmpty { scheduleRefresh(scope) }
         }
     }
 
@@ -294,13 +340,18 @@ final class AppModel {
         return pendingSearchProgress
     }
 
-    /// Coalesces bursts of scan events into one reload.
-    private func scheduleRefresh() {
+    /// Coalesces bursts of events into one reload per screen: everything
+    /// they invalidate within a second is applied together.
+    private func scheduleRefresh(_ scope: LiveInvalidation) {
+        pendingInvalidation.formUnion(scope)
         guard refreshTask == nil else { return }
         refreshTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 1_000_000_000)
-            self?.refreshTask = nil
-            self?.refresh()
+            guard !Task.isCancelled, let self else { return }
+            self.refreshTask = nil
+            let pending = self.pendingInvalidation
+            self.pendingInvalidation = LiveInvalidation()
+            self.invalidate(pending)
         }
     }
 }
