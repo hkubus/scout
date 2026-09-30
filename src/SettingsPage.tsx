@@ -846,7 +846,7 @@ export default function SettingsPage({
                     ? "Sign-in is required for the dashboard, API, live events, and MCP."
                     : settings.publicExposureWarning
                       ? "Scout is listening beyond loopback with authentication turned off (SCOUT_AUTH=off)."
-                      : "Authentication is off and Scout reports a loopback-only listening address."}
+                      : "Authentication is off. Scout listens on loopback and refuses proxied requests unless SCOUT_AUTH=off; configure credentials before publishing it through a reverse proxy or tunnel."}
               </p>
             </div>
           </div>

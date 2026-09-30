@@ -166,12 +166,28 @@ export function seedDatabase(db: any, seed: { watches: Array<any>; listings: Arr
   for (const listing of seed.listings) listingStmt.run(listing.marketplace, listing.id, listing.title, listing.subtitle ?? '', listing.price, listing.typical, listing.url, listing.image, listing.condition ?? '', listing.location ?? '', now, now);
 }
 
-export function backupDatabase(db: any, databasePath = process.env.SCOUT_DB_PATH ?? './data/scout.sqlite') {
+export function backupDatabase(db: any, databasePath = process.env.SCOUT_DB_PATH ?? './data/scout.sqlite', keep = 10) {
   const absolutePath = resolve(databasePath);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const backupPath = `${absolutePath}.${stamp}-${randomBytes(3).toString('hex')}.backup.sqlite`;
   const escapedPath = backupPath.replace(/'/g, "''");
   db.exec(`VACUUM INTO '${escapedPath}'`);
   try { chmodSync(backupPath, 0o600); } catch { /* permissions are best-effort on non-POSIX filesystems */ }
+  pruneBackups(absolutePath, keep);
   return backupPath;
+}
+
+/** Keep the newest timestamped `<db>.<stamp>.backup.sqlite` copies so repeated backups cannot fill the disk. */
+function pruneBackups(absolutePath: string, keep: number) {
+  try {
+    const dir = dirname(absolutePath);
+    const base = absolutePath.split('/').at(-1) ?? '';
+    const backups = readdirSync(dir)
+      .filter((file) => file.startsWith(`${base}.`) && file.endsWith('.backup.sqlite'))
+      .sort()
+      .reverse();
+    for (const stale of backups.slice(keep)) {
+      try { unlinkSync(resolve(dir, stale)); } catch { /* best-effort */ }
+    }
+  } catch { /* pruning is best-effort */ }
 }

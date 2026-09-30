@@ -5,6 +5,48 @@ export function isPubliclyBoundHost(host: string) {
   return !['127.0.0.1', '::1', 'localhost'].includes(normalized);
 }
 
+const PLACEHOLDER_SECRET = /replace|change-?me|example|placeholder|your[-_]?secret|local-development|dummy|^(.)\1+$/i;
+
+/**
+ * Why SCOUT_SECRET is unusable, or null when it looks like real key material:
+ * at least 32 characters, not a documented placeholder, and not trivially
+ * low-entropy (fewer than 10 distinct characters).
+ */
+export function secretProblem(secret: string) {
+  if (secret.length < 32) return 'must be at least 32 characters';
+  if (PLACEHOLDER_SECRET.test(secret)) return 'looks like a placeholder';
+  if (new Set(secret).size < 10) return 'has too little entropy';
+  return null;
+}
+
+/**
+ * Host-header allowlist that defeats DNS rebinding: IP literals and
+ * `localhost` can never be rebound, and named hosts must be configured
+ * (SCOUT_PUBLIC_ORIGIN / SCOUT_ALLOWED_HOSTS). `host` may include a port.
+ */
+export function isAllowedHost(host: string | undefined, allowedNames: readonly string[]) {
+  if (!host) return false;
+  let hostname: string;
+  try { hostname = new URL(`http://${host}`).hostname.toLowerCase(); } catch { return false; }
+  const bare = hostname.replace(/^\[|\]$/g, '');
+  if (isIP(bare) || bare === 'localhost' || bare.endsWith('.localhost')) return true;
+  return allowedNames.some((name) => name.toLowerCase() === bare);
+}
+
+/**
+ * True when a browser marks the request as coming from another site. Unlike
+ * isSameOriginRequest this lets header-less non-browser clients (curl, MCP
+ * clients, scripts) through, so it suits unauthenticated trusted-LAN mode.
+ */
+export function isCrossSiteBrowserRequest(headers: { origin?: string; 'sec-fetch-site'?: string }, requestOrigin: string) {
+  const fetchSite = headers['sec-fetch-site'];
+  if (fetchSite && fetchSite !== 'same-origin' && fetchSite !== 'none') return true;
+  const origin = headers.origin;
+  if (!origin) return false;
+  if (origin === 'null') return true;
+  try { return new URL(origin).origin !== new URL(requestOrigin).origin; } catch { return true; }
+}
+
 /**
  * Rate-limit identity for a client address. IPv4 (including IPv4-mapped IPv6)
  * keys on the full address; other IPv6 addresses key on their /64 prefix,

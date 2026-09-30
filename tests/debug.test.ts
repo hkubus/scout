@@ -14,12 +14,12 @@ import { encryptSecret, ScoutService, ServiceError } from '../server/service';
 
 if (process.env.SCOUT_JEV_MODE === undefined) process.env.SCOUT_JEV_MODE = 'legacy';
 
-function fixture() {
+function fixture(queryTimeoutMs?: number) {
   const directory = mkdtempSync(join(tmpdir(), 'scout-debug-'));
   const path = join(directory, 'scout.sqlite');
   const db = openDatabase(path);
   const service = new ScoutService(db, () => {}, {});
-  const debug = new ScoutDebug(db, service, path);
+  const debug = new ScoutDebug(db, service, path, queryTimeoutMs);
   const now = new Date().toISOString();
   db.prepare('INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run('discord_webhook', encryptSecret('https://discord.com/api/webhooks/1/secret'), now);
   return { db, debug, service, directory, close: () => { debug.close(); db.close(); rmSync(directory, { recursive: true, force: true }); } };
@@ -39,38 +39,62 @@ test('schema lists every table with columns, row counts, and migrations', () => 
   } finally { context.close(); }
 });
 
-test('table rows and queries redact encrypted secrets', () => {
+test('table rows and queries redact encrypted secrets', async () => {
   const context = fixture();
   try {
     const rows = context.debug.tableRows('settings', { orderBy: 'key', direction: 'asc' });
     assert.equal(rows.rows.find((row) => row.key === 'discord_webhook')?.value, REDACTED);
     assert.equal(rows.rows.find((row) => row.key === 'default_interval')?.value, '5');
 
-    const result = context.debug.query("SELECT key, value FROM settings WHERE key = ?", ['discord_webhook']);
+    const result = await context.debug.query("SELECT key, value FROM settings WHERE key = ?", ['discord_webhook']);
     assert.deepEqual(result.columns, ['key', 'value']);
     assert.deepEqual(result.rows, [{ key: 'discord_webhook', value: REDACTED }]);
     assert.equal(result.truncated, false);
+
+    // Wrapping the ciphertext in an expression must not slip past redaction.
+    const wrapped = await context.debug.query("SELECT 'x ' || value || ' y' AS v FROM settings WHERE key = 'discord_webhook'");
+    assert.equal(wrapped.rows[0].v, `x ${REDACTED} y`);
+    context.db.prepare('INSERT INTO marketplace_sessions (marketplace, storage_state_encrypted, created_at, updated_at) VALUES (?, ?, ?, ?)').run('OLX', encryptSecret('{"cookies":[]}'), 'now', 'now');
+    const session = await context.debug.query("SELECT hex(storage_state_encrypted) AS h FROM marketplace_sessions");
+    assert.equal(session.rows[0].h, '');
 
     assert.throws(() => context.debug.tableRows('nope'), (error: unknown) => error instanceof ServiceError && error.status === 404);
     assert.throws(() => context.debug.tableRows('settings', { orderBy: 'missing' }), ServiceError);
   } finally { context.close(); }
 });
 
-test('query caps rows and refuses to write', () => {
+test('query caps rows and refuses to write', async () => {
   const context = fixture();
   try {
-    const capped = context.debug.query('WITH RECURSIVE n(i) AS (VALUES (1) UNION ALL SELECT i + 1 FROM n WHERE i < 50) SELECT i FROM n', [], 10);
+    const capped = await context.debug.query('WITH RECURSIVE n(i) AS (VALUES (1) UNION ALL SELECT i + 1 FROM n WHERE i < 50) SELECT i FROM n', [], 10);
     assert.equal(capped.rowCount, 10);
     assert.equal(capped.truncated, true);
 
-    assert.equal(context.debug.query('-- comment\n/* block */ SELECT 1 AS one').rows[0].one, 1);
-    assert.throws(() => context.debug.query("DELETE FROM settings"), /Only SELECT/);
-    assert.throws(() => context.debug.query("ATTACH DATABASE 'x.sqlite' AS x"), /Only SELECT/);
-    assert.throws(() => context.debug.query("VACUUM INTO 'x.sqlite'"), /Only SELECT/);
+    assert.equal((await context.debug.query('-- comment\n/* block */ SELECT 1 AS one')).rows[0].one, 1);
+    await assert.rejects(() => context.debug.query("DELETE FROM settings"), /Only SELECT/);
+    await assert.rejects(() => context.debug.query("ATTACH DATABASE 'x.sqlite' AS x"), /Only SELECT/);
+    await assert.rejects(() => context.debug.query("VACUUM INTO 'x.sqlite'"), /Only SELECT/);
     // A write disguised behind a CTE still hits the read-only connection.
-    assert.throws(() => context.debug.query("WITH x AS (SELECT 1) DELETE FROM settings"), /SQL error/);
+    await assert.rejects(() => context.debug.query("WITH x AS (SELECT 1) DELETE FROM settings"), /SQL error/);
     assert.ok(Number((context.db.prepare('SELECT COUNT(*) AS count FROM settings').get() as { count: number }).count) >= 3);
-    assert.throws(() => context.debug.query('SELECT * FROM missing_table'), /SQL error/);
+    await assert.rejects(() => context.debug.query('SELECT * FROM missing_table'), /SQL error/);
+  } finally { context.close(); }
+});
+
+test('a runaway query is stopped at the deadline without blocking the event loop', async () => {
+  const context = fixture(500);
+  try {
+    let ticks = 0;
+    const timer = setInterval(() => { ticks += 1; }, 20);
+    const started = Date.now();
+    await assert.rejects(
+      () => context.debug.query('WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c'),
+      (error: unknown) => error instanceof ServiceError && /time limit/.test(error.message),
+    );
+    clearInterval(timer);
+    assert.ok(Date.now() - started < 5_000);
+    assert.ok(ticks >= 5, `event loop stalled (${ticks} ticks)`);
+    assert.equal((await context.debug.query('SELECT 1 AS one')).rows[0].one, 1);
   } finally { context.close(); }
 });
 

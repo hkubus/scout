@@ -16,7 +16,7 @@ import { debugApiEnabled, ScoutDebug } from './debug';
 import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
 import { bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
-import { isPubliclyBoundHost, RateLimiter, rateLimitKey, securityHeaders } from './security';
+import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
 import { normalizeSourceIntervals, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 
@@ -27,11 +27,16 @@ if (!Number.isInteger(port) || port < 1 || port > 65_535) {
 
 const host = process.env.SCOUT_HOST?.trim() || '127.0.0.1';
 const publicExposureWarning = isPubliclyBoundHost(host);
+// A trusted proxy or a public origin means a reverse proxy publishes Scout even
+// though it listens on loopback, so it must fail closed like a public bind.
+const trustProxyRaw = process.env.SCOUT_TRUST_PROXY?.trim() ?? '';
+const proxied = (trustProxyRaw !== '' && trustProxyRaw.toLowerCase() !== 'false') || Boolean(process.env.SCOUT_PUBLIC_ORIGIN?.trim());
+const auth = await loadAuthConfig(process.env, { publiclyBound: publicExposureWarning, proxied });
 const configuredSecret = process.env.SCOUT_SECRET?.trim() ?? '';
-if ((process.env.NODE_ENV === 'production' || publicExposureWarning) && (configuredSecret.length < 32 || configuredSecret === 'change-me-in-production' || configuredSecret === 'local-development-secret')) {
-  throw new Error('SCOUT_SECRET must be set to a random value of at least 32 characters before exposing Scout');
+if (process.env.NODE_ENV === 'production' || publicExposureWarning || proxied || auth.enabled) {
+  const problem = secretProblem(configuredSecret);
+  if (problem) throw new Error(`SCOUT_SECRET ${problem}; generate one with \`openssl rand -hex 32\` before exposing Scout`);
 }
-const auth = await loadAuthConfig(process.env, { publiclyBound: publicExposureWarning });
 
 function configuredCorsOrigin() {
   const origins = (process.env.SCOUT_CORS_ORIGIN ?? '')
@@ -70,6 +75,13 @@ const trustedOrigins = publicOrigins;
 const publicOriginIsHttps = publicOrigins.some((origin) => origin.startsWith('https:'));
 const isSecureRequest = (request: FastifyRequest) => request.protocol === 'https' || publicOriginIsHttps;
 const sameOrigin = (request: FastifyRequest) => isSameOriginRequest(request.headers, `${request.protocol}://${request.host}`, trustedOrigins);
+// Named hosts accepted in the Host header while auth is off (IP literals and
+// localhost always are); anything else is a DNS-rebinding attempt.
+const allowedHostNames = [
+  ...publicOrigins.map((origin) => new URL(origin).hostname),
+  ...(process.env.SCOUT_ALLOWED_HOSTS ?? '').split(',').map((name) => name.trim()).filter(Boolean),
+];
+const forwardedHeaders = ['x-forwarded-for', 'forwarded', 'x-forwarded-host', 'x-real-ip', 'cf-connecting-ip'] as const;
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -78,7 +90,9 @@ declare module 'fastify' {
 }
 
 const trustProxy = trustProxySetting(process.env.SCOUT_TRUST_PROXY);
-const app = Fastify({ logger: true, bodyLimit: 1_048_576, trustProxy });
+// requestTimeout bounds how long a client may take to send a request, so
+// trickled bodies cannot hold sockets open forever (handlers are unaffected).
+const app = Fastify({ logger: true, bodyLimit: 1_048_576, trustProxy, requestTimeout: 60_000 });
 if (trustProxy === true) app.log.warn('SCOUT_TRUST_PROXY=true trusts X-Forwarded-For from any client, so per-IP limits can be spoofed; prefer a hop count or the proxy address');
 await app.register(cors, { origin: corsOrigins.length === 0 ? false : corsOrigins.length === 1 ? corsOrigins[0] : corsOrigins });
 app.decorateRequest('scoutAuth', 'none');
@@ -86,9 +100,14 @@ app.decorateRequest('scoutAuth', 'none');
 const rateLimiter = new RateLimiter();
 let untrustedForwardWarned = false;
 app.addHook('onRequest', async (request, reply) => {
-  if (trustProxy === false && !untrustedForwardWarned && request.headers['x-forwarded-for']) {
+  // request.ip equals the socket peer only when the forwarding hop was not
+  // trusted, which also catches a SCOUT_TRUST_PROXY value that does not match
+  // the proxy (e.g. 127.0.0.1 under Docker, where the proxy is a bridge IP).
+  if (!untrustedForwardWarned && request.headers['x-forwarded-for'] && request.ip === request.socket.remoteAddress) {
     untrustedForwardWarned = true;
-    app.log.warn('Received X-Forwarded-For but SCOUT_TRUST_PROXY is unset: every client shares the proxy address for rate limits and HTTPS is not detected');
+    app.log.warn({ peer: request.socket.remoteAddress }, trustProxy === false
+      ? 'Received X-Forwarded-For but SCOUT_TRUST_PROXY is unset: every client shares the proxy address for rate limits and HTTPS is not detected'
+      : 'Received X-Forwarded-For from a peer SCOUT_TRUST_PROXY does not trust: every client shares that address for rate limits. Under Docker Compose use SCOUT_TRUST_PROXY=uniquelocal');
   }
   const route = request.routeOptions.url;
   if (!isProtectedRoute(route)) return;
@@ -107,7 +126,8 @@ app.addHook('onRequest', async (request, reply) => {
 });
 app.addHook('onSend', async (request, reply) => {
   // request.protocol honours X-Forwarded-Proto only from SCOUT_TRUST_PROXY hops.
-  for (const [name, value] of Object.entries(securityHeaders(isSecureRequest(request)))) reply.header(name, value);
+  // Keep a stricter per-route policy (e.g. the sandboxed snapshot-image CSP).
+  for (const [name, value] of Object.entries(securityHeaders(isSecureRequest(request)))) if (!reply.hasHeader(name)) reply.header(name, value);
   if (request.routeOptions.url?.startsWith('/api/') && !reply.hasHeader('cache-control')) reply.header('cache-control', 'no-store');
 });
 
@@ -129,11 +149,29 @@ function resolveAuth(request: FastifyRequest): FastifyRequest['scoutAuth'] {
 }
 
 app.addHook('onRequest', async (request, reply) => {
-  if (!auth.enabled) { request.scoutAuth = 'disabled'; return; }
   // Decide on the matched route template, never the raw URL: the router
   // percent-decodes paths, so `/%61pi/...` still reaches `/api/...` handlers.
   // The static SPA shell is public; it holds no data and renders the login form.
   const route = request.routeOptions.url;
+  if (!auth.enabled) {
+    request.scoutAuth = 'disabled';
+    if (!isProtectedRoute(route)) return;
+    // Unauthenticated mode is only for direct loopback/LAN access. A request
+    // relayed by a reverse proxy means Scout is being published without a
+    // password, so refuse it unless SCOUT_AUTH=off accepted that explicitly.
+    if (!auth.explicitlyOff && forwardedHeaders.some((name) => request.headers[name] !== undefined)) {
+      return reply.code(403).send({ error: 'Scout has no credentials configured and refuses proxied requests. Set SCOUT_PASSWORD_HASH and/or SCOUT_API_TOKENS (or SCOUT_AUTH=off for a trusted network).' });
+    }
+    // Without credentials any website could reach Scout through DNS rebinding
+    // or cross-site form posts, so pin the Host and reject browser cross-site writes.
+    if (!isAllowedHost(request.headers.host, allowedHostNames)) {
+      return reply.code(403).send({ error: 'Unrecognized Host header. Add this hostname to SCOUT_ALLOWED_HOSTS.' });
+    }
+    if (!safeMethods.has(request.method) && isCrossSiteBrowserRequest(request.headers, `${request.protocol}://${request.host}`)) {
+      return reply.code(403).send({ error: 'Cross-origin request rejected' });
+    }
+    return;
+  }
   if (!isProtectedRoute(route)) return;
   request.scoutAuth = resolveAuth(request);
   if (publicApiPaths.has(route)) return;
@@ -167,7 +205,7 @@ function emit(event: string, payload: unknown) {
   }
 }
 const service = new ScoutService(db, emit, { publicExposureWarning: publicExposureWarning && !auth.enabled, authEnabled: auth.enabled });
-const debug = debugApiEnabled() ? new ScoutDebug(db, service) : null;
+const debug = debugApiEnabled(auth.enabled) ? new ScoutDebug(db, service) : null;
 const marketplaceParam = z.enum(['OLX', 'Allegro Lokalnie', 'Vinted']);
 const marketplaceSources = z.array(marketplaceParam).min(1).max(3).refine((sources) => new Set(sources).size === sources.length, { message: 'Marketplace sources must be unique' });
 const resourceIdParams = z.object({ id: z.string().trim().min(1).max(160) });

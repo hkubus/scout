@@ -8,7 +8,7 @@ import { parseMarketplaceStorageState } from '../server/marketplace-sessions';
 import { DeepSeekError } from '../server/ai';
 import { listingDescriptionVerificationInputHash, listingRelevanceInputHash } from '../server/ai';
 import { VisionError } from '../server/vision';
-import { ScoutService, ServiceError, decryptSecret, encryptSecret, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
+import { ScoutService, ServiceError, decryptSecret, encryptSecret, escapeDiscordMarkdown, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
 
 // Pin the legacy DeepSeek path for pre-existing tests: live Jev is the
 // production default whenever a key is available, but these tests assert
@@ -1617,15 +1617,19 @@ test('preserves research listings with description and images for post-sale revi
     const listingRow = context.db.prepare('SELECT id FROM market_listings WHERE listing_id = ?').get('offer-1') as { id: number };
     assert.equal(context.service.marketListingSnapshot(listingRow.id), null);
 
-    const detailHtml = `<html><head><meta property="og:image" content="https://cdn.example/photo-1.jpg"></head><body>
+    const detailHtml = `<html><head><meta property="og:image" content="https://ireland.apollo.olxcdn.com/v1/files/photo-1-PL/image;s=644x461"></head><body>
       <script type="application/ld+json">${JSON.stringify({ '@type': 'Product', name: 'RTX 4070', description: 'Karta bez uszkodzeń. W zestawie pudełko.', offers: { price: '2000' } })}</script>
       </body></html>`;
     const imageRequests: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url === 'https://www.olx.pl/d/oferta/rtx-4070-IDabc123.html') return new Response(detailHtml, { status: 200, headers: { 'content-type': 'text/html' } });
-      if (url === 'https://cdn.example/photo-1.jpg') {
+      if (url === 'https://ireland.apollo.olxcdn.com/v1/files/photo-1-PL/image;s=644x461') {
         imageRequests.push(url);
+        // A CDN-internal redirect is followed; the hop is re-validated first.
+        return new Response(null, { status: 302, headers: { location: '/v1/files/photo-1-PL/image;s=1000x750' } });
+      }
+      if (url === 'https://ireland.apollo.olxcdn.com/v1/files/photo-1-PL/image;s=1000x750') {
         return new Response(new Uint8Array([1, 2, 3, 4]), { status: 200, headers: { 'content-type': 'image/jpeg' } });
       }
       throw new Error(`Unexpected fetch: ${url}`);
@@ -1656,6 +1660,36 @@ test('preserves research listings with description and images for post-sale revi
     assert.equal(imageRequests.length, imageRequestsBefore + 1);
 
     await assert.rejects(() => context.service.captureMarketListingSnapshotNow(99_999), (error: unknown) => error instanceof ServiceError && error.status === 404);
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.close();
+  }
+});
+
+test('snapshot image downloads do not follow redirects off the marketplace CDN', async () => {
+  const context = fixture();
+  const originalFetch = globalThis.fetch;
+  const now = new Date().toISOString();
+  try {
+    context.db.prepare(`INSERT INTO market_watches (id, name, query, sources_json, interval_hours, enabled, next_scan_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('market-snap', 'Snap watch', 'gpu', '["OLX"]', 24, 1, now, now, now);
+    context.db.prepare(`INSERT INTO market_listings (market_watch_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans, availability_status, snapshot_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, 'live', 'pending')`).run('market-snap', 'OLX', 'offer-r', 'RTX 4070', 'https://www.olx.pl/d/oferta/rtx-4070-IDred123.html', 2000, 2000, 2000, now, now);
+    const listingRow = context.db.prepare('SELECT id FROM market_listings WHERE listing_id = ?').get('offer-r') as { id: number };
+    const detailHtml = `<html><head><meta property="og:image" content="https://ireland.apollo.olxcdn.com/v1/files/r-PL/image;s=644x461"></head><body>
+      <script type="application/ld+json">${JSON.stringify({ '@type': 'Product', name: 'RTX 4070', description: 'Opis.', offers: { price: '2000' } })}</script></body></html>`;
+    const requested: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requested.push(url);
+      if (url === 'https://www.olx.pl/d/oferta/rtx-4070-IDred123.html') return new Response(detailHtml, { status: 200, headers: { 'content-type': 'text/html' } });
+      if (url.startsWith('https://ireland.apollo.olxcdn.com/')) return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1:3001/api/settings' } });
+      throw new Error(`Unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const snapshot = await context.service.captureMarketListingSnapshotNow(listingRow.id);
+    assert.equal(snapshot?.images.length ?? 0, 0);
+    assert.ok(!requested.some((url) => url.includes('127.0.0.1')), 'redirect to an internal address must not be followed');
   } finally {
     globalThis.fetch = originalFetch;
     context.close();
@@ -2667,4 +2701,11 @@ test('moves a listing to a variant manually, re-scores it, and keeps the pick ac
     seedWatch(context.db, 'plain-watch');
     assert.throws(() => context.service.setListingVariant('plain-watch', key, 'base'), /no model variants/);
   } finally { context.close(); }
+});
+
+test('escapes seller titles so a digest line cannot inject its own Discord link', () => {
+  const title = 'RTX 4090 FE](https://phish.example/pay) [';
+  const line = `[${escapeDiscordMarkdown(title)}](https://www.olx.pl/d/oferta/x)`;
+  assert.equal(line, '[RTX 4090 FE\\]\\(https://phish.example/pay\\) \\[](https://www.olx.pl/d/oferta/x)');
+  assert.equal(escapeDiscordMarkdown('**bold** _x_ `c` ~s~ |a| <@1>'), '\\*\\*bold\\*\\* \\_x\\_ \\`c\\` \\~s\\~ \\|a\\| \\<@1\\>');
 });

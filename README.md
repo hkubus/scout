@@ -25,7 +25,7 @@ npm test
 npm run build
 
 export NODE_ENV=production
-export SCOUT_SECRET='replace-with-a-random-value-at-least-32-characters-long'
+export SCOUT_SECRET="$(openssl rand -hex 32)"   # keep this value; placeholders are rejected
 export SCOUT_PASSWORD_HASH='scrypt$32768$8$1$…'   # node scripts/hash-password.mjs
 export SCOUT_HOST=127.0.0.1
 export TZ=Europe/Warsaw
@@ -47,17 +47,20 @@ Auth turns on as soon as any credential is configured, and protects every `/api/
 | `SCOUT_PASSWORD` | Plaintext alternative (≥12 characters), hashed in memory at boot. |
 | `SCOUT_API_TOKENS` | Comma-separated bearer tokens (≥32 characters each, e.g. `openssl rand -base64 36`) for MCP clients and scripts: `Authorization: Bearer <token>`. |
 | `SCOUT_AUTH` | `on` requires credentials even on loopback; `off` explicitly keeps the old unauthenticated trusted-LAN mode. |
-| `SCOUT_TRUST_PROXY` | **Required behind a reverse proxy**: a hop count such as `1`, or a comma-separated list of proxy IPs/CIDRs (`loopback`, `linklocal`, and `uniquelocal` also work). Any other value stops startup with an error. Makes client IPs (rate limits) and `https` detection (Secure cookies, HSTS) come from `X-Forwarded-*`; without it every client shares the proxy's IP and one client can exhaust sign-in attempts for everyone. Avoid `true`: it trusts `X-Forwarded-For` from anyone, so per-IP limits can be spoofed. Leave unset when Scout is reached directly. |
+| `SCOUT_TRUST_PROXY` | **Required behind a reverse proxy**: a comma-separated list of proxy IPs/CIDRs (`loopback`, `linklocal`, and `uniquelocal` also work), or a hop count such as `1`. Use `loopback` (or `127.0.0.1`) for a proxy on the same host and `uniquelocal` under Docker Compose, where the proxy connects from a bridge address; Compose defaults to `uniquelocal`. A hop count trusts whatever peer connects, so only use it when nothing but the proxy can reach Scout's port. Any other value stops startup with an error. Makes client IPs (rate limits) and `https` detection (Secure cookies, HSTS) come from `X-Forwarded-*`; without it every client shares the proxy's IP and one client can exhaust sign-in attempts for everyone. Avoid `true`: it trusts `X-Forwarded-For` from anyone, so per-IP limits can be spoofed. Leave unset when Scout is reached directly. |
 | `SCOUT_PUBLIC_ORIGIN` | Public origin (e.g. `https://scout.example.com`) when the proxy does not forward the original `Host`. An `https` origin also forces `Secure` cookies and HSTS. |
+| `SCOUT_ALLOWED_HOSTS` | Extra hostnames (e.g. `scout.lan`) accepted in the `Host` header while auth is off. IP addresses and `localhost` are always accepted. |
 
-Scout refuses to start on a non-loopback address without credentials unless `SCOUT_AUTH=off`.
+Scout refuses to start without credentials when it listens on a non-loopback address, when `SCOUT_TRUST_PROXY` or `SCOUT_PUBLIC_ORIGIN` is set (a loopback bind behind a proxy is still published), or when `SCOUT_AUTH=on`, unless `SCOUT_AUTH=off` explicitly accepts trusted-network mode. Without credentials it also answers `403` to any API request carrying `X-Forwarded-For`, `Forwarded`, `X-Real-IP`, or `CF-Connecting-IP`, so a proxy or tunnel added later cannot publish it unprotected. `scout.service` and `.env.example` set `SCOUT_AUTH=on`. `SCOUT_SECRET` must be at least 32 random characters whenever auth is on, Scout is proxied, or `NODE_ENV=production`; documented placeholders are rejected.
+
+- **Unauthenticated mode.** With no credentials (local development, or `SCOUT_AUTH=off` on a trusted LAN), Scout accepts only `Host` headers that are IP addresses, `localhost`, or listed in `SCOUT_ALLOWED_HOSTS`, which defeats DNS rebinding, and rejects browser requests that another site initiates. Non-browser clients such as curl and MCP clients are unaffected.
 
 - **Browser sessions.** Signing in sets an `HttpOnly`, `SameSite=Strict` session cookie (`Secure` over HTTPS). Sessions expire after 7 idle days or 30 days total and are stored server-side as SHA-256 hashes. Changing the password revokes every session, and Settings → Access control has **Sign out everywhere**. Signing out also closes that session's open live-update stream.
 - **CSRF.** Cookie-authenticated `POST`/`PATCH`/`PUT`/`DELETE` requests, including login and sign-out, must come from the same origin (`Origin`/`Sec-Fetch-Site`): the scheme, host, and port the request arrived on, or `SCOUT_PUBLIC_ORIGIN`. Behind a TLS proxy this depends on `SCOUT_TRUST_PROXY` (so Scout sees `https`) or an `https` `SCOUT_PUBLIC_ORIGIN`. Bearer-token requests are not cookie-based and are not checked.
 - **Brute force.** Sign-in is limited to 10 attempts per client per 15 minutes, where a client is an IPv4 address or an IPv6 /64 (the per-IP API limits group IPv6 the same way). At most 2 password checks run at once, and extra attempts get a retryable `429`. There is no global attempt cap, so an attacker cannot use one up and block the correct password for the full window. An attacker who controls many addresses can still slow sign-in down by keeping those 2 slots busy. If more than 50,000 addresses are being tracked, new addresses get `429` until the oldest entries expire. Failed attempts are logged.
 - **Live updates.** The `/events` stream checks its session every 25 seconds and closes once that session expires or is revoked.
 - **Transport.** Terminate TLS in front of Scout (Caddy, nginx, Traefik) and keep Scout itself bound to loopback or a private network. Without HTTPS the password, cookie, and tokens travel in clear text.
-- **Blast radius.** An authenticated user is the operator: the read-only debug API (`SCOUT_DEBUG_API=false` disables it) and Settings → System update (`git pull`, build, restart) stay available. Disable the debug API if you do not need it on an internet-facing host.
+- **Blast radius.** An authenticated user is the operator, and so is every API token: Settings → System update (`git pull`, build, restart) stays available. Give tokens only to clients you would trust with the whole instance. The read-only [Debug API](#debug-api) is off by default while auth is on; set `SCOUT_DEBUG_API=true` to enable it.
 
 Minimal Caddy example:
 
@@ -67,7 +70,7 @@ scout.example.com {
 }
 ```
 
-…with `SCOUT_HOST=127.0.0.1` and `SCOUT_TRUST_PROXY=127.0.0.1` for Scout.
+…with `SCOUT_HOST=127.0.0.1`, `SCOUT_TRUST_PROXY=loopback`, `SCOUT_PUBLIC_ORIGIN=https://scout.example.com`, and credentials for Scout. Under Docker Compose keep the default `SCOUT_TRUST_PROXY=uniquelocal`. After deploying, make one failed sign-in and check that the log shows your own IP address, not the proxy's; Scout also logs a warning when forwarded headers arrive from a proxy it does not trust.
 
 For a source checkout, the deployment checks are:
 
@@ -144,14 +147,14 @@ Research listings are preserved for market research: when a listing first appear
 
 ## Docker Compose
 
-Compose binds Scout to `0.0.0.0` inside the container and publishes port 3001 to the host. The browserless image is pinned and the image build uses `npm ci` from `package-lock.json`:
+Compose binds Scout to `0.0.0.0` inside the container and publishes port 3001 to the host. The Browserless v2 image is pinned by digest and the image build uses `npm ci` from `package-lock.json`. Set `SCOUT_BROWSER_TOKEN` in `.env` (`openssl rand -hex 24`): Browserless requires it on every connection, so scripts on rendered marketplace pages cannot drive the browser. Scout also blocks those pages from requesting loopback, private, or single-label hosts and from opening WebSockets.
 
 ```bash
 docker compose up -d --build
 npm run test:compose
 ```
 
-The smoke test requests `http://127.0.0.1:3001/api/ready` from the host. Compose requires `SCOUT_SECRET` plus either credentials (`SCOUT_PASSWORD_HASH`/`SCOUT_PASSWORD`/`SCOUT_API_TOKENS`) or an explicit `SCOUT_AUTH=off`, because the container listens on `0.0.0.0`. Compose substitutes `${SCOUT_PASSWORD_HASH}` from the project `.env` file, so put the hash in single quotes there (`SCOUT_PASSWORD_HASH='scrypt$32768$8$1$…'`). Compose reads single-quoted `.env` values literally, so the `$` separators are left alone. Do not write them as `$$`, because that escape only applies inside `compose.yaml`. To generate a hash with the image, run `docker compose run --rm --no-deps scout node scripts/hash-password.mjs`. The published port binds to `127.0.0.1` by default (`SCOUT_PUBLISH` overrides it), so put a TLS-terminating proxy in front for internet access. Scout waits for the pinned Browserless container health check before starting. The container runs as a non-root user with a read-only application filesystem; `/app/data` is the writable SQLite volume.
+The smoke test requests `http://127.0.0.1:3001/api/ready` from the host. Compose requires `SCOUT_SECRET`, `SCOUT_BROWSER_TOKEN`, plus either credentials (`SCOUT_PASSWORD_HASH`/`SCOUT_PASSWORD`/`SCOUT_API_TOKENS`) or an explicit `SCOUT_AUTH=off`, because the container listens on `0.0.0.0`. Compose substitutes `${SCOUT_PASSWORD_HASH}` from the project `.env` file, so put the hash in single quotes there (`SCOUT_PASSWORD_HASH='scrypt$32768$8$1$…'`). Compose reads single-quoted `.env` values literally, so the `$` separators are left alone. Do not write them as `$$`, because that escape only applies inside `compose.yaml`. To generate a hash with the image, run `docker compose run --rm --no-deps scout node scripts/hash-password.mjs`. The published port binds to `127.0.0.1` by default (`SCOUT_PUBLISH` overrides it), so put a TLS-terminating proxy in front for internet access. Scout waits for the pinned Browserless container health check before starting. The container runs as a non-root user with a read-only application filesystem; `/app/data` is the writable SQLite volume.
 
 ## AI listing intelligence
 
@@ -181,7 +184,7 @@ curl -s -X POST http://127.0.0.1:3001/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-It is stateless (one fresh server per request, no session ids) and offers twelve tools (plus the four read-only `scout_debug_*` tools from the [Debug API](#debug-api) unless `SCOUT_DEBUG_API=false`): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail`, `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_queue_scan`, and `scout_connectors`. `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. With auth enabled, MCP clients must send `Authorization: Bearer <token>` using a value from `SCOUT_API_TOKENS`.
+It is stateless (one fresh server per request, no session ids) and offers twelve tools (plus the four read-only `scout_debug_*` tools while the [Debug API](#debug-api) is enabled): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail`, `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_queue_scan`, and `scout_connectors`. `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. With auth enabled, MCP clients must send `Authorization: Bearer <token>` using a value from `SCOUT_API_TOKENS`.
 
 ## iOS app
 
@@ -189,7 +192,7 @@ It is stateless (one fresh server per request, no session ids) and offers twelve
 
 ## Debug API
 
-For development and troubleshooting, Scout exposes read-only access to the live database under `/api/debug/*` (enabled by default; set `SCOUT_DEBUG_API=false` to disable it):
+For development and troubleshooting, Scout exposes read-only access to the live database under `/api/debug/*`. It is on by default only while auth is off; with auth enabled set `SCOUT_DEBUG_API=true` to turn it on (and `false` always disables it). With auth enabled every debug request needs a session or API token:
 
 | Endpoint | Returns |
 | --- | --- |
@@ -205,7 +208,7 @@ curl -s -X POST http://127.0.0.1:3001/api/debug/query \
   -d '{"sql":"SELECT marketplace, COUNT(*) AS n FROM listings GROUP BY marketplace"}'
 ```
 
-Queries run on a separate read-only SQLite connection with `query_only` set, and only `SELECT`, `WITH`, `VALUES`, `EXPLAIN`, and `PRAGMA` statements are accepted, so the debug API cannot modify data. Values in the encrypted-credential format are replaced with `[redacted: encrypted secret]` and BLOBs are summarized by size; the snapshot blanks encrypted settings and marketplace browser sessions before download. Queries are synchronous, so avoid unbounded scans on large tables while scans are running. The same surface is available to MCP clients as `scout_debug_schema`, `scout_debug_table`, `scout_debug_query`, and `scout_debug_runtime`. Like the rest of the API there is no authentication — the debug API exposes the full listing and notification history, so keep Scout on a trusted LAN/VPN.
+Each query runs in a short-lived child process on its own read-only SQLite connection with `query_only` set, and is stopped after 5 seconds, so a runaway query cannot stall Scout. Only `SELECT`, `WITH`, `VALUES`, `EXPLAIN`, and `PRAGMA` statements are accepted, so the debug API cannot modify data. Values in the encrypted-credential format are replaced with `[redacted: encrypted secret]` wherever they appear in a value, the encrypted marketplace session column reads as `NULL`, and BLOBs are summarized by size; the snapshot blanks encrypted settings and marketplace browser sessions before download. Redaction is best-effort against deliberate SQL transformations, so treat debug access as access to the encrypted credentials. The same surface is available to MCP clients as `scout_debug_schema`, `scout_debug_table`, `scout_debug_query`, and `scout_debug_runtime`. The debug API exposes the full listing and notification history.
 
 ## Optional marketplace sessions
 

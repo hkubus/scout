@@ -8,7 +8,7 @@ curl --fail --silent --show-error --max-time 10 --retry 3 --retry-delay 2 "${bas
 curl --fail --silent --show-error --max-time 10 "${base_url%/}/" | grep -q '<title>Scout'
 
 if docker compose version >/dev/null 2>&1; then
-  docker compose exec -T chromium node -e 'fetch("http://127.0.0.1:3000/pressure").then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))'
+  docker compose exec -T chromium node -e 'fetch("http://127.0.0.1:3000/active?token=" + process.env.TOKEN).then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))'
   docker compose exec -T scout node -e 'fetch("http://127.0.0.1:3001/api/auth/session").then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))'
 fi
 

@@ -16,6 +16,9 @@ KillSignal=SIGTERM
 
 Environment=NODE_ENV=production
 Environment=SCOUT_HOST=127.0.0.1
+# Refuse to start without SCOUT_PASSWORD_HASH/SCOUT_API_TOKENS: a loopback
+# bind behind a reverse proxy is still published to the internet.
+Environment=SCOUT_AUTH=on
 Environment=TZ=Europe/Warsaw
 Environment=SCOUT_DB_PATH=/var/lib/scout/scout.sqlite
 EnvironmentFile=-/etc/scout/scout.env

@@ -14,7 +14,7 @@ A native SwiftUI client for a self-hosted Scout server. It covers:
 
 Live updates come from the server's `/events` stream. Notifications stay with ntfy.
 
-The app talks to the same API as the web UI. If the server has sign-in enabled, enter one of its `SCOUT_API_TOKENS` on the connect screen; the app sends it as a bearer token and keeps it in the Keychain under the App Group, so the widgets can use it too (widgets only send it to the server the app is connected to). Replace or remove it later in Settings → API token. Without sign-in, keep Scout reachable only over your LAN or VPN (for example Tailscale).
+The app talks to the same API as the web UI. If the server has sign-in enabled, enter one of its `SCOUT_API_TOKENS` on the connect screen; the app sends it as a bearer token and keeps it in the Keychain under the App Group, so the widgets can use it too (widgets only send it to the server the app is connected to). Replace or remove it later in Settings → API token. Configure `SCOUT_API_TOKENS` whenever Scout is reached through a proxy or tunnel, including Tailscale Serve/Funnel and Cloudflare Tunnel: without credentials Scout refuses proxied requests. Only a direct LAN connection to Scout's own address (with `SCOUT_AUTH=off` when it listens beyond loopback) works without sign-in.
 
 ## Layout
 
