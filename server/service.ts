@@ -1,5 +1,8 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
+import { Readable } from 'node:stream';
+// @ts-ignore node:sqlite is present in the supported Node 22+ runtime.
+import { DatabaseSync } from 'node:sqlite';
 import { connect as connectHttp2, type SecureClientSessionOptions } from 'node:http2';
 import { brotliDecompressSync, gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
 import type { Browser, BrowserContext } from 'playwright-core';
@@ -346,6 +349,30 @@ export function nextWatchScanSchedule(options: {
 }
 
 const nowIso = () => new Date().toISOString();
+
+// /api/export: [response key, table] in response order, then redacted settings.
+const EXPORT_TABLES = [
+  ['watches', 'watches'],
+  ['listings', 'listings'],
+  ['observations', 'observations'],
+  ['listingRelevance', 'listing_relevance'],
+  ['scans', 'scans'],
+  ['notificationDeliveries', 'notification_deliveries'],
+  ['marketWatches', 'market_watches'],
+  ['marketWatchVersions', 'market_watch_versions'],
+  ['marketListings', 'market_listings'],
+  ['marketPriceObservations', 'market_price_observations'],
+  ['listingActions', 'listing_actions'],
+  ['notifications', 'notifications'],
+  ['connectorRuns', 'connector_runs'],
+] as const;
+const EXPORT_NOTE = 'Encrypted credentials, browser sessions, and raw secret values are intentionally omitted. Use the authenticated database backup command for a complete restore point.';
+const EXPORT_CHUNK_CHARS = 64 * 1024;
+const EXPORT_MAX_OPEN_MS = 10 * 60_000;
+const redactExportSetting = (row: Record<string, unknown>) => {
+  const key = String(row.key);
+  return { key, configured: Boolean(row.value), value: /(?:webhook|ntfy_config|api_key)/i.test(key) ? null : row.value };
+};
 
 /** Escape seller text for Discord markdown so a title cannot open its own masked link. */
 export function escapeDiscordMarkdown(value: string) {
@@ -3830,28 +3857,69 @@ export class ScoutService {
 
   exportData() {
     const rows = (table: string) => this.stmt(`SELECT * FROM ${table}`).all() as Array<Record<string, unknown>>;
-    const settings = rows('settings').map((row) => {
-      const key = String(row.key);
-      return { key, configured: Boolean(row.value), value: /(?:webhook|ntfy_config|api_key)/i.test(key) ? null : row.value };
-    });
-    return {
-      exportedAt: nowIso(),
-      note: 'Encrypted credentials, browser sessions, and raw secret values are intentionally omitted. Use the authenticated database backup command for a complete restore point.',
-      watches: rows('watches'),
-      listings: rows('listings'),
-      observations: rows('observations'),
-      listingRelevance: rows('listing_relevance'),
-      scans: rows('scans'),
-      notificationDeliveries: rows('notification_deliveries'),
-      marketWatches: rows('market_watches'),
-      marketWatchVersions: rows('market_watch_versions'),
-      marketListings: rows('market_listings'),
-      marketPriceObservations: rows('market_price_observations'),
-      listingActions: rows('listing_actions'),
-      notifications: rows('notifications'),
-      connectorRuns: rows('connector_runs'),
-      settings,
-    };
+    const data: Record<string, unknown> = { exportedAt: nowIso(), note: EXPORT_NOTE };
+    for (const [key, table] of EXPORT_TABLES) data[key] = rows(table);
+    data.settings = rows('settings').map(redactExportSetting);
+    return data;
+  }
+
+  /**
+   * The /api/export JSON as text chunks, byte-identical to
+   * JSON.stringify(exportData()). Rows stream from a separate read-only
+   * connection inside one read transaction (the same snapshot for every
+   * table) in ~64 KB chunks with an event-loop turn between them, so the
+   * export never materializes the database or blocks SSE and the scheduler.
+   * An in-memory database, or a Node without StatementSync.iterate(), falls
+   * back to exportData().
+   */
+  async *exportChunks(): AsyncGenerator<string> {
+    const main = (this.db.prepare('PRAGMA database_list').all() as Array<{ name: string; file: string }>).find((row) => row.name === 'main');
+    const reader = main?.file ? new DatabaseSync(main.file, { readOnly: true }) : null;
+    if (!reader || typeof reader.prepare('SELECT 1').iterate !== 'function') {
+      reader?.close();
+      yield JSON.stringify(this.exportData());
+      return;
+    }
+    let open = false;
+    try {
+      reader.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;');
+      reader.exec('BEGIN');
+      open = true;
+      const settings = (reader.prepare('SELECT * FROM settings').all() as Array<Record<string, unknown>>).map(redactExportSetting);
+      let chunk = `{"exportedAt":${JSON.stringify(nowIso())},"note":${JSON.stringify(EXPORT_NOTE)}`;
+      for (const [key, table] of EXPORT_TABLES) {
+        chunk += `,${JSON.stringify(key)}:[`;
+        let first = true;
+        for (const row of reader.prepare(`SELECT * FROM ${table}`).iterate()) {
+          chunk += first ? JSON.stringify(row) : `,${JSON.stringify(row)}`;
+          first = false;
+          if (chunk.length >= EXPORT_CHUNK_CHARS) {
+            yield chunk;
+            chunk = '';
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          }
+        }
+        chunk += ']';
+      }
+      yield `${chunk},"settings":${JSON.stringify(settings)}}`;
+    } finally {
+      // Also runs when the consumer stops early (client abort or timeout).
+      if (open) { try { reader.exec('ROLLBACK'); } catch { /* the snapshot is released on close */ } }
+      try { reader.close(); } catch { /* best-effort */ }
+    }
+  }
+
+  /**
+   * exportChunks() as a byte stream for the /api/export route. The stream is
+   * destroyed after maxOpenMs, so a stalled client cannot pin the read
+   * snapshot (and block WAL checkpoints from resetting) indefinitely.
+   */
+  exportStream(maxOpenMs = EXPORT_MAX_OPEN_MS) {
+    const stream = Readable.from(this.exportChunks(), { objectMode: false });
+    const timer = setTimeout(() => stream.destroy(new Error(`Export exceeded ${maxOpenMs} ms and was stopped`)), maxOpenMs);
+    timer.unref?.();
+    stream.once('close', () => clearTimeout(timer));
+    return stream;
   }
 
   settings(): SettingsData {

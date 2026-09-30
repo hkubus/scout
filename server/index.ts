@@ -400,7 +400,8 @@ app.get('/api/connector-runs', async (request, reply) => {
 app.get('/api/logs', async () => ({ logs: service.logs() }));
 app.get('/api/settings', async () => service.settings());
 app.get('/api/marketplace-sessions', async () => ({ sessions: service.marketplaceSessions() }));
-app.get('/api/export', async (_request, reply) => reply.header('Content-Disposition', `attachment; filename="scout-export-${new Date().toISOString().slice(0, 10)}.json"`).type('application/json').send(service.exportData()));
+// Streamed from a read-only snapshot so the export never buffers the database.
+app.get('/api/export', async (_request, reply) => reply.header('Content-Disposition', `attachment; filename="scout-export-${new Date().toISOString().slice(0, 10)}.json"`).type('application/json').send(service.exportStream()));
 app.post('/api/backup', async (_request, reply) => reply.code(201).send({ backup: basename(backupDatabase(db)), message: 'SQLite backup created beside the configured database file.' }));
 
 app.put('/api/marketplace-sessions/:marketplace', async (request, reply) => {
