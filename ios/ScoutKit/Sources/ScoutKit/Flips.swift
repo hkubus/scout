@@ -109,6 +109,10 @@ public struct Flip: Codable, Hashable, Sendable, Identifiable {
     public var note: String
     public var createdAt: String
     public var updatedAt: String
+    /// What to post; filled into the marketplace forms by the browser extension.
+    public var listing: FlipListing?
+    /// Listing photos in posting order. Missing on older servers.
+    public var photos: [FlipPhoto]?
 
     public var isSold: Bool { soldOn != nil && salePrice != nil }
     public var cost: Double { Profit.cost(buyPrice: buyPrice, buyCosts: buyCosts) }
@@ -122,6 +126,21 @@ public struct Flip: Codable, Hashable, Sendable, Identifiable {
         guard isSold else { return [] }
         return listedOn.filter { $0 != saleChannel && !delisted.contains($0) }
     }
+}
+
+public struct FlipListing: Codable, Hashable, Sendable {
+    public var title: String
+    public var description: String
+    /// `new`, `like-new`, `good`, or `damaged`.
+    public var condition: String?
+    public var prices: [String: Double]
+    public var basePrice: Double?
+}
+
+public struct FlipPhoto: Codable, Hashable, Sendable, Identifiable {
+    public var id: Int
+    public var mime: String
+    public var byteSize: Int
 }
 
 public struct FlipsData: Codable, Hashable, Sendable {

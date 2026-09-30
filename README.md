@@ -165,6 +165,12 @@ The **Flips** page records what you bought, where it is listed for sale, and wha
 
 The ledger is private bookkeeping. Nothing in scanning, scoring, bands or alerts reads it, so your own buy and sale prices never mix with marketplace asking prices. Retention never prunes it. It is included in `/api/export` and database backups, but hidden from the Debug API: it is left out of the table list, refused in read-only SQL, and emptied in debug snapshots.
 
+### Listing on OLX, Allegro Lokalnie and Vinted
+
+Each unsold flip can hold a listing: title, description, condition, an asking price per platform, and up to 20 photos. The prices are suggested from your fee presets so each platform leaves you the same amount. Add photos on the web or from the iOS app. They are resized to at most 2000 px and stored on your server, private like the rest of the ledger.
+
+The **Scout listing helper** Firefox extension in [`extension/`](extension/README.md) opens a platform's listing form and fills it from the flip, photos included. You check the form and publish it yourself; nothing is submitted automatically. Pressing **I published it** marks the platform in the flip's "Listed on". OLX, Allegro Lokalnie and Vinted offer no listing API for private sellers, except OLX's partner program, so a browser-side helper is the safe way to avoid typing each listing three times.
+
 ## Preserved listing copies
 
 Research listings are preserved for market research: when a listing first appears in a research watch, Scout fetches its detail page once (bounded per scan, with a small retry budget on later scans), stores the description, and downloads the gallery images into the Scout database so the listing stays viewable after it is sold or removed. Captures are deduplicated by listing state, capped at 12 images of up to 4 MB each, and served only from Scout's own image endpoint. Use the eye action on a Saved listings row to view the preserved copy, or the save action to capture or refresh a copy on demand — including for listings that already ended. Copies live and die with their research listing row, so the daily 180-day retention cleanup also prunes them; deleting a research watch deletes its copies.

@@ -1,0 +1,34 @@
+{
+  "manifest_version": 2,
+  "name": "Scout listing helper",
+  "version": "0.1.0",
+  "description": "Fills OLX, Allegro Lokalnie and Vinted listing forms from a flip in your Scout server. You check each form and publish it yourself.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "scout-listing-helper@scout.local",
+      "strict_min_version": "115.0",
+      "data_collection_permissions": { "required": ["none"] }
+    }
+  },
+  "icons": { "48": "icon.svg", "96": "icon.svg" },
+  "permissions": [
+    "storage",
+    "tabs",
+    "downloads",
+    "clipboardWrite",
+    "https://www.olx.pl/*",
+    "https://allegrolokalnie.pl/*",
+    "https://www.vinted.pl/*"
+  ],
+  "optional_permissions": ["http://*/*", "https://*/*"],
+  "background": { "scripts": ["background.js"], "persistent": false },
+  "browser_action": { "default_title": "Scout listing helper", "default_popup": "popup.html", "default_icon": "icon.svg" },
+  "options_ui": { "page": "options.html", "open_in_tab": true },
+  "content_scripts": [
+    {
+      "matches": ["https://www.olx.pl/*", "https://allegrolokalnie.pl/*", "https://www.vinted.pl/*"],
+      "js": ["filler.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 import ScoutKit
 
@@ -251,7 +252,8 @@ struct FlipsView: View {
         guard let client = model.client else { return }
         Task { @MainActor in
             do {
-                replace(try await client.removeSale(flipId: flip.id))
+                let unsold = try await client.removeSale(flipId: flip.id)
+                replace(unsold)
             } catch {
                 model.report(error)
             }
@@ -266,13 +268,14 @@ struct FlipEditorRequest: Identifiable {
     var draft: FlipDraft
     /// `nil` creates a new flip.
     var flipID: Int?
+    var photos: [FlipPhoto] = []
 
     static func create(_ draft: FlipDraft = FlipDraft()) -> FlipEditorRequest {
         FlipEditorRequest(draft: draft, flipID: nil)
     }
 
     static func edit(_ flip: Flip) -> FlipEditorRequest {
-        FlipEditorRequest(draft: FlipDraft(flip: flip), flipID: flip.id)
+        FlipEditorRequest(draft: FlipDraft(flip: flip), flipID: flip.id, photos: flip.photos ?? [])
     }
 }
 
@@ -320,6 +323,11 @@ struct FlipEditorView: View {
     @State private var buyCosts: String
     @State private var saving = false
     @State private var error: String?
+    @State private var photos: [FlipPhoto]
+    @State private var pickerItems: [PhotosPickerItem] = []
+    @State private var uploading = false
+
+    private static let maxPhotos = 20
 
     init(request: FlipEditorRequest, onSaved: @escaping (Flip) -> Void) {
         self.request = request
@@ -327,6 +335,7 @@ struct FlipEditorView: View {
         _draft = State(initialValue: request.draft)
         _buyPrice = State(initialValue: amountText(request.draft.buyPrice))
         _buyCosts = State(initialValue: amountText(request.draft.buyCosts))
+        _photos = State(initialValue: request.photos)
     }
 
     var body: some View {
@@ -366,6 +375,9 @@ struct FlipEditorView: View {
                     TextField("Optional", text: $draft.note, axis: .vertical)
                         .lineLimit(1...4)
                 }
+                if request.flipID != nil {
+                    photosSection
+                }
                 if let error {
                     Section {
                         Label(error, systemImage: "exclamationmark.triangle")
@@ -391,6 +403,98 @@ struct FlipEditorView: View {
             }
             .interactiveDismissDisabled(saving)
         }
+    }
+
+    @ViewBuilder
+    private var photosSection: some View {
+        Section {
+            if !photos.isEmpty, let client = model.client {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(photos) { photo in
+                            ServerImage(client: client, url: client.flipPhotoURL(id: photo.id)) {
+                                Color.secondary.opacity(0.12)
+                            }
+                            .frame(width: 72, height: 72)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            .contextMenu {
+                                Button(role: .destructive) {
+                                    deletePhoto(photo)
+                                } label: {
+                                    Label("Delete photo", systemImage: "trash")
+                                }
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+            PhotosPicker(selection: $pickerItems, maxSelectionCount: max(1, Self.maxPhotos - photos.count), matching: .images) {
+                HStack {
+                    Label("Add photos", systemImage: "photo.on.rectangle.angled")
+                    Spacer()
+                    if uploading { ProgressView() }
+                }
+            }
+            .disabled(uploading || photos.count >= Self.maxPhotos)
+            .onChange(of: pickerItems) { uploadPicked() }
+        } header: {
+            Text(verbatim: "Listing photos · \(photos.count) of \(Self.maxPhotos)")
+        } footer: {
+            Text("Saved to Scout right away; the browser extension attaches them on OLX, Allegro Lokalnie and Vinted. The first one is the cover. Long-press a photo to delete it. Listing text and prices are edited on the web Flips page.")
+        }
+    }
+
+    private func uploadPicked() {
+        guard !pickerItems.isEmpty, let client = model.client, let flipID = request.flipID else { return }
+        let items = pickerItems
+        pickerItems = []
+        uploading = true
+        Task { @MainActor in
+            defer {
+                uploading = false
+                model.refresh()
+            }
+            for item in items {
+                do {
+                    guard let data = try await item.loadTransferable(type: Data.self), let jpeg = Self.listingJPEG(from: data) else {
+                        error = "One of the photos couldn't be read."
+                        continue
+                    }
+                    let photo = try await client.uploadFlipPhoto(flipId: flipID, jpeg: jpeg)
+                    photos.append(photo)
+                } catch {
+                    self.error = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    private func deletePhoto(_ photo: FlipPhoto) {
+        guard let client = model.client else { return }
+        Task { @MainActor in
+            do {
+                try await client.deleteFlipPhoto(id: photo.id)
+                photos.removeAll { $0.id == photo.id }
+                model.refresh()
+            } catch {
+                self.error = error.localizedDescription
+            }
+        }
+    }
+
+    /// Upright JPEG, at most 2000 px on the long edge: the marketplaces resize
+    /// larger photos anyway, and HEIC from the camera becomes JPEG here.
+    private static func listingJPEG(from data: Data) -> Data? {
+        guard let image = UIImage(data: data), image.size.width > 0, image.size.height > 0 else { return nil }
+        let scale = min(1, 2000 / max(image.size.width, image.size.height))
+        let size = CGSize(width: (image.size.width * scale).rounded(), height: (image.size.height * scale).rounded())
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let rendered = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: size))
+        }
+        return rendered.jpegData(compressionQuality: 0.85)
     }
 
     private func listedBinding(_ channel: FlipChannel) -> Binding<Bool> {
@@ -582,7 +686,8 @@ struct SellFlipView: View {
         Task { @MainActor in
             defer { saving = false }
             do {
-                onSaved(try await client.recordSale(flipId: flip.id, sale: sale))
+                let saved = try await client.recordSale(flipId: flip.id, sale: sale)
+                onSaved(saved)
                 dismiss()
             } catch {
                 self.error = error.localizedDescription
@@ -757,7 +862,8 @@ struct FeePresetsView: View {
         Task { @MainActor in
             defer { saving = false }
             do {
-                onSaved(try await client.saveFeePresets(presets))
+                let saved = try await client.saveFeePresets(presets)
+                onSaved(saved)
                 dismiss()
             } catch {
                 self.error = error.localizedDescription

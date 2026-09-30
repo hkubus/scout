@@ -19,7 +19,9 @@
     "test:compose": "bash scripts/compose-smoke.sh",
     "test": "node --import tsx --test \"tests/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
-    "audit": "npm audit --omit=dev"
+    "audit": "npm audit --omit=dev",
+    "extension:lint": "npx --yes web-ext@8 lint --source-dir extension",
+    "extension:build": "npx --yes web-ext@8 build --source-dir extension --artifacts-dir dist-extension --overwrite-dest"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.1",

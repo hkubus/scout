@@ -17,8 +17,8 @@ import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
 import { apiTokenCredentialId, bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
 import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
-import { FlipStore } from './flips';
-import { FLIP_CHANNELS } from '../src/profit';
+import { FlipStore, MAX_FLIP_PHOTO_BYTES, MAX_FLIP_PHOTOS } from './flips';
+import { FLIP_CHANNELS, LISTING_CONDITIONS } from '../src/profit';
 import { NO_LOCATION_FILTER, normalizeSourceIntervals, olxCategoryToJson, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 import { parseVariantGroups } from './variants';
@@ -643,6 +643,50 @@ app.delete('/api/flips/:id', async (request, reply) => {
   const params = flipIdParams.safeParse(request.params);
   if (!params.success) return reply.code(400).send({ error: 'A valid flip id is required' });
   flips.delete(params.data.id);
+  return { ok: true };
+});
+app.put('/api/flips/:id/listing', async (request, reply) => {
+  const params = flipIdParams.safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid flip id is required' });
+  const listing = z.object({
+    title: z.string().trim().max(200),
+    description: z.string().max(9000),
+    condition: z.enum(LISTING_CONDITIONS).nullable(),
+    prices: z.object(Object.fromEntries(FLIP_CHANNELS.map((channel) => [channel, flipAmount.positive().optional()])) as Record<(typeof FLIP_CHANNELS)[number], z.ZodOptional<z.ZodNumber>>).strict(),
+    basePrice: flipAmount.positive().nullable(),
+  }).strict().nullable().safeParse(request.body);
+  if (!listing.success) return reply.code(400).send({ error: 'Invalid listing draft', details: listing.error.flatten() });
+  return { flip: flips.setListing(params.data.id, listing.data) };
+});
+// Raw image bodies (the photo is the whole request), checked by their bytes.
+app.addContentTypeParser(['image/jpeg', 'image/png', 'image/webp'], { parseAs: 'buffer', bodyLimit: MAX_FLIP_PHOTO_BYTES }, (_request, body, done) => done(null, body));
+app.post('/api/flips/:id/photos', async (request, reply) => {
+  const params = flipIdParams.safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid flip id is required' });
+  if (!Buffer.isBuffer(request.body)) return reply.code(415).send({ error: 'Send the photo as the request body with an image/jpeg, image/png or image/webp content type' });
+  return reply.code(201).send({ photo: flips.addPhoto(params.data.id, request.body) });
+});
+app.put('/api/flips/:id/photos/order', async (request, reply) => {
+  const params = flipIdParams.safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid flip id is required' });
+  const parsed = z.object({ ids: z.array(z.number().int().positive()).max(MAX_FLIP_PHOTOS) }).strict().safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'Invalid photo order' });
+  return { flip: flips.orderPhotos(params.data.id, parsed.data.ids) };
+});
+app.get('/api/flip-photos/:id', async (request, reply) => {
+  const params = flipIdParams.safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid photo id is required' });
+  const photo = flips.photo(params.data.id);
+  if (!photo) return reply.code(404).send({ error: 'Photo not found' });
+  reply.header('cache-control', 'private, max-age=31536000, immutable');
+  reply.header('content-disposition', 'inline');
+  reply.header('content-security-policy', "default-src 'none'; sandbox");
+  return reply.type(photo.mime).send(Buffer.from(photo.data));
+});
+app.delete('/api/flip-photos/:id', async (request, reply) => {
+  const params = flipIdParams.safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid photo id is required' });
+  flips.deletePhoto(params.data.id);
   return { ok: true };
 });
 app.put('/api/flips/fee-presets', async (request, reply) => {

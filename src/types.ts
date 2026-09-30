@@ -615,7 +615,7 @@ export interface DashboardData {
   lastScanTime: string;
 }
 
-export type { FeePreset, FeePresets, FlipChannel } from './profit';
+export type { FeePreset, FeePresets, FlipChannel, FlipListing, ListingCondition } from './profit';
 
 export interface Flip {
   id: number;
@@ -640,6 +640,16 @@ export interface Flip {
   note: string;
   createdAt: string;
   updatedAt: string;
+  /** What to post, filled into the marketplace forms by the browser extension. */
+  listing: import('./profit').FlipListing | null;
+  /** Listing photos in posting order; bytes come from `/api/flip-photos/:id`. */
+  photos: FlipPhoto[];
+}
+
+export interface FlipPhoto {
+  id: number;
+  mime: string;
+  byteSize: number;
 }
 
 export interface FlipsData {
