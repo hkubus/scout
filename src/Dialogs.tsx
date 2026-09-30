@@ -8,6 +8,7 @@ import {
   LoaderCircle,
   Plus,
   Send,
+  Sparkles,
   X,
   Zap,
 } from "lucide-react";
@@ -62,6 +63,10 @@ export function WatchDialog({
   const [typoVariants, setTypoVariants] = useState(initialWatch?.typoVariants ?? false);
   const [aiRelevance, setAiRelevance] = useState(initialWatch?.aiRelevance ?? preset?.aiRelevance ?? true);
   const [variantGroups, setVariantGroups] = useState<VariantGroup[]>(initialWatch?.variantGroups ?? []);
+  // New watches wait for listings and then propose their own groups.
+  const [variantGroupsAuto, setVariantGroupsAuto] = useState(initialWatch ? Boolean(initialWatch.variantGroupsAuto) : true);
+  const [suggesting, setSuggesting] = useState(false);
+  const [suggestionNote, setSuggestionNote] = useState<string | null>(null);
   const [referenceOptions, setReferenceOptions] = useState<MarketWatch[]>([]);
   const [referenceMarketWatchId, setReferenceMarketWatchId] = useState(initialWatch?.referenceMarketWatchId ?? "");
   const [submitting, setSubmitting] = useState(false);
@@ -144,6 +149,7 @@ export function WatchDialog({
         typoVariants,
         aiRelevance,
         variantGroups: cleanVariantGroups,
+        variantGroupsAuto: variantGroupsAuto && !cleanVariantGroups.length,
         variants: initialWatch?.variants ?? [],
         dealCounts: initialWatch?.dealCounts ?? { exceptional: 0, veryStrong: 0, strong: 0 },
         referenceMarketWatchId: referenceMarketWatchId.trim() ? referenceMarketWatchId.trim() : null,
@@ -175,6 +181,25 @@ export function WatchDialog({
     );
   const removeVariant = (index: number) =>
     setVariantGroups((current) => current.filter((_, position) => position !== index));
+  const suggestVariants = async () => {
+    if (!initialWatch?.id) return;
+    setSuggesting(true);
+    setSuggestionNote(null);
+    try {
+      const result = await api.suggestVariantGroups(initialWatch.id);
+      const source = result.method === "ai" ? "AI" : "title analysis";
+      if (result.groups.length) {
+        setVariantGroups(result.groups);
+        setSuggestionNote(`Suggested ${result.groups.length} from ${result.listings} listings (${source}). Review, then save to apply.`);
+      } else {
+        setSuggestionNote(result.listings < 2 ? "Not enough listings yet to suggest variants." : `No distinct models found in ${result.listings} listings (${source}).`);
+      }
+    } catch (suggestError) {
+      setSuggestionNote(errorMessage(suggestError));
+    } finally {
+      setSuggesting(false);
+    }
+  };
   const cleanVariantGroups = variantGroups
     .map((group) => ({ ...group, label: group.label.trim(), terms: group.terms.trim() }))
     .filter((group) => group.label && group.terms);
@@ -384,10 +409,25 @@ export function WatchDialog({
                   </button>
                 </div>
               ))}
-              <button type="button" className="ghost-button" disabled={variantGroups.length >= 12} onClick={addVariant}>
-                <Plus size={15} />
-                Add variant
-              </button>
+              <div className="variant-actions">
+                <button type="button" className="ghost-button" disabled={variantGroups.length >= 12} onClick={addVariant}>
+                  <Plus size={15} />
+                  Add variant
+                </button>
+                {initialWatch?.id ? (
+                  <button type="button" className="ghost-button" disabled={suggesting} onClick={() => void suggestVariants()}>
+                    {suggesting ? <LoaderCircle size={15} className="spin" /> : <Sparkles size={15} />}
+                    {variantGroups.length ? "Re-suggest from listings" : "Suggest from listings"}
+                  </button>
+                ) : null}
+              </div>
+              {suggestionNote ? <small className="field-hint" role="status">{suggestionNote}</small> : null}
+              {variantGroups.length ? null : (
+                <label className="check-option check-option--modal">
+                  <input type="checkbox" checked={variantGroupsAuto} onChange={(event) => setVariantGroupsAuto(event.target.checked)} />
+                  <span><strong>Generate variants automatically</strong><small>Once {initialWatch ? "this watch has" : "the watch finds"} enough listings, Scout groups them by model from their titles. You can edit the groups afterwards.</small></span>
+                </label>
+              )}
               <small className="field-hint">
                 The most specific match wins, so “1660 super” and “1660 ti” take precedence over “1660”. Listings that match no group share an “Other” baseline. Each variant learns its own typical price and alerts separately.
               </small>

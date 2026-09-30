@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase } from '../server/db';
 import { ScoutService } from '../server/service';
-import { OTHER_VARIANT_KEY, assignVariant, parseVariantGroups, variantLabelFor } from '../server/variants';
+import { OTHER_VARIANT_KEY, assignVariant, finalizeVariantSuggestions, parseVariantGroups, suggestVariantGroupsFromTitles, variantLabelFor } from '../server/variants';
 
 const gtxGroups = [
   { id: 'gtx-1660', label: 'GTX 1660', terms: '1660' },
@@ -193,5 +193,146 @@ test('scores a new listing against its own model baseline during a scan', async 
   } finally {
     globalThis.fetch = originalFetch;
     context.close();
+  }
+});
+
+function gpuSamples() {
+  const samples: Array<{ title: string; price: number }> = [];
+  for (let index = 0; index < 12; index += 1) samples.push({ title: `Karta graficzna GTX 1660 Super 6GB stan idealny ${index}`, price: 780 + index * 5 });
+  for (let index = 0; index < 10; index += 1) samples.push({ title: `MSI GeForce GTX 1660 Ti Gaming X ${index}`, price: 920 + index * 5 });
+  for (let index = 0; index < 14; index += 1) samples.push({ title: `GTX 1660 6GB sprzedam ${index}`, price: 560 + index * 5 });
+  return samples;
+}
+
+test('title analysis proposes the model suffixes that are priced apart, plus the plain model', () => {
+  const samples = gpuSamples();
+  const candidates = suggestVariantGroupsFromTitles(samples, { query: 'GTX 1660' });
+  const groups = finalizeVariantSuggestions(candidates, samples);
+  assert.deepEqual(groups.map((group) => group.terms).sort(), ['1660', '1660 super', '1660 ti']);
+  assert.deepEqual(groups.map((group) => group.label).sort(), ['GTX 1660', 'GTX 1660 Super', 'GTX 1660 Ti']);
+  assert.equal(assignVariant('GTX 1660 Super OC', groups), groups.find((group) => group.terms === '1660 super')!.id);
+  assert.equal(assignVariant('GTX 1660 6GB', groups), groups.find((group) => group.terms === '1660')!.id);
+});
+
+test('title analysis ignores filler words and finds nothing in a single-product watch', () => {
+  const samples = Array.from({ length: 40 }, (_, index) => ({
+    title: index % 2 ? `LEGO 10316 Rivendell nowy ${index}` : `LEGO 10316 Rivendell zestaw komplet ${index}`,
+    price: 1800 + (index % 7) * 20,
+  }));
+  const candidates = suggestVariantGroupsFromTitles(samples, { query: 'lego 10316 rivendell' });
+  assert.deepEqual(finalizeVariantSuggestions(candidates, samples), []);
+});
+
+test('title analysis keeps a two-word refinement only when it is priced apart from its prefix', () => {
+  const samples: Array<{ title: string; price: number }> = [];
+  for (let index = 0; index < 10; index += 1) samples.push({ title: `iPhone 13 128GB ${index}`, price: 1700 + index * 10 });
+  for (let index = 0; index < 10; index += 1) samples.push({ title: `iPhone 13 Pro 128GB ${index}`, price: 2400 + index * 10 });
+  for (let index = 0; index < 10; index += 1) samples.push({ title: `iPhone 13 Pro Max 256GB ${index}`, price: 3000 + index * 10 });
+  const groups = finalizeVariantSuggestions(suggestVariantGroupsFromTitles(samples, { query: 'iPhone 13' }), samples);
+  const byTerms = new Map(groups.map((group) => [group.terms, group]));
+  assert.ok(byTerms.has('13 pro'));
+  assert.ok(byTerms.has('13 pro max'));
+  assert.equal(assignVariant('iPhone 13 Pro Max 512GB', groups), byTerms.get('13 pro max')!.id);
+  assert.equal(assignVariant('iPhone 13 Pro 256GB', groups), byTerms.get('13 pro')!.id);
+});
+
+test('finalizing drops groups too few titles support, keeps existing ids, and rejects a non-split', () => {
+  const samples = gpuSamples();
+  const existing = [{ id: 'my-super', label: 'Super (mine)', terms: '1660 super' }];
+  const groups = finalizeVariantSuggestions([
+    { label: 'GTX 1660 Super', terms: '1660 Super' },
+    { label: 'GTX 1660 Ti', terms: '1660 ti' },
+    { label: 'RTX 3060', terms: '3060' },
+  ], samples, existing);
+  assert.deepEqual(groups.map((group) => group.id), ['my-super', 'gtx-1660-ti']);
+  assert.equal(groups[0].label, 'GTX 1660 Super');
+  // One group that swallows every title is not a split.
+  assert.deepEqual(finalizeVariantSuggestions([{ label: 'GTX 1660', terms: '1660' }], samples), []);
+});
+
+function seedAutoWatch(context: ReturnType<typeof fixture>, id: string, samples: Array<{ title: string; price: number }>, overrides: { auto?: number; groups?: string } = {}) {
+  const now = new Date().toISOString();
+  context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, variant_groups_json, variant_groups_auto, ai_relevance, enabled, next_scan_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?)`).run(id, 'GTX 1660', 'gtx 1660', '["OLX"]', overrides.groups ?? '[]', overrides.auto ?? 1, now, now, now);
+  const insertListing = context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+  const insertAssociation = context.db.prepare('INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)');
+  samples.forEach((sample, index) => {
+    const listing = insertListing.run('OLX', `${id}-${index}`, sample.title, sample.price, `https://www.olx.pl/d/oferta/${id}-${index}`, now, now);
+    insertAssociation.run(id, Number(listing.lastInsertRowid), now, now);
+  });
+}
+
+test('a pending watch gets groups generated from its listings after a scan, then keeps them', async () => {
+  const context = fixture();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(null, { status: 204 })) as typeof fetch;
+  const previousKey = process.env.SCOUT_OPENROUTER_API_KEY;
+  delete process.env.SCOUT_OPENROUTER_API_KEY;
+  try {
+    seedAutoWatch(context, 'auto', gpuSamples());
+    assert.equal(context.service.getWatches()[0].variantGroupsAuto, true);
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [], metadata: { visible_total_count: 0 } } });
+    await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('auto'));
+
+    const watch = context.service.getWatches()[0];
+    assert.equal(watch.variantGroupsAuto, false);
+    assert.deepEqual(watch.variantGroups.map((group) => group.terms).sort(), ['1660', '1660 super', '1660 ti']);
+    const keys = context.db.prepare("SELECT COUNT(*) AS count FROM watch_listings WHERE watch_id = 'auto' AND variant_key IS NOT NULL").get() as { count: number };
+    assert.equal(keys.count, 36);
+
+    // Once generated, later scans leave the (possibly user-edited) groups alone.
+    context.db.prepare("UPDATE watches SET variant_groups_json = ? WHERE id = 'auto'").run(JSON.stringify([{ id: 'mine', label: 'Mine', terms: '1660 ti' }]));
+    await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('auto'));
+    assert.deepEqual(context.service.getWatches()[0].variantGroups.map((group) => group.id), ['mine']);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousKey !== undefined) process.env.SCOUT_OPENROUTER_API_KEY = previousKey;
+    context.close();
+  }
+});
+
+test('auto generation waits for enough listings and skips watches that opted out', async () => {
+  const context = fixture();
+  try {
+    seedAutoWatch(context, 'small', gpuSamples().slice(0, 20));
+    seedAutoWatch(context, 'optout', gpuSamples(), { auto: 0 });
+    await (context.service as any).autoGenerateVariantGroups('small');
+    await (context.service as any).autoGenerateVariantGroups('optout');
+    const watches = new Map(context.service.getWatches().map((watch) => [watch.id, watch]));
+    assert.deepEqual(watches.get('small')?.variantGroups, []);
+    assert.equal(watches.get('small')?.variantGroupsAuto, true);
+    assert.deepEqual(watches.get('optout')?.variantGroups, []);
+    assert.equal(watches.get('optout')?.variantGroupsAuto, false);
+  } finally { context.close(); }
+});
+
+test('AI proposals are validated against the titles and fall back to title analysis on failure', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'scout-variants-ai-'));
+  const db = openDatabase(join(directory, 'scout.sqlite'));
+  const previousKey = process.env.SCOUT_OPENROUTER_API_KEY;
+  process.env.SCOUT_OPENROUTER_API_KEY = 'test-key';
+  let fail = false;
+  const service = new ScoutService(db, () => {}, {
+    suggestVariantGroups: async () => {
+      if (fail) throw new Error('provider down');
+      return [{ label: '1660 Ti', terms: '1660 ti' }, { label: '1660 Super', terms: '1660 super' }, { label: 'Made up', terms: 'nonexistent' }];
+    },
+  });
+  try {
+    seedAutoWatch({ db, service, close: () => {} }, 'ai', gpuSamples());
+    const fromAi = await service.suggestWatchVariantGroups('ai');
+    assert.equal(fromAi.method, 'ai');
+    assert.deepEqual(fromAi.groups.map((group) => group.terms), ['1660 ti', '1660 super']);
+    fail = true;
+    const fallback = await service.suggestWatchVariantGroups('ai');
+    assert.equal(fallback.method, 'titles');
+    assert.equal(fallback.groups.length, 3);
+    // Suggestions are only proposals: nothing is stored.
+    assert.deepEqual(service.getWatches()[0].variantGroups, []);
+  } finally {
+    if (previousKey === undefined) delete process.env.SCOUT_OPENROUTER_API_KEY;
+    else process.env.SCOUT_OPENROUTER_API_KEY = previousKey;
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
