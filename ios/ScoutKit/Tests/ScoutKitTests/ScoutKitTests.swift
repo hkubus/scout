@@ -879,3 +879,22 @@ final class LiveUpdatesTests: XCTestCase {
         XCTAssertEqual(ReloadPolicy.pagesToKeep(loadedRows: 900, maxRows: 400), 8)
     }
 }
+
+final class ImageSizingTests: XCTestCase {
+    func testDecodesAtTheDrawnSizeWithoutUpscaling() {
+        // A 68 pt thumbnail at 3x from an 800 × 800 Vinted photo.
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: 800, height: 800, pixels: 204, fill: true), 204)
+        // Filling a square from 4:3: the short side must reach 204 px.
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: 4000, height: 3000, pixels: 204, fill: true), 272)
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: 3000, height: 4000, pixels: 204, fill: true), 272)
+        // Fitting: the long side is the limit.
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: 4000, height: 3000, pixels: 1290, fill: false), 1290)
+        // OLX's 320 × 240 is already close to thumbnail size.
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: 320, height: 240, pixels: 204, fill: true), 272)
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: 320, height: 240, pixels: 1290, fill: false), 320)
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: 200, height: 100, pixels: 204, fill: true), 200)
+        // Unknown size: the drawn size.
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: nil, height: 100, pixels: 204, fill: true), 204)
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: 0, height: 0, pixels: 0, fill: false), 1)
+    }
+}

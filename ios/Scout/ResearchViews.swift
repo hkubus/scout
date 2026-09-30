@@ -585,12 +585,8 @@ struct ResearchListingDetailView: View {
         List {
             Section {
                 if let url = listing.imageURL {
-                    AsyncImage(url: url) { phase in
-                        if let image = phase.image {
-                            image.resizable().scaledToFit()
-                        } else {
-                            Color.secondary.opacity(0.1)
-                        }
+                    PipelineImage(url: url, contentMode: .fit, pointSize: ImagePipeline.headerPoints) {
+                        Color.secondary.opacity(0.1)
                     }
                     .frame(maxWidth: .infinity, minHeight: 180, maxHeight: 300)
                     .listRowInsets(EdgeInsets())
@@ -654,7 +650,7 @@ struct ResearchListingDetailView: View {
             NavigationStack {
                 Group {
                     if let client = model.client {
-                        ServerImage(client: client, url: enlarged.url, contentMode: .fit) { ProgressView() }
+                        ServerImage(client: client, url: enlarged.url, contentMode: .fit, pointSize: ImagePipeline.fullScreenPoints) { ProgressView() }
                     }
                 }
                 .toolbar {
@@ -677,13 +673,13 @@ struct ResearchListingDetailView: View {
                 if let location = snapshot.location { LabeledContent("Location", value: location) }
                 if !snapshot.images.isEmpty, let client = model.client {
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
+                        LazyHStack(spacing: 8) {
                             ForEach(snapshot.images.sorted { $0.position < $1.position }) { image in
                                 let url = client.marketSnapshotImageURL(imageId: image.id)
                                 Button {
                                     enlargedImage = EnlargedImage(url: url)
                                 } label: {
-                                    ServerImage(client: client, url: url) {
+                                    ServerImage(client: client, url: url, pointSize: 96) {
                                         ZStack {
                                             Color.secondary.opacity(0.12)
                                             Image(systemName: "photo").foregroundStyle(.tertiary)
