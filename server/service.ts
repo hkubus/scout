@@ -1916,6 +1916,9 @@ export class ScoutService {
       while (cursor < queue.length) {
         const group = queue[cursor++];
         for (const candidate of group) {
+          // notifyDeal ignores hidden listings, so verifying one would only
+          // fetch its page and spend an AI call for nothing.
+          if (this.isListingHidden(candidate.listing)) continue;
           if (candidate.requiresDescriptionVerification && !await this.verifyHighPriorityDeal(candidate, context)) continue;
           await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence, context, candidate.variantLabel ?? null);
         }

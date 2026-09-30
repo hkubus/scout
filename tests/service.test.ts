@@ -946,6 +946,59 @@ test('repeat verification of an unchanged deal rewrites no verification or snaps
   }
 });
 
+// A watch with a ready 30-listing baseline at 1000 PLN whose OLX search
+// returns the given deals; the detail page fetch is counted.
+function standingDealScenario(context: ReturnType<typeof fixture>, watchId: string, deals: Array<{ id: string; price: number }>) {
+  const baselineAt = new Date(Date.now() - 8 * 60 * 60_000).toISOString();
+  seedWatch(context.db, watchId);
+  const insertListing = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+  const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+  for (let index = 0; index < 30; index += 1) {
+    insertListing.run('OLX', `${watchId}-baseline-${index}`, `CPU reference ${index}`, 1000, `https://www.olx.pl/d/oferta/${watchId}-baseline-${index}`, baselineAt, baselineAt);
+    const listing = context.db.prepare('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get('OLX', `${watchId}-baseline-${index}`) as { id: number };
+    insertObservation.run(listing.id, watchId, 1000, baselineAt);
+  }
+  const state = { fetches: 0, deals };
+  const service = context.service as any;
+  service.fetchPublicPage = async () => { state.fetches += 1; return '<div data-testid="description">Fully working CPU, tested.</div>'; };
+  service.fetchOlxApi = async () => ({ status: 200, json: { data: state.deals.map((deal) => (
+    { id: deal.id, url: `https://www.olx.pl/d/oferta/${deal.id}`, title: `CPU ${deal.id}`, created_time: baselineAt, params: [{ key: 'price', value: { value: deal.price, currency: 'PLN', negotiable: false } }] }
+  )), metadata: { visible_total_count: state.deals.length } } });
+  // Re-running the originally loaded row keeps every source due, as a
+  // scheduler tick would after the interval.
+  const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get(watchId);
+  return { state, scan: () => service.runWatch(row) as Promise<void> };
+}
+
+test('skips description verification for hidden deal candidates', async () => {
+  let verificationRequests = 0;
+  const context = fixture({
+    classifyListingRelevance: async () => ({ relevant: true }),
+    verifyListingDescription: async () => { verificationRequests += 1; return { decision: 'pass', confidence: 0.9, summary: 'Working.', issues: [], evidence: ['works'] }; },
+  });
+  const originalFetch = globalThis.fetch;
+  let webhookPosts = 0;
+  globalThis.fetch = (async () => { webhookPosts += 1; return new Response(null, { status: 204 }); }) as typeof fetch;
+  try {
+    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' }, webhook: 'https://discord.com/api/webhooks/123/token' });
+    const scenario = standingDealScenario(context, 'hidden-deal-watch', [{ id: 'hidden-deal', price: 650 }]);
+    context.db.prepare('INSERT INTO listing_actions (marketplace, listing_id, decision, note, hidden, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run('OLX', 'hidden-deal', null, '', 1, new Date().toISOString());
+    await scenario.scan();
+    assert.equal(scenario.state.fetches, 0);
+    assert.equal(verificationRequests, 0);
+    assert.equal(webhookPosts, 0);
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM listing_detail_snapshots').get() as { count: number }).count, 0);
+    context.service.updateListingAction('OLX:hidden-deal', { hidden: false });
+    await scenario.scan();
+    assert.equal(scenario.state.fetches, 1);
+    assert.equal(verificationRequests, 1);
+    assert.equal(webhookPosts, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.close();
+  }
+});
+
 test('holds a high-priority alert when OpenRouter verification output is malformed', async () => {
   let verificationRequests = 0;
   const context = fixture({
