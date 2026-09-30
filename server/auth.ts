@@ -63,14 +63,17 @@ export type AuthConfig = {
   tokenDigests: Buffer[];
   /** Fingerprint of the password; sessions minted under another password are rejected. */
   credentialId: string;
+  /** True only when SCOUT_AUTH=off explicitly accepted unauthenticated trusted-network mode. */
+  explicitlyOff: boolean;
 };
 
 /**
  * Read credentials from the environment. Auth is on whenever any credential
- * is configured. With none configured Scout refuses to listen beyond loopback
- * unless SCOUT_AUTH=off explicitly opts back into trusted-network mode.
+ * is configured. With none configured Scout refuses to start when it listens
+ * beyond loopback or is configured for a reverse proxy (`proxied`), unless
+ * SCOUT_AUTH=off explicitly opts back into trusted-network mode.
  */
-export async function loadAuthConfig(env: NodeJS.ProcessEnv, options: { publiclyBound: boolean }): Promise<AuthConfig> {
+export async function loadAuthConfig(env: NodeJS.ProcessEnv, options: { publiclyBound: boolean; proxied?: boolean }): Promise<AuthConfig> {
   const mode = env.SCOUT_AUTH?.trim().toLowerCase() ?? '';
   if (mode && mode !== 'off' && mode !== 'on') throw new Error('SCOUT_AUTH must be "on" or "off"');
 
@@ -89,10 +92,15 @@ export async function loadAuthConfig(env: NodeJS.ProcessEnv, options: { publicly
   const hasCredentials = Boolean(passwordHash) || tokens.length > 0;
   if (mode === 'off') {
     if (hasCredentials) throw new Error('SCOUT_AUTH=off conflicts with configured SCOUT_PASSWORD/SCOUT_PASSWORD_HASH/SCOUT_API_TOKENS');
-    return { enabled: false, passwordHash: null, tokenDigests: [], credentialId: '' };
+    return { enabled: false, passwordHash: null, tokenDigests: [], credentialId: '', explicitlyOff: true };
   }
-  if (!hasCredentials && (mode === 'on' || options.publiclyBound)) {
-    throw new Error('Scout is listening beyond loopback without authentication. Set SCOUT_PASSWORD_HASH (or SCOUT_PASSWORD) and/or SCOUT_API_TOKENS, or set SCOUT_AUTH=off to accept trusted-LAN mode.');
+  if (!hasCredentials && (mode === 'on' || options.publiclyBound || options.proxied)) {
+    const reason = mode === 'on'
+      ? 'SCOUT_AUTH=on is set but no credentials are configured, so Scout would run without authentication'
+      : options.publiclyBound
+        ? 'Scout is listening beyond loopback without authentication'
+        : 'Scout is configured for a reverse proxy (SCOUT_TRUST_PROXY or SCOUT_PUBLIC_ORIGIN is set) without authentication, so the proxy would publish it unprotected';
+    throw new Error(`${reason}. Set SCOUT_PASSWORD_HASH (or SCOUT_PASSWORD) and/or SCOUT_API_TOKENS, or set SCOUT_AUTH=off to accept trusted-LAN mode.`);
   }
   // With SCOUT_PASSWORD the hash is re-salted on every boot, so fingerprint the
   // plaintext instead (slow and keyed by SCOUT_SECRET, since the fingerprint is
@@ -102,7 +110,7 @@ export async function loadAuthConfig(env: NodeJS.ProcessEnv, options: { publicly
     : plainPassword
       ? (await scrypt(plainPassword.normalize('NFKC'), sha256(`scout-credential:${env.SCOUT_SECRET ?? ''}`), 16, { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P, maxmem: 128 * SCRYPT_N * SCRYPT_R * 2 })).toString('hex')
       : '';
-  return { enabled: hasCredentials, passwordHash, tokenDigests: tokens.map(sha256), credentialId };
+  return { enabled: hasCredentials, passwordHash, tokenDigests: tokens.map(sha256), credentialId, explicitlyOff: false };
 }
 
 /**

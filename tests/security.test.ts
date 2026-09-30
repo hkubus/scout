@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isPubliclyBoundHost, RateLimiter, rateLimitKey, securityHeaders } from '../server/security';
+import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from '../server/security';
 
 test('detects loopback and public listening addresses', () => {
   assert.equal(isPubliclyBoundHost('127.0.0.1'), false);
@@ -50,4 +50,29 @@ test('a full limiter does not reset live counters', () => {
   assert.equal(flood.retryAfterSeconds, 1);
   assert.equal(rejecting.consume('a', 1, 700).allowed, false, 'existing counter survives the flood');
   assert.equal(rejecting.consume('c', 1, 1_001).allowed, true, 'expired buckets make room');
+});
+
+test('rejects placeholder and weak SCOUT_SECRET values', () => {
+  assert.match(String(secretProblem('replace-with-a-random-value-at-least-32-characters-long')), /placeholder/);
+  assert.match(String(secretProblem('change-me-in-production-change-me-in-production')), /placeholder/);
+  assert.match(String(secretProblem('short')), /at least 32/);
+  assert.match(String(secretProblem('ab'.repeat(20))), /entropy/);
+  assert.equal(secretProblem('9f2c4e7a1b3d5f60718293a4b5c6d7e8f9012a3b4c5d6e7f8091a2b3c4d5e6f7'), null);
+});
+
+test('pins the Host header against DNS rebinding', () => {
+  for (const host of ['127.0.0.1:3001', 'localhost:3001', '[::1]:3001', '192.168.1.20:3001', 'scout.localhost']) assert.equal(isAllowedHost(host, []), true, host);
+  assert.equal(isAllowedHost('attacker.example:3001', []), false);
+  assert.equal(isAllowedHost(undefined, []), false);
+  assert.equal(isAllowedHost('scout.home.arpa', ['scout.home.arpa']), true);
+  assert.equal(isAllowedHost('SCOUT.home.arpa:8080', ['scout.home.arpa']), true);
+});
+
+test('flags browser cross-site requests but lets header-less clients through', () => {
+  const own = 'http://127.0.0.1:3001';
+  assert.equal(isCrossSiteBrowserRequest({}, own), false);
+  assert.equal(isCrossSiteBrowserRequest({ origin: own, 'sec-fetch-site': 'same-origin' }, own), false);
+  assert.equal(isCrossSiteBrowserRequest({ 'sec-fetch-site': 'cross-site' }, own), true);
+  assert.equal(isCrossSiteBrowserRequest({ origin: 'https://evil.example' }, own), true);
+  assert.equal(isCrossSiteBrowserRequest({ origin: 'null' }, own), true);
 });

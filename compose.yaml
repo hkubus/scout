@@ -15,13 +15,16 @@ services:
       SCOUT_PASSWORD: ${SCOUT_PASSWORD:-}
       SCOUT_API_TOKENS: ${SCOUT_API_TOKENS:-}
       SCOUT_AUTH: ${SCOUT_AUTH:-}
-      SCOUT_TRUST_PROXY: ${SCOUT_TRUST_PROXY:-}
+      # A host or container proxy reaches Scout from a Docker bridge address,
+      # never 127.0.0.1, so trust private (unique-local) peers by default.
+      SCOUT_TRUST_PROXY: ${SCOUT_TRUST_PROXY:-uniquelocal}
       SCOUT_PUBLIC_ORIGIN: ${SCOUT_PUBLIC_ORIGIN:-}
+      SCOUT_ALLOWED_HOSTS: ${SCOUT_ALLOWED_HOSTS:-}
       SCOUT_DEBUG_API: ${SCOUT_DEBUG_API:-}
       SCOUT_OPENROUTER_API_KEY: ${SCOUT_OPENROUTER_API_KEY:-}
       SCOUT_OPENROUTER_MODEL: ${SCOUT_OPENROUTER_MODEL:-deepseek/deepseek-v4-flash}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-      SCOUT_BROWSER_WS: ws://chromium:3000
+      SCOUT_BROWSER_WS: ws://chromium:3000?token=${SCOUT_BROWSER_TOKEN:?Set SCOUT_BROWSER_TOKEN in .env (openssl rand -hex 24)}
     volumes:
       - scout-data:/app/data
     read_only: true
@@ -42,16 +45,24 @@ services:
       retries: 3
 
   chromium:
-    image: browserless/chrome:1.61-chrome-stable@sha256:efac47cfff3830d9a50b27d29f8bbb61949058ae336c823fbe9bd3c0d1debcc8
+    # Browserless v2 (maintained Chromium). Bump the tag and digest together.
+    image: ghcr.io/browserless/chromium:v2.56.7@sha256:b1ba7b054af2891a8199f884d4bd249cf8c3bd2fa8a97b339077e40f92803ba8
     restart: unless-stopped
     init: true
     environment:
-      CONNECTION_TIMEOUT: 60000
-      MAX_CONCURRENT_SESSIONS: 2
+      # Without a token, any script on a rendered page could drive this browser
+      # through ws://127.0.0.1:3000.
+      TOKEN: ${SCOUT_BROWSER_TOKEN:?Set SCOUT_BROWSER_TOKEN in .env (openssl rand -hex 24)}
+      TIMEOUT: 60000
+      CONCURRENT: 2
     expose:
       - "3000"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
-      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/pressure').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/active?token='+process.env.TOKEN).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
       interval: 30s
       timeout: 5s
       start_period: 20s

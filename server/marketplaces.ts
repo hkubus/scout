@@ -516,6 +516,19 @@ export function parseShippingAvailability(html: string, marketplace: Marketplace
 
 const MARKETPLACE_IMAGE_CDN_SUFFIXES = ['olxcdn.com', 'allegroimg.com', 'vinted.net'];
 
+/**
+ * Whether Scout's server may download this image: https on the default port
+ * from a marketplace image CDN. Page markup is seller-influenced, so any other
+ * host could turn snapshot capture into a request to an arbitrary server.
+ */
+export function isMarketplaceImageUrl(raw: string) {
+  let parsed: URL;
+  try { parsed = new URL(raw); } catch { return false; }
+  if (parsed.protocol !== 'https:' || parsed.port || parsed.username || parsed.password) return false;
+  const hostname = parsed.hostname.toLowerCase();
+  return MARKETPLACE_IMAGE_CDN_SUFFIXES.some((suffix) => hostname === suffix || hostname.endsWith(`.${suffix}`));
+}
+
 /** Replace OLX CDN resize placeholders with a concrete gallery-size request. */
 function concreteImageUrl(raw: string) {
   return raw
@@ -544,7 +557,7 @@ export function parseListingImageUrls(html: string, marketplace: Marketplace, li
   const push = (value: unknown) => {
     if (typeof value !== 'string') return;
     const candidate = concreteImageUrl(value.trim());
-    if (!/^https:\/\//i.test(candidate)) return;
+    if (!isMarketplaceImageUrl(candidate)) return;
     if (candidate.length > 1_000) return;
     if (/favicon|sprite|logo|icon|avatar|placeholder|banner|emoji|flag/i.test(candidate)) return;
     const identity = imageIdentityKey(candidate);
@@ -576,7 +589,7 @@ export function parseListingImageUrls(html: string, marketplace: Marketplace, li
     const candidate = match[0].replace(/[),.;]+$/, '');
     try {
       const parsed = new URL(candidate);
-      if (!MARKETPLACE_IMAGE_CDN_SUFFIXES.some((suffix) => parsed.hostname === suffix || parsed.hostname.endsWith(`.${suffix}`))) continue;
+      if (!isMarketplaceImageUrl(parsed.toString())) continue;
       if (!/\.(?:jpe?g|png|webp)(?:$|[?;])/i.test(parsed.pathname + (parsed.search ?? '')) && !/\/image(;|$)/i.test(parsed.pathname)) continue;
       push(concreteImageUrl(parsed.toString()));
     } catch { /* not a usable URL */ }

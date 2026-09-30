@@ -2,8 +2,8 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:
 import { existsSync } from 'node:fs';
 import { connect as connectHttp2 } from 'node:http2';
 import { chromium, type Browser, type BrowserContext } from 'playwright-core';
-import { buildDiscordEmbed, buildNtfyPayload, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
-import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
+import { buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
+import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext } from './ai';
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchVariantWithJev, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
@@ -317,6 +317,11 @@ export function nextWatchScanSchedule(options: {
 }
 
 const nowIso = () => new Date().toISOString();
+
+/** Escape seller text for Discord markdown so a title cannot open its own masked link. */
+export function escapeDiscordMarkdown(value: string) {
+  return value.replace(/[\\[\]()*_~`|<>]/g, (character) => `\\${character}`);
+}
 
 function relativeTime(value?: string | null) {
   if (!value) return 'Never';
@@ -3299,20 +3304,45 @@ export class ScoutService {
   }
 
   private async fetchSnapshotImage(url: string, referer: string): Promise<{ mime: string; data: Buffer } | null> {
-    let parsed: URL;
-    try { parsed = new URL(url); } catch { return null; }
-    if (parsed.protocol !== 'https:') return null;
-    const response = await fetch(parsed.toString(), {
-      headers: { 'user-agent': MARKETPLACE_API_USER_AGENT, accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', referer },
-      signal: AbortSignal.timeout(10_000),
-    });
+    // Follow redirects by hand so every hop stays on a marketplace image CDN;
+    // fetch's automatic following would go to any host, including internal ones.
+    let current = url;
+    let response: Response | undefined;
+    for (let hop = 0; hop <= 3; hop += 1) {
+      if (!isMarketplaceImageUrl(current)) return null;
+      response = await fetch(current, {
+        headers: { 'user-agent': MARKETPLACE_API_USER_AGENT, accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', referer },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (response.status < 300 || response.status >= 400) break;
+      const location = response.headers.get('location');
+      discardResponse(response, 'snapshot-image');
+      response = undefined;
+      if (!location) return null;
+      try { current = new URL(location, current).toString(); } catch { return null; }
+    }
+    if (!response) return null;
     if (!response.ok) { discardResponse(response, 'snapshot-image'); return null; }
     const declared = Number(response.headers.get('content-length') ?? 0);
     if (declared > SNAPSHOT_MAX_IMAGE_BYTES) { discardResponse(response, 'snapshot-image'); return null; }
     const contentType = (response.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
     if (!new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']).has(contentType)) { discardResponse(response, 'snapshot-image'); return null; }
-    const data = Buffer.from(await response.arrayBuffer());
-    if (!data.byteLength || data.byteLength > SNAPSHOT_MAX_IMAGE_BYTES) return null;
+    // Count bytes while streaming so a missing or false Content-Length cannot
+    // make Scout buffer an arbitrarily large body.
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    if (!response.body) return null;
+    const reader = response.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > SNAPSHOT_MAX_IMAGE_BYTES) { await reader.cancel().catch(() => {}); return null; }
+      chunks.push(value);
+    }
+    const data = Buffer.concat(chunks);
+    if (!data.byteLength) return null;
     return { mime: contentType, data };
   }
 
@@ -4044,7 +4074,10 @@ export class ScoutService {
       } else {
         const executablePath = process.env.SCOUT_CHROMIUM_PATH ?? ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'].find(existsSync);
         if (!executablePath) throw new Error('Chromium is not available; configure SCOUT_BROWSER_WS');
-        browser = await chromium.launch({ executablePath, headless: true, args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'] });
+        // Pass a minimal environment: the renderer parses third-party pages and
+        // must not inherit SCOUT_SECRET, API tokens, or provider keys.
+        const browserEnv = Object.fromEntries(['PATH', 'HOME', 'TZ', 'LANG', 'XDG_RUNTIME_DIR', 'FONTCONFIG_PATH'].flatMap((key) => (process.env[key] ? [[key, process.env[key] as string]] : [])));
+        browser = await chromium.launch({ executablePath, headless: true, env: browserEnv, args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'] });
         ownsBrowser = true;
       }
       // Always isolate scans in their own context: reusing the shared default
@@ -4052,9 +4085,20 @@ export class ScoutService {
       // A real Chrome UA + viewport hides the headless default (DataDome and
       // Cloudflare Turnstile fence HeadlessChrome on flagged IPs).
       context = await browser.newContext(storageState
-        ? { locale: 'pl-PL', storageState: storageState as any, userAgent: MARKETPLACE_API_USER_AGENT, viewport: { width: 1366, height: 768 } }
-        : { locale: 'pl-PL', userAgent: MARKETPLACE_API_USER_AGENT, viewport: { width: 1366, height: 768 } });
+        ? { locale: 'pl-PL', storageState: storageState as any, userAgent: MARKETPLACE_API_USER_AGENT, viewport: { width: 1366, height: 768 }, serviceWorkers: 'block' }
+        : { locale: 'pl-PL', userAgent: MARKETPLACE_API_USER_AGENT, viewport: { width: 1366, height: 768 }, serviceWorkers: 'block' });
       if (!context) throw new Error('Chromium context could not be created');
+      // Marketplace pages run third-party ad and analytics scripts. Keep them
+      // off Scout's own network: no requests to loopback, private, or single-label
+      // hosts (such as the Browserless container itself), and no WebSockets at all.
+      await context.route('**/*', (route) => {
+        let hostname = '';
+        try { hostname = new URL(route.request().url()).hostname; } catch { /* unparseable URLs are aborted */ }
+        const bare = hostname.replace(/^\[|\]$/g, '');
+        const reachable = bare && isSafeNetworkHost(bare) && (bare.includes('.') || bare.includes(':'));
+        return reachable ? route.continue() : route.abort('blockedbyclient');
+      });
+      await context.routeWebSocket(/.*/, (socket) => { socket.close(); });
       const page = await context.newPage();
       try {
         // Vinted-only warm-up: the homepage sets the anonymous session cookies
@@ -4364,7 +4408,7 @@ export class ScoutService {
         color: 0x1d61e8,
         fields: shown.map((row) => ({
           name: `${row.discount_percent.toFixed(1)}% below typical · ${row.marketplace} · ${row.watch_name}`.slice(0, 256),
-          value: `[${row.title.slice(0, 180)}](${row.url})\n${Number(row.price_pln).toLocaleString('pl-PL')} zł · typical ${Number(row.typical_pln).toLocaleString('pl-PL')} zł · ${row.confidence}% confidence`.slice(0, 1024),
+          value: `[${escapeDiscordMarkdown(row.title.replace(/[\r\n]+/g, ' ').slice(0, 180))}](${row.url})\n${Number(row.price_pln).toLocaleString('pl-PL')} zł · typical ${Number(row.typical_pln).toLocaleString('pl-PL')} zł · ${row.confidence}% confidence`.slice(0, 1024),
         })),
         footer: { text: 'Scout · daily digest · asking prices' },
         timestamp: nowIso(),

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, buildVintedSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createVintedJsonAdapter, dedupeKey, normalizeListing, parseAllegroBatchEnrichmentApi, parseAllegroCards, parseListingAvailability, parseListingDescription, parseListingImageUrls, parseOlxListingAvailabilityApi, parseOlxOffersApi, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, parseVintedCatalogApi, parseVintedItemPageAvailability, validateSearchUrl, type ConnectorAdapter } from '../server/marketplaces';
+import { buildMarketplaceSearchUrl, buildOlxSearchApiUrl, buildVintedSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createVintedJsonAdapter, dedupeKey, normalizeListing, parseAllegroBatchEnrichmentApi, parseAllegroCards, parseListingAvailability, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseOlxListingAvailabilityApi, parseOlxOffersApi, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, parseVintedCatalogApi, parseVintedItemPageAvailability, validateSearchUrl, type ConnectorAdapter } from '../server/marketplaces';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { median, pruneBefore, scoreDeal } from '../server/scoring';
@@ -129,6 +129,21 @@ test('collects deduplicated gallery image URLs from detail pages', () => {
     'https://images1.vinted.net/t/03_0266a_9f08b2cb1_800x800.jpeg?s=sig',
   ]);
   assert.deepEqual(parseListingImageUrls('', 'OLX'), []);
+});
+
+test('only downloads gallery images from marketplace CDNs', () => {
+  // og:image / JSON-LD markup is seller-influenced, so off-CDN hosts are dropped.
+  const html = [
+    '<meta property="og:image" content="https://attacker.example/x.jpg">',
+    `<script type="application/ld+json">${JSON.stringify({ '@type': 'Product', image: ['https://169.254.169.254/latest.jpg', 'https://ireland.apollo.olxcdn.com/v1/files/ok-PL/image;s=644x461'] })}</script>`,
+  ].join('');
+  assert.deepEqual(parseListingImageUrls(html, 'OLX'), ['https://ireland.apollo.olxcdn.com/v1/files/ok-PL/image;s=644x461']);
+  assert.equal(isMarketplaceImageUrl('https://images1.vinted.net/t/a.jpeg'), true);
+  assert.equal(isMarketplaceImageUrl('https://a.allegroimg.com/original/x'), true);
+  assert.equal(isMarketplaceImageUrl('https://olxcdn.com.attacker.example/x.jpg'), false);
+  assert.equal(isMarketplaceImageUrl('https://images1.vinted.net:8443/x.jpg'), false);
+  assert.equal(isMarketplaceImageUrl('https://user@images1.vinted.net/x.jpg'), false);
+  assert.equal(isMarketplaceImageUrl('http://images1.vinted.net/x.jpg'), false);
 });
 
 test('parses rendered OLX cards without relying on generated class names', () => {

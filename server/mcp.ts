@@ -206,7 +206,7 @@ export function registerScoutDebugMcpTools(server: McpServer, debug: ScoutDebug)
   });
 
   server.registerTool('scout_debug_query', {
-    description: 'Debug: run one read-only SQL statement (SELECT, WITH, VALUES, EXPLAIN, or PRAGMA) against the live SQLite database on a read-only connection. Use ? placeholders with params.',
+    description: 'Debug: run one read-only SQL statement (SELECT, WITH, VALUES, EXPLAIN, or PRAGMA) against the live SQLite database on a read-only connection, stopped after 5 seconds. Use ? placeholders with params.',
     inputSchema: {
       sql: z.string().min(1).max(20_000),
       params: z.array(z.union([z.string(), z.number(), z.null()])).max(100).optional().default([]),
@@ -214,7 +214,7 @@ export function registerScoutDebugMcpTools(server: McpServer, debug: ScoutDebug)
     },
     annotations: { readOnlyHint: true },
   }, async ({ sql, params, maxRows }) => {
-    try { return text(debug.query(sql, params, maxRows)); } catch (error) { return toolError(error); }
+    try { return text(await debug.query(sql, params, maxRows)); } catch (error) { return toolError(error); }
   });
 
   server.registerTool('scout_debug_runtime', {

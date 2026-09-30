@@ -118,7 +118,7 @@ function isPrivateAddress(hostname: string) {
   return false;
 }
 
-function isSafeNetworkHost(hostname: string) {
+export function isSafeNetworkHost(hostname: string) {
   const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
   if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.lan') || isPrivateAddress(host)) return false;
   return true;
@@ -182,9 +182,13 @@ export async function publishNtfy(config: NtfyConfig, payload: NtfyPayload, fetc
       ...(config.token ? { authorization: `Bearer ${config.token}` } : {}),
     },
     body: JSON.stringify(payload),
+    // A redirect could send the POST to an internal address the host checks
+    // above never saw, so treat it as a failed delivery instead of following it.
+    redirect: 'manual',
     signal: AbortSignal.timeout(12_000),
   });
   discardResponse(response, 'ntfy');
+  if (response.status >= 300 && response.status < 400) throw new Error('ntfy server redirected the request; configure its final URL');
   if (!response.ok) throw new Error(`ntfy returned ${response.status}`);
 }
 

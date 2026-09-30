@@ -43,6 +43,11 @@ test('refuses to listen publicly without credentials unless explicitly opted out
   assert.equal((await loadAuthConfig({}, { publiclyBound: false })).enabled, false);
   assert.equal((await loadAuthConfig({ SCOUT_AUTH: 'off' }, { publiclyBound: true })).enabled, false);
   await assert.rejects(loadAuthConfig({ SCOUT_AUTH: 'on' }, { publiclyBound: false }), /without authentication/);
+  // A loopback bind behind a reverse proxy is still published, so it fails closed too.
+  await assert.rejects(loadAuthConfig({}, { publiclyBound: false, proxied: true }), /reverse proxy/);
+  assert.equal((await loadAuthConfig({ SCOUT_AUTH: 'off' }, { publiclyBound: false, proxied: true })).explicitlyOff, true);
+  assert.equal((await loadAuthConfig({}, { publiclyBound: false })).explicitlyOff, false);
+  assert.equal((await loadAuthConfig({ SCOUT_API_TOKENS: token }, { publiclyBound: false, proxied: true })).enabled, true);
   await assert.rejects(loadAuthConfig({ SCOUT_AUTH: 'off', SCOUT_API_TOKENS: token }, { publiclyBound: true }), /conflicts/);
   await assert.rejects(loadAuthConfig({ SCOUT_PASSWORD: 'short' }, { publiclyBound: true }), /at least 12/);
   await assert.rejects(loadAuthConfig({ SCOUT_API_TOKENS: 'short' }, { publiclyBound: true }), /at least 32/);

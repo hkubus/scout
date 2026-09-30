@@ -4,7 +4,7 @@ This repository is `/home/kubus/Projects/apps/scout`. Treat the current working 
 
 ## Current release posture
 
-Scout is a React/Vite frontend with a Fastify + SQLite API and a scheduled marketplace monitor. The server supports internet deployment behind a TLS reverse proxy: password sign-in with server-side sessions, bearer tokens (`SCOUT_API_TOKENS`) for MCP/scripts, same-origin CSRF checks, and sign-in throttling (see README "Authentication and internet deployment"). It refuses to listen beyond loopback without credentials unless `SCOUT_AUTH=off`. It also has secure response headers, per-IP rate limits, SQLite recovery/migration checksums, scheduler leasing, bounded retention, export/backup endpoints, and truthful `/api/health`/`/api/ready` probes.
+Scout is a React/Vite frontend with a Fastify + SQLite API and a scheduled marketplace monitor. The server supports internet deployment behind a TLS reverse proxy: password sign-in with server-side sessions, bearer tokens (`SCOUT_API_TOKENS`) for MCP/scripts, same-origin CSRF checks, and sign-in throttling (see README "Authentication and internet deployment"). It refuses to start without credentials when listening beyond loopback, when configured for a reverse proxy (`SCOUT_TRUST_PROXY`/`SCOUT_PUBLIC_ORIGIN`), or with `SCOUT_AUTH=on`, unless `SCOUT_AUTH=off`; without credentials it rejects proxied requests and pins the Host header. It also has secure response headers, per-IP rate limits, SQLite recovery/migration checksums, scheduler leasing, bounded retention, export/backup endpoints, and truthful `/api/health`/`/api/ready` probes.
 
 Research watches use immutable criteria versions, bounded detail checks, price refreshes when a missing listing is live, connector backoff, paginated history, and in-flight version checks. Archived ordinary watches are available through the Watches archive filter.
 
@@ -23,7 +23,7 @@ For a controlled local smoke test, use a temporary `SCOUT_DB_PATH`, loopback bin
 
 ## Inspecting live data
 
-The running app exposes read-only database access at `/api/debug/*` (schema, table rows, read-only SQL, runtime/logs, full redacted SQLite snapshot) and as `scout_debug_*` MCP tools; see README "Debug API". Use it to check real listings, scores, and scan history before changing behavior.
+The running app exposes read-only database access at `/api/debug/*` (schema, table rows, read-only SQL with a 5 s limit, runtime/logs, full redacted SQLite snapshot) and as `scout_debug_*` MCP tools; see README "Debug API". It is on by default only while auth is off; an authenticated instance needs `SCOUT_DEBUG_API=true`. Use it to check real listings, scores, and scan history before changing behavior.
 
 ## Important boundaries
 

@@ -1,9 +1,12 @@
 // Read-only debug access to the live database for development and agent
-// troubleshooting. Queries run on a separate read-only SQLite connection
-// (query_only as well), so nothing reachable from here can modify Scout's
-// data. Encrypted credentials are redacted by shape wherever they appear.
+// troubleshooting. Browsing runs on a separate read-only SQLite connection;
+// free-form SQL runs in a short-lived child process on its own read-only
+// connection that is killed at a deadline, so a runaway query cannot block
+// Scout's event loop. Encrypted credentials are redacted by shape wherever
+// they appear.
 // @ts-ignore node:sqlite is present in the supported Node 22+ runtime.
 import { DatabaseSync } from 'node:sqlite';
+import { spawn } from 'node:child_process';
 import { chmodSync, existsSync, statSync, unlinkSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { basename, dirname, resolve } from 'node:path';
@@ -13,23 +16,35 @@ import type { ScoutService } from './service';
 export const REDACTED = '[redacted: encrypted secret]';
 // encryptSecret() output: base64url(12-byte iv).base64url(16-byte tag).base64url(ciphertext)
 const ENCRYPTED_SECRET = /^[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]+$/;
+// The same shape anywhere inside a value, e.g. `' ' || value` in free-form SQL.
+const EMBEDDED_SECRET = /[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]+/g;
+const QUERY_TIMEOUT_MS = 5_000;
+const QUERY_MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
 const READ_STATEMENT = /^(?:select|with|values|explain|pragma)\b/i;
 const QUERY_MAX_ROWS = 5000;
 const TABLE_MAX_ROWS = 1000;
 const SAFE_ENV_KEYS = [
   'NODE_ENV', 'PORT', 'SCOUT_HOST', 'TZ', 'SCOUT_DB_PATH', 'SCOUT_VERSION', 'SCOUT_CORS_ORIGIN',
   'SCOUT_OPENROUTER_MODEL', 'SCOUT_JEV_MODE', 'SCOUT_JEV_MODEL', 'SCOUT_VISION_MODEL', 'SCOUT_JEV_CONCURRENCY',
-  'SCOUT_BROWSER_WS', 'SCOUT_CHROMIUM_PATH', 'SCOUT_DIST_PATH', 'SCOUT_SEED_DEMO', 'SCOUT_SKIP_MIGRATION_BACKUP',
+  'SCOUT_CHROMIUM_PATH', 'SCOUT_DIST_PATH', 'SCOUT_SEED_DEMO', 'SCOUT_SKIP_MIGRATION_BACKUP',
 ];
 const SECRET_ENV_KEYS = ['SCOUT_SECRET', 'SCOUT_OPENROUTER_API_KEY', 'OPENROUTER_API_KEY'];
 
-export function debugApiEnabled() {
-  return process.env.SCOUT_DEBUG_API?.trim().toLowerCase() !== 'false';
+/**
+ * SCOUT_DEBUG_API=true/false decides explicitly; unset, the debug API is on
+ * only while authentication is off (local development), so an internet-facing
+ * instance does not hand arbitrary SQL to every credential by default.
+ */
+export function debugApiEnabled(authEnabled = false) {
+  const value = process.env.SCOUT_DEBUG_API?.trim().toLowerCase();
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  return !authEnabled;
 }
 
 /** JSON-safe, secret-free copy of a SQLite value. */
 export function debugValue(value: unknown): unknown {
-  if (typeof value === 'string') return ENCRYPTED_SECRET.test(value) ? REDACTED : value;
+  if (typeof value === 'string') return ENCRYPTED_SECRET.test(value) ? REDACTED : value.replace(EMBEDDED_SECRET, REDACTED);
   if (typeof value === 'bigint') return Number.isSafeInteger(Number(value)) ? Number(value) : value.toString();
   if (value instanceof Uint8Array) return { blob: true, bytes: value.byteLength };
   return value;
@@ -54,17 +69,81 @@ function stripLeadingComments(sql: string) {
   }
 }
 
-function sqliteMessage(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
-}
-
 const quoteIdent = (name: string) => `"${name.replace(/"/g, '""')}"`;
+
+// Runs in a child process: opens its own read-only connection, blanks the
+// encrypted marketplace session column via the authorizer (where supported),
+// runs one statement, and prints rows as JSON with blobs and bigints made safe.
+const QUERY_CHILD = `
+const { DatabaseSync, constants } = require('node:sqlite');
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => { input += chunk; });
+process.stdin.on('end', () => {
+  const { path, sql, params, maxRows } = JSON.parse(input);
+  const out = (value) => process.stdout.write(JSON.stringify(value));
+  let db;
+  try {
+    db = new DatabaseSync(path, { readOnly: true });
+    db.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 2000;');
+    if (typeof db.setAuthorizer === 'function' && constants) {
+      db.setAuthorizer((action, table, column) => (action === constants.SQLITE_READ && table === 'marketplace_sessions' && column === 'storage_state_encrypted' ? constants.SQLITE_IGNORE : constants.SQLITE_OK));
+    }
+  } catch (error) { out({ error: 'open', message: String(error && error.message || error) }); return; }
+  let statement;
+  try { statement = db.prepare(sql); } catch (error) { out({ error: 'sql', message: String(error && error.message || error) }); return; }
+  const rows = [];
+  let truncated = false;
+  try {
+    for (const row of statement.iterate(...(Array.isArray(params) ? params : [params]))) {
+      if (rows.length >= maxRows) { truncated = true; break; }
+      const safe = {};
+      for (const [key, value] of Object.entries(row)) {
+        safe[key] = typeof value === 'bigint' ? (Number.isSafeInteger(Number(value)) ? Number(value) : value.toString())
+          : value instanceof Uint8Array ? { blob: true, bytes: value.byteLength } : value;
+      }
+      rows.push(safe);
+    }
+  } catch (error) { out({ error: 'sql', message: String(error && error.message || error) }); return; }
+  let columns;
+  try { columns = statement.columns().map((column) => column.name); } catch { columns = rows[0] ? Object.keys(rows[0]) : []; }
+  out({ columns, rows, truncated });
+});
+`;
+
+type QueryChildResult = { error?: 'open' | 'sql'; message?: string; columns?: string[]; rows?: Array<Record<string, unknown>>; truncated?: boolean };
+
+function runQueryChild(payload: object, timeoutMs: number): Promise<QueryChildResult> {
+  return new Promise((resolvePromise, reject) => {
+    // Keep flags such as --experimental-sqlite that node:sqlite needs on older Node 22.
+    const flags = process.execArgv.filter((flag) => flag.startsWith('--experimental'));
+    const child = spawn(process.execPath, [...flags, '--no-warnings', '--max-old-space-size=256', '-e', QUERY_CHILD], { stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: process.env.PATH ?? '' } });
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let failure: Error | null = null;
+    const kill = (error: Error) => { if (!failure) { failure = error; child.kill('SIGKILL'); } };
+    const timer = setTimeout(() => kill(new ServiceError(`Query exceeded the ${timeoutMs} ms debug time limit and was stopped`, 400)), timeoutMs);
+    child.stdout.on('data', (chunk: Buffer) => {
+      bytes += chunk.byteLength;
+      if (bytes > QUERY_MAX_OUTPUT_BYTES) kill(new ServiceError('Query result is too large; select fewer columns or rows', 400));
+      else chunks.push(chunk);
+    });
+    child.stderr.resume();
+    child.on('error', (error) => { clearTimeout(timer); reject(error); });
+    child.on('close', () => {
+      clearTimeout(timer);
+      if (failure) { reject(failure); return; }
+      try { resolvePromise(JSON.parse(Buffer.concat(chunks).toString('utf8')) as QueryChildResult); } catch { reject(new ServiceError('Query process ended without a result (out of memory?)', 400)); }
+    });
+    child.stdin.end(JSON.stringify(payload));
+  });
+}
 
 export class ScoutDebug {
   private readonlyDb: any = null;
   readonly databasePath: string;
 
-  constructor(private readonly db: any, private readonly service: ScoutService, databasePath = process.env.SCOUT_DB_PATH ?? './data/scout.sqlite') {
+  constructor(private readonly db: any, private readonly service: ScoutService, databasePath = process.env.SCOUT_DB_PATH ?? './data/scout.sqlite', private readonly queryTimeoutMs = QUERY_TIMEOUT_MS) {
     this.databasePath = resolve(databasePath);
   }
 
@@ -148,36 +227,20 @@ export class ScoutDebug {
     return { table, columns, total, limit, offset, orderBy: options.orderBy ?? (order ? 'rowid' : null), direction: direction.toLowerCase(), rows: rows.map(debugRow) };
   }
 
-  /** Run one read-only statement (SELECT/WITH/VALUES/EXPLAIN/PRAGMA) with positional or named params. */
-  query(sql: string, params: unknown[] | Record<string, unknown> = [], maxRows = 500) {
+  /**
+   * Run one read-only statement (SELECT/WITH/VALUES/EXPLAIN/PRAGMA) with
+   * positional or named params in a child process that is killed after the
+   * debug time limit, so the event loop and scheduler keep running.
+   */
+  async query(sql: string, params: unknown[] | Record<string, unknown> = [], maxRows = 500) {
     const statementText = stripLeadingComments(sql);
     if (!READ_STATEMENT.test(statementText)) throw new ServiceError('Only SELECT, WITH, VALUES, EXPLAIN, and PRAGMA statements are allowed', 400);
     const limit = Math.min(Math.max(1, Math.trunc(maxRows)), QUERY_MAX_ROWS);
     const started = performance.now();
-    let statement: any;
-    try {
-      statement = this.reader().prepare(statementText);
-    } catch (error) {
-      throw new ServiceError(`SQL error: ${sqliteMessage(error)}`, 400);
-    }
-    const bound = Array.isArray(params) ? params : [params];
-    const rows: Array<Record<string, unknown>> = [];
-    let truncated = false;
-    try {
-      for (const row of statement.iterate(...bound)) {
-        if (rows.length >= limit) { truncated = true; break; }
-        rows.push(debugRow(row));
-      }
-    } catch (error) {
-      throw new ServiceError(`SQL error: ${sqliteMessage(error)}`, 400);
-    }
-    let columns: string[];
-    try {
-      columns = (statement.columns() as Array<{ name: string }>).map((column) => column.name);
-    } catch {
-      columns = rows[0] ? Object.keys(rows[0]) : [];
-    }
-    return { columns, rows, rowCount: rows.length, truncated, maxRows: limit, elapsedMs: Math.round((performance.now() - started) * 10) / 10 };
+    const result = await runQueryChild({ path: this.databasePath, sql: statementText, params, maxRows: limit }, this.queryTimeoutMs);
+    if (result.error) throw new ServiceError(result.error === 'sql' ? `SQL error: ${result.message}` : `Could not open the database: ${result.message}`, 400);
+    const rows = (result.rows ?? []).map(debugRow);
+    return { columns: result.columns ?? [], rows, rowCount: rows.length, truncated: Boolean(result.truncated), maxRows: limit, elapsedMs: Math.round((performance.now() - started) * 10) / 10 };
   }
 
   /** Process, configuration, readiness, and the in-memory log buffer. */
