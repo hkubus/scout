@@ -1136,6 +1136,24 @@ test('association-driven watch stats match the per-observation aggregate', () =>
   } finally { context.close(); }
 });
 
+test('single-watch stats equal the matching entry of the full watch list', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const fresh = new Date().toISOString();
+    context.db.prepare("UPDATE watch_listings SET deal_strength = (id % 6), typical_pln = 400 + (id % 3), last_seen_at = ? WHERE id % 2 = 0").run(fresh);
+    const all = context.service.allWatches();
+    assert.equal(all.length, 5);
+    for (const watch of all) assert.deepEqual(context.service.watchById(watch.id), watch);
+    assert.equal(context.service.watchById('missing-watch'), undefined);
+    // Listing detail reads readiness and groups of its own (here archived) watch.
+    const listing = context.db.prepare("SELECT l.marketplace, l.listing_id FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE wl.watch_id = 'stats-plain' ORDER BY wl.id LIMIT 1").get() as { marketplace: string; listing_id: string };
+    context.db.prepare('UPDATE watches SET archived_at = ? WHERE id = ?').run(fresh, 'stats-plain');
+    const detail = context.service.listingDetail(`${listing.marketplace}:${listing.listing_id}`, 'stats-plain');
+    assert.deepEqual(detail.variantGroups, context.service.allWatches().find((watch) => watch.id === 'stats-plain')!.variantGroups);
+  } finally { context.close(); }
+});
+
 test('market research filters match terms, price, condition, and shipping, from any town', () => {
   const listings = [
     { marketplace: 'OLX' as const, listingId: 'match', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/match', condition: 'New', location: 'Warszawa', shippingAvailable: true, observedAt: new Date().toISOString() },

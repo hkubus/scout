@@ -2093,9 +2093,19 @@ export class ScoutService {
     };
   }
 
-  private watches(includeArchived: boolean) {
-    const rows = this.stmt(`SELECT * FROM watches ${includeArchived ? '' : 'WHERE archived_at IS NULL '}ORDER BY created_at DESC`).all() as WatchRow[];
+  /**
+   * Watches with their baseline stats. `onlyWatchId` restricts every query to
+   * one watch (archived or not) for callers that need a single watch's
+   * readiness or groups; the filtered statements are separate fixed shapes
+   * with the id bound as a parameter.
+   */
+  private watches(includeArchived: boolean, onlyWatchId?: string) {
+    const single = onlyWatchId !== undefined;
+    const rows = (single
+      ? this.stmt('SELECT * FROM watches WHERE id = ?').all(onlyWatchId)
+      : this.stmt(`SELECT * FROM watches ${includeArchived ? '' : 'WHERE archived_at IS NULL '}ORDER BY created_at DESC`).all()) as WatchRow[];
     if (!rows.length) return [];
+    if (single) includeArchived = true;
     // One row per (watch, listing) association: listing-level filters run once
     // per association and the earliest in-range observation is an ordered
     // LIMIT-1 probe of observations_watch_listing, so the cost scales with
@@ -2114,20 +2124,20 @@ export class ScoutService {
         FROM watch_listings wl
         JOIN watches w ON w.id = wl.watch_id
         JOIN listings l ON l.id = wl.listing_id
-        WHERE (?2 = 1 OR w.archived_at IS NULL)
+        WHERE (?2 = 1 OR w.archived_at IS NULL)${single ? ' AND wl.watch_id = ?3' : ''}
           AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)
           AND (w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
       )
       SELECT watch_id, variant_key, COUNT(first_observed) AS samples, MIN(first_observed) AS first_observed
-      FROM a GROUP BY watch_id, variant_key HAVING COUNT(first_observed) > 0`).all(OTHER_VARIANT_KEY, includeArchived ? 1 : 0) as Array<{ watch_id: string; variant_key: string; samples: number; first_observed: string | null }>;
+      FROM a GROUP BY watch_id, variant_key HAVING COUNT(first_observed) > 0`).all(OTHER_VARIANT_KEY, includeArchived ? 1 : 0, ...(single ? [onlyWatchId] : [])) as Array<{ watch_id: string; variant_key: string; samples: number; first_observed: string | null }>;
     // Latest stored typical per variant. Every association in a variant shares
     // the value written by the most recent scan; MAX(last_seen_at) picks that
     // row so a stale pre-regroup value cannot win.
     const typicalRows = this.stmt(`SELECT wl.watch_id, COALESCE(wl.variant_key, ?) AS variant_key, wl.typical_pln AS typical, MAX(wl.last_seen_at) AS last_seen_at
       FROM watch_listings wl
       JOIN watches w ON w.id = wl.watch_id
-      WHERE wl.typical_pln IS NOT NULL${includeArchived ? '' : ' AND w.archived_at IS NULL'}
-      GROUP BY wl.watch_id, COALESCE(wl.variant_key, ?)`).all(OTHER_VARIANT_KEY, OTHER_VARIANT_KEY) as Array<{ watch_id: string; variant_key: string; typical: number }>;
+      WHERE wl.typical_pln IS NOT NULL${includeArchived ? '' : ' AND w.archived_at IS NULL'}${single ? ' AND wl.watch_id = ?' : ''}
+      GROUP BY wl.watch_id, COALESCE(wl.variant_key, ?)`).all(OTHER_VARIANT_KEY, ...(single ? [onlyWatchId] : []), OTHER_VARIANT_KEY) as Array<{ watch_id: string; variant_key: string; typical: number }>;
     const statsByWatch = new Map<string, { samples: number; first_observed: string | null }>();
     const variantsByWatch = new Map<string, Map<string, { samples: number; first_observed: string | null; typical: number | null }>>();
     const variantEntry = (watchId: string, key: string) => {
@@ -2162,13 +2172,13 @@ export class ScoutService {
       JOIN watches w ON w.id = wl.watch_id
       LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id
       WHERE wl.last_seen_at > ?
-        AND (? = 1 OR w.archived_at IS NULL)
+        AND (? = 1 OR w.archived_at IS NULL)${single ? ' AND wl.watch_id = ?' : ''}
         AND COALESCE(a.hidden, 0) = 0
         AND (w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
         AND (w.min_price_pln IS NULL OR l.price_pln >= w.min_price_pln)
         AND (w.max_price_pln IS NULL OR l.price_pln <= w.max_price_pln)
         AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)
-      GROUP BY wl.watch_id, COALESCE(wl.deal_strength, 0)`).all(freshnessCutoff, includeArchived ? 1 : 0) as Array<{ watch_id: string; deal_strength: number; count: number }>;
+      GROUP BY wl.watch_id, COALESCE(wl.deal_strength, 0)`).all(freshnessCutoff, includeArchived ? 1 : 0, ...(single ? [onlyWatchId] : [])) as Array<{ watch_id: string; deal_strength: number; count: number }>;
     const dealCountsByWatch = new Map<string, WatchDealCounts>();
     for (const row of dealRows) {
       const counts = dealCountsByWatch.get(row.watch_id) ?? { exceptional: 0, veryStrong: 0, strong: 0 };
@@ -2188,6 +2198,11 @@ export class ScoutService {
 
   allWatches() {
     return this.watches(true);
+  }
+
+  /** One watch (archived included) with the same stats as allWatches(). */
+  watchById(id: string): Watch | undefined {
+    return this.watches(true, id)[0];
   }
 
   /**
@@ -2666,8 +2681,9 @@ export class ScoutService {
       WHERE l.marketplace = ? AND l.listing_id = ? AND (? IS NULL OR wl.watch_id = ?)
       ORDER BY CASE WHEN wl.id IS NOT NULL THEN 0 ELSE 1 END, wl.last_seen_at DESC LIMIT 1`).get(watchId ?? null, watchId ?? null, marketplace, listingId, watchId ?? null, watchId ?? null) as Record<string, any> | undefined;
     if (!row) throw new ServiceError('Listing detail is not available yet', 404);
-    const watches = new Map(this.allWatches().map((watch) => [watch.id, watch]));
-    const listing = this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100, watches.get(row.watch_id)?.variantGroups ?? []);
+    // Only the associated watch's readiness and groups are needed.
+    const watch = row.watch_id != null ? this.watchById(String(row.watch_id)) : undefined;
+    const listing = this.listingFromRow(row, watch?.readiness === 100, watch?.variantGroups ?? []);
     const history = (this.stmt('SELECT price_pln, observed_at FROM observations WHERE listing_id = ? AND (? IS NULL OR watch_id = ?) ORDER BY observed_at DESC, id DESC LIMIT 120').all(row.id, row.watch_id ?? watchId ?? null, row.watch_id ?? watchId ?? null) as Array<{ price_pln: number; observed_at: string }>).reverse().map((point): PriceHistoryPoint => ({ price: Number(point.price_pln), observedAt: point.observed_at }));
     const snapshotRow = this.stmt(`SELECT title, price_pln, condition, location, url, description, captured_at, verification_status
       FROM listing_detail_snapshots WHERE listing_id = ? ORDER BY captured_at DESC, id DESC LIMIT 1`).get(row.id) as Record<string, any> | undefined;
@@ -2735,7 +2751,7 @@ export class ScoutService {
       verificationTrace,
       verificationInputHash,
       verificationModel,
-      ...(watches.get(row.watch_id)?.variantGroups.length ? { variantGroups: watches.get(row.watch_id)!.variantGroups } : {}),
+      ...(watch?.variantGroups.length ? { variantGroups: watch.variantGroups } : {}),
     };
   }
 

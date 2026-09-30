@@ -477,7 +477,7 @@ app.post('/api/watches', async (request, reply) => {
     throw error;
   }
   emit('watch', { id, name: value.name });
-  const created = service.getWatches().find((watch) => watch.id === id);
+  const created = service.watchById(id);
   return reply.code(201).send({ watch: created });
 });
 
