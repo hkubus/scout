@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { connect as connectHttp2 } from 'node:http2';
+import { connect as connectHttp2, type SecureClientSessionOptions } from 'node:http2';
+import { brotliDecompressSync, gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
 import { chromium, type Browser, type BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
@@ -409,9 +410,12 @@ function parseListingKey(key: string): { marketplace: Marketplace; listingId: st
  * `--http1.1` vs default, and Node undici vs `node:http2`), so this bypasses
  * `fetch` (HTTP/1.1-only in undici) for the OLX path. A fresh session per
  * request keeps scan volumes simple; bodies are fully consumed before the
- * session closes, so no socket-diagnostic discard is needed.
+ * session closes, so no socket-diagnostic discard is needed. `node:http2`
+ * adds no Accept-Encoding of its own, so the header is sent explicitly and the
+ * body decoded here (see decodeOlxApiBody). `connectOptions` exists for tests
+ * against a local TLS server.
  */
-function fetchOlxApiSingleRequest(url: string, timeoutMs: number): Promise<{ status: number; json: unknown; location: string | null }> {
+export function fetchOlxApiSingleRequest(url: string, timeoutMs: number, connectOptions?: SecureClientSessionOptions): Promise<{ status: number; json: unknown; location: string | null }> {
   return new Promise((resolve, reject) => {
     let parsed: URL;
     try {
@@ -420,7 +424,7 @@ function fetchOlxApiSingleRequest(url: string, timeoutMs: number): Promise<{ sta
       reject(new Error('Invalid URL'));
       return;
     }
-    const session = connectHttp2(`${parsed.protocol}//${parsed.host}`);
+    const session = connectHttp2(`${parsed.protocol}//${parsed.host}`, connectOptions);
     let settled = false;
     const fail = (error: unknown) => {
       if (settled) return;
@@ -439,6 +443,7 @@ function fetchOlxApiSingleRequest(url: string, timeoutMs: number): Promise<{ sta
       ':path': `${parsed.pathname}${parsed.search}`,
       'user-agent': MARKETPLACE_API_USER_AGENT,
       accept: 'application/json',
+      'accept-encoding': 'gzip, deflate, br',
     });
     request.on('error', fail);
     request.on('close', () => {
@@ -447,8 +452,11 @@ function fetchOlxApiSingleRequest(url: string, timeoutMs: number): Promise<{ sta
     const chunks: Buffer[] = [];
     let status = 0;
     let location: string | null = null;
+    let contentEncoding: string | null = null;
     request.on('response', (headers) => {
       status = Number(headers[':status'] ?? 0);
+      const rawEncoding = headers['content-encoding'];
+      contentEncoding = (Array.isArray(rawEncoding) ? rawEncoding[0] : rawEncoding) ?? null;
       const rawLocation = headers.location;
       location = Array.isArray(rawLocation) ? (rawLocation[0] ?? null) : (rawLocation ?? null);
     });
@@ -462,15 +470,45 @@ function fetchOlxApiSingleRequest(url: string, timeoutMs: number): Promise<{ sta
       try {
         session.close();
       } catch { /* session already gone */ }
-      const raw = Buffer.concat(chunks).toString('utf8');
       let json: unknown = null;
       try {
+        const raw = decodeOlxApiBody(Buffer.concat(chunks), contentEncoding).toString('utf8');
         json = raw ? JSON.parse(raw) : null;
-      } catch { /* non-JSON bodies (e.g. challenge pages) surface through the status */ }
+      } catch { /* undecodable or non-JSON bodies (e.g. challenge pages) surface through the status */ }
       resolve({ status, json, location });
     });
     request.end();
   });
+}
+
+/** Decompression-bomb guard: an offers page is ~200 KB decoded. */
+const OLX_API_MAX_DECODED_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Decodes an offers-API body by its Content-Encoding. Identity and unknown
+ * encodings pass through unchanged; a corrupt or oversized body throws, which
+ * the caller turns into `json: null` so status handling stays fail-closed.
+ */
+export function decodeOlxApiBody(body: Buffer, contentEncoding: string | null): Buffer {
+  if (!body.length) return body;
+  const options = { maxOutputLength: OLX_API_MAX_DECODED_BYTES };
+  switch (contentEncoding?.trim().toLowerCase()) {
+    case 'gzip':
+    case 'x-gzip':
+      return gunzipSync(body, options);
+    case 'deflate':
+      // Servers disagree on zlib-wrapped vs raw deflate; accept both.
+      try {
+        return inflateSync(body, options);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ERR_BUFFER_TOO_LARGE') throw error;
+        return inflateRawSync(body, options);
+      }
+    case 'br':
+      return brotliDecompressSync(body, options);
+    default:
+      return body;
+  }
 }
 
 function parseListingDecision(value: unknown): ListingDecision | null {
