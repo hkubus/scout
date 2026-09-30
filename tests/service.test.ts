@@ -999,6 +999,80 @@ test('skips description verification for hidden deal candidates', async () => {
   }
 });
 
+test('re-verifies a standing deal only when it can alert or its verdict is older than six hours', async () => {
+  let verificationRequests = 0;
+  const context = fixture({
+    classifyListingRelevance: async () => ({ relevant: true }),
+    verifyListingDescription: async () => { verificationRequests += 1; return { decision: 'pass', confidence: 0.9, summary: 'Working.', issues: [], evidence: ['works'] }; },
+  });
+  const originalFetch = globalThis.fetch;
+  const posts: string[] = [];
+  globalThis.fetch = (async (input) => { posts.push(new URL(String(input)).host); return new Response(null, { status: 204 }); }) as typeof fetch;
+  try {
+    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' }, webhook: 'https://discord.com/api/webhooks/123/token' });
+    const scenario = standingDealScenario(context, 'standing-watch', [{ id: 'standing-deal', price: 750 }]);
+    const count = (host: string) => posts.filter((item) => item === host).length;
+    const verifiedAt = () => String((context.db.prepare("SELECT ai_description_verification_at AS at FROM listings WHERE listing_id = 'standing-deal'").get() as { at: string }).at);
+
+    await scenario.scan();
+    assert.deepEqual([scenario.state.fetches, verificationRequests, count('discord.com')], [1, 1, 1]);
+    // Already alerted at this price and the verdict is fresh: no page fetch.
+    await scenario.scan();
+    await scenario.scan();
+    assert.deepEqual([scenario.state.fetches, verificationRequests, count('discord.com')], [1, 1, 1]);
+
+    // A newly configured channel makes it alertable: verified (cached verdict) and sent.
+    context.service.saveSettings({ ntfy: { serverUrl: 'https://ntfy.sh', topic: 'scout-deals', token: 'tk_secret', minimumPriority: 'very-strong' } });
+    await scenario.scan();
+    assert.deepEqual([scenario.state.fetches, verificationRequests, count('ntfy.sh')], [2, 1, 1]);
+    await scenario.scan();
+    assert.equal(scenario.state.fetches, 2);
+
+    // A price drop of at least 5% is verified immediately and alerts again.
+    scenario.state.deals = [{ id: 'standing-deal', price: 700 }];
+    await scenario.scan();
+    assert.deepEqual([scenario.state.fetches, verificationRequests, count('discord.com'), count('ntfy.sh')], [3, 1, 2, 2]);
+    await scenario.scan();
+    assert.equal(scenario.state.fetches, 3);
+
+    // After six hours the standing deal is re-verified once and the verdict
+    // timestamp renewed, without an AI call or an alert.
+    const stale = new Date(Date.now() - 7 * 60 * 60_000).toISOString();
+    context.db.prepare("UPDATE listings SET ai_description_verification_at = ? WHERE listing_id = 'standing-deal'").run(stale);
+    await scenario.scan();
+    assert.deepEqual([scenario.state.fetches, verificationRequests, count('discord.com'), count('ntfy.sh')], [4, 1, 2, 2]);
+    assert.ok(Date.now() - Date.parse(verifiedAt()) < 60_000);
+    await scenario.scan();
+    assert.equal(scenario.state.fetches, 4);
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.close();
+  }
+});
+
+test('verifies a new strong deal once even with no notification channel', async () => {
+  let verificationRequests = 0;
+  const context = fixture({
+    classifyListingRelevance: async () => ({ relevant: true }),
+    verifyListingDescription: async () => { verificationRequests += 1; return { decision: 'pass', confidence: 0.9, summary: 'Working.', issues: [], evidence: ['works'] }; },
+  });
+  try {
+    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' } });
+    const scenario = standingDealScenario(context, 'quiet-watch', [{ id: 'quiet-deal', price: 750 }]);
+    await scenario.scan();
+    assert.deepEqual([scenario.state.fetches, verificationRequests], [1, 1]);
+    assert.equal((context.db.prepare("SELECT ai_description_verification_status AS status FROM listings WHERE listing_id = 'quiet-deal'").get() as { status: string }).status, 'pass');
+    await scenario.scan();
+    assert.deepEqual([scenario.state.fetches, verificationRequests], [1, 1]);
+    // A retitled listing is a new state and is verified again.
+    const service = context.service as any;
+    const fetchOlx = service.fetchOlxApi;
+    service.fetchOlxApi = async () => { const response = await fetchOlx(); response.json.data[0].title = 'CPU quiet-deal, box included'; return response; };
+    await scenario.scan();
+    assert.equal(scenario.state.fetches, 2);
+  } finally { context.close(); }
+});
+
 test('holds a high-priority alert when OpenRouter verification output is malformed', async () => {
   let verificationRequests = 0;
   const context = fixture({

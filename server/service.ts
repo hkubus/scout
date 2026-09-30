@@ -133,6 +133,13 @@ const MAX_RESEARCH_DETAIL_CHECKS = 100;
 const TYPO_VARIANTS_PER_SCAN = 2;
 /** Jev variant assignments a grouped watch may request per scan and source. */
 const VARIANT_JEV_BUDGET = 10;
+/**
+ * A standing deal that cannot alert (already alerted at this price, no due
+ * channel or digest) is not re-verified while its stored verdict for the
+ * active model is younger than this. Anything that makes it alertable (a
+ * price drop, a higher priority, a new channel) verifies it as before.
+ */
+const DESCRIPTION_VERIFICATION_FRESH_MS = 6 * 60 * 60_000;
 /** Rolling window of ended listings that feed probable-sale bands. */
 const SALE_BAND_WINDOW_DAYS = 90;
 /** Bounded per-scan capture of preserved listing copies (description + downloaded images). */
@@ -1671,7 +1678,9 @@ export class ScoutService {
       return;
     }
     // A repeat of the stored verdict (a cache hit, or no key on every scan)
-    // changes nothing but the timestamp, so it is not rewritten.
+    // changes nothing but the timestamp, so it is not rewritten, except to
+    // renew a timestamp older than the freshness window: a standing deal that
+    // cannot alert skips re-verification while its verdict is fresh.
     this.stmt(`UPDATE listings SET
       ai_description_verification_json = ?,
       ai_description_verification_input_hash = ?,
@@ -1682,10 +1691,12 @@ export class ScoutService {
       WHERE marketplace = ? AND listing_id = ?
         AND (ai_description_verification_json IS NOT ? OR ai_description_verification_input_hash IS NOT ?
           OR ai_description_verification_model IS NOT ? OR ai_description_verification_status IS NOT ?
-          OR ai_description_verification_error IS NOT NULL)`).run(
+          OR ai_description_verification_error IS NOT NULL
+          OR ai_description_verification_at IS NULL OR ai_description_verification_at < ?)`).run(
       json, input.inputHash ?? null, input.model ?? null, nowIso(), input.status,
       input.marketplace, input.listingId,
       json, input.inputHash ?? null, input.model ?? null, input.status,
+      new Date(Date.now() - DESCRIPTION_VERIFICATION_FRESH_MS).toISOString(),
     );
   }
 
@@ -1893,6 +1904,33 @@ export class ScoutService {
     return verification;
   }
 
+  /**
+   * True when the listing already holds a finished verdict (pass, reject, or
+   * unknown for a page without a description; not an error) from the active
+   * model that is younger than DESCRIPTION_VERIFICATION_FRESH_MS, for a
+   * listing state (title, price, condition, location, url) that was already
+   * captured. Without an AI key verification is a write-free no-op anyway.
+   */
+  private hasFreshDescriptionVerification(candidate: DealNotificationCandidate, notifyContext?: ScanNotifyContext) {
+    const config = notifyContext?.deepSeek ?? this.deepSeekConfig();
+    const jevLive = this.jevLiveConfig();
+    const apiKey = jevLive ? jevLive.apiKey : config.apiKey;
+    if (!apiKey) return false;
+    const activeModel = jevLive ? jevLive.jevModel : config.model;
+    const { listing } = candidate;
+    const row = this.stmt(`SELECT id, ai_description_verification_model AS model, ai_description_verification_status AS status,
+      ai_description_verification_error AS error, ai_description_verification_at AS at
+      FROM listings WHERE marketplace = ? AND listing_id = ?`).get(listing.marketplace, listing.listingId) as { id?: number; model?: string | null; status?: string | null; error?: string | null; at?: string | null } | undefined;
+    if (!row?.id || row.model !== activeModel || row.error) return false;
+    if (row.status !== 'pass' && row.status !== 'reject' && row.status !== 'unknown') return false;
+    const verifiedAt = row.at ? Date.parse(row.at) : Number.NaN;
+    if (!Number.isFinite(verifiedAt) || Date.now() - verifiedAt >= DESCRIPTION_VERIFICATION_FRESH_MS) return false;
+    return Boolean(this.stmt(`SELECT 1 AS found FROM listing_detail_snapshots
+      WHERE listing_id = ? AND title = ? AND price_pln = ? AND url = ? AND condition IS ? AND location IS ? LIMIT 1`).get(
+      row.id, listing.title, listing.price, listing.url, listing.condition ?? null, listing.location ?? null,
+    ));
+  }
+
   /** Read once per scan — see ScanNotifyContext. */
   private scanNotifyContext(): ScanNotifyContext {
     return {
@@ -1930,7 +1968,12 @@ export class ScoutService {
           // notifyDeal ignores hidden listings, so verifying one would only
           // fetch its page and spend an AI call for nothing.
           if (this.isListingHidden(candidate.listing)) continue;
-          if (candidate.requiresDescriptionVerification && !await this.verifyHighPriorityDeal(candidate, context)) continue;
+          if (candidate.requiresDescriptionVerification) {
+            // notifyDeal re-plans after the awaits, since state can change.
+            const plan = this.planDealNotification(candidate.watchId, candidate.listing, candidate.discountPercent, context);
+            if (!plan.channels.length && !plan.digestDue && this.hasFreshDescriptionVerification(candidate, context)) continue;
+            if (!await this.verifyHighPriorityDeal(candidate, context)) continue;
+          }
           await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence, context, candidate.variantLabel ?? null);
         }
       }
@@ -4719,10 +4762,14 @@ export class ScoutService {
     return null;
   }
 
-  private queueDailyDigestCandidate(watchId: string, listing: NormalizedListing, typical: number, discountPercent: number, confidence: number, priority: NotificationPriority) {
-    const latest = this.stmt(`SELECT sequence, price_pln AS last_alerted_price_pln, priority AS last_priority
+  private latestDigestCandidate(watchId: string, listing: NormalizedListing) {
+    return this.stmt(`SELECT sequence, price_pln AS last_alerted_price_pln, priority AS last_priority
       FROM daily_digest_candidates WHERE watch_id = ? AND marketplace = ? AND listing_id = ?
       ORDER BY sequence DESC LIMIT 1`).get(watchId, listing.marketplace, listing.listingId) as { sequence?: number; last_alerted_price_pln?: number; last_priority?: NotificationPriority } | undefined;
+  }
+
+  private queueDailyDigestCandidate(watchId: string, listing: NormalizedListing, typical: number, discountPercent: number, confidence: number, priority: NotificationPriority) {
+    const latest = this.latestDigestCandidate(watchId, listing);
     if (!this.shouldAlert(latest, listing.price, priority)) return false;
     const sequence = Number(latest?.sequence ?? 0) + 1;
     this.stmt(`INSERT INTO daily_digest_candidates (
@@ -4974,40 +5021,34 @@ export class ScoutService {
    * The first four arguments are kept backward-compatible for existing
    * integrations/tests. New scan code always supplies watchId explicitly.
    */
-  private async notifyDeal(
-    watchIdOrListing: string | NormalizedListing,
-    listingOrTypical: NormalizedListing | number,
-    typicalOrDiscount: number,
-    discountOrConfidence: number,
-    maybeConfidence?: number,
-    context?: ScanNotifyContext,
-    variantLabel?: string | null,
-  ) {
-    const legacy = typeof watchIdOrListing !== 'string';
-    const watchId = legacy ? '__legacy__' : watchIdOrListing;
-    const listing = (legacy ? watchIdOrListing : listingOrTypical) as NormalizedListing;
-    const typical = (legacy ? listingOrTypical : typicalOrDiscount) as number;
-    const discountPercent = legacy ? typicalOrDiscount : discountOrConfidence;
-    const confidence = legacy ? discountOrConfidence : maybeConfidence!;
+  /**
+   * The write-free part of notifyDeal: whether the listing is hidden, whether
+   * a digest entry would be queued, and which channels would send, with the
+   * alert sequence and keys each would use. A channel reads only its own
+   * alert state and deliveries, so planning every channel before any write
+   * decides exactly what the interleaved loop used to.
+   */
+  private planDealNotification(watchId: string, listing: NormalizedListing, discountPercent: number, context?: ScanNotifyContext, legacy = false) {
     const priority = priorityFromDiscount(discountPercent);
-    if (this.isListingHidden(listing)) return;
+    const channels: Array<{ channel: 'Discord' | 'ntfy'; sequence: number; eventKey: string; deliveryKey: string }> = [];
+    if (this.isListingHidden(listing)) return { hidden: true, priority, encryptedDiscord: null, ntfy: null, digestQualifies: false, digestDue: false, channels };
     const encryptedDiscord = context?.encryptedDiscord ?? this.getSetting('discord_webhook');
     const ntfy = context?.ntfy ?? this.ntfyConfig();
+    const plan = { hidden: false, priority, encryptedDiscord, ntfy, digestQualifies: false, digestDue: false, channels };
     const digest = context?.digest ?? this.dailyDigestConfig();
     const discordMinimum = context?.discordMinimumPriority ?? this.discordMinimumPriority();
     const digestSelected = (channel: DigestChannel) => digest.enabled && (channel === 'Discord' ? digest.discord : digest.ntfy);
     if (!legacy && priority !== 'exceptional') {
-      const qualifiesForDigest = (digestSelected('Discord') && Boolean(encryptedDiscord) && meetsMinimumPriority(priority, discordMinimum))
+      plan.digestQualifies = (digestSelected('Discord') && Boolean(encryptedDiscord) && meetsMinimumPriority(priority, discordMinimum))
         || (digestSelected('ntfy') && Boolean(ntfy) && meetsMinimumPriority(priority, ntfy?.minimumPriority ?? 'exceptional'));
-      if (qualifiesForDigest) this.queueDailyDigestCandidate(watchId, listing, typical, discountPercent, confidence, priority);
+      // queueDailyDigestCandidate's own check: a digest row is added only
+      // when the listing is new to the digest or improved enough.
+      plan.digestDue = plan.digestQualifies && this.shouldAlert(this.latestDigestCandidate(watchId, listing), listing.price, priority);
     }
-    const channels: Array<'Discord' | 'ntfy'> = [];
-    if (encryptedDiscord && meetsMinimumPriority(priority, discordMinimum) && (priority === 'exceptional' || !digestSelected('Discord'))) channels.push('Discord');
-    if (ntfy && meetsMinimumPriority(priority, ntfy.minimumPriority) && (priority === 'exceptional' || !digestSelected('ntfy'))) channels.push('ntfy');
-    if (!channels.length) return;
-
-    const planned: Array<{ channel: 'Discord' | 'ntfy'; eventKey: string; deliveryKey: string; sequence?: number; claim: { id: number; attemptCount: number }; legacy: boolean }> = [];
-    for (const channel of channels) {
+    const eligible: Array<'Discord' | 'ntfy'> = [];
+    if (encryptedDiscord && meetsMinimumPriority(priority, discordMinimum) && (priority === 'exceptional' || !digestSelected('Discord'))) eligible.push('Discord');
+    if (ntfy && meetsMinimumPriority(priority, ntfy.minimumPriority) && (priority === 'exceptional' || !digestSelected('ntfy'))) eligible.push('ntfy');
+    for (const channel of eligible) {
       let sequence = 1;
       let eventKey = notificationKey(listing);
       let deliveryKey = eventKey;
@@ -5025,6 +5066,34 @@ export class ScoutService {
         eventKey = this.notificationEventKey(watchId, listing, sequence);
         deliveryKey = this.notificationDeliveryKey(eventKey, channel);
       }
+      channels.push({ channel, sequence, eventKey, deliveryKey });
+    }
+    return plan;
+  }
+
+  private async notifyDeal(
+    watchIdOrListing: string | NormalizedListing,
+    listingOrTypical: NormalizedListing | number,
+    typicalOrDiscount: number,
+    discountOrConfidence: number,
+    maybeConfidence?: number,
+    context?: ScanNotifyContext,
+    variantLabel?: string | null,
+  ) {
+    const legacy = typeof watchIdOrListing !== 'string';
+    const watchId = legacy ? '__legacy__' : watchIdOrListing;
+    const listing = (legacy ? watchIdOrListing : listingOrTypical) as NormalizedListing;
+    const typical = (legacy ? listingOrTypical : typicalOrDiscount) as number;
+    const discountPercent = legacy ? typicalOrDiscount : discountOrConfidence;
+    const confidence = legacy ? discountOrConfidence : maybeConfidence!;
+    const plan = this.planDealNotification(watchId, listing, discountPercent, context, legacy);
+    if (plan.hidden) return;
+    const { priority, encryptedDiscord, ntfy } = plan;
+    if (plan.digestQualifies) this.queueDailyDigestCandidate(watchId, listing, typical, discountPercent, confidence, priority);
+    if (!plan.channels.length) return;
+
+    const planned: Array<{ channel: 'Discord' | 'ntfy'; eventKey: string; deliveryKey: string; sequence?: number; claim: { id: number; attemptCount: number }; legacy: boolean }> = [];
+    for (const { channel, sequence, eventKey, deliveryKey } of plan.channels) {
       const payload = { ...buildDiscordEmbed({ listing, typical, discountPercent, confidence, variantLabel }), _scout: { watchId, listing, typical, discountPercent, confidence, priority, sequence, variantLabel } };
       this.stmt('INSERT OR IGNORE INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(eventKey, JSON.stringify(payload), 'pending', nowIso());
       const claim = this.claimNotificationDelivery(deliveryKey, channel);
