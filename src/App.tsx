@@ -27,6 +27,7 @@ import {
 } from "lucide-react";
 import { api, UNAUTHORIZED_EVENT, type AuthSession } from "./api";
 import { emptyDashboard } from "./data";
+import { subscribe, subscribeStatus } from "./events";
 import ListingTable from "./ListingTable";
 import type { WatchPreset } from "./presets";
 import type {
@@ -269,7 +270,6 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     void refreshData(true);
   }, [refreshData]);
   useEffect(() => {
-    const source = new EventSource("/events");
     let refreshTimer: number | null = null;
     const refresh = () => {
       setAnalyticsRefreshKey((value) => value + 1);
@@ -280,18 +280,23 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         setListingsRefreshKey((value) => value + 1);
       }, 100);
     };
-    source.addEventListener("ready", () => setConnection("online"));
-    source.addEventListener("scan", refresh);
-    source.addEventListener("watch", refresh);
-    source.addEventListener("notification", refresh);
-    source.addEventListener("listing-action", refresh);
-    source.addEventListener("ai-description-verification", refresh);
-    source.addEventListener("market-watch", () => { setMarketRefreshKey((value) => value + 1); setAnalyticsRefreshKey((value) => value + 1); });
-    source.addEventListener("log", () => setLogsRefreshKey((value) => value + 1));
-    source.onerror = () => setConnection("offline");
+    const unsubscribers = [
+      // A stream that comes back after a gap (server restart, hidden tab) may have missed events.
+      subscribeStatus((status, reconnected) => {
+        setConnection(status);
+        if (reconnected) refresh();
+      }),
+      subscribe("scan", refresh),
+      subscribe("watch", refresh),
+      subscribe("notification", refresh),
+      subscribe("listing-action", refresh),
+      subscribe("ai-description-verification", refresh),
+      subscribe("market-watch", () => { setMarketRefreshKey((value) => value + 1); setAnalyticsRefreshKey((value) => value + 1); }),
+      subscribe("log", () => setLogsRefreshKey((value) => value + 1)),
+    ];
     return () => {
       if (refreshTimer !== null) window.clearTimeout(refreshTimer);
-      source.close();
+      for (const unsubscribe of unsubscribers) unsubscribe();
     };
   }, [refreshData]);
   useEffect(() => {
