@@ -15,6 +15,8 @@ public actor DemoTransport: HTTPTransport {
     private var marketWatches: [MarketWatch]
     private var marketListings: [MarketTrackedListing]
     private var ntfyOpenInApp = false
+    private var flips: [Flip]
+    private var feePresets = FeePresets.defaults
     private let encoder = JSONEncoder()
 
     public init(now: Date = Date()) {
@@ -22,6 +24,26 @@ public actor DemoTransport: HTTPTransport {
         self.dashboard = dashboard
         marketWatches = DemoMarket.watches(now: now)
         marketListings = DemoMarket.listings(dashboard: dashboard, now: now)
+        flips = Self.demoFlips(now: now)
+    }
+
+    /// A few flips around today so the ledger, quarter total, and sales record have content.
+    static func demoFlips(now: Date) -> [Flip] {
+        func day(_ offset: Int) -> String { Profit.today(now.addingTimeInterval(Double(offset) * 86_400)) }
+        let stamp = ISO8601DateFormatter().string(from: now)
+        func flip(_ id: Int, _ title: String, bought: Int, from: FlipChannel, price: Double, costs: Double, listed: [FlipChannel], sold: (day: Int, on: FlipChannel, price: Double, fee: Double, costs: Double, delisted: [FlipChannel])?) -> Flip {
+            Flip(
+                id: id, title: title, listingKey: nil, watchId: nil, buyChannel: from, boughtOn: day(bought), buyPrice: price, buyCosts: costs,
+                listedOn: listed, soldOn: sold.map { day($0.day) }, saleChannel: sold?.on, salePrice: sold?.price, saleFee: sold?.fee,
+                saleCosts: sold?.costs, delisted: sold?.delisted ?? [], note: "", createdAt: stamp, updatedAt: stamp
+            )
+        }
+        return [
+            flip(4, "Gigabyte RTX 3070 Eagle OC 8GB", bought: -2, from: .vinted, price: 1_150, costs: 16.99, listed: [.olx, .allegroLokalnie], sold: nil),
+            flip(3, "Ryzen 5 5600X box", bought: -9, from: .olx, price: 290, costs: 12, listed: [.olx, .allegroLokalnie, .vinted], sold: (day: -1, on: .allegroLokalnie, price: 420, fee: 20.58, costs: 0, delisted: [.olx])),
+            flip(2, "Steam Deck OLED 512GB", bought: -20, from: .olx, price: 1_899, costs: 0, listed: [.olx], sold: (day: -12, on: .olx, price: 2_350, fee: 0, costs: 0, delisted: [])),
+            flip(1, "Sony WH-1000XM5", bought: -30, from: .allegroLokalnie, price: 749, costs: 14.99, listed: [.vinted], sold: (day: -24, on: .vinted, price: 980, fee: 0, costs: 0, delisted: [])),
+        ]
     }
 
     /// Demo dashboard with timestamps moved so the newest listing is a minute
@@ -37,6 +59,22 @@ public actor DemoTransport: HTTPTransport {
         for index in dashboard.listings.indices {
             dashboard.listings[index].observedAt = shifted(dashboard.listings[index].observedAt) ?? ""
             dashboard.listings[index].aiDescriptionVerificationAt = shifted(dashboard.listings[index].aiDescriptionVerificationAt)
+        }
+        // Posting times and seller flags as OLX and Vinted send them: a fresh
+        // post, an old one bumped to the top of "newest", and a dealer ad.
+        for index in dashboard.listings.indices {
+            guard let seen = dashboard.listings[index].observedDate else { continue }
+            let marketplace = dashboard.listings[index].marketplace
+            if marketplace == .olx {
+                let ages: [TimeInterval] = [180, 420 * 86_400, 9 * 86_400]
+                let age = ages[index % 3]
+                dashboard.listings[index].postedAt = formatter.string(from: seen.addingTimeInterval(-age))
+                dashboard.listings[index].refreshedAt = formatter.string(from: seen.addingTimeInterval(age > 86_400 ? -7_200 : -age))
+            }
+            if marketplace == .olx || marketplace == .vinted {
+                dashboard.listings[index].sellerType = index % 3 == 2 ? "business" : "private"
+                dashboard.listings[index].promoted = index % 3 == 2
+            }
         }
         return dashboard
     }
@@ -57,7 +95,7 @@ public actor DemoTransport: HTTPTransport {
         let segments = components.path.split(separator: "/").map(String.init)
         let method = request.httpMethod ?? "GET"
         // `/api/<collection>/<id>/...` routes are matched with the id replaced by `:id`.
-        let collections: Set<String> = ["watches", "market-watches", "market-listings"]
+        let collections: Set<String> = ["watches", "market-watches", "market-listings", "flips"]
         let watchID = segments.count >= 3 && segments[0] == "api" && collections.contains(segments[1]) ? segments[2] : nil
         let route = method + " /" + segments.enumerated().map { $0.offset == 2 && watchID != nil ? ":id" : $0.element }.joined(separator: "/")
         try await Task.sleep(nanoseconds: 150_000_000)
@@ -136,7 +174,7 @@ public actor DemoTransport: HTTPTransport {
                 location: draft.location, condition: draft.condition, sources: draft.sources, intervalHours: draft.intervalHours,
                 minPrice: draft.minPrice, maxPrice: draft.maxPrice, shippingOnly: draft.shippingOnly, typoVariants: draft.typoVariants,
                 enabled: true, nextScan: "due now", lastScan: "Never", totalListings: 0, activeListings: 0, endedListings: 0,
-                estimatedMedianPrice: nil, saleBand: nil, activeVersionId: nil
+                estimatedMedianPrice: nil, saleBand: nil, activeVersionId: nil, olxCategory: draft.olxCategory
             )
             marketWatches.insert(watch, at: 0)
             return try respond(["watch": watch], status: 201)
@@ -159,6 +197,7 @@ public actor DemoTransport: HTTPTransport {
             if let value = patch.maxPrice { marketWatches[index].maxPrice = value }
             if let value = patch.shippingOnly { marketWatches[index].shippingOnly = value }
             if let value = patch.typoVariants { marketWatches[index].typoVariants = value }
+            if let value = patch.olxCategory { marketWatches[index].olxCategory = value }
             return try respond(["ok": true])
         case "DELETE /api/market-watches/:id":
             marketWatches.removeAll { $0.id == watchID }
@@ -197,6 +236,34 @@ public actor DemoTransport: HTTPTransport {
             return try respond(ServerSettings(ntfy: ServerSettings.Ntfy(configured: true, minimumPriority: "exceptional", openInApp: ntfyOpenInApp)))
         case "GET /api/connectors":
             return try respond(["connectors": dashboard.connectors])
+        case "GET /api/marketplaces/olx/categories":
+            return try respond(["categories": Self.demoCategories])
+        case "GET /api/flips":
+            return try respond(FlipsData(flips: flips.sorted { ($0.soldOn ?? $0.boughtOn, $0.id) > ($1.soldOn ?? $1.boughtOn, $1.id) }, feePresets: feePresets))
+        case "POST /api/flips":
+            let draft = try JSONDecoder().decode(FlipDraft.self, from: request.httpBody ?? Data())
+            let stamp = ISO8601DateFormatter().string(from: Date())
+            let flip = Flip(
+                id: (flips.map(\.id).max() ?? 0) + 1, title: draft.title, listingKey: draft.listingKey, watchId: draft.watchId,
+                buyChannel: draft.buyChannel, boughtOn: draft.boughtOn, buyPrice: draft.buyPrice, buyCosts: draft.buyCosts,
+                listedOn: draft.listedOn, soldOn: nil, saleChannel: nil, salePrice: nil, saleFee: nil, saleCosts: nil,
+                delisted: [], note: draft.note, createdAt: stamp, updatedAt: stamp
+            )
+            flips.append(flip)
+            return try respond(["flip": flip], status: 201)
+        case "PUT /api/flips/:id" where watchID == "fee-presets":
+            feePresets = try JSONDecoder().decode(FeePresets.self, from: request.httpBody ?? Data())
+            return try respond(["feePresets": feePresets])
+        case "PATCH /api/flips/:id":
+            guard let index = flips.firstIndex(where: { String($0.id) == watchID }) else {
+                return try respond(["error": "Flip not found"], status: 404)
+            }
+            let body = (try? JSONSerialization.jsonObject(with: request.httpBody ?? Data())) as? [String: Any] ?? [:]
+            applyFlip(body, to: &flips[index])
+            return try respond(["flip": flips[index]])
+        case "DELETE /api/flips/:id":
+            flips.removeAll { String($0.id) == watchID }
+            return try respond(["ok": true])
         default:
             return try respond(["error": "Not available in demo mode"], status: 404)
         }
@@ -292,7 +359,8 @@ public actor DemoTransport: HTTPTransport {
             exactUrls: [], sensitivity: draft.sensitivity, shippingOnly: draft.shippingOnly,
             typoVariants: draft.typoVariants, aiRelevance: draft.aiRelevance, variantGroups: [], variants: [],
             dealCounts: WatchDealCounts(exceptional: 0, veryStrong: 0, strong: 0), referenceMarketWatchId: nil,
-            minPrice: draft.minPrice, maxPrice: draft.maxPrice, archivedAt: nil
+            minPrice: draft.minPrice, maxPrice: draft.maxPrice, archivedAt: nil,
+            olxCategory: draft.olxCategory, sellerType: draft.sellerType?.rawValue, ignorePromoted: draft.ignorePromoted
         )
     }
 
@@ -312,12 +380,61 @@ public actor DemoTransport: HTTPTransport {
         if let value = body["typoVariants"] as? Bool { watch.typoVariants = value }
         if let value = body["aiRelevance"] as? Bool { watch.aiRelevance = value }
         if let value = body["sensitivity"] as? Double { watch.sensitivity = value }
+        if body.keys.contains("olxCategory") {
+            watch.olxCategory = (body["olxCategory"] as? [String: Any]).flatMap { value in
+                guard let id = value["id"] as? Int, let label = value["label"] as? String else { return nil }
+                return OlxCategory(id: id, label: label, path: value["path"] as? String ?? "")
+            }
+        }
+        if body.keys.contains("sellerType") { watch.sellerType = body["sellerType"] as? String }
+        if let value = body["ignorePromoted"] as? Bool { watch.ignorePromoted = value }
         if let value = body["enabled"] as? Bool { enabled[watch.id] = value }
         if let value = body["archived"] as? Bool {
             watch.archivedAt = value ? ISO8601DateFormatter().string(from: Date()) : nil
             watch.status = value ? "Archived" : (watch.readiness >= 100 ? "Ready" : "Learning")
         }
     }
+
+    /// The server's merge: present keys change, `soldOn: null` clears the sale,
+    /// and a sale without a fee gets the channel's preset fee.
+    private func applyFlip(_ body: [String: Any], to flip: inout Flip) {
+        if let value = body["title"] as? String { flip.title = value }
+        if let value = body["buyChannel"] as? String { flip.buyChannel = FlipChannel(rawValue: value) }
+        if let value = body["boughtOn"] as? String { flip.boughtOn = value }
+        if let value = body["buyPrice"] as? Double { flip.buyPrice = value }
+        if let value = body["buyCosts"] as? Double { flip.buyCosts = value }
+        if let value = body["listedOn"] as? [String] { flip.listedOn = value.map(FlipChannel.init(rawValue:)) }
+        if let value = body["note"] as? String { flip.note = value }
+        if let value = body["delisted"] as? [String] { flip.delisted = value.map(FlipChannel.init(rawValue:)) }
+        if body.keys.contains("soldOn"), body["soldOn"] is NSNull {
+            flip.soldOn = nil
+            flip.saleChannel = nil
+            flip.salePrice = nil
+            flip.saleFee = nil
+            flip.saleCosts = nil
+            flip.delisted = []
+        } else {
+            if let value = body["soldOn"] as? String { flip.soldOn = value }
+            if let value = body["saleChannel"] as? String { flip.saleChannel = FlipChannel(rawValue: value) }
+            if let value = body["salePrice"] as? Double { flip.salePrice = value }
+            if let value = body["saleCosts"] as? Double { flip.saleCosts = value }
+            if let value = body["saleFee"] as? Double {
+                flip.saleFee = value
+            } else if let price = flip.salePrice, let channel = flip.saleChannel, body.keys.contains("salePrice") || body.keys.contains("saleChannel") {
+                flip.saleFee = Profit.saleFee(salePrice: price, preset: feePresets[channel])
+            }
+        }
+        flip.updatedAt = ISO8601DateFormatter().string(from: Date())
+    }
+
+    static let demoCategories: [OlxCategoryOption] = [
+        OlxCategoryOption(id: 99, label: "Elektronika", path: "elektronika", count: 710),
+        OlxCategoryOption(id: 443, label: "Komputery", path: "elektronika/komputery", count: 707),
+        OlxCategoryOption(id: 1197, label: "Komputery stacjonarne", path: "elektronika/komputery/komputery-stacjonarne", count: 364),
+        OlxCategoryOption(id: 1199, label: "Laptopy", path: "elektronika/komputery/laptopy", count: 231),
+        OlxCategoryOption(id: 1845, label: "Podzespoły i części", path: "elektronika/komputery/podzespoly-i-czesci", count: 104),
+        OlxCategoryOption(id: 2184, label: "Karty graficzne", path: "elektronika/komputery/podzespoly-i-czesci/karty-graficzne", count: 83),
+    ]
 
     private func applyAction(_ listing: Listing) -> Listing {
         guard let action = actions[listing.key] else { return listing }

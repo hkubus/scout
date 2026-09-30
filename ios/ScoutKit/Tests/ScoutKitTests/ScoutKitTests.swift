@@ -543,3 +543,183 @@ final class MarketTests: XCTestCase {
         XCTAssertEqual(client.marketSnapshotImageURL(imageId: 7).absoluteString, "https://host/scout/api/market-snapshot-images/7")
     }
 }
+
+final class FlipTests: XCTestCase {
+    private func flip(id: Int = 1, bought: String = "2026-09-01", price: Double = 1_000, costs: Double = 0, sold: String? = nil, on channel: FlipChannel? = nil, salePrice: Double? = nil, fee: Double? = nil) -> Flip {
+        Flip(id: id, title: "RTX", listingKey: nil, watchId: nil, buyChannel: .olx, boughtOn: bought, buyPrice: price, buyCosts: costs, listedOn: [.olx, .allegroLokalnie], soldOn: sold, saleChannel: channel, salePrice: salePrice, saleFee: fee, saleCosts: nil, delisted: [], note: "", createdAt: "", updatedAt: "")
+    }
+
+    func testProfitMatchesTheWebMaths() {
+        XCTAssertEqual(Profit.saleFee(salePrice: 1_000, preset: FeePresets.defaults[.allegroLokalnie]), 49)
+        XCTAssertEqual(Profit.saleFee(salePrice: 299.99, preset: FeePreset(percent: 4.9, fixed: 1)), 15.7)
+        XCTAssertEqual(Profit.saleFee(salePrice: 0, preset: FeePreset(percent: 10, fixed: 5)), 0)
+        XCTAssertNil(flip().net)
+        XCTAssertEqual(flip(sold: "2026-09-20", on: .allegroLokalnie, salePrice: 1_300, fee: 63.7).net, 236.3)
+        let estimate = Profit.estimate(buyPrice: 220, buyCosts: 12, resalePrice: 300, preset: FeePresets.defaults[.allegroLokalnie])
+        XCTAssertEqual(estimate.fee, 14.7)
+        XCTAssertEqual(estimate.net, 53.3)
+        XCTAssertEqual(Profit.quarter(of: "2026-09-30"), YearQuarter(year: 2026, quarter: 3))
+        XCTAssertEqual(Profit.quarter(of: "2026-10-01"), YearQuarter(year: 2026, quarter: 4))
+        XCTAssertNil(Profit.quarter(of: "not a date"))
+        XCTAssertTrue(Profit.isDate("2026-02-28"))
+        XCTAssertFalse(Profit.isDate("2026-13-01"))
+        XCTAssertEqual(Profit.today(Date(timeIntervalSince1970: 1_790_757_000), calendar: Calendar(identifier: .gregorian)).count, 10)
+    }
+
+    func testSalesRecordRestartsEachQuarter() {
+        let flips = [
+            flip(id: 1, sold: "2026-06-30", on: .olx, salePrice: 999),
+            flip(id: 2, sold: "2026-07-02", on: .olx, salePrice: 300),
+            flip(id: 3, sold: "2026-07-02", on: .vinted, salePrice: 250.5),
+            flip(id: 4, sold: "2026-08-15", on: .olx, salePrice: 400),
+            flip(id: 5),
+        ]
+        let rows = Profit.salesRecord(flips, quarter: YearQuarter(year: 2026, quarter: 3))
+        XCTAssertEqual(rows.map(\.date), ["2026-07-02", "2026-08-15"])
+        XCTAssertEqual(rows.map(\.daySales), [550.5, 400])
+        XCTAssertEqual(rows.map(\.quarterToDate), [550.5, 950.5])
+        XCTAssertEqual(Profit.salesRecordCSV(rows).components(separatedBy: "\r\n")[1], "1;2026-07-02;550,50;550,50")
+    }
+
+    func testSummaryCountsTheQuarterYearAndPlatforms() {
+        let flips = [
+            flip(id: 1, sold: "2026-07-10", on: .allegroLokalnie, salePrice: 1_300, fee: 63.7),
+            flip(id: 2, bought: "2026-05-01", price: 500, sold: "2026-05-20", on: .olx, salePrice: 700, fee: 0),
+            flip(id: 3, price: 800, costs: 20),
+        ]
+        let summary = FlipsSummary(flips: flips, today: "2026-09-30")
+        XCTAssertEqual(summary.quarter, YearQuarter(year: 2026, quarter: 3))
+        XCTAssertEqual(summary.quarterRevenue, 1_300)
+        XCTAssertEqual(summary.quarterLimit, 10_813.5)
+        XCTAssertEqual(summary.quarterNet, 236.3)
+        XCTAssertEqual(summary.yearNet, 436.3)
+        XCTAssertEqual(summary.yearSales, 2)
+        XCTAssertEqual(summary.openCount, 1)
+        XCTAssertEqual(summary.openCost, 820)
+        XCTAssertEqual(summary.platforms.map(\.sales), [1, 1, 0])
+        XCTAssertNil(FlipsSummary(flips: flips, today: "2025-09-30").quarterLimit)
+    }
+
+    func testStillListedElsewhere() {
+        var sold = flip(sold: "2026-09-20", on: .allegroLokalnie, salePrice: 1_300)
+        XCTAssertEqual(sold.stillListedElsewhere, [.olx])
+        sold.delisted = [.olx]
+        XCTAssertEqual(sold.stillListedElsewhere, [])
+        XCTAssertEqual(flip().stillListedElsewhere, [])
+    }
+
+    func testSaleBodiesMatchTheServer() throws {
+        let sale = FlipSale(soldOn: "2026-09-20", saleChannel: .allegroLokalnie, salePrice: 1_300, delisted: [.olx])
+        let body = try JSONSerialization.jsonObject(with: JSONEncoder().encode(FlipSaleBody(sale: sale))) as? [String: Any]
+        XCTAssertNil(body?["saleFee"], "the server applies the preset when the fee is left out")
+        XCTAssertEqual(body?["saleChannel"] as? String, "Allegro Lokalnie")
+        XCTAssertEqual(body?["delisted"] as? [String], ["OLX"])
+        XCTAssertEqual(sale.validationError(boughtOn: "2026-09-21"), "The sale date can't be before the purchase date.")
+        XCTAssertNil(sale.validationError(boughtOn: "2026-09-01"))
+        let unsell = try JSONSerialization.jsonObject(with: JSONEncoder().encode(FlipUnsellBody())) as? [String: Any]
+        XCTAssertTrue(unsell?["soldOn"] is NSNull)
+        let presets = try JSONSerialization.jsonObject(with: JSONEncoder().encode(FeePresets.defaults)) as? [String: [String: Double]]
+        XCTAssertEqual(presets?.keys.sorted(), ["Allegro Lokalnie", "OLX", "Other", "Vinted"])
+        XCTAssertEqual(presets?["Allegro Lokalnie"]?["percent"], 4.9)
+    }
+
+    func testDecodesAServerLedgerAndFillsMissingPresets() throws {
+        let json = #"{"flips":[{"id":7,"title":"RTX 3070","listingKey":"OLX:1","watchId":null,"buyChannel":"Vinted","boughtOn":"2026-09-20","buyPrice":1000,"buyCosts":22,"listedOn":["OLX","Allegro Lokalnie"],"soldOn":"2026-09-29","saleChannel":"Allegro Lokalnie","salePrice":1300,"saleFee":63.7,"saleCosts":0,"delisted":["OLX"],"note":"","createdAt":"now","updatedAt":"now"}],"feePresets":{"OLX":{"percent":8,"fixed":0}}}"#
+        let data: FlipsData = try ScoutClient.decode(Data(json.utf8))
+        XCTAssertEqual(data.flips.first?.net, 214.3)
+        XCTAssertEqual(data.feePresets[.olx].percent, 8)
+        XCTAssertEqual(data.feePresets[.allegroLokalnie].percent, 4.9)
+    }
+
+    func testLedgerFlowInDemo() async throws {
+        let client = ScoutClient(baseURL: DemoTransport.baseURL, transport: DemoTransport())
+        let start = try await client.flips()
+        XCTAssertEqual(start.flips.count, 4)
+        let created = try await client.createFlip(FlipDraft(title: "  Ryzen 7 5800X ", buyChannel: .vinted, buyPrice: 500, buyCosts: 15, listedOn: [.olx, .olx, .allegroLokalnie]))
+        XCTAssertEqual(created.title, "Ryzen 7 5800X")
+        XCTAssertEqual(created.listedOn, [.olx, .allegroLokalnie])
+        let sold = try await client.recordSale(flipId: created.id, sale: FlipSale(saleChannel: .allegroLokalnie, salePrice: 700))
+        XCTAssertEqual(sold.saleFee, 34.3)
+        XCTAssertEqual(sold.net, 150.7)
+        let unsold = try await client.removeSale(flipId: created.id)
+        XCTAssertFalse(unsold.isSold)
+        var presets = start.feePresets
+        presets[.olx] = FeePreset(percent: 8, fixed: 0)
+        let saved = try await client.saveFeePresets(presets)
+        XCTAssertEqual(saved[.olx].percent, 8)
+        try await client.deleteFlip(id: created.id)
+        let after = try await client.flips()
+        XCTAssertEqual(after.flips.count, 4)
+        XCTAssertEqual(after.feePresets[.olx].percent, 8)
+    }
+}
+
+final class ListingSignalTests: XCTestCase {
+    func testWatchDraftSendsCategorySellerAndPromotedSoEditsCanClearThem() throws {
+        let gpu = OlxCategory(id: 2184, label: "Karty graficzne", path: "elektronika/komputery/podzespoly-i-czesci/karty-graficzne")
+        var draft = WatchDraft(name: "GPU", query: "rtx 3070", olxCategory: gpu, sellerType: .private, ignorePromoted: true)
+        var body = try JSONSerialization.jsonObject(with: JSONEncoder().encode(draft.normalized())) as? [String: Any]
+        XCTAssertEqual((body?["olxCategory"] as? [String: Any])?["id"] as? Int, 2184)
+        XCTAssertEqual(body?["sellerType"] as? String, "private")
+        XCTAssertEqual(body?["ignorePromoted"] as? Bool, true)
+        draft.sources = [.vinted]
+        draft.sellerType = nil
+        body = try JSONSerialization.jsonObject(with: JSONEncoder().encode(draft.normalized())) as? [String: Any]
+        XCTAssertTrue(body?["olxCategory"] is NSNull, "no OLX source, no category")
+        XCTAssertTrue(body?["sellerType"] is NSNull)
+        XCTAssertEqual(gpu.readablePath, "elektronika › komputery › podzespoly i czesci › karty graficzne")
+    }
+
+    func testWatchSettingsRoundTripInDemo() async throws {
+        let client = ScoutClient(baseURL: DemoTransport.baseURL, transport: DemoTransport())
+        let categories = try await client.olxCategories(query: "rtx 3070")
+        let gpu = try XCTUnwrap(categories.first { $0.label == "Karty graficzne" })
+        var draft = WatchDraft(name: "GPU", query: "rtx 3070", olxCategory: gpu.category, sellerType: .business, ignorePromoted: true)
+        let created = try await client.createWatch(draft)
+        XCTAssertEqual(created.olxCategory?.id, 2184)
+        XCTAssertEqual(created.sellerType, "business")
+        let reopened = WatchDraft(watch: created)
+        XCTAssertEqual(reopened.sellerType, .business)
+        XCTAssertTrue(reopened.ignorePromoted)
+        draft.olxCategory = nil
+        draft.sellerType = nil
+        try await client.updateWatch(id: created.id, draft: draft)
+        let edited = try await client.watches().first { $0.id == created.id }
+        XCTAssertNil(edited?.olxCategory)
+        XCTAssertNil(edited?.sellerType)
+    }
+
+    func testResearchCategoryChangeIsACriteriaChangeComparedById() throws {
+        let gpu = OlxCategory(id: 2184, label: "Karty graficzne", path: "a/b")
+        let original = MarketWatchDraft(name: "GPU", query: "rtx", olxCategory: gpu)
+        var renamed = original
+        renamed.olxCategory = OlxCategory(id: 2184, label: "Renamed", path: "a/b")
+        XCTAssertTrue(renamed.patch(from: original).isEmpty)
+        var cleared = original
+        cleared.olxCategory = nil
+        let patch = cleared.patch(from: original)
+        XCTAssertTrue(patch.changesCriteria)
+        let body = try JSONSerialization.jsonObject(with: JSONEncoder().encode(patch)) as? [String: Any]
+        XCTAssertTrue(body?["olxCategory"] is NSNull)
+        let created = try JSONSerialization.jsonObject(with: JSONEncoder().encode(MarketWatchDraft(name: "a", query: "b"))) as? [String: Any]
+        XCTAssertNil(created?["olxCategory"], "left out when unset so creating works on older servers")
+    }
+
+    func testDecodesListingSignals() throws {
+        let json = #"{"id":"OLX:1","title":"RTX","subtitle":"","marketplace":"OLX","price":1300,"typical":null,"belowTypical":null,"observed":"now","observedAt":"2026-09-30T20:00:00.000Z","dealStrength":1,"dealLabel":"Watch","image":"","url":"https://www.olx.pl/d/oferta/x","watch":"GPU","shippingAvailable":true,"postedAt":"2025-06-01T08:00:00.000Z","refreshedAt":"2026-09-30T17:00:00.000Z","promoted":true,"sellerType":"business"}"#
+        let listing: Listing = try ScoutClient.decode(Data(json.utf8))
+        XCTAssertTrue(listing.isBusinessSeller)
+        XCTAssertEqual(listing.promoted, true)
+        XCTAssertNotNil(listing.bumpedDate)
+        let old: Listing = try ScoutClient.decode(Data(json.replacingOccurrences(of: #","postedAt":"2025-06-01T08:00:00.000Z","refreshedAt":"2026-09-30T17:00:00.000Z","promoted":true,"sellerType":"business""#, with: "").utf8))
+        XCTAssertNil(old.postedDate)
+        XCTAssertFalse(old.isBusinessSeller)
+    }
+
+    func testSearchDropsTheCategoryWithoutOLX() {
+        let gpu = OlxCategory(id: 2184, label: "Karty graficzne", path: "")
+        XCTAssertEqual(SearchFilters(query: "rtx", sources: [.olx], olxCategory: gpu).normalized().olxCategory, gpu)
+        XCTAssertNil(SearchFilters(query: "rtx", sources: [.vinted], olxCategory: gpu).normalized().olxCategory)
+        XCTAssertEqual(WatchDraft(search: SearchFilters(query: "rtx", sources: [.olx], ownerType: .private, olxCategory: gpu)).sellerType, .private)
+    }
+}

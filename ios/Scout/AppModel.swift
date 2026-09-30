@@ -86,7 +86,7 @@ final class AppModel {
     @ObservationIgnored private let defaults = UserDefaults.standard
 
     private static let serverURLKey = "serverURL"
-    private static let refreshEvents: Set<String> = ["scan", "watch", "notification", "listing-action", "ai-description-verification", "market-watch"]
+    private static let refreshEvents: Set<String> = ["scan", "watch", "notification", "listing-action", "ai-description-verification", "market-watch", "flips"]
 
     init() {
         // `-ScoutDemo YES -ScoutScreen <screen>` launch arguments drive the CI screenshots.
@@ -105,6 +105,9 @@ final class AppModel {
         case "analytics":
             selectedTab = .market
             marketSection = .analytics
+        case "flips":
+            selectedTab = .market
+            marketSection = .flips
         case "watches": selectedTab = .watches
         case "settings": selectedTab = .settings
         case "watch":

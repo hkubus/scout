@@ -5,10 +5,11 @@ A native SwiftUI client for a self-hosted Scout server. It covers:
 - the deal feed;
 - live marketplace search, like the web Search page, with "Save as watch";
 - the paginated listing history with triage (buy / watch / pass / hide);
-- listing detail with price history and the AI description check;
-- creating, editing, archiving, pausing, and scanning watches, plus asking-price analytics;
+- listing detail with price history, the AI description check, when the listing was really posted, seller type, and a resale estimate after the platform's fee with **I bought this**;
+- creating, editing, archiving, pausing, and scanning watches (including the OLX category, seller type, and skipping promoted listings), plus asking-price analytics;
 - market research watches with probable-sale estimates, saved listings, and saved copies;
 - deal analytics (Market tab → Analytics);
+- the flip ledger (Market tab → Flips): buys and sales with net profit, the delist checklist, the quarterly limit for działalność nierejestrowana, DAC7 counts, the sales record as CSV, and seller fee presets;
 - connector health, and a switch that makes ntfy alerts open in the app;
 - Home Screen and Lock Screen widgets.
 

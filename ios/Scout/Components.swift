@@ -35,6 +35,21 @@ enum Format {
     static func minutes(_ value: Double) -> String {
         value >= 60 && value.truncatingRemainder(dividingBy: 60) == 0 ? "\(Int(value / 60)) h" : "\(Int(value)) min"
     }
+
+    /// Compact age like the web chips: "3 min", "5 h", "2 d", "4 mo", "1 y".
+    static func age(since date: Date, now: Date = Date()) -> String {
+        let elapsed = max(0, now.timeIntervalSince(date))
+        if elapsed < 3600 { return "\(max(1, Int(elapsed / 60))) min" }
+        if elapsed < 86_400 { return "\(Int(elapsed / 3600)) h" }
+        if elapsed < 30 * 86_400 { return "\(Int(elapsed / 86_400)) d" }
+        if elapsed < 365 * 86_400 { return "\(Int(elapsed / (30 * 86_400))) mo" }
+        return "\(Int(elapsed / (365 * 86_400))) y"
+    }
+
+    /// Money with up to two decimals, for ledger amounts.
+    static func zl(_ value: Double) -> String {
+        value.formatted(.currency(code: "PLN").precision(.fractionLength(0...2)).locale(Locale(identifier: "pl_PL")))
+    }
 }
 
 extension Color {
@@ -239,6 +254,7 @@ struct ListingRow: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                ListingSignals(listing: listing)
                 if listing.aiFiltered == true {
                     Label("AI marked as not relevant", systemImage: "sparkles")
                         .font(.caption2)
@@ -248,6 +264,171 @@ struct ListingRow: View {
         }
         .padding(.vertical, 2)
         .opacity(listing.aiFiltered == true ? 0.55 : 1)
+    }
+}
+
+/// When a listing was really posted, and whether it's promoted or from a
+/// business: OLX's "newest" order is really "most recently refreshed", so a
+/// months-old listing can sit at the top of a scan.
+struct ListingSignals: View {
+    var listing: Listing
+
+    var body: some View {
+        if hasSignals {
+            HStack(spacing: 6) {
+                if let posted = listing.postedDate {
+                    Text(verbatim: postedText(posted))
+                        .foregroundStyle(ageColor(posted))
+                }
+                if listing.promoted == true {
+                    Text("Promoted")
+                        .padding(.horizontal, 5)
+                        .overlay(Capsule().stroke(Color.secondary.opacity(0.4)))
+                        .foregroundStyle(.secondary)
+                }
+                if listing.isBusinessSeller {
+                    Text("Business")
+                        .padding(.horizontal, 5)
+                        .background(Color.scoutBlue.opacity(0.14), in: Capsule())
+                        .foregroundStyle(Color.scoutBlue)
+                }
+            }
+            .font(.caption2.weight(.medium))
+            .lineLimit(1)
+        }
+    }
+
+    private var hasSignals: Bool {
+        listing.postedDate != nil || listing.promoted == true || listing.isBusinessSeller
+    }
+
+    private func postedText(_ posted: Date) -> String {
+        if let bumped = listing.bumpedDate {
+            return "Posted \(Format.age(since: posted)) ago · bumped \(Format.age(since: bumped)) ago"
+        }
+        return "Posted \(Format.age(since: posted)) ago"
+    }
+
+    private func ageColor(_ posted: Date) -> Color {
+        let age = Date().timeIntervalSince(posted)
+        if age < 86_400 { return .scoutGreen }
+        if age > 30 * 86_400 { return .dealOrange }
+        return .secondary
+    }
+}
+
+/// A form row that opens the OLX category picker for `query`.
+struct OlxCategoryField: View {
+    var query: String
+    @Binding var category: OlxCategory?
+
+    var body: some View {
+        NavigationLink {
+            OlxCategoryPickerView(query: query, category: $category)
+        } label: {
+            LabeledContent("OLX category") {
+                Text(verbatim: category?.label ?? "All categories")
+            }
+        }
+    }
+}
+
+/// OLX's own per-category hit counts for the query, loaded on demand (one request).
+struct OlxCategoryPickerView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    var query: String
+    @Binding var category: OlxCategory?
+    @State private var options: [OlxCategoryOption] = []
+    @State private var loaded = false
+    @State private var error: String?
+
+    var body: some View {
+        List {
+            Section {
+                Button {
+                    category = nil
+                    dismiss()
+                } label: {
+                    row(title: "All categories", detail: "OLX searches every category", selected: category == nil)
+                }
+                if let category, !options.contains(where: { $0.id == category.id }) {
+                    row(title: category.label, detail: category.readablePath, selected: true)
+                }
+            }
+            if !options.isEmpty {
+                Section {
+                    ForEach(options) { option in
+                        Button {
+                            category = option.category
+                            dismiss()
+                        } label: {
+                            row(title: option.label, detail: "\(option.count.formatted()) listings · \(option.category.readablePath)", selected: category?.id == option.id)
+                                .padding(.leading, CGFloat(max(0, option.depth - minDepth)) * 14)
+                        }
+                    }
+                } header: {
+                    Text(verbatim: "Matches for “\(trimmedQuery)”")
+                } footer: {
+                    Text("Only OLX scans use this. Pick the category of the item itself, so whole PCs or cases don't skew the typical price.")
+                }
+            } else if loaded && error == nil {
+                Section {
+                    Text(verbatim: "OLX has no category counts for “\(trimmedQuery)”.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if let error {
+                Section {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.red)
+                }
+            }
+        }
+        .overlay {
+            if !loaded && error == nil && !trimmedQuery.isEmpty { ProgressView() }
+        }
+        .navigationTitle("OLX category")
+        .navigationBarTitleDisplayMode(.inline)
+        .task { await load() }
+    }
+
+    private var trimmedQuery: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var minDepth: Int { options.map(\.depth).min() ?? 1 }
+
+    private func row(title: String, detail: String, selected: Bool) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(verbatim: title)
+                    .foregroundStyle(.primary)
+                Text(verbatim: detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            if selected {
+                Image(systemName: "checkmark")
+                    .foregroundStyle(Color.scoutBlue)
+            }
+        }
+    }
+
+    private func load() async {
+        guard let client = model.client, !trimmedQuery.isEmpty else {
+            loaded = true
+            if trimmedQuery.isEmpty { error = "Enter the search query first." }
+            return
+        }
+        do {
+            // Path order reads as a tree: parents come before their children.
+            options = try await client.olxCategories(query: trimmedQuery).sorted { $0.path < $1.path }
+            error = nil
+        } catch {
+            if error.isCancellation { return }
+            self.error = error.localizedDescription
+        }
+        loaded = true
     }
 }
 
