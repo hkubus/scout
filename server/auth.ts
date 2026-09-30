@@ -1,8 +1,8 @@
-// Single-operator authentication: a password-backed browser session (HttpOnly
-// cookie, server-side session rows) plus optional static bearer tokens for
-// MCP clients and scripts. Everything here is independent of Fastify so it can
+// Single-operator authentication: a browser session (HttpOnly cookie,
+// server-side session rows) signed in with the password or an API token, plus
+// static bearer tokens for MCP clients and scripts. Everything here is independent of Fastify so it can
 // be unit tested directly.
-import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
 import type { ScryptOptions } from 'node:crypto';
 import { isIP } from 'node:net';
 
@@ -61,6 +61,8 @@ export type AuthConfig = {
   passwordHash: string | null;
   /** SHA-256 digests of the configured bearer tokens. */
   tokenDigests: Buffer[];
+  /** Session credential ids for the tokens, parallel to tokenDigests. */
+  tokenCredentialIds: string[];
   /** Fingerprint of the password; sessions minted under another password are rejected. */
   credentialId: string;
   /** True only when SCOUT_AUTH=off explicitly accepted unauthenticated trusted-network mode. */
@@ -92,7 +94,7 @@ export async function loadAuthConfig(env: NodeJS.ProcessEnv, options: { publicly
   const hasCredentials = Boolean(passwordHash) || tokens.length > 0;
   if (mode === 'off') {
     if (hasCredentials) throw new Error('SCOUT_AUTH=off conflicts with configured SCOUT_PASSWORD/SCOUT_PASSWORD_HASH/SCOUT_API_TOKENS');
-    return { enabled: false, passwordHash: null, tokenDigests: [], credentialId: '', explicitlyOff: true };
+    return { enabled: false, passwordHash: null, tokenDigests: [], tokenCredentialIds: [], credentialId: '', explicitlyOff: true };
   }
   if (!hasCredentials && (mode === 'on' || options.publiclyBound || options.proxied)) {
     const reason = mode === 'on'
@@ -110,7 +112,11 @@ export async function loadAuthConfig(env: NodeJS.ProcessEnv, options: { publicly
     : plainPassword
       ? (await scrypt(plainPassword.normalize('NFKC'), sha256(`scout-credential:${env.SCOUT_SECRET ?? ''}`), 16, { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P, maxmem: 128 * SCRYPT_N * SCRYPT_R * 2 })).toString('hex')
       : '';
-  return { enabled: hasCredentials, passwordHash, tokenDigests: tokens.map(sha256), credentialId, explicitlyOff: false };
+  // A session signed in with an API token is bound to that token alone, so
+  // removing it from SCOUT_API_TOKENS revokes only its browser sessions. Keyed
+  // by SCOUT_SECRET like the password fingerprint, since it is stored too.
+  const tokenCredentialIds = tokens.map((token) => createHmac('sha256', `scout-token-credential:${env.SCOUT_SECRET ?? ''}`).update(token).digest('hex').slice(0, 32));
+  return { enabled: hasCredentials, passwordHash, tokenDigests: tokens.map(sha256), tokenCredentialIds, credentialId, explicitlyOff: false };
 }
 
 /**
@@ -130,10 +136,17 @@ export function bearerToken(header: string | undefined) {
 }
 
 export function matchesApiToken(config: AuthConfig, token: string) {
+  return apiTokenCredentialId(config, token) !== null;
+}
+
+/** The session credential id of the matching API token, or null. */
+export function apiTokenCredentialId(config: AuthConfig, token: string) {
   const digest = sha256(token);
-  let matched = false;
+  let matched: string | null = null;
   // Compare against every token so timing does not reveal which one matched.
-  for (const candidate of config.tokenDigests) matched = timingSafeEqual(candidate, digest) || matched;
+  for (const [index, candidate] of config.tokenDigests.entries()) {
+    if (timingSafeEqual(candidate, digest)) matched = config.tokenCredentialIds[index];
+  }
   return matched;
 }
 
@@ -178,14 +191,24 @@ export function isSameOriginRequest(headers: { origin?: string; 'sec-fetch-site'
   return parsed.origin === own || allowedOrigins.includes(parsed.origin);
 }
 
+/**
+ * Server-side browser sessions. Each session records the credential (password
+ * or API token) it was signed in with and stays valid only while that
+ * credential is still configured.
+ */
 export class SessionStore {
-  constructor(private readonly db: Db, private readonly credentialId: string) {}
+  private readonly credentialIds: ReadonlySet<string>;
 
-  create(meta: { ip?: string; userAgent?: string }, now = Date.now()) {
+  constructor(private readonly db: Db, credentialIds: readonly string[]) {
+    this.credentialIds = new Set(credentialIds.filter(Boolean));
+  }
+
+  create(meta: { ip?: string; userAgent?: string }, credentialId: string, now = Date.now()) {
+    if (!this.credentialIds.has(credentialId)) throw new Error('Unknown session credential');
     const token = b64(randomBytes(32));
     const iso = new Date(now).toISOString();
     this.db.prepare('INSERT INTO auth_sessions (token_hash, credential_id, created_at, last_seen_at, expires_at, ip, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(this.hash(token), this.credentialId, iso, iso, new Date(now + SESSION_ABSOLUTE_MS).toISOString(), meta.ip ?? null, (meta.userAgent ?? '').slice(0, 300) || null);
+      .run(this.hash(token), credentialId, iso, iso, new Date(now + SESSION_ABSOLUTE_MS).toISOString(), meta.ip ?? null, (meta.userAgent ?? '').slice(0, 300) || null);
     return token;
   }
 
@@ -208,7 +231,7 @@ export class SessionStore {
     const row = this.db.prepare('SELECT credential_id, last_seen_at, expires_at FROM auth_sessions WHERE token_hash = ?').get(tokenHash) as { credential_id: string; last_seen_at: string; expires_at: string } | undefined;
     if (!row) return null;
     const lastSeen = Date.parse(row.last_seen_at);
-    if (row.credential_id !== this.credentialId || Date.parse(row.expires_at) <= now || lastSeen + SESSION_IDLE_MS <= now) {
+    if (!this.credentialIds.has(row.credential_id) || Date.parse(row.expires_at) <= now || lastSeen + SESSION_IDLE_MS <= now) {
       this.db.prepare('DELETE FROM auth_sessions WHERE token_hash = ?').run(tokenHash);
       return null;
     }
@@ -224,8 +247,8 @@ export class SessionStore {
   }
 
   purgeExpired(now = Date.now()) {
-    this.db.prepare('DELETE FROM auth_sessions WHERE expires_at <= ? OR last_seen_at <= ? OR credential_id <> ?')
-      .run(new Date(now).toISOString(), new Date(now - SESSION_IDLE_MS).toISOString(), this.credentialId);
+    this.db.prepare('DELETE FROM auth_sessions WHERE expires_at <= ? OR last_seen_at <= ? OR credential_id NOT IN (SELECT value FROM json_each(?))')
+      .run(new Date(now).toISOString(), new Date(now - SESSION_IDLE_MS).toISOString(), JSON.stringify([...this.credentialIds]));
   }
 
   private hash(token: string) {

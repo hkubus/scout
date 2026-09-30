@@ -12,7 +12,7 @@ export class ApiError extends Error {
 
 export const UNAUTHORIZED_EVENT = 'scout:unauthorized';
 
-export type AuthSession = { authEnabled: boolean; authenticated: boolean; passwordLogin: boolean };
+export type AuthSession = { authEnabled: boolean; authenticated: boolean; passwordLogin: boolean; tokenLogin?: boolean };
 
 const inFlightGets = new Map<string, Promise<unknown>>();
 
