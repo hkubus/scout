@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { Download, LoaderCircle, RefreshCw, ScrollText } from "lucide-react";
 import { api } from "./api";
 import { subscribe, subscribeStatus } from "./events";
+import { formatDate, timeWithSeconds } from "./format";
 import type { LogEntry } from "./types";
 
 const errorMessage = (error: unknown) =>
@@ -21,13 +22,7 @@ function PageHeader({ title, description }: { title: string; description?: strin
   );
 }
 
-// One formatter for every row; toLocaleTimeString with options builds a new one per call.
-const timeFormat = new Intl.DateTimeFormat("pl-PL", {
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-});
-const timeOnly = (value: string) => timeFormat.format(new Date(value));
+const timeOnly = (value: string) => formatDate(timeWithSeconds, value);
 
 /** Matches the server's in-memory LOG_BUFFER_LIMIT. */
 const LOG_LIMIT = 500;
