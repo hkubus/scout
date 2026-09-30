@@ -151,8 +151,16 @@ const SNAPSHOT_MAX_ATTEMPTS = 3;
 // In-flight request cap per marketplace, shared by watch scans, research
 // scans, manual searches and detail checks; queued requests wait FIFO.
 const MARKETPLACE_REQUEST_CONCURRENCY = 2;
-// Concurrent Chromium renders across all marketplaces (each can be its own browser process).
+// Concurrent Chromium renders across all marketplaces (each its own context;
+// a Browserless connection is its own browser process).
 const BROWSER_RENDER_CONCURRENCY = 2;
+/** A locally launched Chromium is shared across renders and closed this long after the last one. */
+const BROWSER_IDLE_CLOSE_MS = 20_000;
+/**
+ * Served for marketplace CDN images during renders: only page.content() is
+ * read, and a real (tiny) image keeps onerror handlers from rewriting src.
+ */
+const ONE_PIXEL_GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
 /**
  * The anonymous marketplace APIs (OLX offers, Vinted catalog, Lokalnie
  * additional-data) reject Scout's plain identifier UA; a modern Chrome UA plus
@@ -4474,21 +4482,77 @@ export class ScoutService {
     return response.text();
   }
 
+  // Locally launched Chromium, shared by renders (each still gets its own
+  // context) and closed BROWSER_IDLE_CLOSE_MS after the last render ends.
+  // Browserless connections stay per render: its TIMEOUT is a hard session
+  // limit, so a cached connection would be killed mid-render.
+  private sharedBrowser: Promise<Browser> | null = null;
+  private activeBrowserRenders = 0;
+  private browserIdleTimer: NodeJS.Timeout | null = null;
+
+  private launchLocalBrowser(executablePath: string): Promise<Browser> {
+    // Pass a minimal environment: the renderer parses third-party pages and
+    // must not inherit SCOUT_SECRET, API tokens, or provider keys.
+    const browserEnv = Object.fromEntries(['PATH', 'HOME', 'TZ', 'LANG', 'XDG_RUNTIME_DIR', 'FONTCONFIG_PATH'].flatMap((key) => (process.env[key] ? [[key, process.env[key] as string]] : [])));
+    return chromium.launch({ executablePath, headless: true, env: browserEnv, args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'] });
+  }
+
+  /** Callers must pair every call with releaseLocalBrowser, even when the launch fails. */
+  private acquireLocalBrowser(executablePath: string): Promise<Browser> {
+    this.activeBrowserRenders += 1;
+    if (this.browserIdleTimer) {
+      clearTimeout(this.browserIdleTimer);
+      this.browserIdleTimer = null;
+    }
+    if (!this.sharedBrowser) {
+      const pending = this.launchLocalBrowser(executablePath).then((browser) => {
+        // A crash or external kill drops the cache; the next render relaunches.
+        browser.on('disconnected', () => {
+          if (this.sharedBrowser === pending) this.sharedBrowser = null;
+        });
+        return browser;
+      });
+      pending.catch(() => {
+        if (this.sharedBrowser === pending) this.sharedBrowser = null;
+      });
+      this.sharedBrowser = pending;
+    }
+    return this.sharedBrowser;
+  }
+
+  private releaseLocalBrowser() {
+    this.activeBrowserRenders -= 1;
+    if (this.activeBrowserRenders > 0 || !this.sharedBrowser || this.browserIdleTimer) return;
+    this.browserIdleTimer = setTimeout(() => {
+      this.browserIdleTimer = null;
+      if (this.activeBrowserRenders === 0) void this.closeBrowser();
+    }, BROWSER_IDLE_CLOSE_MS);
+    this.browserIdleTimer.unref?.();
+  }
+
+  /** Close the shared local Chromium, if any (idle timeout and server shutdown). */
+  async closeBrowser() {
+    if (this.browserIdleTimer) {
+      clearTimeout(this.browserIdleTimer);
+      this.browserIdleTimer = null;
+    }
+    const pending = this.sharedBrowser;
+    this.sharedBrowser = null;
+    if (pending) await pending.then((browser) => browser.close()).catch(() => undefined);
+  }
+
   private async renderInBrowser(url: string, marketplace: Marketplace, storageState?: MarketplaceStorageState): Promise<string> {
     let browser: Browser | undefined;
     let context: BrowserContext | undefined;
-    let ownsBrowser = false;
+    let sharedLocal = false;
     try {
       if (process.env.SCOUT_BROWSER_WS) {
         browser = await chromium.connectOverCDP(process.env.SCOUT_BROWSER_WS, { timeout: 8_000 });
       } else {
         const executablePath = process.env.SCOUT_CHROMIUM_PATH ?? ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'].find(existsSync);
         if (!executablePath) throw new Error('Chromium is not available; configure SCOUT_BROWSER_WS');
-        // Pass a minimal environment: the renderer parses third-party pages and
-        // must not inherit SCOUT_SECRET, API tokens, or provider keys.
-        const browserEnv = Object.fromEntries(['PATH', 'HOME', 'TZ', 'LANG', 'XDG_RUNTIME_DIR', 'FONTCONFIG_PATH'].flatMap((key) => (process.env[key] ? [[key, process.env[key] as string]] : [])));
-        browser = await chromium.launch({ executablePath, headless: true, env: browserEnv, args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'] });
-        ownsBrowser = true;
+        sharedLocal = true;
+        browser = await this.acquireLocalBrowser(executablePath);
       }
       // Always isolate scans in their own context: reusing the shared default
       // context leaks cookies across marketplaces and concurrent scans.
@@ -4506,7 +4570,13 @@ export class ScoutService {
         try { hostname = new URL(route.request().url()).hostname; } catch { /* unparseable URLs are aborted */ }
         const bare = hostname.replace(/^\[|\]$/g, '');
         const reachable = bare && isSafeNetworkHost(bare) && (bare.includes('.') || bare.includes(':'));
-        return reachable ? route.continue() : route.abort('blockedbyclient');
+        if (!reachable) return route.abort('blockedbyclient');
+        // Only the HTML is read: marketplace CDN photos get a 1x1 GIF instead of
+        // a download. Other hosts' images (challenge platforms) still load.
+        if (route.request().resourceType() === 'image' && isMarketplaceImageUrl(route.request().url())) {
+          return route.fulfill({ status: 200, contentType: 'image/gif', body: ONE_PIXEL_GIF });
+        }
+        return route.continue();
       });
       await context.routeWebSocket(/.*/, (socket) => { socket.close(); });
       const page = await context.newPage();
@@ -4539,7 +4609,8 @@ export class ScoutService {
       try {
         if (context) await context.close();
       } finally {
-        if (browser) await browser.close().catch(() => undefined);
+        if (sharedLocal) this.releaseLocalBrowser();
+        else if (browser) await browser.close().catch(() => undefined);
       }
     }
   }

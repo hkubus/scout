@@ -3671,3 +3671,95 @@ test('a stored town no longer filters watch scans and the API reports no locatio
     assert.equal(context.service.getWatches().find((watch) => watch.id === 'town-watch')?.location, 'Polska');
   } finally { context.close(); }
 });
+
+test('shares one locally launched Chromium across renders with a context each, and closes it when idle', async (t) => {
+  const previousPath = process.env.SCOUT_CHROMIUM_PATH;
+  const previousWs = process.env.SCOUT_BROWSER_WS;
+  process.env.SCOUT_CHROMIUM_PATH = '/nonexistent/chromium';
+  delete process.env.SCOUT_BROWSER_WS;
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const context = fixture();
+  const service = context.service as any;
+  const log = { launches: 0, contexts: 0, contextsClosed: 0, browsersClosed: 0 };
+  const routes: Array<(route: any) => unknown> = [];
+  const browsers: Array<{ disconnect: () => void }> = [];
+  let failLaunch = false;
+  service.launchLocalBrowser = async () => {
+    log.launches += 1;
+    if (failLaunch) throw new Error('launch failed');
+    const listeners: Array<() => void> = [];
+    const browser = {
+      on: (event: string, listener: () => void) => { if (event === 'disconnected') listeners.push(listener); },
+      close: async () => { log.browsersClosed += 1; },
+      newContext: async () => {
+        log.contexts += 1;
+        let target = '';
+        return {
+          route: async (_pattern: string, handler: (route: any) => unknown) => { routes.push(handler); },
+          routeWebSocket: async () => {},
+          close: async () => { log.contextsClosed += 1; },
+          newPage: async () => ({
+            goto: async (url: string) => { target = url; await new Promise<void>((resolve) => setImmediate(resolve)); return { status: () => 200, ok: () => true }; },
+            waitForTimeout: async () => {},
+            url: () => target,
+            content: async () => `<html>${target}</html>`,
+            close: async () => {},
+          }),
+        };
+      },
+    };
+    browsers.push({ disconnect: () => listeners.forEach((listener) => listener()) });
+    return browser;
+  };
+  const render = (id: string) => service.renderInBrowser(`https://www.olx.pl/d/oferta/${id}`, 'OLX') as Promise<string>;
+  try {
+    // Two concurrent renders: one launch, two isolated contexts.
+    assert.deepEqual(await Promise.all([render('a'), render('b')]), ['<html>https://www.olx.pl/d/oferta/a</html>', '<html>https://www.olx.pl/d/oferta/b</html>']);
+    assert.deepEqual(log, { launches: 1, contexts: 2, contextsClosed: 2, browsersClosed: 0 });
+    t.mock.timers.tick(19_000);
+    await render('c');
+    t.mock.timers.tick(19_000);
+    assert.deepEqual(log, { launches: 1, contexts: 3, contextsClosed: 3, browsersClosed: 0 });
+    // 20 s after the last render the browser closes; the next render relaunches.
+    t.mock.timers.tick(1_000);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(log.browsersClosed, 1);
+    await render('d');
+    assert.equal(log.launches, 2);
+    // A disconnected browser is dropped and relaunched.
+    browsers.at(-1)!.disconnect();
+    await render('e');
+    assert.equal(log.launches, 3);
+    // A failed launch is not cached.
+    await service.closeBrowser();
+    failLaunch = true;
+    await assert.rejects(render('f'), /launch failed/);
+    failLaunch = false;
+    await render('g');
+    assert.equal(log.launches, 5);
+    assert.equal(service.activeBrowserRenders, 0);
+
+    // Marketplace CDN images get a 1x1 GIF; everything else keeps the host guard.
+    const outcomes: string[] = [];
+    const route = (url: string, resourceType: string) => ({
+      request: () => ({ url: () => url, resourceType: () => resourceType }),
+      fulfill: async (response: { status: number; contentType: string; body: Buffer }) => { outcomes.push(`fulfill ${response.contentType} ${response.body.length}`); },
+      continue: async () => { outcomes.push('continue'); },
+      abort: async () => { outcomes.push('abort'); },
+    });
+    const handler = routes.at(-1)!;
+    await handler(route('https://ireland.apollo.olxcdn.com/v1/files/x-PL/image;s=1000x750', 'image'));
+    await handler(route('https://ireland.apollo.olxcdn.com/v1/files/app.js', 'script'));
+    await handler(route('https://challenges.cloudflare.com/cdn-cgi/challenge.png', 'image'));
+    await handler(route('http://localhost:3000/x.png', 'image'));
+    assert.deepEqual(outcomes, ['fulfill image/gif 42', 'continue', 'continue', 'abort']);
+
+    await service.closeBrowser();
+    assert.equal(log.browsersClosed, 3);
+  } finally {
+    await service.closeBrowser();
+    if (previousPath === undefined) delete process.env.SCOUT_CHROMIUM_PATH; else process.env.SCOUT_CHROMIUM_PATH = previousPath;
+    if (previousWs !== undefined) process.env.SCOUT_BROWSER_WS = previousWs;
+    context.close();
+  }
+});

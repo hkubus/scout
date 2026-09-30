@@ -944,7 +944,7 @@ const diagnosticsInterval = setInterval(() => {
   service.logDiagnostic(formatMemoryLine());
 }, 30 * 60_000);
 
-app.addHook('onClose', async () => { debug?.close(); clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); clearInterval(sessionPurge); for (const client of clients) client.end(); try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ } db.close(); });
+app.addHook('onClose', async () => { await service.closeBrowser(); debug?.close(); clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); clearInterval(sessionPurge); for (const client of clients) client.end(); try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ } db.close(); });
 let shuttingDown = false;
 const shutdown = async (signal: string) => {
   if (shuttingDown) return;
