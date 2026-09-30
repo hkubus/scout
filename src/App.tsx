@@ -226,7 +226,6 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
   const [marketRefreshKey, setMarketRefreshKey] = useState(0);
   const [analyticsRefreshKey, setAnalyticsRefreshKey] = useState(0);
   const [listingsRefreshKey, setListingsRefreshKey] = useState(0);
-  const [logsRefreshKey, setLogsRefreshKey] = useState(0);
   const [selectedWatchId, setSelectedWatchId] = useState<string | null>(
     null,
   );
@@ -352,7 +351,6 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         .filter(([event]) => event !== "listing-action")
         .map(([event, resources]) => subscribe(event, () => markDirty(resources))),
       subscribe("listing-action", onListingAction),
-      subscribe("log", () => setLogsRefreshKey((value) => value + 1)),
     ];
     return () => {
       if (flushTimer.current !== null) window.clearTimeout(flushTimer.current);
@@ -717,7 +715,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         ) : null}
         {view === "logs" ? (
           <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading logs…</div>}>
-            <LazyLogsPage refreshKey={logsRefreshKey} onToast={notify} />
+            <LazyLogsPage onToast={notify} />
           </Suspense>
         ) : null}
         {view === "settings" ? (

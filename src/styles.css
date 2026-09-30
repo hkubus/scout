@@ -408,6 +408,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .log-head, .log-row { display: grid; grid-template-columns: 90px 90px 1fr; align-items: baseline; gap: 14px; padding: 0 14px; }
 .log-head { min-height: 35px; color: var(--muted); font-size: 11px; font-family: inherit; }
 .log-row { min-height: 38px; padding-top: 8px; padding-bottom: 8px; border-top: 1px solid var(--line); font-size: 12px; line-height: 1.5; }
+.log-row { content-visibility: auto; contain-intrinsic-size: auto 38px; }
 .log-time { color: var(--muted); white-space: nowrap; }
 .log-scope { text-transform: uppercase; font-size: 10px; font-weight: 700; letter-spacing: 0.6px; color: var(--muted); }
 .log-scope--watch { color: #159b96; }

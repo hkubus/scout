@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { Download, LoaderCircle, RefreshCw, ScrollText } from "lucide-react";
 import { api } from "./api";
+import { subscribe, subscribeStatus } from "./events";
 import type { LogEntry } from "./types";
 
 const errorMessage = (error: unknown) =>
@@ -20,34 +21,73 @@ function PageHeader({ title, description }: { title: string; description?: strin
   );
 }
 
-const timeOnly = (value: string) =>
-  new Date(value).toLocaleTimeString("pl-PL", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
+// One formatter for every row; toLocaleTimeString with options builds a new one per call.
+const timeFormat = new Intl.DateTimeFormat("pl-PL", {
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+});
+const timeOnly = (value: string) => timeFormat.format(new Date(value));
 
-export default function LogsPage({ refreshKey, onToast }: { refreshKey: number; onToast: (message: string, type?: "success" | "error" | "info") => void }) {
+/** Matches the server's in-memory LOG_BUFFER_LIMIT. */
+const LOG_LIMIT = 500;
+
+const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
+  return (
+    <div className={`log-row ${log.level === "error" ? "log-row--error" : ""}`}>
+      <span className="log-time" title={log.at}>
+        {timeOnly(log.at)}
+      </span>
+      <span className={`log-scope log-scope--${log.scope}`}>
+        {log.scope}
+      </span>
+      <span className="log-message">{log.message}</span>
+    </div>
+  );
+});
+
+export default function LogsPage({ onToast }: { onToast: (message: string, type?: "success" | "error" | "info") => void }) {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [level, setLevel] = useState<LevelFilter>("all");
   const [scope, setScope] = useState<ScopeFilter>("all");
 
-  const loadLogs = async () => {
-    setLoading(true);
+  // The spinner replaces the list only on the first load and on Refresh;
+  // reconnect refetches keep the rows (and the scroll position) in place.
+  const loadLogs = useCallback(async (showLoader: boolean) => {
+    if (showLoader) setLoading(true);
     try {
       const result = await api.logs();
       setLogs(result.logs);
     } catch (error) {
       onToast(errorMessage(error), "error");
     } finally {
-      setLoading(false);
+      if (showLoader) setLoading(false);
     }
-  };
+  }, [onToast]);
 
   useEffect(() => {
-    void loadLogs();
-  }, [refreshKey]);
+    void loadLogs(true);
+  }, [loadLogs]);
+
+  // Each 'log' event carries the whole entry, so new lines are prepended
+  // (newest first, like GET /api/logs) instead of refetching the buffer.
+  // A stream that reconnects may have missed lines, or the server restarted
+  // and its ids started over, so it reconciles with one refetch.
+  useEffect(() => {
+    const unsubscribeLog = subscribe("log", (payload) => {
+      const entry = payload as LogEntry;
+      if (!entry || typeof entry.id !== "number") return;
+      setLogs((current) => current.some((log) => log.id === entry.id) ? current : [entry, ...current].slice(0, LOG_LIMIT));
+    });
+    const unsubscribeStatus = subscribeStatus((_status, reconnected) => {
+      if (reconnected) void loadLogs(false);
+    });
+    return () => {
+      unsubscribeLog();
+      unsubscribeStatus();
+    };
+  }, [loadLogs]);
 
   const filtered = useMemo(
     () =>
@@ -108,7 +148,7 @@ export default function LogsPage({ refreshKey, onToast }: { refreshKey: number; 
           <button
             className="icon-button"
             aria-label="Refresh logs"
-            onClick={() => void loadLogs()}
+            onClick={() => void loadLogs(true)}
           >
             <RefreshCw size={16} className={loading ? "spin" : ""} />
           </button>
@@ -134,20 +174,7 @@ export default function LogsPage({ refreshKey, onToast }: { refreshKey: number; 
             Loading logs…
           </div>
         ) : filtered.length ? (
-          filtered.map((log) => (
-            <div
-              className={`log-row ${log.level === "error" ? "log-row--error" : ""}`}
-              key={log.id}
-            >
-              <span className="log-time" title={log.at}>
-                {timeOnly(log.at)}
-              </span>
-              <span className={`log-scope log-scope--${log.scope}`}>
-                {log.scope}
-              </span>
-              <span className="log-message">{log.message}</span>
-            </div>
-          ))
+          filtered.map((log) => <LogRow key={log.id} log={log} />)
         ) : (
           <div className="panel-empty panel-empty--large">
             <ScrollText size={22} />
