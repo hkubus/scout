@@ -2,7 +2,7 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:
 import { existsSync } from 'node:fs';
 import { connect as connectHttp2, type SecureClientSessionOptions } from 'node:http2';
 import { brotliDecompressSync, gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
-import { chromium, type Browser, type BrowserContext } from 'playwright-core';
+import type { Browser, BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult, olxDetailHint } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
@@ -151,6 +151,17 @@ const SNAPSHOT_MAX_ATTEMPTS = 3;
 // In-flight request cap per marketplace, shared by watch scans, research
 // scans, manual searches and detail checks; queued requests wait FIFO.
 const MARKETPLACE_REQUEST_CONCURRENCY = 2;
+// playwright-core costs ~80 MB RSS and ~200 ms to import, and most instances
+// never render: it loads on the first render once a browser is configured.
+let playwright: Promise<typeof import('playwright-core')> | undefined;
+function loadPlaywright() {
+  playwright ??= import('playwright-core').catch((error) => {
+    playwright = undefined;
+    throw error;
+  });
+  return playwright;
+}
+
 // Concurrent Chromium renders across all marketplaces (each its own context;
 // a Browserless connection is its own browser process).
 const BROWSER_RENDER_CONCURRENCY = 2;
@@ -4490,7 +4501,8 @@ export class ScoutService {
   private activeBrowserRenders = 0;
   private browserIdleTimer: NodeJS.Timeout | null = null;
 
-  private launchLocalBrowser(executablePath: string): Promise<Browser> {
+  private async launchLocalBrowser(executablePath: string): Promise<Browser> {
+    const { chromium } = await loadPlaywright();
     // Pass a minimal environment: the renderer parses third-party pages and
     // must not inherit SCOUT_SECRET, API tokens, or provider keys.
     const browserEnv = Object.fromEntries(['PATH', 'HOME', 'TZ', 'LANG', 'XDG_RUNTIME_DIR', 'FONTCONFIG_PATH'].flatMap((key) => (process.env[key] ? [[key, process.env[key] as string]] : [])));
@@ -4547,6 +4559,7 @@ export class ScoutService {
     let sharedLocal = false;
     try {
       if (process.env.SCOUT_BROWSER_WS) {
+        const { chromium } = await loadPlaywright();
         browser = await chromium.connectOverCDP(process.env.SCOUT_BROWSER_WS, { timeout: 8_000 });
       } else {
         const executablePath = process.env.SCOUT_CHROMIUM_PATH ?? ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'].find(existsSync);

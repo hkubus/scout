@@ -1,7 +1,6 @@
 import Fastify, { type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createReadStream, existsSync } from 'node:fs';
@@ -11,7 +10,6 @@ import { z } from 'zod';
 import { listings as seedListings, watches as seedWatches } from '../src/data';
 import type { Marketplace } from '../src/types';
 import { validateSearchUrl } from './marketplaces';
-import { createScoutMcpServer } from './mcp';
 import { debugApiEnabled, ScoutDebug } from './debug';
 import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
@@ -885,8 +883,21 @@ app.get('/events', async (request, reply) => {
 // servers keep every request independent: no session ids, no resumability,
 // any replica can serve any call. When auth is enabled, clients send an
 // `Authorization: Bearer` token from SCOUT_API_TOKENS.
+// The MCP SDK (~40 MB RSS) loads on the first /mcp request, not at startup.
+let mcpModules: Promise<[typeof import('./mcp'), typeof import('@modelcontextprotocol/sdk/server/streamableHttp.js')]> | undefined;
 app.post('/mcp', async (request, reply) => {
   reply.hijack();
+  let modules: Awaited<NonNullable<typeof mcpModules>>;
+  try {
+    modules = await (mcpModules ??= Promise.all([import('./mcp'), import('@modelcontextprotocol/sdk/server/streamableHttp.js')]));
+  } catch (error) {
+    mcpModules = undefined;
+    app.log.error(error);
+    reply.raw.writeHead(500, { 'content-type': 'application/json' });
+    reply.raw.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null }));
+    return;
+  }
+  const [{ createScoutMcpServer }, { StreamableHTTPServerTransport }] = modules;
   const mcpServer = createScoutMcpServer(service, debug);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   reply.raw.on('close', () => {
