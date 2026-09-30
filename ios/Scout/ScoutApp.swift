@@ -10,12 +10,10 @@ struct ScoutApp: App {
             RootView()
                 .environment(model)
                 .onOpenURL { model.open($0) }
-                .task { model.startLiveUpdates() }
-                .onChange(of: scenePhase) { _, phase in
+                .onChange(of: scenePhase, initial: true) { _, phase in
                     switch phase {
                     case .active:
-                        model.startLiveUpdates()
-                        model.refresh()
+                        model.resumeLiveUpdates()
                     case .background:
                         model.stopLiveUpdates()
                     default:

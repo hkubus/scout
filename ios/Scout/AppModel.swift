@@ -102,6 +102,7 @@ final class AppModel {
     @ObservationIgnored private var eventsTask: Task<Void, Never>?
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var pendingInvalidation = LiveInvalidation()
+    @ObservationIgnored private var fallbackRefresh: Task<Void, Never>?
     @ObservationIgnored private var listingActionCount = 0
     @ObservationIgnored private var pendingSearchProgress: [SearchProgressEvent] = []
     @ObservationIgnored private let defaults = UserDefaults.standard
@@ -305,9 +306,31 @@ final class AppModel {
         }
     }
 
+    /// On becoming active. A running stream, even one waiting to reconnect,
+    /// is kept, so brief inactive spells (Control Center, alerts) cost
+    /// nothing. A new stream's first event does the one catch-up refresh; if
+    /// it can't go live within 3 s, screens refresh over HTTP anyway.
+    func resumeLiveUpdates() {
+        if isDemo {
+            refresh()
+            return
+        }
+        guard eventsTask == nil, client != nil else { return }
+        startLiveUpdates()
+        fallbackRefresh?.cancel()
+        fallbackRefresh = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled, let self, self.connection != .live else { return }
+            self.fallbackRefresh = nil
+            self.refresh()
+        }
+    }
+
     func stopLiveUpdates() {
         eventsTask?.cancel()
         eventsTask = nil
+        fallbackRefresh?.cancel()
+        fallbackRefresh = nil
         if !isDemo { connection = .connecting }
     }
 
@@ -315,7 +338,14 @@ final class AppModel {
         if event.event == "ready" || event.event == "ping" {
             if connection != .live {
                 connection = .live
-                scheduleRefresh(.everything)
+                // Subscribed now, so one refresh catches up on anything missed
+                // while offline; it covers any pending one.
+                fallbackRefresh?.cancel()
+                fallbackRefresh = nil
+                refreshTask?.cancel()
+                refreshTask = nil
+                pendingInvalidation = LiveInvalidation()
+                refresh()
             }
         } else if event.event == "search" {
             if let progress = try? JSONDecoder().decode(SearchProgressEvent.self, from: Data(event.data.utf8)) {
