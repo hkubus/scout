@@ -15,7 +15,7 @@ import { createScoutMcpServer } from './mcp';
 import { debugApiEnabled, ScoutDebug } from './debug';
 import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
-import { bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
+import { apiTokenCredentialId, bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
 import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
 import { normalizeSourceIntervals, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
@@ -133,7 +133,7 @@ app.addHook('onSend', async (request, reply) => {
 
 const db = openDatabase();
 if (process.env.SCOUT_SEED_DEMO === 'true') seedDatabase(db, { watches: seedWatches, listings: seedListings });
-const sessions = new SessionStore(db, auth.credentialId);
+const sessions = new SessionStore(db, [auth.credentialId, ...auth.tokenCredentialIds]);
 if (auth.enabled) sessions.purgeExpired();
 
 // Health/readiness stay public for container probes (details only when
@@ -145,7 +145,7 @@ function resolveAuth(request: FastifyRequest): FastifyRequest['scoutAuth'] {
   const token = bearerToken(request.headers.authorization);
   if (token !== null) return matchesApiToken(auth, token) ? 'token' : 'none';
   const cookie = parseCookies(request.headers.cookie).get(SESSION_COOKIE);
-  return cookie && auth.passwordHash && sessions.validate(cookie) ? 'session' : 'none';
+  return cookie && sessions.validate(cookie) ? 'session' : 'none';
 }
 
 app.addHook('onRequest', async (request, reply) => {
@@ -240,9 +240,12 @@ app.get('/api/auth/session', async (request) => ({
   authEnabled: auth.enabled,
   authenticated: authenticated(request),
   passwordLogin: Boolean(auth.passwordHash),
+  tokenLogin: auth.tokenDigests.length > 0,
 }));
+// The browser can sign in with the password or with any configured API token;
+// either way it gets a cookie session bound to that credential.
 app.post('/api/auth/login', async (request, reply) => {
-  if (!auth.passwordHash) return reply.code(404).send({ error: 'Password login is not configured' });
+  if (!auth.passwordHash && auth.tokenDigests.length === 0) return reply.code(404).send({ error: 'Sign-in is not configured' });
   if (!sameOrigin(request)) return reply.code(403).send({ error: 'Cross-origin request rejected' });
   const perIp = loginLimiter.consume(`ip:${rateLimitKey(request.ip)}`, 10);
   if (!perIp.allowed) {
@@ -251,19 +254,25 @@ app.post('/api/auth/login', async (request, reply) => {
   }
   const parsed = z.object({ password: z.string().min(1).max(1024) }).strict().safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: 'A password is required' });
-  if (loginsInFlight >= MAX_CONCURRENT_LOGINS) {
-    reply.header('Retry-After', '1');
-    return reply.code(429).send({ error: 'Sign-in is busy. Try again in a moment.' });
+  let credentialId = apiTokenCredentialId(auth, parsed.data.password);
+  const method = credentialId ? 'token' : 'password';
+  if (!credentialId && auth.passwordHash) {
+    if (loginsInFlight >= MAX_CONCURRENT_LOGINS) {
+      reply.header('Retry-After', '1');
+      return reply.code(429).send({ error: 'Sign-in is busy. Try again in a moment.' });
+    }
+    loginsInFlight += 1;
+    try {
+      if (await verifyPassword(parsed.data.password, auth.passwordHash)) credentialId = auth.credentialId;
+    } finally { loginsInFlight -= 1; }
   }
-  loginsInFlight += 1;
-  let valid: boolean;
-  try { valid = await verifyPassword(parsed.data.password, auth.passwordHash); } finally { loginsInFlight -= 1; }
-  if (!valid) {
+  if (!credentialId) {
     request.log.warn({ ip: request.ip }, 'Failed sign-in attempt');
-    return reply.code(401).send({ error: 'Incorrect password' });
+    const expected = auth.passwordHash && auth.tokenDigests.length > 0 ? 'password or API token' : auth.passwordHash ? 'password' : 'API token';
+    return reply.code(401).send({ error: `Incorrect ${expected}` });
   }
-  const token = sessions.create({ ip: request.ip, userAgent: request.headers['user-agent'] });
-  request.log.info({ ip: request.ip }, 'Signed in');
+  const token = sessions.create({ ip: request.ip, userAgent: request.headers['user-agent'] }, credentialId);
+  request.log.info({ ip: request.ip, method }, 'Signed in');
   return reply.header('set-cookie', sessionCookie(token, isSecureRequest(request))).send({ ok: true });
 });
 app.post('/api/auth/logout', async (request, reply) => {

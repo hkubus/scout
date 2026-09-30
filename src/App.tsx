@@ -141,14 +141,14 @@ function App() {
     };
   }, []);
   if (auth === "checking") return null;
-  if (auth === "login") return <LoginScreen passwordLogin={session?.passwordLogin ?? true} />;
-  const logout = session?.authEnabled && session.passwordLogin
+  if (auth === "login") return <LoginScreen passwordLogin={session?.passwordLogin ?? true} tokenLogin={session?.tokenLogin ?? false} />;
+  const logout = session?.authEnabled && (session.passwordLogin || session.tokenLogin)
     ? () => { void api.logout().finally(() => window.location.reload()); }
     : null;
   return <ScoutApp onLogout={logout} />;
 }
 
-function LoginScreen({ passwordLogin }: { passwordLogin: boolean }) {
+function LoginScreen({ passwordLogin, tokenLogin }: { passwordLogin: boolean; tokenLogin: boolean }) {
   useTheme();
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -176,10 +176,10 @@ function LoginScreen({ passwordLogin }: { passwordLogin: boolean }) {
           </div>
           <span className="brand-name">Scout</span>
         </div>
-        {passwordLogin ? (
+        {passwordLogin || tokenLogin ? (
           <>
             <label className="field-label">
-              <span>Password</span>
+              <span>{passwordLogin && tokenLogin ? "Password or API token" : passwordLogin ? "Password" : "API token"}</span>
               <input
                 type="password"
                 autoComplete="current-password"
@@ -197,7 +197,7 @@ function LoginScreen({ passwordLogin }: { passwordLogin: boolean }) {
           </>
         ) : (
           <p className="login-error" role="alert">
-            Password sign-in is not configured. Set SCOUT_PASSWORD_HASH on the server, or use an API token.
+            Sign-in is not configured. Set SCOUT_PASSWORD_HASH or SCOUT_API_TOKENS on the server.
           </p>
         )}
       </form>

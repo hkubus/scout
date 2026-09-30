@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Fastify from 'fastify';
 import {
+  apiTokenCredentialId,
   bearerToken,
   hashPassword,
   isProtectedRoute,
@@ -31,6 +32,18 @@ test('hashes and verifies passwords, rejecting malformed hashes', async () => {
   assert.equal(await verifyPassword('correct horse battery', hash), true);
   assert.equal(await verifyPassword('wrong password', hash), false);
   assert.equal(await verifyPassword('correct horse battery', 'scrypt$1$1$1$x$y'), false);
+});
+
+test('the token script prints tokens the server accepts', async () => {
+  const output = execFileSync(process.execPath, ['scripts/generate-api-token.mjs', '2']).toString().trim();
+  const tokens = output.split(',');
+  assert.equal(tokens.length, 2);
+  assert.notEqual(tokens[0], tokens[1]);
+  const config = await loadAuthConfig({ SCOUT_API_TOKENS: output }, { publiclyBound: true });
+  for (const generated of tokens) {
+    assert.match(generated, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(matchesApiToken(config, generated), true);
+  }
 });
 
 test('the standalone hash script produces hashes the server accepts', async () => {
@@ -62,6 +75,28 @@ test('fingerprints credentials so password changes revoke sessions but restarts 
   assert.equal(first.credentialId, restarted.credentialId);
   assert.notEqual(first.credentialId, rotated.credentialId);
   assert.equal(await verifyPassword('first-password', first.passwordHash!), true);
+});
+
+test('token sign-in sessions are bound to their token', async () => {
+  const other = 'b'.repeat(32);
+  const secret = { SCOUT_SECRET: 's'.repeat(32) };
+  const both = await loadAuthConfig({ ...secret, SCOUT_API_TOKENS: `${token},${other}` }, { publiclyBound: true });
+  const credential = apiTokenCredentialId(both, token)!;
+  assert.ok(credential);
+  assert.notEqual(credential, apiTokenCredentialId(both, other));
+  assert.equal(apiTokenCredentialId(both, 'c'.repeat(40)), null);
+  assert.equal(apiTokenCredentialId(await loadAuthConfig({ ...secret, SCOUT_API_TOKENS: token }, { publiclyBound: true }), token), credential, 'stable across restarts');
+
+  const db = new DatabaseSync(':memory:');
+  db.exec(readFileSync('migrations/026_auth_sessions.sql', 'utf8'));
+  const session = new SessionStore(db, both.tokenCredentialIds).create({}, credential);
+  assert.throws(() => new SessionStore(db, both.tokenCredentialIds).create({}, 'unknown'), /Unknown session credential/);
+  const kept = await loadAuthConfig({ ...secret, SCOUT_API_TOKENS: token }, { publiclyBound: true });
+  assert.equal(new SessionStore(db, kept.tokenCredentialIds).validate(session), true, 'removing another token keeps it');
+  const removed = await loadAuthConfig({ ...secret, SCOUT_API_TOKENS: other }, { publiclyBound: true });
+  const store = new SessionStore(db, removed.tokenCredentialIds);
+  store.purgeExpired();
+  assert.equal(new SessionStore(db, kept.tokenCredentialIds).validate(session), false, 'removing its token revokes it');
 });
 
 test('matches bearer tokens and parses cookies', async () => {
@@ -109,27 +144,27 @@ test('validates SCOUT_TRUST_PROXY at startup', () => {
 test('session store enforces idle, absolute, and credential expiry', () => {
   const db = new DatabaseSync(':memory:');
   db.exec(readFileSync('migrations/026_auth_sessions.sql', 'utf8'));
-  const store = new SessionStore(db, 'cred-1');
+  const store = new SessionStore(db, ['cred-1']);
   const start = Date.UTC(2026, 0, 1);
 
-  const session = store.create({ ip: '203.0.113.1' }, start);
+  const session = store.create({ ip: '203.0.113.1' }, 'cred-1', start);
   assert.equal(store.validate(session, start + 1000), true);
   assert.equal(store.validate('not-a-token', start), false);
-  assert.equal(new SessionStore(db, 'cred-2').validate(session, start + 1000), false, 'rotated password revokes');
+  assert.equal(new SessionStore(db, ['cred-2']).validate(session, start + 1000), false, 'rotated password revokes');
 
-  const idle = store.create({}, start);
+  const idle = store.create({}, 'cred-1', start);
   assert.equal(store.validate(idle, start + SESSION_IDLE_MS + 1), false);
 
-  const active = store.create({}, start);
+  const active = store.create({}, 'cred-1', start);
   for (let at = start; at < start + SESSION_ABSOLUTE_MS; at += SESSION_IDLE_MS / 2) assert.equal(store.validate(active, at), true);
   assert.equal(store.validate(active, start + SESSION_ABSOLUTE_MS + 1), false);
 
-  const watched = store.create({}, start);
+  const watched = store.create({}, 'cred-1', start);
   assert.equal(store.isActive(watched, start + SESSION_IDLE_MS - 1), true);
   assert.equal(store.validate(watched, start + SESSION_IDLE_MS + 1), false, 'isActive() never extends the idle window');
   assert.equal(store.isActive(active, start + SESSION_ABSOLUTE_MS + 1), false);
 
-  const revoked = store.create({}, start);
+  const revoked = store.create({}, 'cred-1', start);
   store.revoke(revoked);
   assert.equal(store.validate(revoked, start), false);
 
@@ -167,7 +202,7 @@ test('restoring a backup drops its sign-in sessions', () => {
     const backup = new DatabaseSync(backupPath);
     backup.exec('CREATE TABLE migrations (id TEXT); CREATE TABLE settings (key TEXT); CREATE TABLE watches (id TEXT);');
     backup.exec(readFileSync('migrations/026_auth_sessions.sql', 'utf8'));
-    new SessionStore(backup, 'cred').create({});
+    new SessionStore(backup, ['cred']).create({}, 'cred');
     backup.close();
     const databasePath = join(dir, 'scout.sqlite');
     execFileSync(process.execPath, ['--import', 'tsx', 'scripts/restore.ts', '--backup', backupPath, '--database', databasePath, '--confirm'], { stdio: 'pipe' });
