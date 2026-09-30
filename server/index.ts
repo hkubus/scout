@@ -11,7 +11,7 @@ import { listings as seedListings, watches as seedWatches } from '../src/data';
 import type { Marketplace } from '../src/types';
 import { validateSearchUrl } from './marketplaces';
 import { debugApiEnabled, ScoutDebug } from './debug';
-import { backupDatabase, openDatabase, seedDatabase } from './db';
+import { backupDatabase, openDatabase, seedDatabase, startWalCheckpointer } from './db';
 import { buildDiscordEmbed } from './notifications';
 import { compressApiResponse } from './compression';
 import { apiTokenCredentialId, bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
@@ -134,6 +134,8 @@ app.addHook('onSend', async (request, reply) => {
 });
 
 const db = openDatabase();
+// WAL checkpoints run on a worker thread instead of inside scan commits.
+const checkpointer = startWalCheckpointer(db, { onError: (message) => app.log.warn(message) });
 if (process.env.SCOUT_SEED_DEMO === 'true') seedDatabase(db, { watches: seedWatches, listings: seedListings });
 const sessions = new SessionStore(db, [auth.credentialId, ...auth.tokenCredentialIds]);
 if (auth.enabled) sessions.purgeExpired();
@@ -972,7 +974,7 @@ const diagnosticsInterval = setInterval(() => {
   service.logDiagnostic(formatMemoryLine());
 }, 30 * 60_000);
 
-app.addHook('onClose', async () => { await service.closeBrowser(); debug?.close(); clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); clearInterval(sessionPurge); for (const client of clients) client.end(); try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ } db.close(); });
+app.addHook('onClose', async () => { await service.closeBrowser(); debug?.close(); clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); clearInterval(sessionPurge); for (const client of clients) client.end(); await checkpointer?.stop(); try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ } db.close(); });
 let shuttingDown = false;
 const shutdown = async (signal: string) => {
   if (shuttingDown) return;

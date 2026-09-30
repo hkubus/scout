@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
+import { Worker } from 'node:worker_threads';
 
 function prunePreMigrationBackups(absolutePath: string, keep = 5) {
   try {
@@ -155,6 +156,89 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
     db.prepare("UPDATE scans SET status = 'interrupted', completed_at = ?, error = COALESCE(error, 'Process restarted before scan completed') WHERE status IN ('running', 'interrupted') AND status = 'running'").run(new Date().toISOString());
   }
   return db;
+}
+
+// Runs in a worker thread with its own connection. PASSIVE never waits on or
+// blocks the main connection's readers and writers, and is a cheap no-op when
+// every WAL frame is already backfilled. Plain CommonJS so it needs no build.
+const CHECKPOINT_WORKER = `
+const { parentPort, workerData } = require('node:worker_threads');
+const { DatabaseSync } = require('node:sqlite');
+const db = new DatabaseSync(workerData.path);
+db.exec('PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;');
+const statement = db.prepare('PRAGMA wal_checkpoint(PASSIVE)');
+let timer;
+let lastLog = 0;
+let lastError = '';
+// The WAL only resets when a write starts with every frame backfilled. While
+// writes keep landing during checkpoints the log keeps growing, so chase it
+// with short retries until it resets instead of leaving the main thread's
+// safety-net checkpoint to fire.
+const checkpoint = () => {
+  clearTimeout(timer);
+  let delay = workerData.intervalMs;
+  try {
+    const result = statement.get();
+    if (result.log >= 1000 && result.log !== lastLog) delay = Math.min(delay, 100);
+    lastLog = result.log;
+    lastError = '';
+  } catch (error) {
+    // Report each distinct failure once rather than every interval.
+    const message = String((error && error.message) || error);
+    if (message !== lastError) parentPort.postMessage({ error: message });
+    lastError = message;
+  }
+  timer = setTimeout(checkpoint, delay);
+};
+timer = setTimeout(checkpoint, workerData.intervalMs);
+parentPort.on('message', (message) => {
+  if (message === 'checkpoint') checkpoint();
+  if (message === 'stop') { clearTimeout(timer); try { db.close(); } catch {} parentPort.close(); }
+});
+`;
+
+export type WalCheckpointer = { checkpoint(): void; stop(): Promise<void> };
+
+/**
+ * Move WAL checkpoints off the event loop. SQLite's default auto-checkpoint
+ * (1000 frames) runs inside whichever commit crosses the threshold, so every
+ * few scans one commit on the main thread paid the page write-back and fsyncs.
+ * A worker thread now checkpoints on a timer; the main connection keeps a
+ * high auto-checkpoint only as a safety net, and journal_size_limit trims a
+ * WAL inflated by a burst when it next resets. If the worker dies, the
+ * default auto-checkpoint is restored. Returns null for a non-WAL database.
+ */
+export function startWalCheckpointer(db: any, options: { intervalMs?: number; onError?: (message: string) => void } = {}): WalCheckpointer | null {
+  const journal = db.prepare('PRAGMA journal_mode').get() as { journal_mode?: string } | undefined;
+  const main = (db.prepare('PRAGMA database_list').all() as Array<{ name: string; file: string }>).find((row) => row.name === 'main');
+  if (journal?.journal_mode !== 'wal' || !main?.file) return null;
+  const worker = new Worker(CHECKPOINT_WORKER, { eval: true, workerData: { path: main.file, intervalMs: options.intervalMs ?? 2_000 } });
+  worker.unref();
+  let stopping = false;
+  let failed = false;
+  const exited = new Promise<void>((done) => worker.once('exit', () => done()));
+  const fallBack = (message: string) => {
+    if (failed) return;
+    failed = true;
+    options.onError?.(`${message}; restored inline WAL auto-checkpoints`);
+    try { db.exec('PRAGMA wal_autocheckpoint = 1000;'); } catch { /* the connection may already be closed */ }
+  };
+  worker.on('message', (message: { error?: string }) => { if (message?.error) options.onError?.(`WAL checkpoint failed: ${message.error}`); });
+  worker.on('error', (error) => fallBack(`WAL checkpointer failed: ${error.message}`));
+  worker.on('exit', (code) => { if (!stopping) fallBack(`WAL checkpointer exited with code ${code}`); });
+  db.exec('PRAGMA wal_autocheckpoint = 10000; PRAGMA journal_size_limit = 67108864;');
+  return {
+    checkpoint: () => { if (!stopping && !failed) worker.postMessage('checkpoint'); },
+    stop: async () => {
+      if (stopping) return;
+      stopping = true;
+      worker.postMessage('stop');
+      const timeout = setTimeout(() => { void worker.terminate(); }, 5_000);
+      await exited;
+      clearTimeout(timeout);
+      try { db.exec('PRAGMA wal_autocheckpoint = 1000;'); } catch { /* best-effort */ }
+    },
+  };
 }
 
 export function seedDatabase(db: any, seed: { watches: Array<any>; listings: Array<any> }) {
