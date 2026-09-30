@@ -103,7 +103,8 @@ export function WatchDialog({
   }, [onClose, submitting]);
   useEffect(() => {
     let active = true;
-    api.marketResearch({ pageSize: 100 }).then((result) => {
+    // Only the research watch list is used; it does not depend on the page size.
+    api.marketResearch({ pageSize: 1 }).then((result) => {
       if (active) setReferenceOptions(result.watches);
     }).catch(() => { /* the fallback-baseline select stays empty; core dialog works without it */ });
     return () => { active = false; };
