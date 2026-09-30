@@ -18,3 +18,23 @@ export class Limiter {
     }
   }
 }
+
+/**
+ * Map `items` through `fn` with at most `concurrency` calls in flight. Workers
+ * take items strictly in index order, each call's synchronous prefix runs
+ * before the next item is started, and results keep the input order. Unlike
+ * fixed batches, a slow item holds only its own slot.
+ */
+export async function mapPool<T, R>(items: readonly T[], concurrency: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await fn(items[index], index);
+    }
+  };
+  const width = Math.min(Math.max(1, Math.floor(concurrency) || 1), items.length);
+  await Promise.all(Array.from({ length: width }, worker));
+  return results;
+}

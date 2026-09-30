@@ -9,7 +9,7 @@ import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVa
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchVariantWithJev, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
 import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, verifyListingDescriptionWithVision, visionToVerification } from './vision';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
-import { Limiter } from './limiter';
+import { Limiter, mapPool } from './limiter';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, median, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
 import { normalizeFilterText } from './text';
@@ -1287,107 +1287,106 @@ export class ScoutService {
       persistRelevance(listing, inputHash, activeModel, true, 'unknown', reason);
     };
 
-    const classified: Array<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> = [];
-    // Jev relevance calls are network round trips and independent per listing:
-    // a wider pool overlaps more of them than the old fixed batch of four.
-    const relevanceConcurrency = jevCheckConcurrency();
-    for (let offset = 0; offset < listings.length; offset += relevanceConcurrency) {
-      const batch = await Promise.all(listings.slice(offset, offset + relevanceConcurrency).map(async (listing): Promise<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> => {
-        const context: ListingRelevanceContext = {
-          marketplace: listing.marketplace,
-          title: listing.title,
-          condition: listing.condition,
-          location: listing.location,
-          query: search.query,
-          includedTerms: search.includedTerms,
-          excludedTerms: search.excludedTerms,
-        };
-        const inputHash = listingRelevanceInputHash(context);
-        const legacyInputHash = legacyListingRelevanceInputHash(context);
-        let cached: CachedRelevance | undefined;
-        if (watchId) {
-          cached = this.stmt('SELECT input_hash, model, relevant, reason, error, relevance_status FROM listing_relevance WHERE watch_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, listing.marketplace, listing.listingId) as CachedRelevance | undefined;
-          const cachedStatus: 'relevant' | 'irrelevant' | 'unknown' = cached?.relevance_status === 'irrelevant' || cached?.relevance_status === 'unknown' || cached?.relevance_status === 'relevant'
-            ? cached.relevance_status
-            : cached?.error ? 'unknown' : cached?.relevant === 0 ? 'irrelevant' : 'relevant';
-          if ((cached?.input_hash === inputHash || cached?.input_hash === legacyInputHash) && cached.model === activeModel && cachedStatus !== 'unknown' && !cached.error) {
-            if (cached.input_hash === legacyInputHash) persistRelevance(listing, inputHash, activeModel, cachedStatus === 'relevant', cachedStatus, cached.reason ?? 'Reused cached relevance decision');
-            return { listing, status: cachedStatus };
-          }
-        } else {
-          const manual = this.readManualRelevance(inputHash, legacyInputHash, activeModel);
-          if (manual) return { listing, status: manual };
+    // Jev relevance calls are network round trips and independent per listing,
+    // so they run through a worker pool: a slow call holds only its own slot
+    // and cache hits never wait for one. Workers start listings in index
+    // order and everything before a listing's first await (cache reads, the
+    // gate, the budget count and the in-flight dedup) runs synchronously, so
+    // budgets and dedup match a sequential pass.
+    const classified = await mapPool(listings, jevCheckConcurrency(), async (listing): Promise<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> => {
+      const context: ListingRelevanceContext = {
+        marketplace: listing.marketplace,
+        title: listing.title,
+        condition: listing.condition,
+        location: listing.location,
+        query: search.query,
+        includedTerms: search.includedTerms,
+        excludedTerms: search.excludedTerms,
+      };
+      const inputHash = listingRelevanceInputHash(context);
+      const legacyInputHash = legacyListingRelevanceInputHash(context);
+      let cached: CachedRelevance | undefined;
+      if (watchId) {
+        cached = this.stmt('SELECT input_hash, model, relevant, reason, error, relevance_status FROM listing_relevance WHERE watch_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, listing.marketplace, listing.listingId) as CachedRelevance | undefined;
+        const cachedStatus: 'relevant' | 'irrelevant' | 'unknown' = cached?.relevance_status === 'irrelevant' || cached?.relevance_status === 'unknown' || cached?.relevance_status === 'relevant'
+          ? cached.relevance_status
+          : cached?.error ? 'unknown' : cached?.relevant === 0 ? 'irrelevant' : 'relevant';
+        if ((cached?.input_hash === inputHash || cached?.input_hash === legacyInputHash) && cached.model === activeModel && cachedStatus !== 'unknown' && !cached.error) {
+          if (cached.input_hash === legacyInputHash) persistRelevance(listing, inputHash, activeModel, cachedStatus === 'relevant', cachedStatus, cached.reason ?? 'Reused cached relevance decision');
+          return { listing, status: cachedStatus };
         }
+      } else {
+        const manual = this.readManualRelevance(inputHash, legacyInputHash, activeModel);
+        if (manual) return { listing, status: manual };
+      }
 
-        // Cross-listing reuse is keyed by input hash, which omits the per-listing
-        // URL/thumbnail live escalation uses — live mode relies on the
-        // per-listing watch cache above instead.
-        const reusable = !jevLive ? this.stmt(`SELECT relevant, reason, relevance_status FROM listing_relevance
-          WHERE input_hash = ? AND model = ? AND relevance_status IN ('relevant', 'irrelevant') AND error IS NULL
-          ORDER BY checked_at DESC LIMIT 1`).get(inputHash, activeModel) as { relevant?: number; reason?: string; relevance_status?: string } | undefined : undefined;
-        if (reusable) {
-          const status: 'relevant' | 'irrelevant' = reusable.relevance_status === 'irrelevant' || reusable.relevant === 0 ? 'irrelevant' : 'relevant';
-          persistRelevance(listing, inputHash, activeModel, status === 'relevant', status, reusable.reason ?? 'Reused cached relevance decision');
-          return { listing, status };
-        }
+      // Cross-listing reuse is keyed by input hash, which omits the per-listing
+      // URL/thumbnail live escalation uses — live mode relies on the
+      // per-listing watch cache above instead.
+      const reusable = !jevLive ? this.stmt(`SELECT relevant, reason, relevance_status FROM listing_relevance
+        WHERE input_hash = ? AND model = ? AND relevance_status IN ('relevant', 'irrelevant') AND error IS NULL
+        ORDER BY checked_at DESC LIMIT 1`).get(inputHash, activeModel) as { relevant?: number; reason?: string; relevance_status?: string } | undefined : undefined;
+      if (reusable) {
+        const status: 'relevant' | 'irrelevant' = reusable.relevance_status === 'irrelevant' || reusable.relevant === 0 ? 'irrelevant' : 'relevant';
+        persistRelevance(listing, inputHash, activeModel, status === 'relevant', status, reusable.reason ?? 'Reused cached relevance decision');
+        return { listing, status };
+      }
 
-        // Deal-strength gate: an uncached listing that is neither a notifiable
-        // deal nor a very strong display candidate is kept (unknown) without
-        // spending an AI call. This is the main lever on Jev/DeepSeek spend —
-        // the check runs after cache reuse so cached decisions still apply.
-        if (gate && !gate(listing)) {
-          skipped += 1;
-          persistNotJudged(listing, inputHash, cached, 'AI relevance skipped: deal below the Very strong threshold');
-          return { listing, status: 'unknown' as const };
-        }
+      // Deal-strength gate: an uncached listing that is neither a notifiable
+      // deal nor a very strong display candidate is kept (unknown) without
+      // spending an AI call. This is the main lever on Jev/DeepSeek spend —
+      // the check runs after cache reuse so cached decisions still apply.
+      if (gate && !gate(listing)) {
+        skipped += 1;
+        persistNotJudged(listing, inputHash, cached, 'AI relevance skipped: deal below the Very strong threshold');
+        return { listing, status: 'unknown' as const };
+      }
 
-        // Per-scan budget: uncached listings beyond the budget stay unknown
-        // instead of burning quota on every scan before the cache warms.
-        // Live dedupe is per listing (not per input hash): the escalation path
-        // uses each listing's own URL and thumbnail, which the hash omits.
-        const liveKey = `${inputHash}|${listing.url}|${listing.imageUrl ?? ''}`;
-        if (aiCalls >= AI_RELEVANCE_BUDGET_PER_SCAN && !pendingClassifications.has(inputHash) && !pendingLive.has(liveKey)) {
-          persistNotJudged(listing, inputHash, cached, 'AI relevance budget exhausted for this scan');
-          return { listing, status: 'unknown' as const };
-        }
-        if (jevLive) {
-          try {
-            let decision = pendingLive.get(liveKey);
-            if (!decision) {
-              aiCalls += 1;
-              decision = this.decideRelevanceLive(context, inputHash, jevLive);
-              pendingLive.set(liveKey, decision);
-            }
-            const live = await decision;
-            persistRelevance(listing, inputHash, jevLive.jevModel, live.relevant, live.status, live.reason, live.error ?? null);
-            return { listing, status: live.status };
-          } catch (error) {
-            const message = (error instanceof Error ? error.message : 'Jev could not classify listing relevance').slice(0, 500);
-            persistRelevance(listing, inputHash, jevLive.jevModel, true, 'unknown', 'Jev relevance check failed unexpectedly', message);
-            return { listing, status: 'unknown' };
-          }
-        }
+      // Per-scan budget: uncached listings beyond the budget stay unknown
+      // instead of burning quota on every scan before the cache warms.
+      // Live dedupe is per listing (not per input hash): the escalation path
+      // uses each listing's own URL and thumbnail, which the hash omits.
+      const liveKey = `${inputHash}|${listing.url}|${listing.imageUrl ?? ''}`;
+      if (aiCalls >= AI_RELEVANCE_BUDGET_PER_SCAN && !pendingClassifications.has(inputHash) && !pendingLive.has(liveKey)) {
+        persistNotJudged(listing, inputHash, cached, 'AI relevance budget exhausted for this scan');
+        return { listing, status: 'unknown' as const };
+      }
+      if (jevLive) {
         try {
-          let classification = pendingClassifications.get(inputHash);
-          if (!classification) {
+          let decision = pendingLive.get(liveKey);
+          if (!decision) {
             aiCalls += 1;
-            classification = this.classifyListingRelevance(context, { apiKey, model: config.model });
-            pendingClassifications.set(inputHash, classification);
+            decision = this.decideRelevanceLive(context, inputHash, jevLive);
+            pendingLive.set(liveKey, decision);
           }
-          const result = await classification;
-          if (jevShadow) this.shadowJevRelevance(context, inputHash, result.relevant, listing.imageUrl, jevShadow);
-          const status: 'relevant' | 'irrelevant' = result.relevant ? 'relevant' : 'irrelevant';
-          persistRelevance(listing, inputHash, activeModel, result.relevant, status, result.relevant ? 'AI classified listing as relevant' : 'AI classified listing as irrelevant');
-          return { listing, status };
+          const live = await decision;
+          persistRelevance(listing, inputHash, jevLive.jevModel, live.relevant, live.status, live.reason, live.error ?? null);
+          return { listing, status: live.status };
         } catch (error) {
-          const message = (error instanceof Error ? error.message : 'OpenRouter could not classify listing relevance').slice(0, 500);
-          persistRelevance(listing, inputHash, activeModel, true, 'unknown', 'AI relevance check failed', message);
-          if (jevShadow) this.shadowJevRelevance(context, inputHash, null, listing.imageUrl, jevShadow);
+          const message = (error instanceof Error ? error.message : 'Jev could not classify listing relevance').slice(0, 500);
+          persistRelevance(listing, inputHash, jevLive.jevModel, true, 'unknown', 'Jev relevance check failed unexpectedly', message);
           return { listing, status: 'unknown' };
         }
-      }));
-      classified.push(...batch);
-    }
+      }
+      try {
+        let classification = pendingClassifications.get(inputHash);
+        if (!classification) {
+          aiCalls += 1;
+          classification = this.classifyListingRelevance(context, { apiKey, model: config.model });
+          pendingClassifications.set(inputHash, classification);
+        }
+        const result = await classification;
+        if (jevShadow) this.shadowJevRelevance(context, inputHash, result.relevant, listing.imageUrl, jevShadow);
+        const status: 'relevant' | 'irrelevant' = result.relevant ? 'relevant' : 'irrelevant';
+        persistRelevance(listing, inputHash, activeModel, result.relevant, status, result.relevant ? 'AI classified listing as relevant' : 'AI classified listing as irrelevant');
+        return { listing, status };
+      } catch (error) {
+        const message = (error instanceof Error ? error.message : 'OpenRouter could not classify listing relevance').slice(0, 500);
+        persistRelevance(listing, inputHash, activeModel, true, 'unknown', 'AI relevance check failed', message);
+        if (jevShadow) this.shadowJevRelevance(context, inputHash, null, listing.imageUrl, jevShadow);
+        return { listing, status: 'unknown' };
+      }
+    });
     if (relevanceWrites.length || manualRelevanceWrites.length) {
       this.transaction(() => {
         for (const input of relevanceWrites) this.saveListingRelevance(input);
@@ -2436,24 +2435,46 @@ export class ScoutService {
       return score.qualifies || (dealStrength ?? 0) >= 4;
     });
     const candidates = listings.filter((listing) => resolver.get(listing).key === OTHER_VARIANT_KEY && couldBeDeal(listing)).slice(0, VARIANT_JEV_BUDGET);
-    for (const listing of candidates) {
+    // The calls are independent round trips, so they run through the same
+    // bounded pool as the fuzzy rescue. Candidates sharing an input hash are
+    // asked once: sequentially the repeat would have hit the cache the first
+    // one wrote. Assignments are applied in candidate order after the pool.
+    type VariantOutcome = { variantId: string | null; cached: boolean } | null;
+    const byHash = new Map<string, { context: Parameters<ScoutService['jevVariant']>[0]; outcome?: VariantOutcome }>();
+    const hashes = candidates.map((listing) => {
       const context = { query: String(row.query ?? ''), title: listing.title, condition: listing.condition, variants: groups };
       const inputHash = listingVariantInputHash(context);
+      if (!byHash.has(inputHash)) byHash.set(inputHash, { context });
+      return inputHash;
+    });
+    await mapPool([...byHash.entries()], jevCheckConcurrency(), async ([inputHash, task]) => {
       const cached = this.readFuzzyCache(inputHash, live.jevModel, 'variant');
       if (cached) {
-        if (cached.rescued && ids.has(cached.decision)) resolver.setJev(listing, cached.decision);
-        continue;
+        task.outcome = { variantId: cached.rescued && ids.has(cached.decision) ? cached.decision : null, cached: true };
+        return;
       }
       try {
-        const judgment = await this.jevVariant(context, { apiKey: live.apiKey, model: live.jevModel });
+        const judgment = await this.jevVariant(task.context, { apiKey: live.apiKey, model: live.jevModel });
         this.logJevLive('variant', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
         const variantId = judgment.decision === 'variant' && !judgment.unsure ? judgment.variantId : null;
         this.writeFuzzyCache(inputHash, live.jevModel, 'variant', judgment.variantId ?? judgment.decision, judgment.confidence, variantId !== null);
-        if (variantId) resolver.setJev(listing, variantId);
+        task.outcome = { variantId, cached: false };
       } catch (error) {
         this.logJevLive('variant', inputHash, live, { jevError: error instanceof Error ? error.message : String(error) });
+        task.outcome = null;
       }
-    }
+    });
+    const applied = new Set<string>();
+    candidates.forEach((listing, index) => {
+      const outcome = byHash.get(hashes[index])?.outcome;
+      if (!outcome) return;
+      // A repeat reads what the first answer cached, which only counts a
+      // known variant id.
+      const repeat = applied.has(hashes[index]);
+      applied.add(hashes[index]);
+      const variantId = repeat && !outcome.cached && outcome.variantId !== null && !ids.has(outcome.variantId) ? null : outcome.variantId;
+      if (variantId) resolver.setJev(listing, variantId);
+    });
   }
 
   /**

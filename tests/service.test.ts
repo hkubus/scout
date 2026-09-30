@@ -3256,6 +3256,77 @@ test('asks Jev to place Other listings that could be deals, before the relevance
   }
 });
 
+test('asks Jev variant questions through a bounded pool, once per distinct input, and applies picks in order', async () => {
+  const restore = liveJevEnv();
+  const asked: string[] = [];
+  let inFlight = 0;
+  let peak = 0;
+  const context = fixture({
+    classifyWatchVariantWithJev: async (ctx: any) => {
+      asked.push(ctx.title);
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      inFlight -= 1;
+      return { variantId: ctx.title.endsWith('v3') ? null : 'pro', decision: ctx.title.endsWith('v3') ? 'none' : 'variant', confidence: 0.9, unsure: false };
+    },
+    classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.95, unsure: false }),
+  });
+  try {
+    seedVariantWatch(context.db, context.service, 'pooled-variant-watch', 'iphone');
+    (context.service as any).processDealCandidates = async () => {};
+    // Ten candidates (the per-scan budget), two of them repeating the first
+    // title, so eight distinct questions.
+    const offers = Array.from({ length: 10 }, (_, index) => ({ id: `pooled-${index}`, title: `iPhone trzynastka Pro 128GB v${index >= 8 ? 0 : index}`, price: 1900 + index }));
+    (context.service as any).fetchOlxApi = olxListings(offers);
+    await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('pooled-variant-watch'));
+    assert.equal(asked.length, 8);
+    assert.equal(new Set(asked).size, 8);
+    assert.ok(peak > 1, 'calls overlap');
+    assert.ok(peak <= 6, `at most the Jev concurrency is in flight (peak ${peak})`);
+    const placed = (context.db.prepare(`SELECT l.listing_id, wl.variant_key, wl.variant_source FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id
+      WHERE l.listing_id LIKE 'pooled-%' ORDER BY l.listing_id`).all() as Array<Record<string, unknown>>).map((item) => ({ ...item }));
+    assert.deepEqual(placed, offers.map((offer, index) => index === 3
+      ? { listing_id: offer.id, variant_key: '__other__', variant_source: 'rule' }
+      : { listing_id: offer.id, variant_key: 'pro', variant_source: 'jev' }));
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('runs relevance checks through a bounded pool and keeps the input order and budget', async () => {
+  const restore = liveJevEnv();
+  let inFlight = 0;
+  let peak = 0;
+  const asked: string[] = [];
+  const context = fixture({
+    classifyListingRelevanceWithJev: async (ctx: any) => {
+      asked.push(ctx.title);
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      // The first listing is slow; the others must not wait for it.
+      await new Promise((resolve) => setTimeout(resolve, ctx.title.endsWith(' 0') ? 80 : 5));
+      inFlight -= 1;
+      return { relevant: !ctx.title.includes('case'), p: 0.95, unsure: false };
+    },
+  });
+  try {
+    seedWatch(context.db, 'pool-relevance-watch', { query: 'gpu' });
+    const now = new Date().toISOString();
+    const listings = Array.from({ length: 45 }, (_, index) => ({ marketplace: 'OLX' as const, listingId: `pool-${index}`, title: `${index % 5 === 2 ? 'GPU case' : 'RTX card'} ${index}`, price: 2000 + index, currency: 'PLN' as const, url: `https://www.olx.pl/d/oferta/pool-${index}`, observedAt: now }));
+    const result = await (context.service as any).filterListingsByAiRelevance(listings, { query: 'gpu', includedTerms: '', excludedTerms: '' }, 'pool-relevance-watch', true);
+    assert.ok(peak > 1 && peak <= 6, `peak ${peak}`);
+    // The per-scan budget of 40 goes to the first 40 listings in input order.
+    assert.deepEqual([...asked].sort(), listings.slice(0, 40).map((listing) => listing.title).sort());
+    assert.equal(result.unknown, 5);
+    assert.deepEqual(result.listings.map((listing: { listingId: string }) => listing.listingId), listings.filter((listing, index) => index >= 40 || !listing.title.includes('case')).map((listing) => listing.listingId));
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
 test('keeps unsure or failed Jev variant answers in Other, caching answers but retrying failures', async () => {
   const restore = liveJevEnv();
   let calls = 0;
