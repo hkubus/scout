@@ -1631,6 +1631,40 @@ test('association-driven watch baselines match the per-observation queries', () 
   } finally { context.close(); }
 });
 
+test('counts the typo-variant scan ordinal once per watch run and matches the kind-filtered count', async () => {
+  const context = fixture();
+  try {
+    const service = context.service as any;
+    seedWatch(context.db, 'typo-ordinal', { query: 'kindle', sources: '["OLX","Vinted"]' });
+    context.db.prepare('UPDATE watches SET typo_variants = 1 WHERE id = ?').run('typo-ordinal');
+    const insertScan = context.db.prepare("INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, 'OLX', 'completed', ?)");
+    for (let index = 0; index < 7; index += 1) insertScan.run('typo-ordinal', 'watch', new Date(Date.now() - index * 60_000).toISOString());
+    const legacyOrdinal = (id: string, kind: string) => Number((context.db.prepare('SELECT COUNT(*) AS count FROM scans WHERE watch_id = ? AND watch_kind = ?').get(id, kind) as { count: number }).count);
+    const originalOrdinal = service.scanOrdinal.bind(service);
+    const ordinals: number[] = [];
+    service.scanOrdinal = (id: string, kind: 'watch' | 'research') => {
+      const value = originalOrdinal(id, kind);
+      assert.equal(value, legacyOrdinal(id, kind));
+      ordinals.push(value);
+      return value;
+    };
+    const queries: Record<string, string[]> = {};
+    service.fetchSearchPages = async (source: string, query: string) => { (queries[source] ??= []).push(query); return []; };
+    await service.runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('typo-ordinal'), { forceAll: true });
+    // Both sources' scans exist before either asks, so one count serves both.
+    assert.deepEqual(ordinals, [9]);
+    assert.ok(queries.OLX.length > 1);
+    assert.deepEqual(queries.Vinted, queries.OLX);
+
+    // An id shared with a research watch falls back to the kind-filtered count.
+    const now = new Date().toISOString();
+    context.db.prepare('INSERT INTO market_watches (id, name, query, sources_json, interval_hours, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run('typo-ordinal', 'Twin', 'kindle', '["OLX"]', 24, 0, now, now, now);
+    for (let index = 0; index < 4; index += 1) context.db.prepare("INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES ('typo-ordinal', 'research', 'OLX', 'completed', ?)").run(now);
+    assert.equal(originalOrdinal('typo-ordinal', 'watch'), 9);
+    assert.equal(originalOrdinal('typo-ordinal', 'research'), 4);
+  } finally { context.close(); }
+});
+
 test('market research filters match terms, price, condition, and shipping, from any town', () => {
   const listings = [
     { marketplace: 'OLX' as const, listingId: 'match', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/match', condition: 'New', location: 'Warszawa', shippingAvailable: true, observedAt: new Date().toISOString() },

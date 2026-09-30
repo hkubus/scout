@@ -651,8 +651,20 @@ export class ScoutService {
    * attempts recorded for this watch (including the running one). Deterministic
    * per attempt, needs no extra state, and never depends on wall-clock time.
    */
+  /**
+   * How many scans this watch has run, which rotates the typo-variant batch.
+   * watch_kind is not in scans_watch_status, so the kind-filtered count reads
+   * every retained scan row; the covering count by watch_id alone is exact
+   * unless a watch of the other kind shares the id (ids are client-supplied
+   * on create), and then the filtered count is used.
+   */
   private scanOrdinal(watchId: string, watchKind: 'watch' | 'research') {
-    const row = this.stmt('SELECT COUNT(*) AS count FROM scans WHERE watch_id = ? AND watch_kind = ?').get(watchId, watchKind) as { count?: number };
+    const otherKind = watchKind === 'watch'
+      ? this.stmt('SELECT 1 AS found FROM market_watches WHERE id = ?').get(watchId)
+      : this.stmt('SELECT 1 AS found FROM watches WHERE id = ?').get(watchId);
+    const row = (otherKind
+      ? this.stmt('SELECT COUNT(*) AS count FROM scans WHERE watch_id = ? AND watch_kind = ?').get(watchId, watchKind)
+      : this.stmt('SELECT COUNT(*) AS count FROM scans WHERE watch_id = ?').get(watchId)) as { count?: number };
     return Number(row?.count ?? 0);
   }
 
@@ -3337,6 +3349,10 @@ export class ScoutService {
       const sources = parseJson<Marketplace[]>(row.sources_json, []);
       const version = this.ensureMarketWatchVersion(row);
       let latestBackoffUntil: string | null = null;
+      // Every source's createScan runs before the first await and the running
+      // set excludes a concurrent run, so all sources see the same ordinal.
+      let ordinal: number | undefined;
+      const scanOrdinal = () => ordinal ??= this.scanOrdinal(String(row.id), 'research');
       await Promise.all(sources.map(async (source) => {
         const paths: string[] = [];
         const onPath: ConnectorPathReporter = (path) => { if (!paths.includes(path)) paths.push(path); };
@@ -3357,7 +3373,7 @@ export class ScoutService {
           // Typo variants come from the immutable criteria version, like every
           // other research criterion, and append one page per variant query.
           const variantQueries = version.typo_variants
-            ? pickVariantBatch(typoVariants(String(version.query ?? row.query)), this.scanOrdinal(String(row.id), 'research'), TYPO_VARIANTS_PER_SCAN)
+            ? pickVariantBatch(typoVariants(String(version.query ?? row.query)), scanOrdinal(), TYPO_VARIANTS_PER_SCAN)
             : [];
           const variantFetches: string[] = [];
           for (const variantQuery of variantQueries) {
@@ -3960,6 +3976,11 @@ export class ScoutService {
       // Reference-series fallback is computed once per scan, like the baseline.
       const referenceMedian = row.reference_market_watch_id ? this.referenceBandMedian(String(row.reference_market_watch_id)) : null;
       const backoffBySource = new Map<string, string>();
+      // Every due source's createScan runs before the first await and the
+      // running set excludes a concurrent run, so all sources see the same
+      // ordinal; it is counted once, on first use.
+      let ordinal: number | undefined;
+      const scanOrdinal = () => ordinal ??= this.scanOrdinal(String(row.id), 'watch');
       if (!dueSources.length) {
         const pending = sources.map((source) => storedSourceNext[source]).filter((value): value is string => Boolean(value)).sort();
         if (pending.length) this.stmt('UPDATE watches SET next_scan_at = ?, updated_at = ? WHERE id = ?').run(pending[0], nowIso(), row.id);
@@ -3992,7 +4013,7 @@ export class ScoutService {
           // main page; exact-URL watches pin their own searches instead.
           const variantQueries = matchingExact.length || !row.typo_variants
             ? []
-            : pickVariantBatch(typoVariants(String(row.query)), this.scanOrdinal(String(row.id), 'watch'), TYPO_VARIANTS_PER_SCAN);
+            : pickVariantBatch(typoVariants(String(row.query)), scanOrdinal(), TYPO_VARIANTS_PER_SCAN);
           const variantFetches: string[] = [];
           for (const variantQuery of variantQueries) {
             variantFetches.push(`"${variantQuery}"`);
