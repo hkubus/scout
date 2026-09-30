@@ -1154,6 +1154,27 @@ test('single-watch stats equal the matching entry of the full watch list', () =>
   } finally { context.close(); }
 });
 
+test('listing detail price history matches the unsplit history query', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const legacy = context.db.prepare('SELECT price_pln, observed_at FROM observations WHERE listing_id = ? AND (? IS NULL OR watch_id = ?) ORDER BY observed_at DESC, id DESC LIMIT 120');
+    const expected = (listingId: number, watchId: string | null) => (legacy.all(listingId, watchId, watchId) as Array<{ price_pln: number; observed_at: string }>).reverse().map((point) => ({ price: Number(point.price_pln), observedAt: point.observed_at }));
+    const rows = context.db.prepare('SELECT l.id, l.marketplace, l.listing_id, wl.watch_id FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE l.id % 5 = 0').all() as Array<{ id: number; marketplace: string; listing_id: string; watch_id: string }>;
+    assert.ok(rows.length > 5);
+    for (const row of rows) {
+      const detail = context.service.listingDetail(`${row.marketplace}:${row.listing_id}`, row.watch_id);
+      assert.ok(detail.history.length > 0);
+      assert.deepEqual(detail.history, expected(row.id, row.watch_id));
+    }
+    // A listing without any association (e.g. a manual search result).
+    const now = new Date().toISOString();
+    context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run('OLX', 'unassociated', 'CPU', 100, 'https://example.test/unassociated', now, now);
+    const manual = context.db.prepare("SELECT id FROM listings WHERE listing_id = 'unassociated'").get() as { id: number };
+    assert.deepEqual(context.service.listingDetail('OLX:unassociated').history, expected(manual.id, null));
+  } finally { context.close(); }
+});
+
 test('market research filters match terms, price, condition, and shipping, from any town', () => {
   const listings = [
     { marketplace: 'OLX' as const, listingId: 'match', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/match', condition: 'New', location: 'Warszawa', shippingAvailable: true, observedAt: new Date().toISOString() },

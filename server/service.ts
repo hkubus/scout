@@ -2684,7 +2684,14 @@ export class ScoutService {
     // Only the associated watch's readiness and groups are needed.
     const watch = row.watch_id != null ? this.watchById(String(row.watch_id)) : undefined;
     const listing = this.listingFromRow(row, watch?.readiness === 100, watch?.variantGroups ?? []);
-    const history = (this.stmt('SELECT price_pln, observed_at FROM observations WHERE listing_id = ? AND (? IS NULL OR watch_id = ?) ORDER BY observed_at DESC, id DESC LIMIT 120').all(row.id, row.watch_id ?? watchId ?? null, row.watch_id ?? watchId ?? null) as Array<{ price_pln: number; observed_at: string }>).reverse().map((point): PriceHistoryPoint => ({ price: Number(point.price_pln), observedAt: point.observed_at }));
+    // Split instead of '(? IS NULL OR watch_id = ?)' so the watch-scoped read
+    // seeks observations_watch_listing. The unscoped form is exact because
+    // observations.watch_id is an enforced foreign key to watches.
+    const historyWatchId = row.watch_id ?? watchId ?? null;
+    const historyRows = historyWatchId !== null
+      ? this.stmt('SELECT price_pln, observed_at FROM observations WHERE watch_id = ? AND listing_id = ? ORDER BY observed_at DESC, id DESC LIMIT 120').all(historyWatchId, row.id)
+      : this.stmt('SELECT price_pln, observed_at FROM observations WHERE watch_id IN (SELECT id FROM watches) AND listing_id = ? ORDER BY observed_at DESC, id DESC LIMIT 120').all(row.id);
+    const history = (historyRows as Array<{ price_pln: number; observed_at: string }>).reverse().map((point): PriceHistoryPoint => ({ price: Number(point.price_pln), observedAt: point.observed_at }));
     const snapshotRow = this.stmt(`SELECT title, price_pln, condition, location, url, description, captured_at, verification_status
       FROM listing_detail_snapshots WHERE listing_id = ? ORDER BY captured_at DESC, id DESC LIMIT 1`).get(row.id) as Record<string, any> | undefined;
     const snapshotStatus = snapshotRow?.verification_status === 'pass'
