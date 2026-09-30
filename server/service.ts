@@ -1250,8 +1250,8 @@ export class ScoutService {
     let skipped = 0;
     const pendingClassifications = new Map<string, Promise<{ relevant: boolean }>>();
     const pendingLive = new Map<string, Promise<{ relevant: boolean; status: 'relevant' | 'irrelevant' | 'unknown'; reason: string; error?: string }>>();
-    // Relevance rows are collected while the batch awaits the AI calls and
-    // flushed in one transaction per batch: a per-row autocommit would mean a
+    // Relevance rows are collected while the AI calls are awaited and flushed
+    // in one transaction after the pass: a per-row autocommit would mean a
     // commit per listing, and the transaction must never span an await.
     const relevanceWrites: Array<Parameters<ScoutService['saveListingRelevance']>[0]> = [];
     // Manual searches have no watch row to key `listing_relevance` on, so their
@@ -1271,11 +1271,25 @@ export class ScoutService {
       // Unknown means "not judged" — caching it would suppress a later real check.
       else if (status !== 'unknown') manualRelevanceWrites.push({ inputHash, model, relevant, status, reason, error });
     };
+    type CachedRelevance = { input_hash?: string; model?: string; relevant?: number; reason?: string; error?: string | null; relevance_status?: string };
+    // Gate-skipped and budget-exhausted listings are re-marked 'unknown' on
+    // every scan. When the stored row already says exactly that, rewriting it
+    // would only move checked_at (read by nothing but the 180-day prune), so
+    // the write is skipped.
+    const persistNotJudged = (listing: NormalizedListing, inputHash: string, cached: CachedRelevance | undefined, reason: string) => {
+      if (cached
+        && cached.input_hash === inputHash
+        && cached.model === activeModel
+        && cached.relevance_status === 'unknown'
+        && Number(cached.relevant) === 1
+        && (cached.reason ?? '') === reason.slice(0, 240)
+        && (cached.error ?? null) === null) return;
+      persistRelevance(listing, inputHash, activeModel, true, 'unknown', reason);
+    };
 
     const classified: Array<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> = [];
     // Jev relevance calls are network round trips and independent per listing:
-    // a wider pool overlaps more of them than the old fixed batch of four,
-    // while the per-batch flush below still persists results incrementally.
+    // a wider pool overlaps more of them than the old fixed batch of four.
     const relevanceConcurrency = jevCheckConcurrency();
     for (let offset = 0; offset < listings.length; offset += relevanceConcurrency) {
       const batch = await Promise.all(listings.slice(offset, offset + relevanceConcurrency).map(async (listing): Promise<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> => {
@@ -1290,8 +1304,9 @@ export class ScoutService {
         };
         const inputHash = listingRelevanceInputHash(context);
         const legacyInputHash = legacyListingRelevanceInputHash(context);
+        let cached: CachedRelevance | undefined;
         if (watchId) {
-          const cached = this.stmt('SELECT input_hash, model, relevant, reason, error, relevance_status FROM listing_relevance WHERE watch_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, listing.marketplace, listing.listingId) as { input_hash?: string; model?: string; relevant?: number; reason?: string; error?: string | null; relevance_status?: string } | undefined;
+          cached = this.stmt('SELECT input_hash, model, relevant, reason, error, relevance_status FROM listing_relevance WHERE watch_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, listing.marketplace, listing.listingId) as CachedRelevance | undefined;
           const cachedStatus: 'relevant' | 'irrelevant' | 'unknown' = cached?.relevance_status === 'irrelevant' || cached?.relevance_status === 'unknown' || cached?.relevance_status === 'relevant'
             ? cached.relevance_status
             : cached?.error ? 'unknown' : cached?.relevant === 0 ? 'irrelevant' : 'relevant';
@@ -1322,7 +1337,7 @@ export class ScoutService {
         // the check runs after cache reuse so cached decisions still apply.
         if (gate && !gate(listing)) {
           skipped += 1;
-          persistRelevance(listing, inputHash, activeModel, true, 'unknown', 'AI relevance skipped: deal below the Very strong threshold');
+          persistNotJudged(listing, inputHash, cached, 'AI relevance skipped: deal below the Very strong threshold');
           return { listing, status: 'unknown' as const };
         }
 
@@ -1332,7 +1347,7 @@ export class ScoutService {
         // uses each listing's own URL and thumbnail, which the hash omits.
         const liveKey = `${inputHash}|${listing.url}|${listing.imageUrl ?? ''}`;
         if (aiCalls >= AI_RELEVANCE_BUDGET_PER_SCAN && !pendingClassifications.has(inputHash) && !pendingLive.has(liveKey)) {
-          persistRelevance(listing, inputHash, activeModel, true, 'unknown', 'AI relevance budget exhausted for this scan');
+          persistNotJudged(listing, inputHash, cached, 'AI relevance budget exhausted for this scan');
           return { listing, status: 'unknown' as const };
         }
         if (jevLive) {
@@ -1372,14 +1387,12 @@ export class ScoutService {
         }
       }));
       classified.push(...batch);
-      if (relevanceWrites.length || manualRelevanceWrites.length) {
-        const writes = relevanceWrites.splice(0, relevanceWrites.length);
-        const manualWrites = manualRelevanceWrites.splice(0, manualRelevanceWrites.length);
-        this.transaction(() => {
-          for (const input of writes) this.saveListingRelevance(input);
-          for (const input of manualWrites) this.saveManualRelevance(input);
-        });
-      }
+    }
+    if (relevanceWrites.length || manualRelevanceWrites.length) {
+      this.transaction(() => {
+        for (const input of relevanceWrites) this.saveListingRelevance(input);
+        for (const input of manualRelevanceWrites) this.saveManualRelevance(input);
+      });
     }
 
     return {
@@ -1631,22 +1644,37 @@ export class ScoutService {
       );
       return;
     }
+    const json = input.verification ? JSON.stringify(input.verification) : null;
+    const error = input.error?.slice(0, 500) ?? null;
+    if (error !== null) {
+      // Error and fallback rows always refresh their timestamp: the 6-hour
+      // retry window is measured from the latest failure.
+      this.stmt(`UPDATE listings SET
+        ai_description_verification_json = ?,
+        ai_description_verification_input_hash = ?,
+        ai_description_verification_model = ?,
+        ai_description_verification_at = ?,
+        ai_description_verification_status = ?,
+        ai_description_verification_error = ?
+        WHERE marketplace = ? AND listing_id = ?`).run(json, input.inputHash ?? null, input.model ?? null, nowIso(), input.status, error, input.marketplace, input.listingId);
+      return;
+    }
+    // A repeat of the stored verdict (a cache hit, or no key on every scan)
+    // changes nothing but the timestamp, so it is not rewritten.
     this.stmt(`UPDATE listings SET
       ai_description_verification_json = ?,
       ai_description_verification_input_hash = ?,
       ai_description_verification_model = ?,
       ai_description_verification_at = ?,
       ai_description_verification_status = ?,
-      ai_description_verification_error = ?
-      WHERE marketplace = ? AND listing_id = ?`).run(
-      input.verification ? JSON.stringify(input.verification) : null,
-      input.inputHash ?? null,
-      input.model ?? null,
-      nowIso(),
-      input.status,
-      input.error?.slice(0, 500) ?? null,
-      input.marketplace,
-      input.listingId,
+      ai_description_verification_error = NULL
+      WHERE marketplace = ? AND listing_id = ?
+        AND (ai_description_verification_json IS NOT ? OR ai_description_verification_input_hash IS NOT ?
+          OR ai_description_verification_model IS NOT ? OR ai_description_verification_status IS NOT ?
+          OR ai_description_verification_error IS NOT NULL)`).run(
+      json, input.inputHash ?? null, input.model ?? null, nowIso(), input.status,
+      input.marketplace, input.listingId,
+      json, input.inputHash ?? null, input.model ?? null, input.status,
     );
   }
 
@@ -1661,6 +1689,10 @@ export class ScoutService {
       url: candidate.listing.url,
       description,
     })).digest('hex');
+    // An already captured state keeps its row and status: the caller sets the
+    // final status, and only the fresh-AI path marks it pending while it waits.
+    const existing = this.stmt('SELECT id FROM listing_detail_snapshots WHERE listing_id = ? AND state_hash = ?').get(stored.id, stateHash) as { id?: number } | undefined;
+    if (existing?.id) return { id: Number(existing.id), stateHash };
     const capturedAt = nowIso();
     this.stmt(`INSERT INTO listing_detail_snapshots (
       listing_id, marketplace, external_listing_id, title, price_pln, url,
@@ -1685,7 +1717,7 @@ export class ScoutService {
 
   private updateListingDetailSnapshot(snapshotId: number | null, status: ListingDescriptionVerificationStatus, inputHash: string | null) {
     if (!snapshotId) return;
-    this.stmt('UPDATE listing_detail_snapshots SET verification_status = ?, verification_input_hash = ? WHERE id = ?').run(status, inputHash, snapshotId);
+    this.stmt('UPDATE listing_detail_snapshots SET verification_status = ?, verification_input_hash = ? WHERE id = ? AND (verification_status IS NOT ? OR verification_input_hash IS NOT ?)').run(status, inputHash, snapshotId, status, inputHash);
   }
 
   private async verifyHighPriorityDealOnce(candidate: DealNotificationCandidate, notifyContext?: ScanNotifyContext): Promise<boolean> {
@@ -1698,9 +1730,11 @@ export class ScoutService {
     const apiKey = jevLive ? jevLive.apiKey : config.apiKey;
     const activeModel = jevLive ? jevLive.jevModel : config.model;
     if (!apiKey) {
-      const snapshot = this.captureListingDetailSnapshot(candidate, null);
-      this.updateListingDetailSnapshot(snapshot?.id ?? null, 'not-configured', null);
-      this.saveDescriptionVerification({ marketplace, listingId, status: 'not-configured' });
+      this.transaction(() => {
+        const snapshot = this.captureListingDetailSnapshot(candidate, null);
+        this.updateListingDetailSnapshot(snapshot?.id ?? null, 'not-configured', null);
+        this.saveDescriptionVerification({ marketplace, listingId, status: 'not-configured' });
+      });
       return true;
     }
 
@@ -1721,9 +1755,11 @@ export class ScoutService {
       }
     } catch (error) {
       const message = (error instanceof Error ? error.message : 'Could not fetch the high-priority listing detail page').slice(0, 500);
-      const snapshot = this.captureListingDetailSnapshot(candidate, null);
-      this.updateListingDetailSnapshot(snapshot?.id ?? null, 'unknown', null);
-      this.saveDescriptionVerification({ marketplace, listingId, status: 'unknown', model: activeModel, error: message });
+      this.transaction(() => {
+        const snapshot = this.captureListingDetailSnapshot(candidate, null);
+        this.updateListingDetailSnapshot(snapshot?.id ?? null, 'unknown', null);
+        this.saveDescriptionVerification({ marketplace, listingId, status: 'unknown', model: activeModel, error: message });
+      });
       this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: 'unknown' });
       return false;
     }
@@ -1738,55 +1774,67 @@ export class ScoutService {
       excludedTerms: candidate.excludedTerms?.trim() ? candidate.excludedTerms : null,
     };
     const inputHash = listingDescriptionVerificationInputHash(context);
-    const snapshot = this.captureListingDetailSnapshot(candidate, description);
-    const row = this.stmt(`SELECT ai_description_verification_json, ai_description_verification_input_hash,
-      ai_description_verification_model, ai_description_verification_at, ai_description_verification_error,
-      ai_description_verification_status
-      FROM listings WHERE marketplace = ? AND listing_id = ?`).get(marketplace, listingId) as Record<string, any> | undefined;
-    const cached = parseStoredListingDescriptionVerification(row?.ai_description_verification_json);
-    if (cached && row?.ai_description_verification_input_hash === inputHash && row.ai_description_verification_model === activeModel) {
-      this.updateListingDetailSnapshot(snapshot?.id ?? null, cached.decision, inputHash);
-      this.saveDescriptionVerification({ marketplace, listingId, status: cached.decision, verification: cached, inputHash, model: activeModel });
-      return cached.decision === 'pass';
-    }
-    if (row?.ai_description_verification_error && row.ai_description_verification_input_hash === inputHash
-      && row.ai_description_verification_model === activeModel && row.ai_description_verification_at
-      && Date.now() - Date.parse(row.ai_description_verification_at) < 6 * 60 * 60_000) {
-      const status: ListingDescriptionVerificationStatus = row.ai_description_verification_status === 'fallback' ? 'fallback' : 'unknown';
-      this.updateListingDetailSnapshot(snapshot?.id ?? null, status, inputHash);
-      this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: activeModel, error: row.ai_description_verification_error });
-      return status === 'fallback';
-    }
+    // Everything up to the fresh AI call is synchronous, so the snapshot and
+    // any cached decision are written in one transaction.
+    type CachedOutcome = { done: true; allowed: boolean; emit: ListingDescriptionVerificationStatus | null } | { done: false; snapshotId: number | null };
+    const outcome = this.transaction((): CachedOutcome => {
+      const snapshot = this.captureListingDetailSnapshot(candidate, description);
+      const row = this.stmt(`SELECT ai_description_verification_json, ai_description_verification_input_hash,
+        ai_description_verification_model, ai_description_verification_at, ai_description_verification_error,
+        ai_description_verification_status
+        FROM listings WHERE marketplace = ? AND listing_id = ?`).get(marketplace, listingId) as Record<string, any> | undefined;
+      const cached = parseStoredListingDescriptionVerification(row?.ai_description_verification_json);
+      if (cached && row?.ai_description_verification_input_hash === inputHash && row.ai_description_verification_model === activeModel) {
+        this.updateListingDetailSnapshot(snapshot?.id ?? null, cached.decision, inputHash);
+        this.saveDescriptionVerification({ marketplace, listingId, status: cached.decision, verification: cached, inputHash, model: activeModel });
+        return { done: true, allowed: cached.decision === 'pass', emit: null };
+      }
+      if (row?.ai_description_verification_error && row.ai_description_verification_input_hash === inputHash
+        && row.ai_description_verification_model === activeModel && row.ai_description_verification_at
+        && Date.now() - Date.parse(row.ai_description_verification_at) < 6 * 60 * 60_000) {
+        const status: ListingDescriptionVerificationStatus = row.ai_description_verification_status === 'fallback' ? 'fallback' : 'unknown';
+        this.updateListingDetailSnapshot(snapshot?.id ?? null, status, inputHash);
+        this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: activeModel, error: row.ai_description_verification_error });
+        return { done: true, allowed: status === 'fallback', emit: null };
+      }
 
-    if (!description) {
-      const unknown: ListingDescriptionVerification = {
-        decision: 'unknown',
-        confidence: 0,
-        summary: 'The detail page did not expose a listing description.',
-        issues: ['No listing description was available to verify.'],
-        evidence: [],
-      };
-      this.updateListingDetailSnapshot(snapshot?.id ?? null, unknown.decision, inputHash);
-      this.saveDescriptionVerification({ marketplace, listingId, status: unknown.decision, verification: unknown, inputHash, model: activeModel });
-      this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: unknown.decision });
-      return false;
-    }
+      if (!description) {
+        const unknown: ListingDescriptionVerification = {
+          decision: 'unknown',
+          confidence: 0,
+          summary: 'The detail page did not expose a listing description.',
+          issues: ['No listing description was available to verify.'],
+          evidence: [],
+        };
+        this.updateListingDetailSnapshot(snapshot?.id ?? null, unknown.decision, inputHash);
+        this.saveDescriptionVerification({ marketplace, listingId, status: unknown.decision, verification: unknown, inputHash, model: activeModel });
+        return { done: true, allowed: false, emit: unknown.decision };
+      }
 
-    // Cross-listing reuse is keyed by input hash, which omits the gallery
-    // photos live escalation uses — live mode relies on the per-listing cache
-    // above instead.
-    const reusable = !jevLive ? this.stmt(`SELECT ai_description_verification_json
-      FROM listings
-      WHERE ai_description_verification_input_hash = ?
-        AND ai_description_verification_model = ?
-        AND ai_description_verification_json IS NOT NULL
-      ORDER BY ai_description_verification_at DESC LIMIT 1`).get(inputHash, activeModel) as { ai_description_verification_json?: string } | undefined : undefined;
-    const shared = parseStoredListingDescriptionVerification(reusable?.ai_description_verification_json);
-    if (shared) {
-      this.updateListingDetailSnapshot(snapshot?.id ?? null, shared.decision, inputHash);
-      this.saveDescriptionVerification({ marketplace, listingId, status: shared.decision, verification: shared, inputHash, model: activeModel });
-      return shared.decision === 'pass';
+      // Cross-listing reuse is keyed by input hash, which omits the gallery
+      // photos live escalation uses — live mode relies on the per-listing cache
+      // above instead.
+      const reusable = !jevLive ? this.stmt(`SELECT ai_description_verification_json
+        FROM listings
+        WHERE ai_description_verification_input_hash = ?
+          AND ai_description_verification_model = ?
+          AND ai_description_verification_json IS NOT NULL
+        ORDER BY ai_description_verification_at DESC LIMIT 1`).get(inputHash, activeModel) as { ai_description_verification_json?: string } | undefined : undefined;
+      const shared = parseStoredListingDescriptionVerification(reusable?.ai_description_verification_json);
+      if (shared) {
+        this.updateListingDetailSnapshot(snapshot?.id ?? null, shared.decision, inputHash);
+        this.saveDescriptionVerification({ marketplace, listingId, status: shared.decision, verification: shared, inputHash, model: activeModel });
+        return { done: true, allowed: shared.decision === 'pass', emit: null };
+      }
+      // A fresh AI call follows: the snapshot shows pending while it runs.
+      if (snapshot?.id) this.stmt("UPDATE listing_detail_snapshots SET verification_status = 'pending' WHERE id = ? AND verification_status IS NOT 'pending'").run(snapshot.id);
+      return { done: false, snapshotId: snapshot?.id ?? null };
+    });
+    if (outcome.done) {
+      if (outcome.emit) this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: outcome.emit });
+      return outcome.allowed;
     }
+    const snapshot = outcome.snapshotId === null ? null : { id: outcome.snapshotId };
 
     // P2: same description upgrades unknown negotiability. Runs only on the
     // fresh-verification path — after every cache early-return above — so an

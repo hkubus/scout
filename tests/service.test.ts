@@ -859,6 +859,93 @@ test('fetches and verifies descriptions for very strong and exceptional deals be
   }
 });
 
+test('repeat verification of an unchanged deal rewrites no verification or snapshot rows', async () => {
+  let verificationRequests = 0;
+  const context = fixture({
+    classifyListingRelevance: async () => ({ relevant: true }),
+    verifyListingDescription: async () => {
+      verificationRequests += 1;
+      return { decision: 'reject', confidence: 0.98, summary: 'Broken.', issues: ['Broken screen.'], evidence: ['broken'] };
+    },
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(null, { status: 204 })) as typeof fetch;
+  try {
+    const baselineAt = new Date(Date.now() - 8 * 60 * 60_000).toISOString();
+    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' } });
+    seedWatch(context.db, 'idempotent-watch');
+    const insertListing = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+    const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    for (let index = 0; index < 30; index += 1) {
+      insertListing.run('OLX', `baseline-${index}`, `CPU reference ${index}`, 1000, `https://www.olx.pl/d/oferta/baseline-${index}`, baselineAt, baselineAt);
+      const listing = context.db.prepare('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get('OLX', `baseline-${index}`) as { id: number };
+      insertObservation.run(listing.id, 'idempotent-watch', 1000, baselineAt);
+    }
+    (context.service as any).fetchPublicPage = async () => '<div data-testid="description">Broken screen, sold for parts.</div>';
+    let price = 700;
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'repeat-deal', url: 'https://www.olx.pl/d/oferta/repeat-deal', title: 'CPU repeat deal', created_time: baselineAt, params: [{ key: 'price', value: { value: price, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 1 } } });
+    const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('idempotent-watch');
+    const state = () => ({ ...(context.db.prepare(`SELECT ai_description_verification_at AS at, ai_description_verification_status AS status, ai_description_verification_input_hash AS hash
+      FROM listings WHERE listing_id = 'repeat-deal'`).get() as Record<string, unknown>) });
+    const snapshots = () => (context.db.prepare('SELECT id, price_pln, verification_status, verification_input_hash FROM listing_detail_snapshots ORDER BY id').all() as Array<Record<string, unknown>>).map((item) => ({ ...item }));
+    const updates: string[] = [];
+    const service = context.service as any;
+    const originalStmt = service.stmt.bind(service);
+    service.stmt = (sql: string) => {
+      const statement = originalStmt(sql);
+      if (!/^\s*UPDATE (listings SET\s+ai_description|listing_detail_snapshots)/.test(sql)) return statement;
+      return { ...statement, run: (...params: unknown[]) => { const result = statement.run(...params); if (Number(result.changes)) updates.push(sql.trim().slice(0, 40)); return result; }, get: statement.get.bind(statement), all: statement.all.bind(statement) };
+    };
+
+    await service.runWatch(row);
+    assert.equal(verificationRequests, 1);
+    const first = state();
+    assert.equal(first.status, 'reject');
+    const firstSnapshots = snapshots();
+    assert.equal(firstSnapshots.length, 1);
+    assert.equal(firstSnapshots[0].verification_status, 'reject');
+
+    updates.length = 0;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await service.runWatch(row);
+    assert.equal(verificationRequests, 1);
+    assert.deepEqual(updates, [], 'a cached verdict for an unchanged state writes nothing');
+    assert.deepEqual(state(), first);
+    assert.deepEqual(snapshots(), firstSnapshots);
+
+    // A new price is a new snapshot state; the description (and so the
+    // verification input) is unchanged, so the cached verdict still applies.
+    price = 650;
+    await service.runWatch(row);
+    assert.equal(verificationRequests, 1);
+    const afterDrop = snapshots();
+    assert.equal(afterDrop.length, 2);
+    assert.equal(afterDrop[1].price_pln, 650);
+    assert.equal(afterDrop[1].verification_status, 'reject');
+    assert.equal(afterDrop[1].verification_input_hash, first.hash);
+    assert.deepEqual(afterDrop[0], firstSnapshots[0]);
+    assert.deepEqual(state(), first);
+
+    // Without an AI key every scan takes the not-configured path; only the
+    // first one changes the stored status.
+    context.service.saveSettings({ ai: { clearApiKey: true } });
+    assert.equal(service.deepSeekConfig().apiKey, null);
+    await service.runWatch(row);
+    const notConfigured = state();
+    assert.equal(notConfigured.status, 'not-configured');
+    updates.length = 0;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await service.runWatch(row);
+    assert.deepEqual(updates, []);
+    assert.deepEqual(state(), notConfigured);
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.close();
+  }
+});
+
 test('holds a high-priority alert when OpenRouter verification output is malformed', async () => {
   let verificationRequests = 0;
   const context = fixture({
@@ -1007,6 +1094,60 @@ test('filters and caches irrelevant listings per watch', async () => {
     assert.deepEqual(shared.listings.map((listing) => listing.listingId), ['gpu-card']);
     assert.equal(requests, 2);
     assert.equal((context.db.prepare('SELECT relevant FROM listing_relevance WHERE watch_id = ? AND listing_id = ?').get('second-relevance-watch', 'gpu-fan') as { relevant: number }).relevant, 0);
+  } finally { context.close(); }
+});
+
+test('does not rewrite unchanged gate-skipped relevance rows and flushes one transaction per pass', async () => {
+  let requests = 0;
+  const context = fixture({ classifyListingRelevance: async () => { requests += 1; return { relevant: true }; } });
+  try {
+    const now = new Date().toISOString();
+    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' } });
+    seedWatch(context.db, 'skip-watch', { query: 'gpu' });
+    const listings = Array.from({ length: 14 }, (_, index) => ({ marketplace: 'OLX' as const, listingId: `skip-${index}`, title: `RTX card ${index}`, price: 2000 + index, currency: 'PLN' as const, url: `https://www.olx.pl/d/oferta/skip-${index}`, observedAt: now }));
+    const service = context.service as any;
+    let transactions = 0;
+    const originalTransaction = service.transaction.bind(service);
+    service.transaction = (callback: () => unknown) => { transactions += 1; return originalTransaction(callback); };
+    const rows = () => (context.db.prepare("SELECT listing_id, input_hash, model, relevance_status, reason, checked_at FROM listing_relevance WHERE watch_id = 'skip-watch' ORDER BY listing_id").all() as Array<Record<string, unknown>>).map((row) => ({ ...row }));
+    const changes = () => Number((context.db.prepare('SELECT total_changes() AS n').get() as { n: number }).n);
+    const search = { query: 'gpu', includedTerms: '', excludedTerms: '' };
+    let strong = new Set<string>();
+    const gate = (listing: { listingId: string }) => strong.has(listing.listingId);
+
+    const first = await service.filterListingsByAiRelevance(listings, search, 'skip-watch', true, gate);
+    assert.equal(first.skipped, 14);
+    assert.equal(transactions, 1, 'all rows land in one transaction');
+    const written = rows();
+    assert.equal(written.length, 14);
+    assert.ok(written.every((row) => row.relevance_status === 'unknown'));
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    transactions = 0;
+    const before = changes();
+    const repeat = await service.filterListingsByAiRelevance(listings, search, 'skip-watch', true, gate);
+    assert.equal(repeat.skipped, 14);
+    assert.equal(changes(), before, 'identical unknown rows are not rewritten');
+    assert.equal(transactions, 0);
+    assert.deepEqual(rows(), written);
+
+    // A retitled listing has a new input hash and is rewritten; a listing
+    // that became strong gets its AI call.
+    const retitled = listings.map((listing, index) => index === 3 ? { ...listing, title: 'RTX card renamed' } : listing);
+    strong = new Set(['skip-5']);
+    await service.filterListingsByAiRelevance(retitled, search, 'skip-watch', true, gate);
+    assert.equal(requests, 1);
+    const after = rows();
+    const changed = after.filter((row, index) => JSON.stringify(row) !== JSON.stringify(written[index])).map((row) => row.listing_id);
+    assert.deepEqual(changed, ['skip-3', 'skip-5']);
+    assert.equal(after.find((row) => row.listing_id === 'skip-5')!.relevance_status, 'relevant');
+
+    // A model change rewrites every skipped row once.
+    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-pro' } } as any);
+    strong = new Set();
+    const beforeModel = changes();
+    await service.filterListingsByAiRelevance(retitled, search, 'skip-watch', true, gate);
+    assert.ok(changes() - beforeModel >= 13);
   } finally { context.close(); }
 });
 
