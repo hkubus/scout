@@ -8,7 +8,7 @@ import { parseMarketplaceStorageState } from '../server/marketplace-sessions';
 import { DeepSeekError } from '../server/ai';
 import { listingDescriptionVerificationInputHash, listingRelevanceInputHash } from '../server/ai';
 import { VisionError } from '../server/vision';
-import { ScoutService, ServiceError, decryptSecret, olxCategoryFromJson, olxCategoryToJson, encryptSecret, escapeDiscordMarkdown, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
+import { ScoutService, ServiceError, dashboardTopParam, decryptSecret, olxCategoryFromJson, olxCategoryToJson, encryptSecret, escapeDiscordMarkdown, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
 import { OTHER_VARIANT_KEY } from '../server/variants';
 
 // Pin the legacy DeepSeek path for pre-existing tests: live Jev is the
@@ -43,6 +43,57 @@ test('starts with truthful empty dashboard data and unconfigured notifications',
     assert.equal(context.service.dashboard().watches.length, 0);
     assert.equal(context.service.settings().webhookConfigured, false);
     assert.equal(context.service.notifications().length, 0);
+  } finally { context.close(); }
+});
+
+test('serves the widget dashboard form with the widget ordering and unchanged stats', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const fresh = new Date().toISOString();
+    // Mixed strengths, discounts (with ties and missing typicals), triage
+    // decisions, hidden rows and AI-filtered rows.
+    context.db.prepare(`UPDATE watch_listings SET last_seen_at = ?, deal_strength = (id % 6), deal_label = 'Deal',
+      typical_pln = CASE WHEN id % 4 = 0 THEN NULL ELSE 400 + (id % 3) * 50 END, typical_source = 'own-history'`).run(fresh);
+    context.db.prepare('UPDATE listings SET price_pln = 300 + (id % 5) * 25, last_seen_at = ?').run(fresh);
+    const actions = context.db.prepare('INSERT INTO listing_actions (marketplace, listing_id, decision, note, hidden, updated_at) VALUES (?, ?, ?, ?, ?, ?)');
+    const picks = context.db.prepare('SELECT marketplace, listing_id FROM listings ORDER BY id').all() as Array<{ marketplace: string; listing_id: string }>;
+    picks.forEach((listing, index) => {
+      if (index % 9 === 0) actions.run(listing.marketplace, listing.listing_id, 'pass', '', 0, fresh);
+      else if (index % 11 === 0) actions.run(listing.marketplace, listing.listing_id, null, '', 1, fresh);
+      else if (index % 13 === 0) actions.run(listing.marketplace, listing.listing_id, 'buy', '', 0, fresh);
+    });
+    const full = context.service.dashboard();
+    assert.ok(full.listings.length > 20);
+    assert.ok(full.listings.some((listing) => listing.aiFiltered));
+    assert.ok(full.listings.some((listing) => listing.decision === 'pass'));
+    // Missing or invalid values return the full dashboard unchanged.
+    for (const top of [undefined, 0, 51, 1.5, Number.NaN, -3]) assert.deepEqual(context.service.dashboard({ top }), full);
+    assert.deepEqual(context.service.dashboard({}), full);
+    // Reference: WidgetSnapshot.make (filter, then stable sort by strength
+    // desc, belowTypical asc, observedAt desc).
+    const expected = full.listings
+      .map((listing, index) => ({ listing, index }))
+      .filter(({ listing }) => listing.hidden !== true && listing.aiFiltered !== true && listing.decision !== 'pass')
+      .sort((a, b) => (b.listing.dealStrength - a.listing.dealStrength)
+        || ((a.listing.belowTypical ?? 0) - (b.listing.belowTypical ?? 0))
+        || (a.listing.observedAt < b.listing.observedAt ? 1 : a.listing.observedAt > b.listing.observedAt ? -1 : 0)
+        || (a.index - b.index))
+      .map(({ listing }) => listing);
+    for (const top of [1, 6, 12, 50]) {
+      const compact = context.service.dashboard({ top });
+      assert.deepEqual(Object.keys(compact), Object.keys(full));
+      assert.deepEqual(compact.listings, expected.slice(0, top));
+      assert.deepEqual(compact.stats, full.stats);
+      assert.equal(compact.lastScan, full.lastScan);
+      assert.equal(compact.lastScanTime, full.lastScanTime);
+      assert.deepEqual(compact.watches, []);
+      assert.deepEqual(compact.connectors, []);
+    }
+    assert.equal(dashboardTopParam('12'), 12);
+    assert.equal(dashboardTopParam('1'), 1);
+    assert.equal(dashboardTopParam('50'), 50);
+    for (const value of [undefined, '', '0', '51', '1.5', '-1', ' 6', '6a', '1e1', '100', ['6'], 6]) assert.equal(dashboardTopParam(value), undefined);
   } finally { context.close(); }
 });
 

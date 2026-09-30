@@ -515,6 +515,31 @@ function dealLabelFromStrength(strength: number): DealLabel {
   return strength >= 5 ? 'Exceptional' : strength === 4 ? 'Very strong' : strength === 3 ? 'Strong' : 'Watch';
 }
 
+/**
+ * The widget's deal order (WidgetSnapshot.make in the iOS ScoutKit): visible,
+ * untriaged-or-kept rows by deal strength, then the deepest discount, then
+ * the newest. Array.prototype.sort is stable, so ties keep feed order.
+ */
+/** Parses the `?top=` query value of GET /api/dashboard; anything but an integer from 1 to 50 means the full dashboard. */
+export function dashboardTopParam(value: unknown): number | undefined {
+  if (typeof value !== 'string' || !/^\d{1,2}$/.test(value)) return undefined;
+  const top = Number(value);
+  return top >= 1 && top <= 50 ? top : undefined;
+}
+
+export function widgetDeals(listings: Listing[], limit: number) {
+  return listings
+    .filter((listing) => listing.hidden !== true && listing.aiFiltered !== true && listing.decision !== 'pass')
+    .sort((left, right) => {
+      if (left.dealStrength !== right.dealStrength) return right.dealStrength - left.dealStrength;
+      const leftBelow = left.belowTypical ?? 0;
+      const rightBelow = right.belowTypical ?? 0;
+      if (leftBelow !== rightBelow) return leftBelow - rightBelow;
+      return left.observedAt === right.observedAt ? 0 : left.observedAt > right.observedAt ? -1 : 1;
+    })
+    .slice(0, limit);
+}
+
 export class ScoutService {
   private db: Database;
   private emit: (event: string, payload: unknown) => void;
@@ -3570,7 +3595,15 @@ export class ScoutService {
     });
   }
 
-  dashboard(): DashboardData {
+  /**
+   * `top` (an integer from 1 to 50) serves the home screen widget: every
+   * scalar is computed over the same 500-row feed, `listings` holds only the
+   * strongest `top` rows in WidgetSnapshot.make's order, and `watches` and
+   * `connectors` are empty (connector reads are skipped). Any other value
+   * returns the full dashboard.
+   */
+  dashboard(options: { top?: number } = {}): DashboardData {
+    const top = typeof options.top === 'number' && Number.isInteger(options.top) && options.top >= 1 && options.top <= 50 ? options.top : null;
     const watches = this.getWatches();
     const listings = this.getListings(watches, true);
     const today = new Date();
@@ -3585,9 +3618,9 @@ export class ScoutService {
     }
     const lastScan = parseJson<{ at?: string }>(this.getSetting('last_scan'), {});
     return {
-      watches,
-      listings,
-      connectors: this.getConnectors(),
+      watches: top === null ? watches : [],
+      listings: top === null ? listings : widgetDeals(listings, top),
+      connectors: top === null ? this.getConnectors() : [],
       stats: {
         watching: watches.reduce((count, watch) => count + (watch.enabled ? 1 : 0), 0),
         newToday,

@@ -17,7 +17,7 @@ import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
 import { apiTokenCredentialId, bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
 import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
-import { NO_LOCATION_FILTER, normalizeSourceIntervals, olxCategoryToJson, ScoutService, ServiceError } from './service';
+import { dashboardTopParam, NO_LOCATION_FILTER, normalizeSourceIntervals, olxCategoryToJson, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 import { parseVariantGroups } from './variants';
 
@@ -290,7 +290,11 @@ app.post('/api/auth/logout-all', async (request, reply) => {
   closeSessionStreams(() => true);
   return reply.header('set-cookie', clearedSessionCookie(isSecureRequest(request))).send({ ok: true });
 });
-app.get('/api/dashboard', async () => service.dashboard());
+app.get('/api/dashboard', async (request) => {
+  // ?top=N (1-50) is the widget's compact form; anything else is ignored and
+  // the full dashboard is returned unchanged.
+  return service.dashboard({ top: dashboardTopParam((request.query as Record<string, unknown> | undefined)?.top) });
+});
 app.get('/api/listings', async (request, reply) => {
   const parsed = z.object({
     marketplace: marketplaceParam.optional(),
