@@ -100,6 +100,60 @@ test('reports the latest connector state from batched health queries', () => {
   } finally { context.close(); }
 });
 
+test('keeps cached connector run counts exact across inserts, rollbacks, prune and other connections', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'scout-connector-counts-'));
+  const databasePath = join(directory, 'scout.sqlite');
+  const db = openDatabase(databasePath);
+  const other = openDatabase(databasePath);
+  try {
+    const service = new ScoutService(db, () => {}, { suggestVariantGroups: async () => [] });
+    const actual = () => Object.fromEntries((db.prepare('SELECT source, COUNT(*) AS count FROM connector_runs GROUP BY source').all() as Array<{ source: string; count: number }>).map((row) => [row.source, Number(row.count)]));
+    const reported = () => Object.fromEntries(service.getConnectors().filter((connector) => connector.requests > 0).map((connector) => [connector.name, connector.requests]));
+    const total = () => Number((db.prepare('SELECT COUNT(*) AS count FROM connector_runs').get() as { count: number }).count);
+    const record = (source: string, startedAt: string) => (service as any).recordRun(source, 'ok', 'run', startedAt, startedAt);
+    const old = new Date(Date.now() - 200 * 24 * 60 * 60_000).toISOString();
+    record('OLX', old);
+    assert.deepEqual(reported(), actual());
+    // Cached now: in-process inserts are counted without a recount.
+    record('OLX', new Date().toISOString());
+    record('Vinted', new Date().toISOString());
+    assert.deepEqual(reported(), { OLX: 2, Vinted: 1 });
+    assert.deepEqual(reported(), actual());
+    db.exec('BEGIN');
+    record('Vinted', new Date().toISOString());
+    db.exec('ROLLBACK');
+    assert.deepEqual(reported(), actual());
+    other.prepare('INSERT INTO connector_runs (source, status, message, started_at, finished_at) VALUES (?, ?, ?, ?, ?)').run('Allegro Lokalnie', 'ok', 'other', old, old);
+    assert.deepEqual(reported(), actual());
+    assert.equal(service.connectorRunsPage({ pageSize: 2 }).pagination.total, total());
+    (service as any).pruneRetention();
+    assert.deepEqual(reported(), actual());
+    assert.deepEqual(actual(), { OLX: 1, Vinted: 1 });
+    assert.equal(service.connectorRunsPage({ pageSize: 1 }).pagination.total, 2);
+    assert.equal(service.connectorRunsPage({ pageSize: 1 }).pagination.hasNext, true);
+    // Readiness reads only statuses and skips the counts.
+    assert.deepEqual(service.readiness().connectors.degraded, []);
+    assert.equal(service.getConnectors(false).every((connector) => connector.requests === 0), true);
+  } finally {
+    other.close();
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('serves connector history and unfinished-scan checks from indexes', () => {
+  const context = fixture();
+  try {
+    const plan = (sql: string) => (context.db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as Array<{ detail: string }>).map((row) => row.detail).join(' | ');
+    const page = plan('SELECT * FROM connector_runs ORDER BY started_at DESC, id DESC LIMIT 100 OFFSET 0');
+    assert.match(page, /connector_runs_recent/);
+    assert.doesNotMatch(page, /TEMP B-TREE/);
+    assert.match(plan("SELECT COUNT(*) AS count FROM scans WHERE status = 'running' OR status = 'interrupted'"), /scans_unfinished/);
+    assert.match(plan("UPDATE scans SET status = 'interrupted' WHERE status IN ('running', 'interrupted') AND status = 'running'"), /scans_unfinished/);
+    assert.match(plan("DELETE FROM listings WHERE last_seen_at < '2000' AND NOT EXISTS (SELECT 1 FROM observations WHERE observations.listing_id = listings.id)"), /observations_listing/);
+  } finally { context.close(); }
+});
+
 test('uses the recent-listing index for feed pagination order', () => {
   const context = fixture();
   try {

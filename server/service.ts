@@ -708,7 +708,7 @@ export class ScoutService {
       if (database) {
         staleScans = Number((this.stmt("SELECT COUNT(*) AS count FROM scans WHERE status = 'running' OR status = 'interrupted'").get() as { count?: number } | undefined)?.count ?? 0);
         migration = this.stmt('SELECT COUNT(*) AS count, MAX(id) AS latest FROM migrations').get() as { count?: number; latest?: string | null };
-        degradedConnectors = this.getConnectors().filter((connector) => connector.status === 'Degraded').map((connector) => connector.name);
+        degradedConnectors = this.getConnectors(false).filter((connector) => connector.status === 'Degraded').map((connector) => connector.name);
       }
     } catch (error) {
       database = false;
@@ -3523,16 +3523,32 @@ export class ScoutService {
     return this.marketListingSnapshot(marketListingId);
   }
 
-  getConnectors(): Connector[] {
+  // Per-source connector_runs counts. Counting walks the whole table (~560k
+  // rows at real scan cadence), so the result is kept and maintained in
+  // place: recordRun (the only INSERT) adds one, the retention prune (the
+  // only DELETE) drops the cache, and a commit from another connection
+  // changes PRAGMA data_version, which forces a recount.
+  private connectorRunCountCache: { version: number; counts: Map<string, number> } | null = null;
+
+  private connectorRunCounts() {
+    const version = Number((this.stmt('PRAGMA data_version').get() as { data_version: number }).data_version);
+    if (!this.connectorRunCountCache || this.connectorRunCountCache.version !== version) {
+      const counts = new Map((this.stmt('SELECT source, COUNT(*) AS count FROM connector_runs GROUP BY source').all() as Array<{ source: string; count: number }>)
+        .map((row) => [String(row.source), Number(row.count)]));
+      this.connectorRunCountCache = { version, counts };
+    }
+    return this.connectorRunCountCache.counts;
+  }
+
+  /** `withCounts: false` skips the run counts (every `requests` is 0) for callers that only read status. */
+  getConnectors(withCounts = true): Connector[] {
     const webhookConfigured = Boolean(this.getSetting('discord_webhook'));
     const ntfyConfigured = Boolean(this.ntfyConfig());
     // Latest row per source comes from one indexed lookup per connector and
-    // the run count from a grouped count (the source-leading index keeps it
-    // b-tree free). The previous window-function query materialized every
-    // connector_runs row — three full scans on every dashboard refresh and
-    // readiness probe.
-    const countBySource = new Map((this.stmt('SELECT source, COUNT(*) AS count FROM connector_runs GROUP BY source').all() as Array<{ source: string; count: number }>)
-      .map((row) => [String(row.source), Number(row.count)]));
+    // the run count from the maintained per-source counts. The previous
+    // window-function query materialized every connector_runs row — three
+    // full scans on every dashboard refresh and readiness probe.
+    const countBySource = withCounts ? this.connectorRunCounts() : new Map<string, number>();
     const latestRun = this.stmt('SELECT * FROM connector_runs WHERE source = ? ORDER BY started_at DESC, id DESC LIMIT 1');
     const latestSuccess = this.stmt("SELECT finished_at FROM connector_runs WHERE source = ? AND status = 'ok' AND finished_at IS NOT NULL ORDER BY started_at DESC, id DESC LIMIT 1");
     const healthBySource = new Map<string, Record<string, any>>();
@@ -3729,7 +3745,8 @@ export class ScoutService {
   connectorRunsPage(options: { page?: number; pageSize?: number } = {}) {
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(200, Math.floor(options.pageSize ?? 100)));
-    const total = Number((this.stmt('SELECT COUNT(*) AS count FROM connector_runs').get() as { count?: number }).count ?? 0);
+    let total = 0;
+    for (const count of this.connectorRunCounts().values()) total += count;
     const rows = this.stmt('SELECT * FROM connector_runs ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?').all(pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
     return { runs: rows.map((row) => ({ id: Number(row.id), source: row.source, status: row.status, message: row.message, startedAt: row.started_at, finishedAt: row.finished_at, duration: duration(row.started_at, row.finished_at) })), pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
   }
@@ -4321,6 +4338,7 @@ export class ScoutService {
     this.stmt('DELETE FROM listing_relevance WHERE checked_at < ?').run(cutoff);
     this.stmt('DELETE FROM manual_relevance_cache WHERE checked_at < ?').run(cutoff);
     this.stmt('DELETE FROM connector_runs WHERE started_at < ?').run(cutoff);
+    this.connectorRunCountCache = null;
     this.stmt('DELETE FROM scans WHERE started_at < ?').run(cutoff);
     this.stmt('DELETE FROM notification_deliveries WHERE created_at < ?').run(cutoff);
     this.stmt('DELETE FROM notifications WHERE created_at < ?').run(cutoff);
@@ -4940,6 +4958,11 @@ export class ScoutService {
 
   private recordRun(source: string, status: string, message: string, startedAt: string, finishedAt: string | null) {
     const result = this.stmt('INSERT INTO connector_runs (source, status, message, started_at, finished_at) VALUES (?, ?, ?, ?, ?)').run(source, status, message, startedAt, finishedAt);
+    // Every caller runs in autocommit, so the row is committed here. Inside an
+    // open transaction a rollback could drop it, so recount instead.
+    const counts = this.connectorRunCountCache?.counts;
+    if ((this.db as { isTransaction?: boolean }).isTransaction) this.connectorRunCountCache = null;
+    else if (counts) counts.set(source, (counts.get(source) ?? 0) + 1);
     return Number(result.lastInsertRowid);
   }
 

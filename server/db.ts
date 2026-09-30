@@ -151,7 +151,8 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
   db.prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run('default_interval', '5', new Date().toISOString());
   db.prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run('night_interval', '30', new Date().toISOString());
   if (db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'scans'").get()) {
-    db.prepare("UPDATE scans SET status = 'interrupted', completed_at = ?, error = COALESCE(error, 'Process restarted before scan completed') WHERE status = 'running'").run(new Date().toISOString());
+    // The redundant IN lets the partial scans_unfinished index serve the lookup.
+    db.prepare("UPDATE scans SET status = 'interrupted', completed_at = ?, error = COALESCE(error, 'Process restarted before scan completed') WHERE status IN ('running', 'interrupted') AND status = 'running'").run(new Date().toISOString());
   }
   return db;
 }
