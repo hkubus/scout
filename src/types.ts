@@ -193,6 +193,7 @@ export interface Watch {
   terms: string;
   excluded: string;
   sources: Marketplace[];
+  /** Always "Polska": Scout no longer filters by location; kept for older iOS builds. */
   location: string;
   condition: string;
   samples: number;
@@ -349,7 +350,6 @@ export interface SearchFilters {
   maxPrice?: number | null;
   shippingOnly?: boolean;
   condition?: string;
-  location?: string;
   /** OLX only: private sellers or business accounts. */
   ownerType?: "private" | "business" | null;
   /** OLX only: search a single category. */
@@ -395,6 +395,7 @@ export interface MarketWatch {
   query: string;
   terms: string;
   excluded: string;
+  /** Always "Polska": Scout no longer filters by location; kept for older iOS builds. */
   location: string;
   condition: string;
   sources: Marketplace[];
@@ -416,7 +417,7 @@ export interface MarketWatch {
   activeVersionId?: string | null;
 }
 
-export type MarketWatchInput = Pick<MarketWatch, 'name' | 'query' | 'terms' | 'excluded' | 'location' | 'condition' | 'sources' | 'intervalHours' | 'minPrice' | 'maxPrice' | 'shippingOnly' | 'typoVariants' | 'olxCategory'>;
+export type MarketWatchInput = Pick<MarketWatch, 'name' | 'query' | 'terms' | 'excluded' | 'condition' | 'sources' | 'intervalHours' | 'minPrice' | 'maxPrice' | 'shippingOnly' | 'typoVariants' | 'olxCategory'>;
 
 export interface MarketTrackedListing {
   id: number;

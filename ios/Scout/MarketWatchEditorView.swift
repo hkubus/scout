@@ -74,7 +74,6 @@ struct MarketWatchEditorView: View {
                     Picker("Condition", selection: $draft.condition) {
                         ForEach(conditionOptions, id: \.self) { Text($0).tag($0) }
                     }
-                    TextField("Location", text: $draft.location)
                     TextField("Minimum price (zł)", text: $minPrice)
                         .keyboardType(.numberPad)
                     TextField("Maximum price (zł)", text: $maxPrice)

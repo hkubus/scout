@@ -762,7 +762,7 @@ test('relaxes the implicit query terms only for opt-in manual searches', () => {
   assert.deepEqual(filterListings(listings, 'iphone 13 pro max', 'iphone,13,pro,max', '', { relaxTerms: true }).map((listing) => listing.listingId), []);
 });
 
-test('applies manual and watch price, condition, and location filters', () => {
+test('applies manual and watch price and condition filters, ignoring the seller town', () => {
   const base = { marketplace: 'OLX' as const, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/test', observedAt: new Date().toISOString(), shippingAvailable: true };
   const listings = [
     { ...base, listingId: '1', title: 'Intel i5 8400', price: 180, condition: 'Używane', location: 'Warszawa' },
@@ -770,7 +770,7 @@ test('applies manual and watch price, condition, and location filters', () => {
     { ...base, listingId: '3', title: 'Intel i5 8400', price: 500, condition: 'Używane', location: 'Warszawa' },
   ];
   assert.deepEqual(filterListings(listings, 'i5 8400', '', '', { minPrice: 150, maxPrice: 300 }).map((listing) => listing.listingId), ['1', '2']);
-  assert.deepEqual(filterListings(listings, 'i5 8400', '', '', { condition: 'Used', location: 'Warszawa' }).map((listing) => listing.listingId), ['1', '3']);
+  assert.deepEqual(filterListings(listings, 'i5 8400', '', '', { condition: 'Used' }).map((listing) => listing.listingId), ['1', '3']);
   assert.deepEqual(filterListings(listings, 'i5 8400', '', '', { condition: 'New' }).map((listing) => listing.listingId), ['2']);
 });
 

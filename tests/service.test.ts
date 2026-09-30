@@ -918,7 +918,7 @@ test('applies the same AI relevance gate to one-off marketplace search', async (
       { id: 'GPU-1', url: 'https://www.olx.pl/d/oferta/gpu-1', title: 'GPU graphics card RTX 4070', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 2000, currency: 'PLN', negotiable: false } }] },
       { id: 'GPU-2', url: 'https://www.olx.pl/d/oferta/gpu-2', title: 'GPU fan replacement', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 80, currency: 'PLN', negotiable: false } }] },
     ], metadata: { visible_total_count: 2 } } });
-    const result = await context.service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
+    const result = await context.service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any' });
     assert.deepEqual(result.listings.map((listing) => listing.title), ['GPU graphics card RTX 4070']);
     assert.equal(result.sources[0].message, '1 matches · 1 excluded by AI');
     assert.equal(requests, 2);
@@ -939,7 +939,7 @@ test('streams per-source manual search progress and honors the result page', asy
     ], metadata: { visible_total_count: 1 } } };
   };
   try {
-    const result = await service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '', page: 3, searchId: 'stream-1' });
+    const result = await service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', page: 3, searchId: 'stream-1' });
     assert.equal(result.listings.length, 1);
     assert.match(urls[0], /offset=100/, 'the requested page maps to a marketplace offset');
     const progress = emitted.filter((entry) => entry.event === 'search');
@@ -950,7 +950,7 @@ test('streams per-source manual search progress and honors the result page', asy
     assert.deepEqual(progress[0].payload.listings.map((listing: any) => listing.id), ['OLX:STREAM-1']);
 
     emitted.length = 0;
-    await service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
+    await service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any' });
     assert.equal(emitted.filter((entry) => entry.event === 'search').length, 0, 'no searchId means no streaming events');
   } finally { db.close(); rmSync(directory, { recursive: true, force: true }); }
 });
@@ -964,7 +964,7 @@ test('keeps manual search results when AI relevance fails', async () => {
     (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
       { id: 'GPU-1', url: 'https://www.olx.pl/d/oferta/gpu-1', title: 'GPU graphics card RTX 4070', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 2000, currency: 'PLN', negotiable: false } }] },
     ], metadata: { visible_total_count: 1 } } });
-    const result = await context.service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
+    const result = await context.service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any' });
     assert.deepEqual(result.listings.map((listing) => listing.title), ['GPU graphics card RTX 4070']);
     assert.equal(result.sources[0].message, '1 matches · 1 AI checks unknown');
   } finally { context.close(); }
@@ -984,7 +984,7 @@ test('partitions deterministic misses into term vs condition rescue candidates',
     base({ listingId: 'price', title: 'Ladowarki do laptopa Dell', price: 9999 }),
   ];
   const { termCandidates, conditionCandidates } = findFuzzyRescueCandidates(
-    listings as any, 'ladowarka', '', '', { minPrice: null, maxPrice: 500, condition: 'New', location: '' },
+    listings as any, 'ladowarka', '', '', { minPrice: null, maxPrice: 500, condition: 'New' },
   );
   assert.deepEqual(termCandidates.map((listing) => listing.listingId), ['inflect']);
   assert.deepEqual(conditionCandidates.map((listing) => listing.listingId), ['cond']);
@@ -1040,19 +1040,19 @@ test('price-filtered watches scope history and baseline samples to their range',
   } finally { context.close(); }
 });
 
-test('market research filters match terms, price, condition, location, and shipping', () => {
+test('market research filters match terms, price, condition, and shipping, from any town', () => {
   const listings = [
     { marketplace: 'OLX' as const, listingId: 'match', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/match', condition: 'New', location: 'Warszawa', shippingAvailable: true, observedAt: new Date().toISOString() },
     { marketplace: 'OLX' as const, listingId: 'too-cheap', title: 'RTX 4070 12GB Founders Edition', price: 500, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/too-cheap', condition: 'New', location: 'Warszawa', shippingAvailable: true, observedAt: new Date().toISOString() },
     { marketplace: 'OLX' as const, listingId: 'pickup', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/pickup', condition: 'New', location: 'Warszawa', shippingAvailable: false, observedAt: new Date().toISOString() },
-    { marketplace: 'OLX' as const, listingId: 'wrong-city', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/wrong-city', condition: 'New', location: 'Kraków', shippingAvailable: true, observedAt: new Date().toISOString() },
+    { marketplace: 'OLX' as const, listingId: 'other-city', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/other-city', condition: 'New', location: 'Kraków', shippingAvailable: true, observedAt: new Date().toISOString() },
     { marketplace: 'OLX' as const, listingId: 'excluded', title: 'RTX 4070 12GB parts only', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/excluded', condition: 'New', location: 'Warszawa', shippingAvailable: true, observedAt: new Date().toISOString() },
     // Vinted's stale pickup flag must not exclude it from a shipping-only filter.
     { marketplace: 'Vinted' as const, listingId: 'vinted-ships', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.vinted.pl/items/vinted-ships', condition: 'New', location: 'Warszawa', shippingAvailable: false, observedAt: new Date().toISOString() },
-    // Vinted cards carry no location at all; a city filter must not drop them.
+    // Vinted cards carry no location at all.
     { marketplace: 'Vinted' as const, listingId: 'vinted-no-location', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.vinted.pl/items/vinted-no-location', condition: 'New', observedAt: new Date().toISOString() },
   ];
-  assert.deepEqual(filterListings(listings, 'rtx 4070', '12gb', 'parts', { minPrice: 1000, maxPrice: 2000, condition: 'New', location: 'Warszawa', shippingOnly: true }).map((listing) => listing.listingId), ['match', 'vinted-ships', 'vinted-no-location']);
+  assert.deepEqual(filterListings(listings, 'rtx 4070', '12gb', 'parts', { minPrice: 1000, maxPrice: 2000, condition: 'New', shippingOnly: true }).map((listing) => listing.listingId), ['match', 'other-city', 'vinted-ships', 'vinted-no-location']);
 });
 
 test('keeps market research separate and reports ended-listing price estimates', () => {
@@ -1069,7 +1069,7 @@ test('keeps market research separate and reports ended-listing price estimates',
     const research = context.service.marketResearch();
     const { saleBand, ...marketWatch } = research.watches[0];
     assert.deepEqual(marketWatch, {
-      id: 'market-watch', name: 'GPU market', query: 'rtx 4070', terms: '12gb', excluded: 'parts', location: 'Warszawa', condition: 'New', sources: ['OLX', 'Vinted'], intervalHours: 24, minPrice: 1000, maxPrice: 2500, shippingOnly: true, typoVariants: false, olxCategory: null, enabled: true, nextScan: 'due now', lastScan: 'just now', totalListings: 3, activeListings: 1, endedListings: 2, estimatedMedianPrice: 2200,
+      id: 'market-watch', name: 'GPU market', query: 'rtx 4070', terms: '12gb', excluded: 'parts', location: 'Polska', condition: 'New', sources: ['OLX', 'Vinted'], intervalHours: 24, minPrice: 1000, maxPrice: 2500, shippingOnly: true, typoVariants: false, olxCategory: null, enabled: true, nextScan: 'due now', lastScan: 'just now', totalListings: 3, activeListings: 1, endedListings: 2, estimatedMedianPrice: 2200,
     });
     // Both ended rows lack a verified ended reason, so the band stays open.
     assert.deepEqual({ ...saleBand, computedAt: null }, { p25: null, median: null, p75: null, sampleCount: 2, eligibleCount: 0, excludedStale: 0, windowDays: 90, computedAt: null });
@@ -1088,7 +1088,7 @@ test('keeps market research separate and reports ended-listing price estimates',
 test('computes probable-sale bands from eligible ended research listings', () => {
   const context = fixture();
   try {
-    context.service.createMarketWatch({ id: 'band-watch', name: 'Band', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
+    context.service.createMarketWatch({ id: 'band-watch', name: 'Band', query: 'cpu', terms: '', excluded: '', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
     const now = Date.now();
     const daysAgoIso = (days: number) => new Date(now - days * 24 * 60 * 60_000).toISOString();
     const insert = context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans, ended_at, ended_reason)
@@ -1123,7 +1123,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1228,7 +1228,7 @@ test('applies manual price filters after marketplace parsing rather than trustin
       { id: 'cpu-150', url: 'https://www.olx.pl/d/oferta/cpu-150', title: 'CPU 150', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 150, currency: 'PLN', negotiable: false } }] },
       { id: 'cpu-250', url: 'https://www.olx.pl/d/oferta/cpu-250', title: 'CPU 250', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 250, currency: 'PLN', negotiable: false } }] },
     ], metadata: { visible_total_count: 3 } } });
-    const result = await context.service.manualSearch({ query: 'cpu', sources: ['OLX'], minPrice: 100, maxPrice: 200, terms: '', excluded: '', shippingOnly: false, condition: 'Any', location: '' });
+    const result = await context.service.manualSearch({ query: 'cpu', sources: ['OLX'], minPrice: 100, maxPrice: 200, terms: '', excluded: '', shippingOnly: false, condition: 'Any' });
     assert.deepEqual(result.listings.map((listing) => listing.price), [150]);
   } finally { context.close(); }
 });
@@ -1249,7 +1249,7 @@ test('does not fetch listing details for shipping when manual search does not re
     (context.service as any).fetchPublicPage = async (url: string) => {
       throw new Error(`unexpected public page fetch: ${url}`);
     };
-    const result = await context.service.manualSearch({ query: 'cpu', sources: ['Vinted'], minPrice: null, maxPrice: null, terms: '', excluded: '', shippingOnly: false, condition: 'Any', location: '' });
+    const result = await context.service.manualSearch({ query: 'cpu', sources: ['Vinted'], minPrice: null, maxPrice: null, terms: '', excluded: '', shippingOnly: false, condition: 'Any' });
     assert.equal(result.sources[0].status, 'ok');
     assert.equal(fetchedUrls.length, 1);
     assert.match(fetchedUrls[0], /api\/v2\/catalog\/items/);
@@ -1272,7 +1272,7 @@ test('assumes Vinted shipping for a shipping-only search without a detail fetch'
       publicFetches.push(url);
       throw new Error(`unexpected public page fetch: ${url}`);
     };
-    const result = await context.service.manualSearch({ query: 'cpu', sources: ['Vinted'], minPrice: null, maxPrice: null, terms: '', excluded: '', shippingOnly: true, condition: 'Any', location: '' });
+    const result = await context.service.manualSearch({ query: 'cpu', sources: ['Vinted'], minPrice: null, maxPrice: null, terms: '', excluded: '', shippingOnly: true, condition: 'Any' });
     assert.equal(result.sources[0].status, 'ok');
     assert.equal(result.listings[0].id, 'Vinted:123');
     assert.equal(result.listings[0].shippingAvailable, true);
@@ -1416,7 +1416,7 @@ test('records one observation per price run per day instead of one per scan', ()
 test('verifies missing research listings before ending them and leaves transient failures as unknown', async () => {
   const context = fixture();
   try {
-    context.service.createMarketWatch({ id: 'availability-watch', name: 'Availability', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
+    context.service.createMarketWatch({ id: 'availability-watch', name: 'Availability', query: 'cpu', terms: '', excluded: '', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
     const now = new Date().toISOString();
     const insert = context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans, availability_status, last_verified_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, 'live', ?)`);
@@ -1463,7 +1463,7 @@ test('verifies missing research listings before ending them and leaves transient
 test('creates immutable research series and computes aggregates across the full result set', () => {
   const context = fixture();
   try {
-    context.service.createMarketWatch({ id: 'version-watch', name: 'Versioned', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
+    context.service.createMarketWatch({ id: 'version-watch', name: 'Versioned', query: 'cpu', terms: '', excluded: '', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
     const now = new Date().toISOString();
     context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0)`).run('version-watch', 'version-watch:v1', 'OLX', 'old-series', 'Old CPU', 'https://www.olx.pl/d/oferta/old-series', 100, 100, 100, now, now);
@@ -1476,7 +1476,7 @@ test('creates immutable research series and computes aggregates across the full 
     assert.equal(context.service.marketResearch().watches.find((watch) => watch.id === 'version-watch')?.totalListings, 0);
     assert.equal(context.service.marketResearch({ status: 'superseded' }).listings[0].status, 'superseded');
 
-    context.service.createMarketWatch({ id: 'median-watch', name: 'Median', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
+    context.service.createMarketWatch({ id: 'median-watch', name: 'Median', query: 'cpu', terms: '', excluded: '', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
     const insert = context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ended', 3)`);
     for (let price = 1; price <= 401; price += 1) insert.run('median-watch', 'median-watch:v1', 'OLX', `median-${price}`, 'CPU', `https://www.olx.pl/d/oferta/median-${price}`, price, price, price, now, now);
@@ -1490,7 +1490,7 @@ test('creates immutable research series and computes aggregates across the full 
 test('toggling typo variants on a research watch starts a new immutable series', () => {
   const context = fixture();
   try {
-    context.service.createMarketWatch({ id: 'typo-watch', name: 'Typo watch', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
+    context.service.createMarketWatch({ id: 'typo-watch', name: 'Typo watch', query: 'cpu', terms: '', excluded: '', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
     const now = new Date().toISOString();
     context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0)`).run('typo-watch', 'typo-watch:v1', 'OLX', 'typo-series-listing', 'CPU', 'https://www.olx.pl/d/oferta/typo-series-listing', 100, 100, 100, now, now);
@@ -1557,7 +1557,7 @@ test('retries failed notifications without duplicating alerts and keeps state pe
 test('seeds fresh listings from a reference series band for display only', async () => {
   const context = fixture();
   try {
-    context.service.createMarketWatch({ id: 'ref-series', name: 'Reference series', query: 'cpu', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
+    context.service.createMarketWatch({ id: 'ref-series', name: 'Reference series', query: 'cpu', terms: '', excluded: '', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
     const now = Date.now();
     const daysAgoIso = (days: number) => new Date(now - days * 24 * 60 * 60_000).toISOString();
     const insertEnded = context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans, ended_at, ended_reason)
@@ -1612,7 +1612,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 29);
+    assert.equal(after.migrations.count, 30);
   } finally { context.close(); }
 });
 
@@ -2187,7 +2187,7 @@ test('rescues term near-misses in manual search on confident Jev pass', async ()
       { id: 'LAD-1', url: 'https://www.olx.pl/d/oferta/lad-1', title: 'Ladowarka Dell 65W', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 100, currency: 'PLN', negotiable: false } }] },
       { id: 'LAD-2', url: 'https://www.olx.pl/d/oferta/lad-2', title: 'Ladowarki do laptopa Dell', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 120, currency: 'PLN', negotiable: false } }] },
     ], metadata: { visible_total_count: 2 } } });
-    const result = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
+    const result = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any' });
     assert.deepEqual(result.listings.map((listing) => listing.title).sort(), ['Ladowarka Dell 65W', 'Ladowarki do laptopa Dell']);
     assert.equal(result.sources[0].count, 2);
   } finally {
@@ -2208,7 +2208,7 @@ test('keeps deterministic drops when fuzzy rescue is unsure', async () => {
       { id: 'LAD-1', url: 'https://www.olx.pl/d/oferta/lad-1', title: 'Ladowarka Dell 65W', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 100, currency: 'PLN', negotiable: false } }] },
       { id: 'LAD-2', url: 'https://www.olx.pl/d/oferta/lad-2', title: 'Ladowarki do laptopa Dell', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 120, currency: 'PLN', negotiable: false } }] },
     ], metadata: { visible_total_count: 2 } } });
-    const result = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
+    const result = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any' });
     assert.deepEqual(result.listings.map((listing) => listing.title), ['Ladowarka Dell 65W']);
   } finally {
     restore();
@@ -2262,7 +2262,7 @@ test('rescues condition misses in manual search on confident Jev match', async (
       { id: 'IPH-1', url: 'https://www.olx.pl/d/oferta/iph-1', title: 'iPhone 13', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 2000, currency: 'PLN', negotiable: false } }, { key: 'state', value: { label: 'Nowe' } }] },
       { id: 'IPH-2', url: 'https://www.olx.pl/d/oferta/iph-2', title: 'iPhone 13 sealed, brand new', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 2100, currency: 'PLN', negotiable: false } }] },
     ], metadata: { visible_total_count: 2 } } });
-    const result = await context.service.manualSearch({ query: 'iphone', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'New', location: '' });
+    const result = await context.service.manualSearch({ query: 'iphone', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'New' });
     assert.deepEqual(result.listings.map((listing) => listing.title).sort(), ['iPhone 13', 'iPhone 13 sealed, brand new']);
   } finally {
     restore();
@@ -2282,7 +2282,7 @@ test('keeps deterministic set when fuzzy rescue throws', async () => {
       { id: 'LAD-1', url: 'https://www.olx.pl/d/oferta/lad-1', title: 'Ladowarka Dell 65W', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 100, currency: 'PLN', negotiable: false } }] },
       { id: 'LAD-2', url: 'https://www.olx.pl/d/oferta/lad-2', title: 'Ladowarki do laptopa Dell', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 120, currency: 'PLN', negotiable: false } }] },
     ], metadata: { visible_total_count: 2 } } });
-    const result = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
+    const result = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any' });
     assert.deepEqual(result.listings.map((listing) => listing.title), ['Ladowarka Dell 65W']);
   } finally {
     restore();
@@ -2394,11 +2394,11 @@ test('lets a manual search opt out of the AI relevance gate', async () => {
     (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
       { id: 'OPT-1', url: 'https://www.olx.pl/d/oferta/opt-1', title: 'Ladowarka Dell 65W', created_time: new Date().toISOString(), params: [{ key: 'price', value: { value: 100, currency: 'PLN', negotiable: false } }] },
     ], metadata: { visible_total_count: 1 } } });
-    const skipped = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '', aiRelevance: false });
+    const skipped = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', aiRelevance: false });
     assert.equal(relevanceCalls, 0);
     assert.deepEqual(skipped.listings.map((listing) => listing.title), ['Ladowarka Dell 65W']);
     // Omitted means default-on, matching the watch-scan default.
-    const filtered = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', location: '' });
+    const filtered = await context.service.manualSearch({ query: 'ladowarka', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any' });
     assert.equal(relevanceCalls, 1);
     assert.equal(filtered.listings.length, 0);
   } finally {
@@ -2817,7 +2817,7 @@ test('an OLX category is part of the immutable research criteria', async () => {
   const context = fixture();
   try {
     const gpu = { id: 2184, label: 'Karty graficzne', path: 'elektronika/komputery/podzespoly-i-czesci/karty-graficzne' };
-    context.service.createMarketWatch({ id: 'research-gpu', name: 'GPU', query: 'rtx 3070', terms: '', excluded: '', location: 'Polska', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false, olxCategory: gpu });
+    context.service.createMarketWatch({ id: 'research-gpu', name: 'GPU', query: 'rtx 3070', terms: '', excluded: '', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false, olxCategory: gpu });
     const versions = () => (context.db.prepare('SELECT COUNT(*) AS count FROM market_watch_versions WHERE market_watch_id = ?').get('research-gpu') as { count: number }).count;
     assert.deepEqual(context.service.marketResearch().watches[0].olxCategory, gpu);
     // Resending the same category (the edit dialog always does) is not a change.
@@ -2850,5 +2850,20 @@ test('manual searches pass an OLX category through and category lookups parse OL
     assert.equal(olxCategoryFromJson('{"id":"2184"}'), null);
     assert.equal(olxCategoryFromJson('not json'), null);
     assert.equal(olxCategoryFromJson(null), null);
+  } finally { context.close(); }
+});
+
+test('a stored town no longer filters watch scans and the API reports no location filter', async () => {
+  const context = fixture();
+  try {
+    seedWatch(context.db, 'town-watch', { query: 'rtx 3070' });
+    // A value written before location filtering was removed.
+    context.db.prepare("UPDATE watches SET location = 'Kraków' WHERE id = 'town-watch'").run();
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 501, url: 'https://www.olx.pl/d/oferta/gpu-ID501.html', title: 'RTX 3070 8GB', location: { city: { name: 'Gdańsk' } }, params: [{ key: 'price', value: { value: 1300, currency: 'PLN' } }] },
+    ], metadata: { visible_total_count: 1 } } });
+    await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('town-watch'), { forceAll: true });
+    assert.equal((context.db.prepare("SELECT COUNT(*) AS count FROM watch_listings WHERE watch_id = 'town-watch'").get() as { count: number }).count, 1);
+    assert.equal(context.service.getWatches().find((watch) => watch.id === 'town-watch')?.location, 'Polska');
   } finally { context.close(); }
 });

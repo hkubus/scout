@@ -17,7 +17,7 @@ import { backupDatabase, openDatabase, seedDatabase } from './db';
 import { buildDiscordEmbed } from './notifications';
 import { apiTokenCredentialId, bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
 import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
-import { normalizeSourceIntervals, olxCategoryToJson, ScoutService, ServiceError } from './service';
+import { NO_LOCATION_FILTER, normalizeSourceIntervals, olxCategoryToJson, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 import { parseVariantGroups } from './variants';
 
@@ -435,7 +435,9 @@ const watchInput = z.object({
   terms: z.string().max(240).optional().default(''),
   excluded: z.string().max(240).optional().default(''),
   sources: marketplaceSources,
-  location: z.string().max(120).optional().default('Polska'),
+  // Ignored: Scout no longer filters by location. Still accepted so older
+  // iOS builds that send it keep working.
+  location: z.string().max(120).optional(),
   condition: z.string().max(80).optional().default('Any'),
   interval: z.number().int().min(5).max(24 * 60).optional().default(5),
   sourceIntervals: z.record(z.string(), z.number().int().min(5).max(1440)).optional().default({}),
@@ -467,7 +469,7 @@ app.post('/api/watches', async (request, reply) => {
   const now = nowIso();
   const sourceIntervals = normalizeSourceIntervals(value.sources, value.sourceIntervals);
   try {
-    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, source_intervals_json, sensitivity, shipping_only, typo_variants, ai_relevance, variant_groups_json, variant_groups_auto, reference_market_watch_id, min_price_pln, max_price_pln, olx_category_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, value.location, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, JSON.stringify(sourceIntervals), value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, JSON.stringify(value.variantGroups), value.variantGroupsAuto && !value.variantGroups.length ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, olxCategoryToJson(value.olxCategory), 1, now, now, now);
+    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, source_intervals_json, sensitivity, shipping_only, typo_variants, ai_relevance, variant_groups_json, variant_groups_auto, reference_market_watch_id, min_price_pln, max_price_pln, olx_category_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, NO_LOCATION_FILTER, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, JSON.stringify(sourceIntervals), value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, JSON.stringify(value.variantGroups), value.variantGroupsAuto && !value.variantGroups.length ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, olxCategoryToJson(value.olxCategory), 1, now, now, now);
   } catch (error) {
     if (error instanceof Error && /UNIQUE|PRIMARY KEY|constraint/i.test(error.message)) {
       return reply.code(409).send({ error: 'A watch with this id already exists' });
@@ -519,7 +521,6 @@ app.patch('/api/watches/:id', async (request, reply) => {
   if (body.terms !== undefined) { fields.push('included_terms = ?'); values.push(body.terms); }
   if (body.excluded !== undefined) { fields.push('excluded_terms = ?'); values.push(body.excluded); }
   if (body.sources !== undefined) { fields.push('sources_json = ?'); values.push(JSON.stringify(body.sources)); }
-  if (body.location !== undefined) { fields.push('location = ?'); values.push(body.location); }
   if (body.condition !== undefined) { fields.push('condition = ?'); values.push(body.condition); }
   if (body.exactUrls !== undefined) { fields.push('exact_urls_json = ?'); values.push(JSON.stringify(body.exactUrls)); }
   if (body.sensitivity !== undefined) { fields.push('sensitivity = ?'); values.push(body.sensitivity); }
@@ -582,7 +583,8 @@ const searchInput = z.object({
   maxPrice: z.number().positive().nullable().optional().default(null),
   shippingOnly: z.boolean().optional().default(false),
   condition: z.string().max(80).optional().default('Any'),
-  location: z.string().max(120).optional().default(''),
+  // Ignored, see watchInput.
+  location: z.string().max(120).optional(),
   ownerType: z.enum(['private', 'business']).nullable().optional().default(null),
   olxCategory: olxCategoryInput.nullable().optional().default(null),
   page: z.number().int().min(1).max(10).optional().default(1),
@@ -607,7 +609,9 @@ const marketWatchInput = z.object({
   query: z.string().trim().min(1).max(240),
   terms: z.string().max(240).optional().default(''),
   excluded: z.string().max(240).optional().default(''),
-  location: z.string().max(120).optional().default('Polska'),
+  // Ignored: Scout no longer filters by location. Still accepted so older
+  // iOS builds that send it keep working.
+  location: z.string().max(120).optional(),
   condition: z.string().max(80).optional().default('Any'),
   sources: marketplaceSources,
   intervalHours: z.number().int().min(6).max(168).optional().default(24),
@@ -630,7 +634,7 @@ app.post('/api/market-watches', async (request, reply) => {
   const value = parsed.data;
   const id = `market-watch-${randomUUID()}`;
   const now = nowIso();
-  const watch = service.createMarketWatch({ id, name: value.name, query: value.query, terms: value.terms, excluded: value.excluded, location: value.location, condition: value.condition, sources: value.sources, intervalHours: value.intervalHours, minPrice: value.minPrice, maxPrice: value.maxPrice, shippingOnly: value.shippingOnly, typoVariants: value.typoVariants, olxCategory: value.olxCategory });
+  const watch = service.createMarketWatch({ id, name: value.name, query: value.query, terms: value.terms, excluded: value.excluded, condition: value.condition, sources: value.sources, intervalHours: value.intervalHours, minPrice: value.minPrice, maxPrice: value.maxPrice, shippingOnly: value.shippingOnly, typoVariants: value.typoVariants, olxCategory: value.olxCategory });
   service.queueMarketScan(id);
   emit('market-watch', { refresh: true, id });
   return reply.code(201).send({ watch });
@@ -661,7 +665,8 @@ app.patch('/api/market-watches/:id', async (request, reply) => {
   const nextMin = parsed.data.minPrice === undefined ? current.min_price_pln : parsed.data.minPrice;
   const nextMax = parsed.data.maxPrice === undefined ? current.max_price_pln : parsed.data.maxPrice;
   if (nextMin !== null && nextMax !== null && nextMin > nextMax) return reply.code(400).send({ error: 'Minimum price cannot exceed maximum price' });
-  return service.updateMarketWatch(params.data.id, parsed.data);
+  const { location: _ignoredLocation, ...patch } = parsed.data;
+  return service.updateMarketWatch(params.data.id, patch);
 });
 
 app.post('/api/market-watches/:id/scan', async (request, reply) => {

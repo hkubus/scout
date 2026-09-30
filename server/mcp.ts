@@ -154,7 +154,6 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       maxPrice: z.number().positive().nullable().optional(),
       shippingOnly: z.boolean().optional().default(false),
       condition: z.string().max(80).optional().default('Any'),
-      location: z.string().max(120).optional().default(''),
       ownerType: z.enum(['private', 'business']).nullable().optional(),
       olxCategoryId: z.number().int().positive().optional().describe('OLX only: search one category; ids come from scout_olx_categories.'),
       page: z.number().int().min(1).max(10).optional().default(1),

@@ -62,7 +62,6 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
   const [maxPrice, setMaxPrice] = useState("");
   const [condition, setCondition] = useState("Any");
   const [ownerType, setOwnerType] = useState("Any");
-  const [location, setLocation] = useState("");
   const [shippingOnly, setShippingOnly] = useState(false);
   const [olxCategory, setOlxCategory] = useState<OlxCategory | null>(null);
   // Persisted across searches: once a user turns the Jev relevance filter off,
@@ -103,7 +102,6 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
     maxPrice: numericMax,
     shippingOnly,
     condition,
-    location: location.trim() || "Polska",
     ownerType: ownerType === "Any" ? null : ownerType.toLowerCase() as "private" | "business",
     olxCategory: sources.includes("OLX") ? olxCategory : null,
     page: targetPage,
@@ -257,14 +255,6 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
               <option>Business</option>
             </select>
           </label>
-          <label className="field-label">
-            Location <span>where available</span>
-            <input
-              placeholder="Anywhere"
-              value={location}
-              onChange={(event) => setLocation(event.target.value)}
-            />
-          </label>
         </div>
         <div className="search-advanced-row">
           <label className="field-label">
@@ -397,7 +387,7 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
                   {loadingMore ? "Loading…" : "Load more"}
                 </button>
               ) : null}
-              <button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, location: location.trim() || "Polska", condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly, aiRelevance, olxCategory: sources.includes("OLX") ? olxCategory : null })}><Bell size={15} />Save as watch</button>
+              <button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly, aiRelevance, olxCategory: sources.includes("OLX") ? olxCategory : null })}><Bell size={15} />Save as watch</button>
             </div>
           ) : null}
         </div>
