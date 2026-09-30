@@ -71,6 +71,31 @@ public struct WidgetSnapshot: Codable, Hashable, Sendable {
         return snapshot.generatedAt.timeIntervalSince(current.generatedAt) >= refreshAfter
     }
 
+    /// Whether this snapshot came from `source` less than `maxAge` ago, so a
+    /// widget can show it instead of fetching the same data again.
+    public func isFresh(for source: String?, maxAge: TimeInterval, now: Date = Date()) -> Bool {
+        let age = now.timeIntervalSince(generatedAt)
+        return self.source == source && age >= 0 && age < maxAge
+    }
+
+    /// Fills in missing thumbnails from `snapshots` (for example the widget's
+    /// last cache) wherever a deal has the same photo address.
+    public mutating func reuseThumbnails(from snapshots: [WidgetSnapshot?]) {
+        var cache: [String: Data] = [:]
+        for deal in snapshots.compactMap({ $0 }).flatMap(\.deals) where !deal.imageURL.isEmpty {
+            if cache[deal.imageURL] == nil, let thumbnail = deal.thumbnail { cache[deal.imageURL] = thumbnail }
+        }
+        guard !cache.isEmpty else { return }
+        for index in deals.indices where deals[index].thumbnail == nil {
+            deals[index].thumbnail = cache[deals[index].imageURL]
+        }
+    }
+
+    /// Indexes of the first `limit` deals that still need a thumbnail downloaded.
+    public func dealsMissingThumbnails(limit: Int) -> [Int] {
+        deals.indices.prefix(max(0, limit)).filter { deals[$0].thumbnail == nil && !deals[$0].imageURL.isEmpty }
+    }
+
     private struct Rendered: Equatable {
         var isDemo: Bool
         var source: String?
@@ -106,6 +131,23 @@ public struct WidgetSnapshot: Codable, Hashable, Sendable {
                 )
             }
         )
+    }
+}
+
+/// Which widget layout a timeline is for, so ScoutKit can reason about it
+/// without WidgetKit.
+public enum WidgetLayout: Sendable {
+    case systemSmall, systemMedium, systemLarge, other
+
+    /// How many deal photos the widget draws: the Top deals small widget
+    /// shows 1, large 6 and every other size 3; the Summary widget none.
+    public func thumbnailCount(drawsThumbnails: Bool) -> Int {
+        guard drawsThumbnails else { return 0 }
+        switch self {
+        case .systemSmall: return 1
+        case .systemLarge: return 6
+        case .systemMedium, .other: return 3
+        }
     }
 }
 

@@ -498,6 +498,58 @@ final class WidgetSnapshotTests: XCTestCase {
         XCTAssertTrue(SharedStore.saveConnection(serverURL: URL(string: "https://b")!, isDemo: true, in: defaults))
     }
 
+    func testFreshnessNeedsTheSameSourceAndARecentFetch() {
+        let now = Date(timeIntervalSince1970: 10_000)
+        let snapshot = WidgetSnapshot.make(from: DemoTransport.dashboard(), source: "https://a", now: now.addingTimeInterval(-30))
+        XCTAssertTrue(snapshot.isFresh(for: "https://a", maxAge: 60, now: now))
+        XCTAssertFalse(snapshot.isFresh(for: "https://a", maxAge: 30, now: now))
+        XCTAssertFalse(snapshot.isFresh(for: "https://b", maxAge: 60, now: now))
+        XCTAssertFalse(snapshot.isFresh(for: nil, maxAge: 60, now: now))
+        // A clock that moved backwards doesn't make an old snapshot look new.
+        XCTAssertFalse(snapshot.isFresh(for: "https://a", maxAge: 60, now: now.addingTimeInterval(-60)))
+    }
+
+    func testReusesThumbnailsByPhotoAddress() {
+        var fresh = WidgetSnapshot.make(from: DemoTransport.dashboard(), source: "https://a")
+        for index in fresh.deals.indices { fresh.deals[index].imageURL = "https://img/\(index).jpg" }
+        var cached = fresh
+        cached.deals = Array(cached.deals.reversed())
+        cached.deals[0].thumbnail = Data([1])
+        let lastPhoto = cached.deals[0].imageURL
+        cached.deals[1].thumbnail = Data([2])
+        cached.deals[1].imageURL = "https://img/other.jpg"
+        var older = fresh
+        older.deals[0].thumbnail = Data([3])
+
+        var snapshot = fresh
+        XCTAssertEqual(snapshot.dealsMissingThumbnails(limit: 3), [0, 1, 2])
+        snapshot.reuseThumbnails(from: [nil, cached, older])
+        XCTAssertEqual(snapshot.deals.last?.imageURL, lastPhoto)
+        XCTAssertEqual(snapshot.deals.last?.thumbnail, Data([1]))
+        XCTAssertEqual(snapshot.deals[0].thumbnail, Data([3]))
+        XCTAssertEqual(snapshot.deals.dropFirst().dropLast().compactMap(\.thumbnail), [])
+        XCTAssertEqual(snapshot.dealsMissingThumbnails(limit: 3), [1, 2])
+        XCTAssertEqual(snapshot.dealsMissingThumbnails(limit: 1), [])
+        XCTAssertEqual(snapshot.dealsMissingThumbnails(limit: 0), [])
+        XCTAssertEqual(snapshot.dealsMissingThumbnails(limit: 6), Array(1..<snapshot.deals.count - 1))
+        // A thumbnail already attached is kept.
+        snapshot.deals[1].thumbnail = Data([9])
+        snapshot.reuseThumbnails(from: [cached])
+        XCTAssertEqual(snapshot.deals[1].thumbnail, Data([9]))
+        // Deals without a photo never need one downloaded.
+        XCTAssertEqual(WidgetSnapshot.make(from: DemoTransport.dashboard()).dealsMissingThumbnails(limit: 6), [])
+    }
+
+    func testThumbnailCountFollowsWhatEachWidgetDraws() {
+        XCTAssertEqual(WidgetLayout.systemSmall.thumbnailCount(drawsThumbnails: true), 1)
+        XCTAssertEqual(WidgetLayout.systemMedium.thumbnailCount(drawsThumbnails: true), 3)
+        XCTAssertEqual(WidgetLayout.systemLarge.thumbnailCount(drawsThumbnails: true), 6)
+        XCTAssertEqual(WidgetLayout.other.thumbnailCount(drawsThumbnails: true), 3)
+        for layout in [WidgetLayout.systemSmall, .systemMedium, .systemLarge, .other] {
+            XCTAssertEqual(layout.thumbnailCount(drawsThumbnails: false), 0)
+        }
+    }
+
     func testDemoTopDashboardMatchesTheWidgetsPick() async throws {
         let transport = DemoTransport()
         let client = ScoutClient(baseURL: DemoTransport.baseURL, transport: transport)
