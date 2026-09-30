@@ -134,7 +134,8 @@ final class AppModel {
         defaults.set(url.absoluteString, forKey: Self.serverURLKey)
         client = candidate
         connection = .connecting
-        syncWidgetConnection()
+        // Force it: reconnecting to the same server may bring a new token.
+        syncWidgetConnection(force: true)
         startLiveUpdates()
         if let warning { alertMessage = warning }
     }
@@ -147,7 +148,8 @@ final class AppModel {
         try await candidate.verifyAccess()
         let warning = try storeAPIToken(candidate.apiToken)
         client = candidate
-        syncWidgetConnection()
+        // Same server, but widgets may now be able to sign in.
+        syncWidgetConnection(force: true)
         startLiveUpdates()
         refresh()
         if let warning { alertMessage = warning }
@@ -225,9 +227,12 @@ final class AppModel {
         }
     }
 
-    private func syncWidgetConnection() {
-        SharedStore.saveConnection(serverURL: serverURL, isDemo: isDemo)
-        WidgetCenter.shared.reloadAllTimelines()
+    /// Reloads widgets only when they should switch server or demo mode, or
+    /// when `force` is set; dashboard loads reload them when data changes.
+    private func syncWidgetConnection(force: Bool = false) {
+        if SharedStore.saveConnection(serverURL: serverURL, isDemo: isDemo) || force {
+            WidgetCenter.shared.reloadAllTimelines()
+        }
     }
 
     func report(_ error: Error) {
