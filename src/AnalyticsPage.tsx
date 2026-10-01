@@ -2,19 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   BarChart3,
-  ChevronDown,
   Database,
-  Info,
   LoaderCircle,
-  RefreshCw,
-  Sparkles,
-  Tag,
   TrendingUp,
 } from "lucide-react";
 import { api } from "./api";
 import { marketplaceColors } from "./data";
-import { AnalyticsTrendChart, formatAnalyticsPrice } from "./AnalyticsTrendChart";
-import { dayMonth, formatDate, timeOfDay } from "./format";
+import { AnalyticsTrendChart } from "./AnalyticsTrendChart";
+import { dayMonth, formatDate } from "./format";
+import { PageHeader, SelectControl } from "./ui";
 import type { AnalyticsData, Marketplace, Watch } from "./types";
 
 type ToastType = "success" | "error" | "info";
@@ -33,50 +29,6 @@ const formatLatency = (value: number | null) => {
   if (value === null || !Number.isFinite(value)) return "—";
   return value < 1000 ? `${Math.round(value)} ms` : `${(value / 1000).toFixed(1)} s`;
 };
-
-function PageHeader({ title, description }: { title: string; description: string }) {
-  return (
-    <header className="page-header page-header--inner">
-      <div>
-        <h1>{title}</h1>
-        <p>{description}</p>
-      </div>
-    </header>
-  );
-}
-
-function SelectControl({
-  label,
-  value,
-  options,
-  onChange,
-}: {
-  label: string;
-  value: string;
-  options: Array<string | { value: string; label: string }>;
-  onChange: (value: string) => void;
-}) {
-  return (
-    <label className="select-control" aria-label={label}>
-      <select value={value} onChange={(event) => onChange(event.target.value)}>
-        {options.map((option) => {
-          const item = typeof option === "string" ? { value: option, label: option } : option;
-          return <option key={item.value} value={item.value}>{item.label}</option>;
-        })}
-      </select>
-      <ChevronDown size={16} />
-    </label>
-  );
-}
-
-function ChartHeading({ kicker, title, detail }: { kicker: string; title: string; detail: string }) {
-  return (
-    <div className="analytics-section-heading">
-      <div><span className="drawer-section-kicker">{kicker}</span><h3>{title}</h3></div>
-      <span>{detail}</span>
-    </div>
-  );
-}
 
 export default function AnalyticsPage({
   watches,
@@ -117,7 +69,7 @@ export default function AnalyticsPage({
       setError(message);
       if (!showLoader) onToast(message, "error");
     } finally {
-      if (showLoader && sequence === loadSequence.current) setLoading(false);
+      if (sequence === loadSequence.current) setLoading(false);
     }
   }, [days, marketplace, onToast, watchId]);
 
@@ -146,24 +98,15 @@ export default function AnalyticsPage({
     return first > 0 ? ((last - first) / first) * 100 : null;
   }, [data]);
 
-  const latestMedian = useMemo(() => {
-    if (!data) return null;
-    const priced = data.trend.filter((point) => point.medianPrice !== null);
-    return priced.length ? priced[priced.length - 1].medianPrice : null;
-  }, [data]);
-
   const hasDealData = Boolean(data && data.trend.length);
 
   return (
     <>
-      <PageHeader
-        title="Analytics"
-        description="Cross-watch deal performance, price movement, and marketplace health from Scout’s observations."
-      />
+      <PageHeader title="Analytics" />
       <div className="analytics-toolbar">
         <span>
           {data
-            ? `${scopeLabel} · ${data.rangeDays}d · generated ${formatDate(timeOfDay, data.generatedAt)}`
+            ? `${scopeLabel} · last ${data.rangeDays} days`
             : "Loading analytics…"}
         </span>
         <div className="analytics-toolbar-controls">
@@ -180,9 +123,6 @@ export default function AnalyticsPage({
               </button>
             ))}
           </div>
-          <button className="icon-button" onClick={() => void load(false)} aria-label="Refresh analytics" title="Refresh analytics">
-            <RefreshCw size={17} />
-          </button>
         </div>
       </div>
 
@@ -194,59 +134,42 @@ export default function AnalyticsPage({
           {error ? <div className="analytics-error" role="alert"><AlertTriangle size={16} />{error}</div> : null}
 
           <div className="analytics-stat-grid">
-            <div className="analytics-stat"><span>Tracked listings</span><strong>{formatCount(data.overview.trackedListings)}</strong><small>observed in range</small></div>
-            <div className="analytics-stat"><span>New listings</span><strong>{formatCount(data.overview.newListings)}</strong><small>first seen in range</small></div>
-            <div className="analytics-stat"><span>Strong deals</span><strong>{formatCount(data.overview.strongDeals)}</strong><small>≥18% below baseline</small></div>
-            <div className="analytics-stat"><span>Median discount</span><strong>{formatPercent(data.overview.medianDiscountPercent)}</strong><small>vs learned baseline</small></div>
+            <div className="analytics-stat"><span>Tracked listings</span><strong>{formatCount(data.overview.trackedListings)}</strong><small>{formatCount(data.overview.newListings)} new in range</small></div>
+            <div className="analytics-stat"><span>Strong deals</span><strong>{formatCount(data.overview.strongDeals)}</strong><small>≥12% below typical</small></div>
+            <div className="analytics-stat"><span>Median discount</span><strong>{formatPercent(data.overview.medianDiscountPercent)}</strong><small>below typical</small></div>
+            <div className="analytics-stat"><span>Median move</span><strong className={trendChange === null || watchId === "All" ? "" : trendChange < 0 ? "analytics-value--positive" : trendChange > 0 ? "analytics-value--negative" : ""}>{watchId === "All" ? "—" : formatPercent(trendChange)}</strong><small>{watchId === "All" ? "pick a watch" : "first vs latest day"}</small></div>
           </div>
 
           <section className="analytics-section">
-            <ChartHeading
-              kicker="Price trend"
-              title="Median asking price"
-              detail={trendChange === null ? "Not enough days" : `${trendChange > 0 ? "+" : ""}${trendChange.toFixed(1)}% in range`}
-            />
-            <div className="analytics-chart-card">
-              <AnalyticsTrendChart analytics={{ watchName: scopeLabel, points: data.trend }} />
+            <div className="analytics-section-heading">
+              <h3>Median asking price</h3>
+              <span>{watchId === "All" ? "" : "Middle 50% shaded"}</span>
             </div>
-            <div className="analytics-stat-grid">
-              <div className="analytics-stat"><span>Latest median</span><strong>{formatAnalyticsPrice(latestMedian)}</strong><small>most recent day</small></div>
-              <div className="analytics-stat"><span>Scan runs</span><strong>{formatCount(data.overview.scanRuns)}</strong><small>{formatPercent(data.overview.scanSuccessRate, 0)} completed</small></div>
-              <div className="analytics-stat"><span>Median move</span><strong className={trendChange === null ? "" : trendChange < 0 ? "analytics-value--positive" : trendChange > 0 ? "analytics-value--negative" : ""}>{formatPercent(trendChange)}</strong><small>first vs latest day</small></div>
-              <div className="analytics-stat"><span>Activity seen</span><strong>{formatCount(data.watchLeaderboard.length)}</strong><small>{data.watchLeaderboard.length === 1 ? "watch" : "watches"} with data</small></div>
-            </div>
+            {watchId === "All" ? (
+              // A median across unrelated products (a Kindle and a laptop) means nothing.
+              <div className="analytics-chart-card analytics-chart-empty analytics-chart-empty--short">Pick a watch above to see its price trend.</div>
+            ) : (
+              <div className="analytics-chart-card">
+                <AnalyticsTrendChart analytics={{ watchName: scopeLabel, points: data.trend }} />
+              </div>
+            )}
           </section>
-
-          <div className="analytics-detail-grid">
-            <section className="analytics-section analytics-section--card">
-              <div className="analytics-section-heading">
-                <div><span className="drawer-section-kicker">Deal shape</span><h3>Discount distribution</h3></div>
-                <Database size={16} />
-              </div>
-              <div className="analytics-distribution-grid">
-                {data.discountDistribution.map((bucket) => (
-                  <div key={bucket.label}><span>{bucket.label}</span><strong>{formatCount(bucket.count)}</strong></div>
-                ))}
-              </div>
-            </section>
-            <section className="analytics-section analytics-section--card">
-              <div className="analytics-section-heading">
-                <div><span className="drawer-section-kicker">Decisions</span><h3>Triage review</h3></div>
-                <Tag size={16} />
-              </div>
-              <div className="analytics-funnel">
-                <div><span>Buy</span><strong>{formatCount(data.triage.buy)}</strong></div>
-                <div><span>Watch</span><strong>{formatCount(data.triage.watch)}</strong></div>
-                <div><span>Pass</span><strong>{formatCount(data.triage.pass)}</strong></div>
-                <div><span>Undecided</span><strong>{formatCount(data.triage.none)}</strong></div>
-              </div>
-              <div className="analytics-note"><Info size={15} /><span>Triage decisions are not watch-scoped, so this section honors the date range and marketplace filters only.</span></div>
-            </section>
-          </div>
 
           <section className="analytics-section analytics-section--card">
             <div className="analytics-section-heading">
-              <div><span className="drawer-section-kicker">Leaderboard</span><h3>Watch performance</h3></div>
+              <h3>Discount distribution</h3>
+              <Database size={16} />
+            </div>
+            <div className="analytics-distribution-grid">
+              {data.discountDistribution.map((bucket) => (
+                <div key={bucket.label}><span>{bucket.label}</span><strong>{formatCount(bucket.count)}</strong></div>
+              ))}
+            </div>
+          </section>
+
+          <section className="analytics-section analytics-section--card">
+            <div className="analytics-section-heading">
+              <h3>Watch performance</h3>
               <TrendingUp size={16} />
             </div>
             {data.watchLeaderboard.length ? (
@@ -271,13 +194,13 @@ export default function AnalyticsPage({
 
           <section className="analytics-section analytics-section--card">
             <div className="analytics-section-heading">
-              <div><span className="drawer-section-kicker">Sources</span><h3>Marketplace comparison</h3></div>
+              <h3>Marketplace comparison</h3>
               <BarChart3 size={16} />
             </div>
             {data.marketplaceComparison.length ? (
               <table className="analytics-table">
                 <thead>
-                  <tr><th>Marketplace</th><th>Listings</th><th>Strong deals</th><th>Median discount</th><th>Scan success</th><th>Avg latency</th></tr>
+                  <tr><th>Marketplace</th><th>Listings</th><th>Strong deals</th><th>Median discount</th><th>Scans OK</th></tr>
                 </thead>
                 <tbody>
                   {data.marketplaceComparison.map((row) => (
@@ -290,8 +213,7 @@ export default function AnalyticsPage({
                       <td>{formatCount(row.listings)}</td>
                       <td><strong>{formatCount(row.strongDeals)}</strong></td>
                       <td>{formatPercent(row.medianDiscountPercent)}</td>
-                      <td>{formatPercent(row.scanSuccessRate, 0)}<small className="analytics-table-muted"> · {formatCount(row.scanRuns)} runs</small></td>
-                      <td>{formatLatency(row.averageLatencyMs)}</td>
+                      <td title={`${formatCount(row.scanRuns)} runs · average ${formatLatency(row.averageLatencyMs)}`}>{formatPercent(row.scanSuccessRate, 0)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -299,28 +221,20 @@ export default function AnalyticsPage({
             ) : <div className="analytics-inline-empty">No marketplace scans in this range yet.</div>}
           </section>
 
-          <div className="analytics-detail-grid analytics-detail-grid--single">
-            <section className="analytics-section analytics-section--card">
-              <div className="analytics-section-heading">
-                <div><span className="drawer-section-kicker">Calibration</span><h3>AI quality</h3></div>
-                <Sparkles size={16} />
-              </div>
-              <div className="analytics-stat-grid analytics-stat-grid--compact">
-                <div className="analytics-stat"><span>Relevance judged</span><strong>{formatCount(data.aiQuality.relevanceJudged)}</strong><small>decided in range</small></div>
-                <div className="analytics-stat"><span>Pass rate</span><strong>{formatPercent(data.aiQuality.relevancePassRate, 0)}</strong><small>kept by relevance</small></div>
-                <div className="analytics-stat"><span>Shadow judged</span><strong>{formatCount(data.aiQuality.shadowJudged)}</strong><small>Jev shadow samples</small></div>
-                <div className="analytics-stat"><span>Shadow agreement</span><strong>{formatPercent(data.aiQuality.shadowAgreementRate, 0)}</strong><small>vs driving decision</small></div>
-              </div>
-            </section>
-          </div>
+          <details className="analytics-section analytics-diagnostics">
+            <summary>Diagnostics: scans, triage and AI quality</summary>
+            <div className="analytics-stat-grid">
+              <div className="analytics-stat"><span>Scan runs</span><strong>{formatCount(data.overview.scanRuns)}</strong><small>{formatPercent(data.overview.scanSuccessRate, 0)} completed</small></div>
+              <div className="analytics-stat"><span>Triaged</span><strong>{formatCount(data.triage.buy + data.triage.watch + data.triage.pass)}</strong><small>{formatCount(data.triage.buy)} buy · {formatCount(data.triage.watch)} maybe · {formatCount(data.triage.pass)} pass</small></div>
+              <div className="analytics-stat"><span>AI relevance</span><strong>{formatPercent(data.aiQuality.relevancePassRate, 0)}</strong><small>kept of {formatCount(data.aiQuality.relevanceJudged)} judged</small></div>
+              <div className="analytics-stat"><span>Jev shadow agreement</span><strong>{formatPercent(data.aiQuality.shadowAgreementRate, 0)}</strong><small>{formatCount(data.aiQuality.shadowJudged)} samples</small></div>
+            </div>
+          </details>
 
-          <div className="analytics-note">
-            <Info size={16} />
-            <span>
-              Discounts compare the asking price with Scout’s learned baseline and are deal heuristics, not confirmed sale prices.
-              {hasDealData ? "" : " No observations in this range yet — scanning a watch populates this page."} Scout prunes raw observations after 180 days, which bounds every trend here.
-            </span>
-          </div>
+          <p className="analytics-footnote">
+            Discounts compare asking prices with Scout’s typical price; they are not sale prices.
+            {hasDealData ? "" : " No observations in this range yet."}
+          </p>
         </div>
       ) : null}
     </>

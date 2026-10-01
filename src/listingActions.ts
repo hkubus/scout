@@ -26,10 +26,14 @@ export function patchListingRows(rows: Listing[], event: ListingActionEvent): Li
   return changed ? next : rows;
 }
 
+/** "none" keeps untriaged rows only. */
+export type DecisionFilter = ListingDecision | "All" | "none";
+
 /** The Listings page's server-side decision and visibility filters, applied to one row. */
-export function matchesTriageFilters(listing: Listing, decision: ListingDecision | "All", visibility: "visible" | "hidden" | "all") {
+export function matchesTriageFilters(listing: Listing, decision: DecisionFilter, visibility: "visible" | "hidden" | "all") {
   if (visibility === "visible" && listing.hidden) return false;
   if (visibility === "hidden" && !listing.hidden) return false;
+  if (decision === "none") return !listing.decision;
   return decision === "All" || listing.decision === decision;
 }
 
@@ -38,7 +42,7 @@ export function matchesTriageFilters(listing: Listing, decision: ListingDecision
  * hidden listing leaves the "Visible" page at once. Returns the removed count
  * for the page's total; later pages are reconciled by the next refetch.
  */
-export function applyListingActionToPage(rows: Listing[], event: ListingActionEvent, decision: ListingDecision | "All", visibility: "visible" | "hidden" | "all") {
+export function applyListingActionToPage(rows: Listing[], event: ListingActionEvent, decision: DecisionFilter, visibility: "visible" | "hidden" | "all") {
   const patched = patchListingRows(rows, event);
   if (patched === rows) return { rows, removed: 0 };
   const kept = patched.filter((listing) => listingActionKey(listing) !== event.key || matchesTriageFilters(listing, decision, visibility));

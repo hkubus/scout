@@ -129,8 +129,11 @@ private struct DealListView: View {
     var state: WidgetState
     var rows: Int
 
+    /// The medium family has room for three one-line rows, not a footer as well.
+    private var compact: Bool { rows <= 3 }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: rows > 3 ? 9 : 6) {
+        VStack(alignment: .leading, spacing: compact ? 5 : 9) {
             WidgetHeader(title: "Top deals", trailing: "\(snapshot.stats.strongDeals) strong · \(snapshot.stats.newToday) new today")
             if snapshot.deals.isEmpty {
                 Spacer()
@@ -140,12 +143,15 @@ private struct DealListView: View {
             } else {
                 ForEach(snapshot.deals.prefix(rows)) { deal in
                     Link(destination: deal.deepLink) {
-                        DealRow(deal: deal, thumbnailSize: rows > 3 ? 38 : 30)
+                        DealRow(deal: deal, thumbnailSize: compact ? 26 : 38, showsMarketplace: !compact)
                     }
                 }
             }
             Spacer(minLength: 0)
-            WidgetFooter(snapshot: snapshot, state: state)
+            // Compact widgets only mention their data when it is stale or demo.
+            if !compact || state != .ready || snapshot.isDemo {
+                WidgetFooter(snapshot: snapshot, state: state)
+            }
         }
         .widgetURL(dealsURL)
     }
@@ -154,6 +160,7 @@ private struct DealListView: View {
 private struct DealRow: View {
     var deal: WidgetDeal
     var thumbnailSize: CGFloat
+    var showsMarketplace: Bool
 
     var body: some View {
         HStack(spacing: 8) {
@@ -162,21 +169,23 @@ private struct DealRow: View {
                 Text(deal.title)
                     .font(.caption.weight(.semibold))
                     .lineLimit(1)
-                Text(deal.marketplace.rawValue)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                if showsMarketplace {
+                    Text(deal.marketplace.rawValue)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
             Spacer(minLength: 4)
-            VStack(alignment: .trailing, spacing: 1) {
-                Text(WidgetFormat.pln(deal.price))
-                    .font(.caption.weight(.bold))
-                    .monospacedDigit()
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
                 if let discount = WidgetFormat.discount(deal.belowTypical) {
                     Text(discount)
                         .font(.caption2.weight(.bold))
                         .foregroundStyle(WidgetPalette.color(for: deal.dealLabel))
                 }
+                Text(WidgetFormat.pln(deal.price))
+                    .font(.caption.weight(.bold))
+                    .monospacedDigit()
             }
         }
     }
@@ -233,7 +242,11 @@ struct SummaryWidgetContent: View {
                 Spacer(minLength: 0)
                 StatLine(value: snapshot.stats.strongDeals, title: "strong deals", color: WidgetPalette.orange, large: true)
                 StatLine(value: snapshot.stats.newToday, title: "new today", color: .primary, large: false)
-                StatLine(value: snapshot.stats.watching, title: "watching", color: .primary, large: false)
+                if let top {
+                    Text([WidgetFormat.pln(top.price), WidgetFormat.discount(top.belowTypical)].compactMap { $0 }.joined(separator: " · "))
+                        .font(.caption)
+                        .lineLimit(1)
+                }
                 WidgetFooter(snapshot: snapshot, state: state)
             }
         }
@@ -312,7 +325,7 @@ private struct DealChip: View {
     var label: DealLabel
 
     var body: some View {
-        Text(label.rawValue)
+        Text(label == .watch ? "Fair" : label.rawValue)
             .font(.system(size: 9, weight: .bold))
             .lineLimit(1)
             .padding(.horizontal, 5)

@@ -4,13 +4,12 @@ import {
   BarChart3,
   Bell,
   Check,
-  ChevronDown,
   Clock3,
   Database,
   ExternalLink,
   Eye,
-  Info,
   LoaderCircle,
+  MoreHorizontal,
   Pause,
   Play,
   Plus,
@@ -27,6 +26,7 @@ import { marketWatchInputFromListing } from "./presets";
 import { OlxCategoryPicker } from "./OlxCategoryPicker";
 import { PriceSparkline } from "./PriceSparkline";
 import { dayMonthYear, formatDate, mediumDateShortTime } from "./format";
+import { formatPln, ListingThumbnail, PageHeader, SelectControl } from "./ui";
 import type {
   Marketplace,
   MarketListingSnapshot,
@@ -42,95 +42,21 @@ import type {
 
 type ToastType = "success" | "error" | "info";
 
-const formatPln = (value: number | null) =>
-  value === null ? "Learning" : `${value.toLocaleString("pl-PL")} zł`;
-
 const SALE_BAND_TOOLTIP =
   "Listings verified no-longer-available; their last asking price is used as a probable-sale estimate, not a confirmed sale price. Prices stale > 30 days before disappearance are excluded.";
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
 
-function safeImageUrl(value: string | null | undefined) {
-  if (!value) return null;
-  if (value.startsWith("data:image/")) return value;
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" ? url.toString() : null;
-  } catch {
-    return null;
-  }
-}
-
-function PageHeader({
-  title,
-  description,
-  action,
-  onAction,
-}: {
-  title: string;
-  description?: string;
-  action?: string;
-  onAction?: () => void;
-}) {
-  return (
-    <header className="page-header page-header--inner">
-      <div>
-        <h1>{title}</h1>
-        {description ? <p>{description}</p> : null}
-      </div>
-      {action ? (
-        <button className="primary-button" onClick={onAction}>
-          <Plus size={19} />
-          {action}
-        </button>
-      ) : null}
-    </header>
-  );
-}
-
-function Stat({ label, value, detail, title }: { label: string; value: string; detail: string; title?: string }) {
-  return (
-    <div className="stat" title={title}>
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <small>{detail}</small>
-    </div>
-  );
-}
-
-function SaleBandChip({ band }: { band: SaleBand | null }) {
+/** The probable-sale estimate as one full-width line, so the band never truncates. */
+function SaleBandLine({ band }: { band: SaleBand | null }) {
   if (!band || band.median === null || band.p25 === null || band.p75 === null) {
-    return <div title={SALE_BAND_TOOLTIP}><span>Probable-sale band</span><strong>Learning</strong><small>{band ? `${band.eligibleCount} eligible sale${band.eligibleCount === 1 ? "" : "s"} so far` : "no ended listings yet"}</small></div>;
+    return <p className="research-sale-band" title={SALE_BAND_TOOLTIP}>Probable sale: learning <small>({band ? `${band.eligibleCount} ended so far` : "no ended listings yet"})</small></p>;
   }
   return (
-    <div title={SALE_BAND_TOOLTIP}>
-      <span>Probable-sale band</span>
-      <strong>{formatPln(band.p25)} — {formatPln(band.median)} — {formatPln(band.p75)}</strong>
-      <small>{band.eligibleCount} probable sale{band.eligibleCount === 1 ? "" : "s"}</small>
-    </div>
-  );
-}
-
-function SelectControl({
-  value,
-  options,
-  onChange,
-}: {
-  value: string;
-  options: Array<string | { value: string; label: string }>;
-  onChange: (value: string) => void;
-}) {
-  return (
-    <label className="select-control">
-      <select aria-label={value} value={value} onChange={(event) => onChange(event.target.value)}>
-        {options.map((option) => {
-          const item = typeof option === "string" ? { value: option, label: option } : option;
-          return <option key={item.value} value={item.value}>{item.label}</option>;
-        })}
-      </select>
-      <ChevronDown size={16} />
-    </label>
+    <p className="research-sale-band" title={SALE_BAND_TOOLTIP}>
+      Probable sale <strong>≈ {formatPln(band.median)}</strong> <small>{formatPln(band.p25)}–{formatPln(band.p75)} · {band.eligibleCount} ended</small>
+    </p>
   );
 }
 
@@ -149,11 +75,11 @@ export default function MarketResearchPage({
   const [status, setStatus] = useState<"All" | "active" | "ended" | "superseded">("All");
   const [page, setPage] = useState(1);
   const [busyIds, setBusyIds] = useState<Set<string>>(() => new Set());
-  const [rowBusy, setRowBusy] = useState<Set<number>>(() => new Set());
   const [snapshotListing, setSnapshotListing] = useState<MarketTrackedListing | null>(null);
   const [watchPreset, setWatchPreset] = useState<MarketWatchInput | null>(null);
   const [dialogNonce, setDialogNonce] = useState(0);
   const [trendWatch, setTrendWatch] = useState<MarketWatch | null>(null);
+  const [menuWatch, setMenuWatch] = useState<string | null>(null);
   const loadSequence = useRef(0);
   const loadController = useRef<AbortController | null>(null);
 
@@ -166,7 +92,7 @@ export default function MarketResearchPage({
     try {
       const result = await api.marketResearch({
         page,
-        pageSize: 100,
+        pageSize: 25,
         watchId: selectedWatch === "All" ? undefined : selectedWatch,
         status: status === "All" ? undefined : status,
       }, controller.signal);
@@ -176,7 +102,9 @@ export default function MarketResearchPage({
       if (sequence !== loadSequence.current || controller.signal.aborted) return;
       onToast(errorMessage(error), "error");
     } finally {
-      if (showLoader && sequence === loadSequence.current) setLoading(false);
+      // Whichever request is newest ends the loading state, so a refresh that
+      // supersedes the first load cannot leave the spinner up forever.
+      if (sequence === loadSequence.current) setLoading(false);
     }
   }, [onToast, page, selectedWatch, status]);
 
@@ -233,23 +161,6 @@ export default function MarketResearchPage({
     await load(false);
     onToast(`${watch.name} deleted.`);
   });
-  const saveCopy = async (listing: MarketTrackedListing) => {
-    setRowBusy((current) => new Set(current).add(listing.id));
-    try {
-      await api.captureMarketListingSnapshot(listing.id);
-      onToast(`Saved a copy of “${listing.title}”.`, "success");
-      await load(false);
-    } catch (error) {
-      onToast(errorMessage(error), "error");
-    } finally {
-      setRowBusy((current) => {
-        const next = new Set(current);
-        next.delete(listing.id);
-        return next;
-      });
-    }
-  };
-
   const visible = useMemo(
     () => data.listings.filter((listing) =>
       (selectedWatch === "All" || listing.marketWatchId === selectedWatch)
@@ -258,35 +169,48 @@ export default function MarketResearchPage({
   );
   const totalEnded = data.aggregates?.endedCount ?? data.watches.reduce((sum, watch) => sum + watch.endedListings, 0);
   const totalActive = data.aggregates?.activeCount ?? data.watches.reduce((sum, watch) => sum + watch.activeListings, 0);
-  const overallBand = data.aggregates?.saleBand ?? null;
 
   return (
     <>
-      <PageHeader title="Market research" description="Daily snapshots that reveal asking-price movement and estimate where listings leave the market." action="New research watch" onAction={openCreate} />
-      <div className="research-explainer"><BarChart3 size={22} /><div><strong>Track the market, separately from deal alerts.</strong><span>Scout records every observed asking price. A listing is marked “no longer available” only after three verified terminal checks. A missing or blocked search result alone is never treated as a sale.</span></div></div>
-      <section className="research-stats" aria-label="Market research summary">
-        <Stat label="Research watches" value={String(data.watches.length)} detail={`${data.watches.filter((watch) => watch.enabled).length} active`} />
-        <Stat label="Live listings" value={String(totalActive)} detail="currently observed" />
-        <Stat label="Ended listings" value={String(totalEnded)} detail="verified unavailable" />
-        <Stat
-          label="Probable-sale median"
-          title={SALE_BAND_TOOLTIP}
-          value={overallBand?.median === null || overallBand?.median === undefined ? "Learning" : formatPln(overallBand.median)}
-          detail={overallBand?.median != null ? `p25–p75 band · ${overallBand.eligibleCount} probable sales` : `${overallBand?.eligibleCount ?? 0} eligible so far`}
-        />
-      </section>
-      <div className="research-section-heading"><h2>Research watches</h2><span>Default cadence: once every 24 hours</span></div>
+      <PageHeader title="Research">
+        <button className="primary-button" onClick={openCreate}><Plus size={18} />New research watch</button>
+      </PageHeader>
+      {data.watches.length ? (
+        <p className="research-meta" title="A listing counts as ended only after three verified terminal checks; a missing search result alone is never treated as a sale.">
+          {data.watches.filter((watch) => watch.enabled).length} of {data.watches.length} research watches active · {totalActive.toLocaleString("pl-PL")} live · {totalEnded.toLocaleString("pl-PL")} ended listings
+        </p>
+      ) : null}
       {loading ? (
         <div className="table-loading"><LoaderCircle size={20} className="spin" />Loading market research…</div>
       ) : data.watches.length ? (
         <div className="research-watch-list">
           {data.watches.map((watch) => (
             <article className={`research-watch ${watch.enabled ? "" : "research-watch--paused"}`} key={watch.id}>
-              <div className="research-watch-heading"><div><strong>{watch.name}</strong><span>{watch.query}</span></div><span className={`state-chip state-chip--${watch.enabled ? "ready" : "paused"}`}><i />{watch.enabled ? "Active" : "Paused"}</span></div>
-              <div className="research-watch-sources">{watch.sources.map((source) => <span key={source}><i style={{ background: marketplaceColors[source] }} />{source}</span>)}</div>
+              <div className="research-watch-heading">
+                <div><strong>{watch.name}</strong><span>{watch.query.toLowerCase() !== watch.name.toLowerCase() ? `${watch.query} · ` : ""}{watch.sources.join(", ")}</span></div>
+                {watch.enabled ? null : <span className="state-chip state-chip--paused"><i />Paused</span>}
+              </div>
               <MarketWatchFilterSummary watch={watch} />
-              <div className="research-watch-metrics"><div><span>Tracked</span><strong>{watch.totalListings}</strong></div><div><span>Ended</span><strong>{watch.endedListings}</strong></div><SaleBandChip band={watch.saleBand} /></div>
-              <div className="research-watch-footer"><span><Clock3 size={14} />Every {watch.intervalHours}h · Last {watch.lastScan} · Next {watch.nextScan}</span><div><button className="icon-button" title="View price trend" aria-label={`View price trend for ${watch.name}`} onClick={() => setTrendWatch(watch)}><BarChart3 size={16} /></button><button className="icon-button" title="Edit research filters" aria-label={`Edit ${watch.name}`} disabled={busyIds.has(watch.id)} onClick={() => openEdit(watch)}><SlidersHorizontal size={16} /></button><button className="icon-button" title="Scan research watch now" aria-label={`Scan ${watch.name} now`} disabled={busyIds.has(watch.id) || !watch.enabled} onClick={() => void scan(watch)}>{busyIds.has(watch.id) ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}</button><button className={`toggle ${watch.enabled ? "toggle--on" : ""}`} aria-label={watch.enabled ? `Pause ${watch.name}` : `Resume ${watch.name}`} disabled={busyIds.has(watch.id)} onClick={() => void toggle(watch)}>{watch.enabled ? <Pause size={13} /> : <Play size={13} />}</button><button className="icon-button danger-icon" title="Delete research watch" aria-label={`Delete ${watch.name}`} disabled={busyIds.has(watch.id)} onClick={() => void remove(watch)}><Trash2 size={16} /></button></div></div>
+              <SaleBandLine band={watch.saleBand} />
+              <div className="research-watch-footer">
+                <span><Clock3 size={14} />{watch.totalListings} tracked · {watch.endedListings} ended · {watch.enabled ? `next ${watch.nextScan}` : "paused"}</span>
+                <div>
+                  <button className="icon-button" title="Price trend" aria-label={`Price trend for ${watch.name}`} onClick={() => setTrendWatch(watch)}><BarChart3 size={16} /></button>
+                  <div className="menu-anchor">
+                    <button className="icon-button" title="More actions" aria-label={`More actions for ${watch.name}`} aria-haspopup="menu" aria-expanded={menuWatch === watch.id} disabled={busyIds.has(watch.id)} onClick={() => setMenuWatch((current) => current === watch.id ? null : watch.id)}>
+                      {busyIds.has(watch.id) ? <LoaderCircle size={16} className="spin" /> : <MoreHorizontal size={17} />}
+                    </button>
+                    {menuWatch === watch.id ? (
+                      <div className="action-menu" role="menu">
+                        <button role="menuitem" disabled={!watch.enabled} onClick={() => { setMenuWatch(null); void scan(watch); }}><RefreshCw size={15} />Scan now</button>
+                        <button role="menuitem" onClick={() => { setMenuWatch(null); openEdit(watch); }}><SlidersHorizontal size={15} />Edit filters</button>
+                        <button role="menuitem" onClick={() => { setMenuWatch(null); void toggle(watch); }}>{watch.enabled ? <Pause size={15} /> : <Play size={15} />}{watch.enabled ? "Pause" : "Resume"}</button>
+                        <button role="menuitem" className="danger-action" onClick={() => { setMenuWatch(null); void remove(watch); }}><Trash2 size={15} />Delete</button>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              </div>
             </article>
           ))}
         </div>
@@ -295,8 +219,8 @@ export default function MarketResearchPage({
       )}
       {data.watches.length ? (
         <section className="research-history">
-          <div className="section-heading-row"><h2>Saved listings</h2><div className="filters"><SelectControl value={selectedWatch} options={[{ value: "All", label: "All research watches" }, ...data.watches.map((watch) => ({ value: watch.id, label: watch.name }))]} onChange={(value) => { setSelectedWatch(value); setPage(1); }} /><SelectControl value={status} options={[{ value: "All", label: "All statuses" }, { value: "active", label: "Active" }, { value: "ended", label: "No longer available" }, { value: "superseded", label: "Previous series" }]} onChange={(value) => { setStatus(value as typeof status); setPage(1); }} /></div></div>
-          <MarketResearchTable listings={visible} onViewSnapshot={setSnapshotListing} rowBusy={rowBusy} onSaveCopy={saveCopy} onAddWatch={openCreateFromListing} />
+          <div className="section-heading-row"><h2>Saved listings</h2><div className="filters"><SelectControl label="Research watch" value={selectedWatch} options={[{ value: "All", label: "All research watches" }, ...data.watches.map((watch) => ({ value: watch.id, label: watch.name }))]} onChange={(value) => { setSelectedWatch(value); setPage(1); }} /><SelectControl label="Status" value={status} options={[{ value: "All", label: "All statuses" }, { value: "active", label: "Active" }, { value: "ended", label: "Ended" }, { value: "superseded", label: "Previous series" }]} onChange={(value) => { setStatus(value as typeof status); setPage(1); }} /></div></div>
+          <MarketResearchTable listings={visible} onViewSnapshot={setSnapshotListing} />
           {data.pagination && (data.pagination.page > 1 || data.pagination.hasNext) ? <div className="research-pagination"><button className="outline-button" disabled={page <= 1 || loading} onClick={() => setPage((current) => Math.max(1, current - 1))}>Previous</button><span>Page {data.pagination.page} · {data.pagination.total.toLocaleString("pl-PL")} listings</span><button className="outline-button" disabled={!data.pagination.hasNext || loading} onClick={() => setPage((current) => current + 1)}>Next</button></div> : null}
         </section>
       ) : null}
@@ -347,9 +271,8 @@ function MarketWatchTrendDialog({ watch, refreshKey, onClose }: {
       <section className="modal modal--analytics" role="dialog" aria-modal="true" aria-labelledby="market-trend-title">
         <div className="modal-header">
           <div>
-            <span className="modal-kicker">Market research</span>
+            <span className="modal-kicker">Price trend</span>
             <h2 id="market-trend-title">{watch.name}</h2>
-            <p>Daily asking-price movement for the current comparable series.</p>
           </div>
           <button className="icon-button" onClick={onClose} aria-label="Close research trend"><X size={20} /></button>
         </div>
@@ -371,10 +294,9 @@ function MarketWatchTrendDialog({ watch, refreshKey, onClose }: {
                 <div className="analytics-stat"><span>Listings last day</span><strong>{lastPoint?.listingCount ?? 0}</strong><small>unique listings observed</small></div>
               </div>
               <section className="analytics-section">
-                <div className="analytics-section-heading"><div><span className="drawer-section-kicker">Price trend</span><h3>Asking prices vs probable sales</h3></div><span>Middle 50% shaded</span></div>
+                <div className="analytics-section-heading"><h3>Asking prices vs probable sales</h3><span title="The dashed line is the probable-sale median from listings verified as no longer available: an estimate, not a confirmed sale price.">Middle 50% shaded · dashed: probable sale</span></div>
                 <div className="analytics-chart-card"><AnalyticsTrendChart analytics={{ watchName: watch.name, points: trend.points }} referenceMedian={trend.probableSaleMedian} /></div>
               </section>
-              <div className="analytics-note"><Info size={16} /><span>The solid line is the median asking price of the live market. The dashed line is the probable-sale median estimated from listings verified as no longer available — an estimate, not a confirmed sale price.</span></div>
             </>
           ) : null}
         </div>
@@ -391,54 +313,34 @@ function MarketWatchFilterSummary({ watch }: { watch: MarketWatch }) {
   if (watch.condition !== "Any") tags.push(`condition: ${watch.condition}`);
   if (watch.shippingOnly) tags.push("shipping only");
   if (watch.olxCategory) tags.push(`OLX category: ${watch.olxCategory.label}`);
-  return <div className="research-watch-filters">{tags.length ? tags.map((tag) => <span key={tag}>{tag}</span>) : <span>All prices · any condition</span>}</div>;
+  return tags.length ? <div className="research-watch-filters">{tags.map((tag) => <span key={tag}>{tag}</span>)}</div> : null;
 }
 
-function MarketResearchTable({ listings, onViewSnapshot, rowBusy, onSaveCopy, onAddWatch }: {
+function MarketResearchTable({ listings, onViewSnapshot }: {
   listings: MarketTrackedListing[];
   onViewSnapshot: (listing: MarketTrackedListing) => void;
-  rowBusy: Set<number>;
-  onSaveCopy: (listing: MarketTrackedListing) => Promise<void>;
-  onAddWatch: (listing: MarketTrackedListing) => void;
 }) {
   if (!listings.length) return <div className="empty-state"><Database size={24} /><strong>No saved listings in this view</strong><span>The first successful snapshot will populate this history.</span></div>;
   return (
     <div className="research-table-wrap" role="table" aria-label="Market research listings">
-      <div className="research-table research-table--head" role="row"><span role="columnheader">Listing</span><span role="columnheader">Status</span><span role="columnheader">First price</span><span role="columnheader">Last price</span><span role="columnheader">Change</span><span role="columnheader">Observations</span><span role="columnheader">Last seen / ended</span><span role="columnheader" /></div>
+      <div className="research-table research-table--head" role="row"><span role="columnheader">Listing</span><span role="columnheader">Status</span><span role="columnheader">First price</span><span role="columnheader" title="For ended listings, the last asking price: not a confirmed sale">Last price</span><span role="columnheader">Change</span><span role="columnheader">Observations</span><span role="columnheader">Last seen / ended</span><span role="columnheader" /></div>
       {listings.map((listing) => (
         <div className="research-table research-listing-row" role="row" key={listing.id}>
-          <div className="research-listing" role="cell"><MarketThumbnail listing={listing} /><div><strong>{listing.title}</strong><span><i style={{ background: marketplaceColors[listing.marketplace] }} />{listing.marketplace} · {listing.watchName}</span></div></div>
-          <span className={`research-status research-status--${listing.status}`} role="cell"><i />{listing.status === "ended" ? "No longer available" : listing.status === "superseded" ? "Previous series" : listing.missingScans ? `Verifying (${listing.missingScans}/3)` : "Active"}{listing.snapshotStatus === "saved" ? <small>copy saved</small> : null}</span>
+          <div className="research-listing" role="cell"><ListingThumbnail listing={listing} /><div><strong>{listing.title}</strong><span><i style={{ background: marketplaceColors[listing.marketplace] }} />{listing.marketplace} · {listing.watchName}</span></div></div>
+          <span className={`research-status research-status--${listing.status}`} role="cell"><i />{listing.status === "ended" ? "Ended" : listing.status === "superseded" ? "Previous series" : listing.missingScans ? `Verifying ${listing.missingScans}/3` : "Active"}</span>
           <span data-label="First price" role="cell">{formatPln(listing.firstPrice)}</span>
-          <strong data-label="Last price" role="cell">{formatPln(listing.lastPrice)}{listing.status === "ended" ? <small>last asking price · not a confirmed sale</small> : null}</strong>
+          <strong data-label="Last price" role="cell">{formatPln(listing.lastPrice)}</strong>
           <span data-label="Change" role="cell" className={listing.priceChangePercent < 0 ? "price-down" : listing.priceChangePercent > 0 ? "price-up" : ""}>{listing.priceChangePercent === 0 ? "—" : `${listing.priceChangePercent > 0 ? "+" : ""}${listing.priceChangePercent.toFixed(1)}%`}</span>
           <span data-label="Observations" role="cell">{listing.observations}</span>
           <span data-label="Last seen / ended" role="cell">{formatDate(dayMonthYear, listing.endedAt ?? listing.lastSeenAt)}</span>
           <span role="cell" className="research-row-actions">
             <button
               className="icon-button"
-              title="View or preserve a listing copy"
-              aria-label={`View saved copy of ${listing.title}`}
+              title="Saved copy, price history and actions"
+              aria-label={`View ${listing.title}`}
               onClick={() => onViewSnapshot(listing)}
             >
               <Eye size={17} />
-            </button>
-            <button
-              className="icon-button"
-              title="Save a fresh copy of this listing now"
-              aria-label={`Save a copy of ${listing.title}`}
-              disabled={rowBusy.has(listing.id)}
-              onClick={() => void onSaveCopy(listing)}
-            >
-              {rowBusy.has(listing.id) ? <LoaderCircle size={17} className="spin" /> : <Database size={17} />}
-            </button>
-            <button
-              className="icon-button"
-              title="Create a research watch from this listing"
-              aria-label={`Create a research watch from ${listing.title}`}
-              onClick={() => onAddWatch(listing)}
-            >
-              <Bell size={17} />
             </button>
             <a href={listing.url} target="_blank" rel="noopener noreferrer" className="external-link" aria-label={`Open ${listing.title}`}><ExternalLink size={17} /></a>
           </span>
@@ -503,12 +405,8 @@ function MarketListingSnapshotModal({ listing, onClose, onToast, onSaved, onWatc
       <section className="modal modal--snapshot" role="dialog" aria-modal="true" aria-labelledby="snapshot-title">
         <div className="modal-header">
           <div>
-            <span className="modal-kicker">Preserved listing copy</span>
+            <span className="modal-kicker">{listing.marketplace} · {formatPln(listing.lastPrice)}{listing.status === "ended" ? " · no longer available" : ""}</span>
             <h2 id="snapshot-title">{listing.title}</h2>
-            <p>
-              {listing.marketplace} · {formatPln(listing.lastPrice)} ·{" "}
-              {listing.status === "ended" ? "no longer available — the copy below is what Scout preserved" : "a local copy that stays viewable if the listing is sold"}
-            </p>
           </div>
           <button className="icon-button" disabled={saving} onClick={onClose} aria-label="Close"><X size={20} /></button>
         </div>
@@ -555,7 +453,6 @@ function MarketListingSnapshotModal({ listing, onClose, onToast, onSaved, onWatc
               ) : (
                 <div className="snapshot-description snapshot-description--empty"><strong>Description</strong><p>The detail page did not expose a description when this copy was saved.</p></div>
               )}
-              <div className="modal-note"><Info size={16} /><span>Images and the description are stored in Scout's database, so they remain viewable even after the marketplace page is gone.</span></div>
             </>
           ) : (
             <div className="snapshot-missing">
@@ -590,12 +487,6 @@ function MarketListingSnapshotModal({ listing, onClose, onToast, onSaved, onWatc
       ) : null}
     </div>
   );
-}
-
-function MarketThumbnail({ listing }: { listing: MarketTrackedListing }) {
-  const [failed, setFailed] = useState(false);
-  const image = safeImageUrl(listing.image);
-  return image && !failed ? <img src={image} alt="" loading="lazy" onError={() => setFailed(true)} /> : <div className="listing-thumb-placeholder"><Tag size={20} /></div>;
 }
 
 function MarketWatchDialog({
@@ -652,20 +543,22 @@ function MarketWatchDialog({
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !submitting && onClose()}>
       <section className="modal" role="dialog" aria-modal="true" aria-labelledby="market-watch-title">
-        <div className="modal-header"><div><span className="modal-kicker">Market research</span><h2 id="market-watch-title">{editing ? "Edit research watch" : "New research watch"}</h2><p>{editing ? "Changing search criteria starts a new comparable series; previous observations remain available." : "Save recurring search snapshots and compare asking-price history."}</p></div><button className="icon-button" disabled={submitting} onClick={onClose} aria-label="Close"><X size={20} /></button></div>
+        <div className="modal-header"><h2 id="market-watch-title">{editing ? "Edit research watch" : "New research watch"}</h2><button className="icon-button" disabled={submitting} onClick={onClose} aria-label="Close"><X size={20} /></button></div>
         <div className="modal-body">
           <label className="field-label">Watch name<input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Used RTX 4070 market" /></label>
           <label className="field-label">Search phrase<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="e.g. RTX 4070" /></label>
           <div className="field-row"><label className="field-label">Included terms<input value={terms} onChange={(event) => setTerms(event.target.value)} placeholder="e.g. 12gb, founders edition" /></label><label className="field-label">Excluded terms<input value={excluded} onChange={(event) => setExcluded(event.target.value)} placeholder="e.g. broken, parts" /></label></div>
           <label className="field-label">Condition<select value={condition} onChange={(event) => setCondition(event.target.value)}><option>Any</option><option>New</option><option>Used</option><option>Like new</option><option>Very good</option><option>Good</option></select></label>
-          <div className="field-row"><label className="field-label">Minimum price <span>PLN · optional</span><input type="number" min="0" step="1" value={minPrice} onChange={(event) => setMinPrice(event.target.value)} placeholder="No minimum" /></label><label className="field-label">Maximum price <span>PLN · optional</span><input type="number" min="1" step="1" value={maxPrice} onChange={(event) => setMaxPrice(event.target.value)} placeholder="No maximum" /></label></div>
-          <div className="field-row"><label className="field-label">Snapshot interval <span>6–168 hours</span><input type="number" min="6" max="168" value={interval} onChange={(event) => setIntervalValue(event.target.value)} /></label><div className="field-label"><span>Sources</span><div className="source-options">{(["OLX", "Allegro Lokalnie", "Vinted"] as Marketplace[]).map((source) => <button type="button" key={source} aria-pressed={sources.includes(source)} className={`source-option ${sources.includes(source) ? "source-option--selected" : ""}`} onClick={() => toggleSource(source)}><i style={{ background: marketplaceColors[source] }} />{source}{sources.includes(source) ? <Check size={15} /> : null}</button>)}</div></div></div>
+          <div className="field-row"><label className="field-label">Minimum price <span className="field-hint-inline">PLN · optional</span><input type="number" min="0" step="1" value={minPrice} onChange={(event) => setMinPrice(event.target.value)} placeholder="No minimum" /></label><label className="field-label">Maximum price <span className="field-hint-inline">PLN · optional</span><input type="number" min="1" step="1" value={maxPrice} onChange={(event) => setMaxPrice(event.target.value)} placeholder="No maximum" /></label></div>
+          <div className="field-row"><label className="field-label">Snapshot interval <span className="field-hint-inline">6–168 hours</span><input type="number" min="6" max="168" value={interval} onChange={(event) => setIntervalValue(event.target.value)} /></label><div className="field-label"><span>Sources</span><div className="source-options">{(["OLX", "Allegro Lokalnie", "Vinted"] as Marketplace[]).map((source) => <button type="button" key={source} aria-pressed={sources.includes(source)} className={`source-option ${sources.includes(source) ? "source-option--selected" : ""}`} onClick={() => toggleSource(source)}><i style={{ background: marketplaceColors[source] }} />{source}{sources.includes(source) ? <Check size={15} /> : null}</button>)}</div></div></div>
           {sources.includes("OLX") ? <OlxCategoryPicker query={query} value={olxCategory} onChange={setOlxCategory} /> : null}
-          <label className="check-option check-option--modal"><input type="checkbox" checked={shippingOnly} onChange={(event) => setShippingOnly(event.target.checked)} /><span><strong>Require shipping</strong><small>Only save listings with confirmed delivery options</small></span></label>
-          <label className="check-option check-option--modal"><input type="checkbox" checked={typoVariants} onChange={(event) => setTypoVariants(event.target.checked)} /><span><strong>Scan typo variants</strong><small>Catch misspelled listings — up to 2 extra searches per scan</small></span></label>
+          <div className="modal-checks">
+            <label className="check-option" title="Only save listings with confirmed delivery options"><input type="checkbox" checked={shippingOnly} onChange={(event) => setShippingOnly(event.target.checked)} /><strong>Require shipping</strong></label>
+            <label className="check-option" title="Catch misspelled listings with up to 2 extra searches per scan"><input type="checkbox" checked={typoVariants} onChange={(event) => setTypoVariants(event.target.checked)} /><strong>Also search typo variants</strong></label>
+          </div>
           {error ? <div className="form-error" role="alert"><AlertTriangle size={15} />{error}</div> : null}
           {!validPrices ? <div className="form-error" role="alert"><AlertTriangle size={15} />Minimum price cannot exceed maximum price.</div> : null}
-          <div className="modal-note"><Info size={16} /><span>Scout displays “no longer available” only after verified terminal checks. The retained last asking price is not a confirmed sale price.</span></div>
+          {editing ? <p className="modal-footnote">Changing the search starts a new comparable series; earlier observations stay available.</p> : null}
         </div>
         <div className="modal-footer"><button className="outline-button" disabled={submitting} onClick={onClose}>Cancel</button><button className="primary-button" disabled={!valid || submitting} onClick={submit}>{submitting ? <LoaderCircle size={17} className="spin" /> : editing ? <Check size={17} /> : <Plus size={17} />}{submitting ? "Saving…" : editing ? "Save research watch" : "Create research watch"}</button></div>
       </section>

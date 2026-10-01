@@ -1,27 +1,17 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Download, LoaderCircle, RefreshCw, ScrollText } from "lucide-react";
+import { Download, LoaderCircle, ScrollText } from "lucide-react";
 import { api } from "./api";
 import { subscribe, subscribeStatus } from "./events";
 import { formatDate, timeWithSeconds } from "./format";
 import { mergeLogs, prependLog } from "./logEntries";
 import type { LogEntry } from "./types";
+import { PageHeader } from "./ui";
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
 
 type LevelFilter = "all" | "info" | "error";
 type ScopeFilter = "all" | "watch" | "research" | "diagnostics";
-
-function PageHeader({ title, description }: { title: string; description?: string }) {
-  return (
-    <header className="page-header page-header--inner">
-      <div>
-        <h1>{title}</h1>
-        {description ? <p>{description}</p> : null}
-      </div>
-    </header>
-  );
-}
 
 const timeOnly = (value: string) => formatDate(timeWithSeconds, value);
 
@@ -114,10 +104,7 @@ export default function LogsPage({ onToast }: { onToast: (message: string, type?
 
   return (
     <>
-      <PageHeader
-        title="Logs"
-        description="Scan-path activity: which connector route each watch takes, skips, and failures."
-      />
+      <PageHeader title="Logs" />
       <div className="log-toolbar">
         <div className="log-filters" role="group" aria-label="Log filters">
           {(["all", "info", "error"] as LevelFilter[]).map((value) => (
@@ -144,13 +131,6 @@ export default function LogsPage({ onToast }: { onToast: (message: string, type?
           ))}
         </div>
         <div className="log-toolbar-actions">
-          <button
-            className="icon-button"
-            aria-label="Refresh logs"
-            onClick={() => void loadLogs(true)}
-          >
-            <RefreshCw size={16} className={loading ? "spin" : ""} />
-          </button>
           <button
             className="icon-button"
             aria-label="Download logs"
@@ -183,8 +163,7 @@ export default function LogsPage({ onToast }: { onToast: (message: string, type?
       </div>
       {!loading && logs.length > 0 ? (
         <p className="log-footnote">
-          Showing the latest {filtered.length} of {logs.length} in-memory entries.
-          Logs are diagnostics only and reset when Scout restarts.
+          {filtered.length} of {logs.length} entries since Scout last started; new ones appear live.
         </p>
       ) : null}
     </>
