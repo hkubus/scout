@@ -107,12 +107,13 @@ struct SettingsView: View {
                 WidgetGalleryView()
             }
             .refreshable { await load() }
-            .task(id: model.refreshToken) { await load() }
+            .reloadOnChange(of: model.serverToken) { await load() }
         }
     }
 
-    private func load() async {
-        guard let client = model.client else { return }
+    @discardableResult
+    private func load() async -> Bool {
+        guard let client = model.client else { return false }
         do {
             async let loadedHealth = client.health()
             async let loadedReadiness = client.readiness()
@@ -123,8 +124,13 @@ struct SettingsView: View {
             self.connectors = connectors
             serverSettings = try? await client.settings()
             error = nil
+            // A cancelled or failed settings fetch leaves the server settings
+            // section missing, so don't mark the load done: the next
+            // appearance loads again.
+            return !Task.isCancelled && serverSettings != nil
         } catch {
             if !error.isCancellation { self.error = error.localizedDescription }
+            return false
         }
     }
 

@@ -44,24 +44,48 @@ export function pooledVariantSpread(buckets: Iterable<number[]>): PooledSpread {
   return { spreadRatio: median(deviations), samples: deviations.length };
 }
 
-export function scoreDeal(prices: number[], price: number, options: { minSamples?: number; minHours?: number; observedHours?: number; sensitivity?: number; typicalOverride?: number; pooled?: PooledSpread } = {}): ScoreResult {
+/**
+ * The listing-independent part of a baseline: its usable prices, their median
+ * and a memo of the MAD per typical value. A scan scores every listing against
+ * the same few buckets, so computing these once per bucket saves two sorts of
+ * up to 400 prices per scored listing.
+ */
+export interface PriceStats {
+  usable: number[];
+  median: number | null;
+  /** median(|price - typical|) keyed by typical; a reference override changes the typical. */
+  madByTypical: Map<number, number>;
+}
+
+export function priceStats(prices: number[]): PriceStats {
+  const usable = prices.filter((value) => Number.isFinite(value) && value > 0);
+  return { usable, median: median(usable), madByTypical: new Map() };
+}
+
+type ScoreOptions = { minSamples?: number; minHours?: number; observedHours?: number; sensitivity?: number; typicalOverride?: number; pooled?: PooledSpread };
+
+export function scoreDeal(prices: number[], price: number, options: ScoreOptions = {}): ScoreResult {
+  return scoreDealFromStats(priceStats(prices), price, options);
+}
+
+/** scoreDeal against precomputed bucket stats; the arithmetic is identical. */
+export function scoreDealFromStats(stats: PriceStats, price: number, options: ScoreOptions = {}): ScoreResult {
   // Named model variants pass their bucket's prices plus the pooled spread:
   // the typical comes from the variant, while the MAD and the 30-sample
   // readiness floor come from all named variants together.
   const pooled = options.pooled;
   const minSamples = options.minSamples ?? (pooled ? VARIANT_MIN_SAMPLES : BASELINE_MIN_SAMPLES);
   const minHours = options.minHours ?? BASELINE_MIN_HOURS;
-  const usablePrices = prices.filter((value) => Number.isFinite(value) && value > 0);
+  const usablePrices = stats.usable;
   // A typicalOverride (e.g. a reference series' probable-sale median) seeds the
   // typical for ranking/display while a watch's own baseline is still learning.
   // Readiness (and therefore the qualifies gate) still requires own samples.
   const override = options.typicalOverride !== undefined && Number.isFinite(options.typicalOverride) && options.typicalOverride > 0
     ? options.typicalOverride
     : null;
-  const typical = override ?? median(usablePrices);
+  const typical = override ?? stats.median;
   if (typical === null || price <= 0) return { typical, mad: null, deviation: null, discountPercent: null, confidence: 0, isReady: false, qualifies: false };
-  const deviations = usablePrices.map((value) => Math.abs(value - typical));
-  const mad = pooled?.spreadRatio != null ? pooled.spreadRatio * typical : median(deviations) ?? 0;
+  const mad = pooled?.spreadRatio != null ? pooled.spreadRatio * typical : ownMad(stats, typical);
   const robustScale = Math.max(mad * 1.4826, typical * 0.035, 1);
   const deviation = (typical - price) / robustScale;
   const discountPercent = ((typical - price) / typical) * 100;
@@ -80,6 +104,15 @@ export function scoreDeal(prices: number[], price: number, options: { minSamples
   const veryStrong = discountPercent >= 20;
   const qualifies = isReady && discountPercent >= 18 && (veryStrong || deviation >= 3.1 / sensitivity);
   return { typical, mad, deviation, discountPercent, confidence, isReady, qualifies };
+}
+
+function ownMad(stats: PriceStats, typical: number) {
+  let mad = stats.madByTypical.get(typical);
+  if (mad === undefined) {
+    mad = median(stats.usable.map((value) => Math.abs(value - typical))) ?? 0;
+    stats.madByTypical.set(typical, mad);
+  }
+  return mad;
 }
 
 export function pruneBefore<T extends { observedAt: string }>(rows: T[], now = Date.now(), retentionDays = 180) {

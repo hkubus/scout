@@ -50,17 +50,6 @@ enum WidgetPalette {
     }
 }
 
-enum WidgetFormat {
-    static func pln(_ value: Double) -> String {
-        value.formatted(.currency(code: "PLN").precision(.fractionLength(0)).locale(Locale(identifier: "pl_PL")))
-    }
-
-    static func discount(_ belowTypical: Double?) -> String? {
-        guard let belowTypical, belowTypical < 0 else { return nil }
-        return "−\(Int(abs(belowTypical).rounded()))%"
-    }
-}
-
 private let dealsURL = URL(string: "scout://deals")!
 
 // MARK: - Top deals widget

@@ -4,26 +4,19 @@ import Foundation
 /// fractional seconds, SQLite `YYYY-MM-DD HH:MM:SS` (UTC), and analytics
 /// calendar days (`YYYY-MM-DD`, interpreted in the device's time zone).
 public enum ScoutDate {
+    // Format styles are Sendable value types, so one shared copy of each is
+    // safe from any thread and saves building a formatter on every parse.
+    private static let fractional = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+    private static let plain = Date.ISO8601FormatStyle()
+
     public static func parse(_ value: String?) -> Date? {
         guard let value = value?.trimmingCharacters(in: .whitespaces), !value.isEmpty else { return nil }
         if value.count == 10 { return day(value) }
-        if let date = fractional().date(from: value) ?? plain().date(from: value) { return date }
+        if let date = (try? fractional.parse(value)) ?? (try? plain.parse(value)) { return date }
         if value.count == 19, value.dropFirst(10).first == " " {
-            return plain().date(from: value.replacingOccurrences(of: " ", with: "T") + "Z")
+            return try? plain.parse(value.replacingOccurrences(of: " ", with: "T") + "Z")
         }
         return nil
-    }
-
-    private static func fractional() -> ISO8601DateFormatter {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }
-
-    private static func plain() -> ISO8601DateFormatter {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter
     }
 
     private static func day(_ value: String) -> Date? {

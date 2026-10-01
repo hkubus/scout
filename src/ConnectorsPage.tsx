@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Activity, ArrowRight, LoaderCircle, RefreshCw, Send } from "lucide-react";
 import { api } from "./api";
+import { formatDate, monthDayTime } from "./format";
 import type { Connector, ConnectorRun } from "./types";
 
 type Toast = { type: "success" | "error" | "info" };
@@ -182,12 +183,7 @@ export default function ConnectorsPage({
                 </span>
                 <span>{run.duration}</span>
                 <span title={run.startedAt}>
-                  {new Date(run.startedAt).toLocaleString("pl-PL", {
-                    month: "short",
-                    day: "numeric",
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  })}
+                  {formatDate(monthDayTime, run.startedAt)}
                 </span>
               </div>
             ))}

@@ -14,6 +14,7 @@ import {
 import { api } from "./api";
 import { marketplaceColors } from "./data";
 import { AnalyticsTrendChart, formatAnalyticsPrice } from "./AnalyticsTrendChart";
+import { dayMonth, formatDate, timeOfDay } from "./format";
 import type { AnalyticsData, Marketplace, Watch } from "./types";
 
 type ToastType = "success" | "error" | "info";
@@ -162,7 +163,7 @@ export default function AnalyticsPage({
       <div className="analytics-toolbar">
         <span>
           {data
-            ? `${scopeLabel} · ${data.rangeDays}d · generated ${new Date(data.generatedAt).toLocaleTimeString("pl-PL", { hour: "2-digit", minute: "2-digit" })}`
+            ? `${scopeLabel} · ${data.rangeDays}d · generated ${formatDate(timeOfDay, data.generatedAt)}`
             : "Loading analytics…"}
         </span>
         <div className="analytics-toolbar-controls">
@@ -260,7 +261,7 @@ export default function AnalyticsPage({
                       <td>{formatCount(row.listings)}</td>
                       <td><strong>{formatCount(row.strongDeals)}</strong></td>
                       <td>{formatPercent(row.medianDiscountPercent)}</td>
-                      <td>{row.lastSeenAt ? new Date(row.lastSeenAt).toLocaleDateString("pl-PL", { day: "2-digit", month: "short" }) : "—"}</td>
+                      <td>{row.lastSeenAt ? formatDate(dayMonth, row.lastSeenAt) : "—"}</td>
                     </tr>
                   ))}
                 </tbody>

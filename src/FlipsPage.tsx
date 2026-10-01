@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Check, Download, LoaderCircle, Pencil, Plus, RotateCcw, Trash2, Wallet, X } from "lucide-react";
-import { api } from "./api";
+import { api, forgetInFlightGets } from "./api";
+import { subscribe, subscribeStatus } from "./events";
 import {
   DAC7_THRESHOLD,
   FEE_PRESET_NOTES,
@@ -233,7 +234,7 @@ function FeePresetsPanel({ presets, onSaved, onToast }: { presets: FeePresets; o
   );
 }
 
-export default function FlipsPage({ refreshKey, onToast }: { refreshKey: number; onToast: (message: string, type?: ToastType) => void }) {
+export default function FlipsPage({ onToast }: { onToast: (message: string, type?: ToastType) => void }) {
   const [flips, setFlips] = useState<Flip[]>([]);
   const [feePresets, setFeePresets] = useState<FeePresets | null>(null);
   const [loading, setLoading] = useState(true);
@@ -254,7 +255,23 @@ export default function FlipsPage({ refreshKey, onToast }: { refreshKey: number;
       setLoading(false);
     }
   };
-  useEffect(() => { void load(); }, [refreshKey]);
+  useEffect(() => { void load(); }, []);
+  // A change from another tab or an MCP client emits 'flips'; a stream that
+  // reconnects may have missed one, so it refetches too.
+  useEffect(() => {
+    const reload = () => {
+      forgetInFlightGets();
+      void load();
+    };
+    const unsubscribeFlips = subscribe("flips", reload);
+    const unsubscribeStatus = subscribeStatus((_status, reconnected) => {
+      if (reconnected) reload();
+    });
+    return () => {
+      unsubscribeFlips();
+      unsubscribeStatus();
+    };
+  }, []);
 
   const summary = useMemo(() => {
     const sold = flips.filter((flip) => flip.soldOn && flip.salePrice !== null);

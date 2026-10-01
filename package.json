@@ -10,7 +10,7 @@
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"tsx server/index.ts\"",
     "dev:client": "vite --host 127.0.0.1",
     "dev:server": "tsx watch server/index.ts",
-    "build": "tsc -b && npm run build:server && vite build",
+    "build": "tsc -b && npm run build:server && vite build && node scripts/precompress.mjs",
     "build:server": "vite build --ssr server/index.ts --outDir dist-server --target node22",
     "start": "node dist-server/index.js",
     "marketplace:login": "tsx scripts/marketplace-login.ts",

@@ -159,7 +159,7 @@ struct MarketWatchEditorView: View {
                 } else {
                     _ = try await client.createMarketWatch(draft)
                 }
-                model.refresh()
+                model.refreshUnlessLive()
                 dismiss()
             } catch {
                 self.error = error.localizedDescription
