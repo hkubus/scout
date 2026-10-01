@@ -1,23 +1,22 @@
 import Fastify, { type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createReadStream, existsSync } from 'node:fs';
-import { basename, resolve } from 'node:path';
+import { basename, join, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { listings as seedListings, watches as seedWatches } from '../src/data';
 import type { Marketplace } from '../src/types';
 import { validateSearchUrl } from './marketplaces';
-import { createScoutMcpServer } from './mcp';
 import { debugApiEnabled, ScoutDebug } from './debug';
-import { backupDatabase, openDatabase, seedDatabase } from './db';
+import { backupDatabase, openDatabase, seedDatabase, startWalCheckpointer } from './db';
 import { buildDiscordEmbed } from './notifications';
+import { compressApiResponse } from './compression';
 import { apiTokenCredentialId, bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
 import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
-import { NO_LOCATION_FILTER, normalizeSourceIntervals, olxCategoryToJson, ScoutService, ServiceError } from './service';
+import { dashboardTopParam, NO_LOCATION_FILTER, normalizeSourceIntervals, olxCategoryToJson, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 import { parseVariantGroups } from './variants';
 
@@ -125,6 +124,8 @@ app.addHook('onRequest', async (request, reply) => {
     return reply.code(429).send({ error: 'Too many requests. Try again later.' });
   }
 });
+// Compress large /api/* JSON bodies for clients that accept br or gzip.
+app.addHook('onSend', compressApiResponse);
 app.addHook('onSend', async (request, reply) => {
   // request.protocol honours X-Forwarded-Proto only from SCOUT_TRUST_PROXY hops.
   // Keep a stricter per-route policy (e.g. the sandboxed snapshot-image CSP).
@@ -133,6 +134,8 @@ app.addHook('onSend', async (request, reply) => {
 });
 
 const db = openDatabase();
+// WAL checkpoints run on a worker thread instead of inside scan commits.
+const checkpointer = startWalCheckpointer(db, { onError: (message) => app.log.warn(message) });
 if (process.env.SCOUT_SEED_DEMO === 'true') seedDatabase(db, { watches: seedWatches, listings: seedListings });
 const sessions = new SessionStore(db, [auth.credentialId, ...auth.tokenCredentialIds]);
 if (auth.enabled) sessions.purgeExpired();
@@ -290,7 +293,11 @@ app.post('/api/auth/logout-all', async (request, reply) => {
   closeSessionStreams(() => true);
   return reply.header('set-cookie', clearedSessionCookie(isSecureRequest(request))).send({ ok: true });
 });
-app.get('/api/dashboard', async () => service.dashboard());
+app.get('/api/dashboard', async (request) => {
+  // ?top=N (1-50) is the widget's compact form; anything else is ignored and
+  // the full dashboard is returned unchanged.
+  return service.dashboard({ top: dashboardTopParam((request.query as Record<string, unknown> | undefined)?.top) });
+});
 app.get('/api/listings', async (request, reply) => {
   const parsed = z.object({
     marketplace: marketplaceParam.optional(),
@@ -395,7 +402,12 @@ app.get('/api/connector-runs', async (request, reply) => {
 app.get('/api/logs', async () => ({ logs: service.logs() }));
 app.get('/api/settings', async () => service.settings());
 app.get('/api/marketplace-sessions', async () => ({ sessions: service.marketplaceSessions() }));
-app.get('/api/export', async (_request, reply) => reply.header('Content-Disposition', `attachment; filename="scout-export-${new Date().toISOString().slice(0, 10)}.json"`).type('application/json').send(service.exportData()));
+// Streamed from a read-only snapshot so the export never buffers the database.
+// The snapshot opens before any header is set, so an open failure is a plain 500.
+app.get('/api/export', async (_request, reply) => {
+  const stream = service.exportStream();
+  return reply.header('Content-Disposition', `attachment; filename="scout-export-${new Date().toISOString().slice(0, 10)}.json"`).type('application/json').send(stream);
+});
 app.post('/api/backup', async (_request, reply) => reply.code(201).send({ backup: basename(backupDatabase(db)), message: 'SQLite backup created beside the configured database file.' }));
 
 app.put('/api/marketplace-sessions/:marketplace', async (request, reply) => {
@@ -479,7 +491,7 @@ app.post('/api/watches', async (request, reply) => {
     throw error;
   }
   emit('watch', { id, name: value.name });
-  const created = service.getWatches().find((watch) => watch.id === id);
+  const created = service.watchById(id);
   return reply.code(201).send({ watch: created });
 });
 
@@ -887,8 +899,21 @@ app.get('/events', async (request, reply) => {
 // servers keep every request independent: no session ids, no resumability,
 // any replica can serve any call. When auth is enabled, clients send an
 // `Authorization: Bearer` token from SCOUT_API_TOKENS.
+// The MCP SDK (~40 MB RSS) loads on the first /mcp request, not at startup.
+let mcpModules: Promise<[typeof import('./mcp'), typeof import('@modelcontextprotocol/sdk/server/streamableHttp.js')]> | undefined;
 app.post('/mcp', async (request, reply) => {
   reply.hijack();
+  let modules: Awaited<NonNullable<typeof mcpModules>>;
+  try {
+    modules = await (mcpModules ??= Promise.all([import('./mcp'), import('@modelcontextprotocol/sdk/server/streamableHttp.js')]));
+  } catch (error) {
+    mcpModules = undefined;
+    app.log.error(error);
+    reply.raw.writeHead(500, { 'content-type': 'application/json' });
+    reply.raw.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null }));
+    return;
+  }
+  const [{ createScoutMcpServer }, { StreamableHTTPServerTransport }] = modules;
   const mcpServer = createScoutMcpServer(service, debug);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   reply.raw.on('close', () => {
@@ -913,7 +938,20 @@ app.delete('/mcp', async (_request, reply) => reply.code(405).send({ jsonrpc: '2
 
 const distPath = process.env.SCOUT_DIST_PATH?.trim() || resolve(process.cwd(), 'dist');
 if (existsSync(distPath)) {
-  await app.register(fastifyStatic, { root: distPath, wildcard: false });
+  // Vite's content-hashed /assets files are safe to cache for a year; index.html,
+  // favicon.svg and the SPA fallback keep revalidating. Build-time .br/.gz
+  // siblings (scripts/precompress.mjs) are served in place of the originals and
+  // are not exposed as routes of their own.
+  const assetsDir = join(resolve(distPath), 'assets') + sep;
+  await app.register(fastifyStatic, {
+    root: distPath,
+    wildcard: false,
+    preCompressed: true,
+    globIgnore: ['**/*.br', '**/*.gz'],
+    setHeaders: (reply, filePath) => {
+      if (filePath.startsWith(assetsDir)) reply.header('cache-control', 'public, max-age=31536000, immutable');
+    },
+  });
   app.setNotFoundHandler((request, reply) => {
     if (request.url.startsWith('/api') || request.url === '/events' || request.url === '/mcp') return reply.code(404).send({ error: 'Not found' });
     if (request.method !== 'GET' && request.method !== 'HEAD') return reply.code(404).send({ error: 'Not found' });
@@ -946,7 +984,10 @@ const diagnosticsInterval = setInterval(() => {
   service.logDiagnostic(formatMemoryLine());
 }, 30 * 60_000);
 
-app.addHook('onClose', async () => { debug?.close(); clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); clearInterval(sessionPurge); for (const client of clients) client.end(); try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ } db.close(); });
+// Stop the timers first so no scheduler tick starts a scan (or a Chromium) while
+// shutting down; the final closeBrowser refuses relaunches and is time-bounded,
+// so the checkpoint and db.close() always run.
+app.addHook('onClose', async () => { clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); clearInterval(sessionPurge); debug?.close(); for (const client of clients) client.end(); await service.closeBrowser({ final: true }); await checkpointer?.stop(); try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ } db.close(); });
 let shuttingDown = false;
 const shutdown = async (signal: string) => {
   if (shuttingDown) return;

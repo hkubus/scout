@@ -7,14 +7,17 @@ enum MarketSection: String, Hashable {
 /// The Market tab: research watches and deal analytics behind one switch.
 struct MarketView: View {
     @Environment(AppModel.self) private var model
+    // Held here because the switch below rebuilds each segment's view.
+    @State private var research = ResearchStore()
+    @State private var analytics = AnalyticsStore()
 
     var body: some View {
         @Bindable var model = model
         NavigationStack {
             Group {
                 switch model.marketSection {
-                case .research: ResearchView()
-                case .analytics: AnalyticsView()
+                case .research: ResearchView(store: research)
+                case .analytics: AnalyticsView(store: analytics)
                 }
             }
             .navigationTitle(Text(verbatim: model.marketSection == .research ? "Research" : "Analytics"))

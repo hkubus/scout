@@ -1,16 +1,20 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { connect as connectHttp2 } from 'node:http2';
-import { chromium, type Browser, type BrowserContext } from 'playwright-core';
+import { Readable } from 'node:stream';
+// @ts-ignore node:sqlite is present in the supported Node 22+ runtime.
+import { DatabaseSync } from 'node:sqlite';
+import { connect as connectHttp2, type SecureClientSessionOptions } from 'node:http2';
+import { brotliDecompressSync, gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
+import type { Browser, BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
-import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, type SellerType, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult } from './marketplaces';
+import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, type SellerType, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult, olxDetailHint } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext } from './ai';
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchVariantWithJev, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
 import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, verifyListingDescriptionWithVision, visionToVerification } from './vision';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
-import { Limiter } from './limiter';
-import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, median, pooledVariantSpread, scoreDeal, type PooledSpread } from './scoring';
+import { Limiter, mapPool } from './limiter';
+import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, median, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
 import { normalizeFilterText } from './text';
 import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assignVariant, finalizeVariantSuggestions, parseVariantGroups, suggestVariantGroupsFromTitles, variantLabelFor, type VariantGroup, type VariantSample } from './variants';
@@ -55,7 +59,8 @@ type DealNotificationCandidate = {
  * With no configured groups every row lands in the single OTHER bucket, which
  * reproduces the legacy watch-wide baseline exactly.
  */
-type WatchVariantBucket = { prices: number[]; firstObservedAt: string | null };
+/** `stats` is filled once the bucket is complete, so every listing in a scan reuses its median and MAD. */
+type WatchVariantBucket = { prices: number[]; firstObservedAt: string | null; stats?: PriceStats };
 type WatchBaselines = {
   groups: VariantGroup[];
   buckets: Map<string, WatchVariantBucket>;
@@ -132,6 +137,13 @@ const MAX_RESEARCH_DETAIL_CHECKS = 100;
 const TYPO_VARIANTS_PER_SCAN = 2;
 /** Jev variant assignments a grouped watch may request per scan and source. */
 const VARIANT_JEV_BUDGET = 10;
+/**
+ * A standing deal that cannot alert (already alerted at this price, no due
+ * channel or digest) is not re-verified while its stored verdict for the
+ * active model is younger than this. Anything that makes it alertable (a
+ * price drop, a higher priority, a new channel) verifies it as before.
+ */
+const DESCRIPTION_VERIFICATION_FRESH_MS = 6 * 60 * 60_000;
 /** Rolling window of ended listings that feed probable-sale bands. */
 const SALE_BAND_WINDOW_DAYS = 90;
 /** Bounded per-scan capture of preserved listing copies (description + downloaded images). */
@@ -142,8 +154,29 @@ const SNAPSHOT_MAX_ATTEMPTS = 3;
 // In-flight request cap per marketplace, shared by watch scans, research
 // scans, manual searches and detail checks; queued requests wait FIFO.
 const MARKETPLACE_REQUEST_CONCURRENCY = 2;
-// Concurrent Chromium renders across all marketplaces (each can be its own browser process).
+// playwright-core costs ~80 MB RSS and ~200 ms to import, and most instances
+// never render: it loads on the first render once a browser is configured.
+let playwright: Promise<typeof import('playwright-core')> | undefined;
+function loadPlaywright() {
+  playwright ??= import('playwright-core').catch((error) => {
+    playwright = undefined;
+    throw error;
+  });
+  return playwright;
+}
+
+// Concurrent Chromium renders across all marketplaces (each its own context;
+// a Browserless connection is its own browser process).
 const BROWSER_RENDER_CONCURRENCY = 2;
+/** A locally launched Chromium is shared across renders and closed this long after the last one. */
+const BROWSER_IDLE_CLOSE_MS = 20_000;
+// A wedged Chromium must not hold up shutdown (and the database close after it).
+const BROWSER_CLOSE_TIMEOUT_MS = 5_000;
+/**
+ * Served for marketplace CDN images during renders: only page.content() is
+ * read, and a real (tiny) image keeps onerror handlers from rewriting src.
+ */
+const ONE_PIXEL_GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
 /**
  * The anonymous marketplace APIs (OLX offers, Vinted catalog, Lokalnie
  * additional-data) reject Scout's plain identifier UA; a modern Chrome UA plus
@@ -319,6 +352,30 @@ export function nextWatchScanSchedule(options: {
 
 const nowIso = () => new Date().toISOString();
 
+// /api/export: [response key, table] in response order, then redacted settings.
+const EXPORT_TABLES = [
+  ['watches', 'watches'],
+  ['listings', 'listings'],
+  ['observations', 'observations'],
+  ['listingRelevance', 'listing_relevance'],
+  ['scans', 'scans'],
+  ['notificationDeliveries', 'notification_deliveries'],
+  ['marketWatches', 'market_watches'],
+  ['marketWatchVersions', 'market_watch_versions'],
+  ['marketListings', 'market_listings'],
+  ['marketPriceObservations', 'market_price_observations'],
+  ['listingActions', 'listing_actions'],
+  ['notifications', 'notifications'],
+  ['connectorRuns', 'connector_runs'],
+] as const;
+const EXPORT_NOTE = 'Encrypted credentials, browser sessions, and raw secret values are intentionally omitted. Use the authenticated database backup command for a complete restore point.';
+const EXPORT_CHUNK_CHARS = 64 * 1024;
+const EXPORT_MAX_OPEN_MS = 10 * 60_000;
+const redactExportSetting = (row: Record<string, unknown>) => {
+  const key = String(row.key);
+  return { key, configured: Boolean(row.value), value: /(?:webhook|ntfy_config|api_key)/i.test(key) ? null : row.value };
+};
+
 /** Escape seller text for Discord markdown so a title cannot open its own masked link. */
 export function escapeDiscordMarkdown(value: string) {
   return value.replace(/[\\[\]()*_~`|<>]/g, (character) => `\\${character}`);
@@ -401,9 +458,12 @@ function parseListingKey(key: string): { marketplace: Marketplace; listingId: st
  * `--http1.1` vs default, and Node undici vs `node:http2`), so this bypasses
  * `fetch` (HTTP/1.1-only in undici) for the OLX path. A fresh session per
  * request keeps scan volumes simple; bodies are fully consumed before the
- * session closes, so no socket-diagnostic discard is needed.
+ * session closes, so no socket-diagnostic discard is needed. `node:http2`
+ * adds no Accept-Encoding of its own, so the header is sent explicitly and the
+ * body decoded here (see decodeOlxApiBody). `connectOptions` exists for tests
+ * against a local TLS server.
  */
-function fetchOlxApiSingleRequest(url: string, timeoutMs: number): Promise<{ status: number; json: unknown; location: string | null }> {
+export function fetchOlxApiSingleRequest(url: string, timeoutMs: number, connectOptions?: SecureClientSessionOptions): Promise<{ status: number; json: unknown; location: string | null }> {
   return new Promise((resolve, reject) => {
     let parsed: URL;
     try {
@@ -412,7 +472,7 @@ function fetchOlxApiSingleRequest(url: string, timeoutMs: number): Promise<{ sta
       reject(new Error('Invalid URL'));
       return;
     }
-    const session = connectHttp2(`${parsed.protocol}//${parsed.host}`);
+    const session = connectHttp2(`${parsed.protocol}//${parsed.host}`, connectOptions);
     let settled = false;
     const fail = (error: unknown) => {
       if (settled) return;
@@ -431,6 +491,7 @@ function fetchOlxApiSingleRequest(url: string, timeoutMs: number): Promise<{ sta
       ':path': `${parsed.pathname}${parsed.search}`,
       'user-agent': MARKETPLACE_API_USER_AGENT,
       accept: 'application/json',
+      'accept-encoding': 'gzip, deflate, br',
     });
     request.on('error', fail);
     request.on('close', () => {
@@ -439,8 +500,11 @@ function fetchOlxApiSingleRequest(url: string, timeoutMs: number): Promise<{ sta
     const chunks: Buffer[] = [];
     let status = 0;
     let location: string | null = null;
+    let contentEncoding: string | null = null;
     request.on('response', (headers) => {
       status = Number(headers[':status'] ?? 0);
+      const rawEncoding = headers['content-encoding'];
+      contentEncoding = (Array.isArray(rawEncoding) ? rawEncoding[0] : rawEncoding) ?? null;
       const rawLocation = headers.location;
       location = Array.isArray(rawLocation) ? (rawLocation[0] ?? null) : (rawLocation ?? null);
     });
@@ -454,15 +518,45 @@ function fetchOlxApiSingleRequest(url: string, timeoutMs: number): Promise<{ sta
       try {
         session.close();
       } catch { /* session already gone */ }
-      const raw = Buffer.concat(chunks).toString('utf8');
       let json: unknown = null;
       try {
+        const raw = decodeOlxApiBody(Buffer.concat(chunks), contentEncoding).toString('utf8');
         json = raw ? JSON.parse(raw) : null;
-      } catch { /* non-JSON bodies (e.g. challenge pages) surface through the status */ }
+      } catch { /* undecodable or non-JSON bodies (e.g. challenge pages) surface through the status */ }
       resolve({ status, json, location });
     });
     request.end();
   });
+}
+
+/** Decompression-bomb guard: an offers page is ~200 KB decoded. */
+const OLX_API_MAX_DECODED_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Decodes an offers-API body by its Content-Encoding. Identity and unknown
+ * encodings pass through unchanged; a corrupt or oversized body throws, which
+ * the caller turns into `json: null` so status handling stays fail-closed.
+ */
+export function decodeOlxApiBody(body: Buffer, contentEncoding: string | null): Buffer {
+  if (!body.length) return body;
+  const options = { maxOutputLength: OLX_API_MAX_DECODED_BYTES };
+  switch (contentEncoding?.trim().toLowerCase()) {
+    case 'gzip':
+    case 'x-gzip':
+      return gunzipSync(body, options);
+    case 'deflate':
+      // Servers disagree on zlib-wrapped vs raw deflate; accept both.
+      try {
+        return inflateSync(body, options);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ERR_BUFFER_TOO_LARGE') throw error;
+        return inflateRawSync(body, options);
+      }
+    case 'br':
+      return brotliDecompressSync(body, options);
+    default:
+      return body;
+  }
 }
 
 function parseListingDecision(value: unknown): ListingDecision | null {
@@ -513,6 +607,31 @@ function dealStrengthFromDiscount(discountPercent: number | null): number | null
 
 function dealLabelFromStrength(strength: number): DealLabel {
   return strength >= 5 ? 'Exceptional' : strength === 4 ? 'Very strong' : strength === 3 ? 'Strong' : 'Watch';
+}
+
+/**
+ * The widget's deal order (WidgetSnapshot.make in the iOS ScoutKit): visible,
+ * untriaged-or-kept rows by deal strength, then the deepest discount, then
+ * the newest. Array.prototype.sort is stable, so ties keep feed order.
+ */
+/** Parses the `?top=` query value of GET /api/dashboard; anything but an integer from 1 to 50 means the full dashboard. */
+export function dashboardTopParam(value: unknown): number | undefined {
+  if (typeof value !== 'string' || !/^\d{1,2}$/.test(value)) return undefined;
+  const top = Number(value);
+  return top >= 1 && top <= 50 ? top : undefined;
+}
+
+export function widgetDeals(listings: Listing[], limit: number) {
+  return listings
+    .filter((listing) => listing.hidden !== true && listing.aiFiltered !== true && listing.decision !== 'pass')
+    .sort((left, right) => {
+      if (left.dealStrength !== right.dealStrength) return right.dealStrength - left.dealStrength;
+      const leftBelow = left.belowTypical ?? 0;
+      const rightBelow = right.belowTypical ?? 0;
+      if (leftBelow !== rightBelow) return leftBelow - rightBelow;
+      return left.observedAt === right.observedAt ? 0 : left.observedAt > right.observedAt ? -1 : 1;
+    })
+    .slice(0, limit);
 }
 
 export class ScoutService {
@@ -625,8 +744,20 @@ export class ScoutService {
    * attempts recorded for this watch (including the running one). Deterministic
    * per attempt, needs no extra state, and never depends on wall-clock time.
    */
+  /**
+   * How many scans this watch has run, which rotates the typo-variant batch.
+   * watch_kind is not in scans_watch_status, so the kind-filtered count reads
+   * every retained scan row; the covering count by watch_id alone is exact
+   * unless a watch of the other kind shares the id (ids are client-supplied
+   * on create), and then the filtered count is used.
+   */
   private scanOrdinal(watchId: string, watchKind: 'watch' | 'research') {
-    const row = this.stmt('SELECT COUNT(*) AS count FROM scans WHERE watch_id = ? AND watch_kind = ?').get(watchId, watchKind) as { count?: number };
+    const otherKind = watchKind === 'watch'
+      ? this.stmt('SELECT 1 AS found FROM market_watches WHERE id = ?').get(watchId)
+      : this.stmt('SELECT 1 AS found FROM watches WHERE id = ?').get(watchId);
+    const row = (otherKind
+      ? this.stmt('SELECT COUNT(*) AS count FROM scans WHERE watch_id = ? AND watch_kind = ?').get(watchId, watchKind)
+      : this.stmt('SELECT COUNT(*) AS count FROM scans WHERE watch_id = ?').get(watchId)) as { count?: number };
     return Number(row?.count ?? 0);
   }
 
@@ -708,7 +839,7 @@ export class ScoutService {
       if (database) {
         staleScans = Number((this.stmt("SELECT COUNT(*) AS count FROM scans WHERE status = 'running' OR status = 'interrupted'").get() as { count?: number } | undefined)?.count ?? 0);
         migration = this.stmt('SELECT COUNT(*) AS count, MAX(id) AS latest FROM migrations').get() as { count?: number; latest?: string | null };
-        degradedConnectors = this.getConnectors().filter((connector) => connector.status === 'Degraded').map((connector) => connector.name);
+        degradedConnectors = this.getConnectors(false).filter((connector) => connector.status === 'Degraded').map((connector) => connector.name);
       }
     } catch (error) {
       database = false;
@@ -1224,8 +1355,8 @@ export class ScoutService {
     let skipped = 0;
     const pendingClassifications = new Map<string, Promise<{ relevant: boolean }>>();
     const pendingLive = new Map<string, Promise<{ relevant: boolean; status: 'relevant' | 'irrelevant' | 'unknown'; reason: string; error?: string }>>();
-    // Relevance rows are collected while the batch awaits the AI calls and
-    // flushed in one transaction per batch: a per-row autocommit would mean a
+    // Relevance rows are collected while the AI calls are awaited and flushed
+    // in one transaction after the pass: a per-row autocommit would mean a
     // commit per listing, and the transaction must never span an await.
     const relevanceWrites: Array<Parameters<ScoutService['saveListingRelevance']>[0]> = [];
     // Manual searches have no watch row to key `listing_relevance` on, so their
@@ -1245,115 +1376,127 @@ export class ScoutService {
       // Unknown means "not judged" — caching it would suppress a later real check.
       else if (status !== 'unknown') manualRelevanceWrites.push({ inputHash, model, relevant, status, reason, error });
     };
+    type CachedRelevance = { input_hash?: string; model?: string; relevant?: number; reason?: string; error?: string | null; relevance_status?: string };
+    // Gate-skipped and budget-exhausted listings are re-marked 'unknown' on
+    // every scan. When the stored row already says exactly that, rewriting it
+    // would only move checked_at (read by nothing but the 180-day prune), so
+    // the write is skipped.
+    const persistNotJudged = (listing: NormalizedListing, inputHash: string, cached: CachedRelevance | undefined, reason: string) => {
+      if (cached
+        && cached.input_hash === inputHash
+        && cached.model === activeModel
+        && cached.relevance_status === 'unknown'
+        && Number(cached.relevant) === 1
+        && (cached.reason ?? '') === reason.slice(0, 240)
+        && (cached.error ?? null) === null) return;
+      persistRelevance(listing, inputHash, activeModel, true, 'unknown', reason);
+    };
 
-    const classified: Array<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> = [];
-    // Jev relevance calls are network round trips and independent per listing:
-    // a wider pool overlaps more of them than the old fixed batch of four,
-    // while the per-batch flush below still persists results incrementally.
-    const relevanceConcurrency = jevCheckConcurrency();
-    for (let offset = 0; offset < listings.length; offset += relevanceConcurrency) {
-      const batch = await Promise.all(listings.slice(offset, offset + relevanceConcurrency).map(async (listing): Promise<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> => {
-        const context: ListingRelevanceContext = {
-          marketplace: listing.marketplace,
-          title: listing.title,
-          condition: listing.condition,
-          location: listing.location,
-          query: search.query,
-          includedTerms: search.includedTerms,
-          excludedTerms: search.excludedTerms,
-        };
-        const inputHash = listingRelevanceInputHash(context);
-        const legacyInputHash = legacyListingRelevanceInputHash(context);
-        if (watchId) {
-          const cached = this.stmt('SELECT input_hash, model, relevant, reason, error, relevance_status FROM listing_relevance WHERE watch_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, listing.marketplace, listing.listingId) as { input_hash?: string; model?: string; relevant?: number; reason?: string; error?: string | null; relevance_status?: string } | undefined;
-          const cachedStatus: 'relevant' | 'irrelevant' | 'unknown' = cached?.relevance_status === 'irrelevant' || cached?.relevance_status === 'unknown' || cached?.relevance_status === 'relevant'
-            ? cached.relevance_status
-            : cached?.error ? 'unknown' : cached?.relevant === 0 ? 'irrelevant' : 'relevant';
-          if ((cached?.input_hash === inputHash || cached?.input_hash === legacyInputHash) && cached.model === activeModel && cachedStatus !== 'unknown' && !cached.error) {
-            if (cached.input_hash === legacyInputHash) persistRelevance(listing, inputHash, activeModel, cachedStatus === 'relevant', cachedStatus, cached.reason ?? 'Reused cached relevance decision');
-            return { listing, status: cachedStatus };
-          }
-        } else {
-          const manual = this.readManualRelevance(inputHash, legacyInputHash, activeModel);
-          if (manual) return { listing, status: manual };
+    // Jev relevance calls are network round trips and independent per listing,
+    // so they run through a worker pool: a slow call holds only its own slot
+    // and cache hits never wait for one. Workers start listings in index
+    // order and everything before a listing's first await (cache reads, the
+    // gate, the budget count and the in-flight dedup) runs synchronously, so
+    // budgets and dedup match a sequential pass.
+    const classified = await mapPool(listings, jevCheckConcurrency(), async (listing): Promise<{ listing: NormalizedListing; status: 'relevant' | 'irrelevant' | 'unknown' }> => {
+      const context: ListingRelevanceContext = {
+        marketplace: listing.marketplace,
+        title: listing.title,
+        condition: listing.condition,
+        location: listing.location,
+        query: search.query,
+        includedTerms: search.includedTerms,
+        excludedTerms: search.excludedTerms,
+      };
+      const inputHash = listingRelevanceInputHash(context);
+      const legacyInputHash = legacyListingRelevanceInputHash(context);
+      let cached: CachedRelevance | undefined;
+      if (watchId) {
+        cached = this.stmt('SELECT input_hash, model, relevant, reason, error, relevance_status FROM listing_relevance WHERE watch_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, listing.marketplace, listing.listingId) as CachedRelevance | undefined;
+        const cachedStatus: 'relevant' | 'irrelevant' | 'unknown' = cached?.relevance_status === 'irrelevant' || cached?.relevance_status === 'unknown' || cached?.relevance_status === 'relevant'
+          ? cached.relevance_status
+          : cached?.error ? 'unknown' : cached?.relevant === 0 ? 'irrelevant' : 'relevant';
+        if ((cached?.input_hash === inputHash || cached?.input_hash === legacyInputHash) && cached.model === activeModel && cachedStatus !== 'unknown' && !cached.error) {
+          if (cached.input_hash === legacyInputHash) persistRelevance(listing, inputHash, activeModel, cachedStatus === 'relevant', cachedStatus, cached.reason ?? 'Reused cached relevance decision');
+          return { listing, status: cachedStatus };
         }
+      } else {
+        const manual = this.readManualRelevance(inputHash, legacyInputHash, activeModel);
+        if (manual) return { listing, status: manual };
+      }
 
-        // Cross-listing reuse is keyed by input hash, which omits the per-listing
-        // URL/thumbnail live escalation uses — live mode relies on the
-        // per-listing watch cache above instead.
-        const reusable = !jevLive ? this.stmt(`SELECT relevant, reason, relevance_status FROM listing_relevance
-          WHERE input_hash = ? AND model = ? AND relevance_status IN ('relevant', 'irrelevant') AND error IS NULL
-          ORDER BY checked_at DESC LIMIT 1`).get(inputHash, activeModel) as { relevant?: number; reason?: string; relevance_status?: string } | undefined : undefined;
-        if (reusable) {
-          const status: 'relevant' | 'irrelevant' = reusable.relevance_status === 'irrelevant' || reusable.relevant === 0 ? 'irrelevant' : 'relevant';
-          persistRelevance(listing, inputHash, activeModel, status === 'relevant', status, reusable.reason ?? 'Reused cached relevance decision');
-          return { listing, status };
-        }
+      // Cross-listing reuse is keyed by input hash, which omits the per-listing
+      // URL/thumbnail live escalation uses — live mode relies on the
+      // per-listing watch cache above instead.
+      const reusable = !jevLive ? this.stmt(`SELECT relevant, reason, relevance_status FROM listing_relevance
+        WHERE input_hash = ? AND model = ? AND relevance_status IN ('relevant', 'irrelevant') AND error IS NULL
+        ORDER BY checked_at DESC LIMIT 1`).get(inputHash, activeModel) as { relevant?: number; reason?: string; relevance_status?: string } | undefined : undefined;
+      if (reusable) {
+        const status: 'relevant' | 'irrelevant' = reusable.relevance_status === 'irrelevant' || reusable.relevant === 0 ? 'irrelevant' : 'relevant';
+        persistRelevance(listing, inputHash, activeModel, status === 'relevant', status, reusable.reason ?? 'Reused cached relevance decision');
+        return { listing, status };
+      }
 
-        // Deal-strength gate: an uncached listing that is neither a notifiable
-        // deal nor a very strong display candidate is kept (unknown) without
-        // spending an AI call. This is the main lever on Jev/DeepSeek spend —
-        // the check runs after cache reuse so cached decisions still apply.
-        if (gate && !gate(listing)) {
-          skipped += 1;
-          persistRelevance(listing, inputHash, activeModel, true, 'unknown', 'AI relevance skipped: deal below the Very strong threshold');
-          return { listing, status: 'unknown' as const };
-        }
+      // Deal-strength gate: an uncached listing that is neither a notifiable
+      // deal nor a very strong display candidate is kept (unknown) without
+      // spending an AI call. This is the main lever on Jev/DeepSeek spend —
+      // the check runs after cache reuse so cached decisions still apply.
+      if (gate && !gate(listing)) {
+        skipped += 1;
+        persistNotJudged(listing, inputHash, cached, 'AI relevance skipped: deal below the Very strong threshold');
+        return { listing, status: 'unknown' as const };
+      }
 
-        // Per-scan budget: uncached listings beyond the budget stay unknown
-        // instead of burning quota on every scan before the cache warms.
-        // Live dedupe is per listing (not per input hash): the escalation path
-        // uses each listing's own URL and thumbnail, which the hash omits.
-        const liveKey = `${inputHash}|${listing.url}|${listing.imageUrl ?? ''}`;
-        if (aiCalls >= AI_RELEVANCE_BUDGET_PER_SCAN && !pendingClassifications.has(inputHash) && !pendingLive.has(liveKey)) {
-          persistRelevance(listing, inputHash, activeModel, true, 'unknown', 'AI relevance budget exhausted for this scan');
-          return { listing, status: 'unknown' as const };
-        }
-        if (jevLive) {
-          try {
-            let decision = pendingLive.get(liveKey);
-            if (!decision) {
-              aiCalls += 1;
-              decision = this.decideRelevanceLive(context, inputHash, jevLive);
-              pendingLive.set(liveKey, decision);
-            }
-            const live = await decision;
-            persistRelevance(listing, inputHash, jevLive.jevModel, live.relevant, live.status, live.reason, live.error ?? null);
-            return { listing, status: live.status };
-          } catch (error) {
-            const message = (error instanceof Error ? error.message : 'Jev could not classify listing relevance').slice(0, 500);
-            persistRelevance(listing, inputHash, jevLive.jevModel, true, 'unknown', 'Jev relevance check failed unexpectedly', message);
-            return { listing, status: 'unknown' };
-          }
-        }
+      // Per-scan budget: uncached listings beyond the budget stay unknown
+      // instead of burning quota on every scan before the cache warms.
+      // Live dedupe is per listing (not per input hash): the escalation path
+      // uses each listing's own URL and thumbnail, which the hash omits.
+      const liveKey = `${inputHash}|${listing.url}|${listing.imageUrl ?? ''}`;
+      if (aiCalls >= AI_RELEVANCE_BUDGET_PER_SCAN && !pendingClassifications.has(inputHash) && !pendingLive.has(liveKey)) {
+        persistNotJudged(listing, inputHash, cached, 'AI relevance budget exhausted for this scan');
+        return { listing, status: 'unknown' as const };
+      }
+      if (jevLive) {
         try {
-          let classification = pendingClassifications.get(inputHash);
-          if (!classification) {
+          let decision = pendingLive.get(liveKey);
+          if (!decision) {
             aiCalls += 1;
-            classification = this.classifyListingRelevance(context, { apiKey, model: config.model });
-            pendingClassifications.set(inputHash, classification);
+            decision = this.decideRelevanceLive(context, inputHash, jevLive);
+            pendingLive.set(liveKey, decision);
           }
-          const result = await classification;
-          if (jevShadow) this.shadowJevRelevance(context, inputHash, result.relevant, listing.imageUrl, jevShadow);
-          const status: 'relevant' | 'irrelevant' = result.relevant ? 'relevant' : 'irrelevant';
-          persistRelevance(listing, inputHash, activeModel, result.relevant, status, result.relevant ? 'AI classified listing as relevant' : 'AI classified listing as irrelevant');
-          return { listing, status };
+          const live = await decision;
+          persistRelevance(listing, inputHash, jevLive.jevModel, live.relevant, live.status, live.reason, live.error ?? null);
+          return { listing, status: live.status };
         } catch (error) {
-          const message = (error instanceof Error ? error.message : 'OpenRouter could not classify listing relevance').slice(0, 500);
-          persistRelevance(listing, inputHash, activeModel, true, 'unknown', 'AI relevance check failed', message);
-          if (jevShadow) this.shadowJevRelevance(context, inputHash, null, listing.imageUrl, jevShadow);
+          const message = (error instanceof Error ? error.message : 'Jev could not classify listing relevance').slice(0, 500);
+          persistRelevance(listing, inputHash, jevLive.jevModel, true, 'unknown', 'Jev relevance check failed unexpectedly', message);
           return { listing, status: 'unknown' };
         }
-      }));
-      classified.push(...batch);
-      if (relevanceWrites.length || manualRelevanceWrites.length) {
-        const writes = relevanceWrites.splice(0, relevanceWrites.length);
-        const manualWrites = manualRelevanceWrites.splice(0, manualRelevanceWrites.length);
-        this.transaction(() => {
-          for (const input of writes) this.saveListingRelevance(input);
-          for (const input of manualWrites) this.saveManualRelevance(input);
-        });
       }
+      try {
+        let classification = pendingClassifications.get(inputHash);
+        if (!classification) {
+          aiCalls += 1;
+          classification = this.classifyListingRelevance(context, { apiKey, model: config.model });
+          pendingClassifications.set(inputHash, classification);
+        }
+        const result = await classification;
+        if (jevShadow) this.shadowJevRelevance(context, inputHash, result.relevant, listing.imageUrl, jevShadow);
+        const status: 'relevant' | 'irrelevant' = result.relevant ? 'relevant' : 'irrelevant';
+        persistRelevance(listing, inputHash, activeModel, result.relevant, status, result.relevant ? 'AI classified listing as relevant' : 'AI classified listing as irrelevant');
+        return { listing, status };
+      } catch (error) {
+        const message = (error instanceof Error ? error.message : 'OpenRouter could not classify listing relevance').slice(0, 500);
+        persistRelevance(listing, inputHash, activeModel, true, 'unknown', 'AI relevance check failed', message);
+        if (jevShadow) this.shadowJevRelevance(context, inputHash, null, listing.imageUrl, jevShadow);
+        return { listing, status: 'unknown' };
+      }
+    });
+    if (relevanceWrites.length || manualRelevanceWrites.length) {
+      this.transaction(() => {
+        for (const input of relevanceWrites) this.saveListingRelevance(input);
+        for (const input of manualRelevanceWrites) this.saveManualRelevance(input);
+      });
     }
 
     return {
@@ -1605,22 +1748,41 @@ export class ScoutService {
       );
       return;
     }
+    const json = input.verification ? JSON.stringify(input.verification) : null;
+    const error = input.error?.slice(0, 500) ?? null;
+    if (error !== null) {
+      // Error and fallback rows always refresh their timestamp: the 6-hour
+      // retry window is measured from the latest failure.
+      this.stmt(`UPDATE listings SET
+        ai_description_verification_json = ?,
+        ai_description_verification_input_hash = ?,
+        ai_description_verification_model = ?,
+        ai_description_verification_at = ?,
+        ai_description_verification_status = ?,
+        ai_description_verification_error = ?
+        WHERE marketplace = ? AND listing_id = ?`).run(json, input.inputHash ?? null, input.model ?? null, nowIso(), input.status, error, input.marketplace, input.listingId);
+      return;
+    }
+    // A repeat of the stored verdict (a cache hit, or no key on every scan)
+    // changes nothing but the timestamp, so it is not rewritten, except to
+    // renew a timestamp older than the freshness window: a standing deal that
+    // cannot alert skips re-verification while its verdict is fresh.
     this.stmt(`UPDATE listings SET
       ai_description_verification_json = ?,
       ai_description_verification_input_hash = ?,
       ai_description_verification_model = ?,
       ai_description_verification_at = ?,
       ai_description_verification_status = ?,
-      ai_description_verification_error = ?
-      WHERE marketplace = ? AND listing_id = ?`).run(
-      input.verification ? JSON.stringify(input.verification) : null,
-      input.inputHash ?? null,
-      input.model ?? null,
-      nowIso(),
-      input.status,
-      input.error?.slice(0, 500) ?? null,
-      input.marketplace,
-      input.listingId,
+      ai_description_verification_error = NULL
+      WHERE marketplace = ? AND listing_id = ?
+        AND (ai_description_verification_json IS NOT ? OR ai_description_verification_input_hash IS NOT ?
+          OR ai_description_verification_model IS NOT ? OR ai_description_verification_status IS NOT ?
+          OR ai_description_verification_error IS NOT NULL
+          OR ai_description_verification_at IS NULL OR ai_description_verification_at < ?)`).run(
+      json, input.inputHash ?? null, input.model ?? null, nowIso(), input.status,
+      input.marketplace, input.listingId,
+      json, input.inputHash ?? null, input.model ?? null, input.status,
+      new Date(Date.now() - DESCRIPTION_VERIFICATION_FRESH_MS).toISOString(),
     );
   }
 
@@ -1635,6 +1797,10 @@ export class ScoutService {
       url: candidate.listing.url,
       description,
     })).digest('hex');
+    // An already captured state keeps its row and status: the caller sets the
+    // final status, and only the fresh-AI path marks it pending while it waits.
+    const existing = this.stmt('SELECT id FROM listing_detail_snapshots WHERE listing_id = ? AND state_hash = ?').get(stored.id, stateHash) as { id?: number } | undefined;
+    if (existing?.id) return { id: Number(existing.id), stateHash };
     const capturedAt = nowIso();
     this.stmt(`INSERT INTO listing_detail_snapshots (
       listing_id, marketplace, external_listing_id, title, price_pln, url,
@@ -1659,7 +1825,7 @@ export class ScoutService {
 
   private updateListingDetailSnapshot(snapshotId: number | null, status: ListingDescriptionVerificationStatus, inputHash: string | null) {
     if (!snapshotId) return;
-    this.stmt('UPDATE listing_detail_snapshots SET verification_status = ?, verification_input_hash = ? WHERE id = ?').run(status, inputHash, snapshotId);
+    this.stmt('UPDATE listing_detail_snapshots SET verification_status = ?, verification_input_hash = ? WHERE id = ? AND (verification_status IS NOT ? OR verification_input_hash IS NOT ?)').run(status, inputHash, snapshotId, status, inputHash);
   }
 
   private async verifyHighPriorityDealOnce(candidate: DealNotificationCandidate, notifyContext?: ScanNotifyContext): Promise<boolean> {
@@ -1672,9 +1838,11 @@ export class ScoutService {
     const apiKey = jevLive ? jevLive.apiKey : config.apiKey;
     const activeModel = jevLive ? jevLive.jevModel : config.model;
     if (!apiKey) {
-      const snapshot = this.captureListingDetailSnapshot(candidate, null);
-      this.updateListingDetailSnapshot(snapshot?.id ?? null, 'not-configured', null);
-      this.saveDescriptionVerification({ marketplace, listingId, status: 'not-configured' });
+      this.transaction(() => {
+        const snapshot = this.captureListingDetailSnapshot(candidate, null);
+        this.updateListingDetailSnapshot(snapshot?.id ?? null, 'not-configured', null);
+        this.saveDescriptionVerification({ marketplace, listingId, status: 'not-configured' });
+      });
       return true;
     }
 
@@ -1683,21 +1851,31 @@ export class ScoutService {
     // Read once: gallery parsing below must stay inert when both modes are off,
     // and this also avoids re-decrypting the OpenRouter key per candidate.
     const jevShadow = this.jevShadowConfig();
+    // The OLX offers API already returned this scan's description and photos,
+    // so the HTML offer page is fetched only when that text is missing.
+    const hint = marketplace === 'OLX' ? olxDetailHint(candidate.listing) : undefined;
     try {
-      const html = await this.fetchPublicPage(candidate.listing.url, marketplace);
-      description = parseListingDescription(html, marketplace);
-      if (jevShadow || jevLive) {
-        try {
-          galleryImageUrls = parseListingImageUrls(html, marketplace, 12).slice(0, 3);
-        } catch {
-          galleryImageUrls = [];
+      if (hint?.description) {
+        description = hint.description;
+        if (jevShadow || jevLive) galleryImageUrls = hint.imageUrls.slice(0, 3);
+      } else {
+        const html = await this.fetchPublicPage(candidate.listing.url, marketplace);
+        description = parseListingDescription(html, marketplace);
+        if (jevShadow || jevLive) {
+          try {
+            galleryImageUrls = parseListingImageUrls(html, marketplace, 12).slice(0, 3);
+          } catch {
+            galleryImageUrls = [];
+          }
         }
       }
     } catch (error) {
       const message = (error instanceof Error ? error.message : 'Could not fetch the high-priority listing detail page').slice(0, 500);
-      const snapshot = this.captureListingDetailSnapshot(candidate, null);
-      this.updateListingDetailSnapshot(snapshot?.id ?? null, 'unknown', null);
-      this.saveDescriptionVerification({ marketplace, listingId, status: 'unknown', model: activeModel, error: message });
+      this.transaction(() => {
+        const snapshot = this.captureListingDetailSnapshot(candidate, null);
+        this.updateListingDetailSnapshot(snapshot?.id ?? null, 'unknown', null);
+        this.saveDescriptionVerification({ marketplace, listingId, status: 'unknown', model: activeModel, error: message });
+      });
       this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: 'unknown' });
       return false;
     }
@@ -1712,55 +1890,67 @@ export class ScoutService {
       excludedTerms: candidate.excludedTerms?.trim() ? candidate.excludedTerms : null,
     };
     const inputHash = listingDescriptionVerificationInputHash(context);
-    const snapshot = this.captureListingDetailSnapshot(candidate, description);
-    const row = this.stmt(`SELECT ai_description_verification_json, ai_description_verification_input_hash,
-      ai_description_verification_model, ai_description_verification_at, ai_description_verification_error,
-      ai_description_verification_status
-      FROM listings WHERE marketplace = ? AND listing_id = ?`).get(marketplace, listingId) as Record<string, any> | undefined;
-    const cached = parseStoredListingDescriptionVerification(row?.ai_description_verification_json);
-    if (cached && row?.ai_description_verification_input_hash === inputHash && row.ai_description_verification_model === activeModel) {
-      this.updateListingDetailSnapshot(snapshot?.id ?? null, cached.decision, inputHash);
-      this.saveDescriptionVerification({ marketplace, listingId, status: cached.decision, verification: cached, inputHash, model: activeModel });
-      return cached.decision === 'pass';
-    }
-    if (row?.ai_description_verification_error && row.ai_description_verification_input_hash === inputHash
-      && row.ai_description_verification_model === activeModel && row.ai_description_verification_at
-      && Date.now() - Date.parse(row.ai_description_verification_at) < 6 * 60 * 60_000) {
-      const status: ListingDescriptionVerificationStatus = row.ai_description_verification_status === 'fallback' ? 'fallback' : 'unknown';
-      this.updateListingDetailSnapshot(snapshot?.id ?? null, status, inputHash);
-      this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: activeModel, error: row.ai_description_verification_error });
-      return status === 'fallback';
-    }
+    // Everything up to the fresh AI call is synchronous, so the snapshot and
+    // any cached decision are written in one transaction.
+    type CachedOutcome = { done: true; allowed: boolean; emit: ListingDescriptionVerificationStatus | null } | { done: false; snapshotId: number | null };
+    const outcome = this.transaction((): CachedOutcome => {
+      const snapshot = this.captureListingDetailSnapshot(candidate, description);
+      const row = this.stmt(`SELECT ai_description_verification_json, ai_description_verification_input_hash,
+        ai_description_verification_model, ai_description_verification_at, ai_description_verification_error,
+        ai_description_verification_status
+        FROM listings WHERE marketplace = ? AND listing_id = ?`).get(marketplace, listingId) as Record<string, any> | undefined;
+      const cached = parseStoredListingDescriptionVerification(row?.ai_description_verification_json);
+      if (cached && row?.ai_description_verification_input_hash === inputHash && row.ai_description_verification_model === activeModel) {
+        this.updateListingDetailSnapshot(snapshot?.id ?? null, cached.decision, inputHash);
+        this.saveDescriptionVerification({ marketplace, listingId, status: cached.decision, verification: cached, inputHash, model: activeModel });
+        return { done: true, allowed: cached.decision === 'pass', emit: null };
+      }
+      if (row?.ai_description_verification_error && row.ai_description_verification_input_hash === inputHash
+        && row.ai_description_verification_model === activeModel && row.ai_description_verification_at
+        && Date.now() - Date.parse(row.ai_description_verification_at) < 6 * 60 * 60_000) {
+        const status: ListingDescriptionVerificationStatus = row.ai_description_verification_status === 'fallback' ? 'fallback' : 'unknown';
+        this.updateListingDetailSnapshot(snapshot?.id ?? null, status, inputHash);
+        this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: activeModel, error: row.ai_description_verification_error });
+        return { done: true, allowed: status === 'fallback', emit: null };
+      }
 
-    if (!description) {
-      const unknown: ListingDescriptionVerification = {
-        decision: 'unknown',
-        confidence: 0,
-        summary: 'The detail page did not expose a listing description.',
-        issues: ['No listing description was available to verify.'],
-        evidence: [],
-      };
-      this.updateListingDetailSnapshot(snapshot?.id ?? null, unknown.decision, inputHash);
-      this.saveDescriptionVerification({ marketplace, listingId, status: unknown.decision, verification: unknown, inputHash, model: activeModel });
-      this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: unknown.decision });
-      return false;
-    }
+      if (!description) {
+        const unknown: ListingDescriptionVerification = {
+          decision: 'unknown',
+          confidence: 0,
+          summary: 'The detail page did not expose a listing description.',
+          issues: ['No listing description was available to verify.'],
+          evidence: [],
+        };
+        this.updateListingDetailSnapshot(snapshot?.id ?? null, unknown.decision, inputHash);
+        this.saveDescriptionVerification({ marketplace, listingId, status: unknown.decision, verification: unknown, inputHash, model: activeModel });
+        return { done: true, allowed: false, emit: unknown.decision };
+      }
 
-    // Cross-listing reuse is keyed by input hash, which omits the gallery
-    // photos live escalation uses — live mode relies on the per-listing cache
-    // above instead.
-    const reusable = !jevLive ? this.stmt(`SELECT ai_description_verification_json
-      FROM listings
-      WHERE ai_description_verification_input_hash = ?
-        AND ai_description_verification_model = ?
-        AND ai_description_verification_json IS NOT NULL
-      ORDER BY ai_description_verification_at DESC LIMIT 1`).get(inputHash, activeModel) as { ai_description_verification_json?: string } | undefined : undefined;
-    const shared = parseStoredListingDescriptionVerification(reusable?.ai_description_verification_json);
-    if (shared) {
-      this.updateListingDetailSnapshot(snapshot?.id ?? null, shared.decision, inputHash);
-      this.saveDescriptionVerification({ marketplace, listingId, status: shared.decision, verification: shared, inputHash, model: activeModel });
-      return shared.decision === 'pass';
+      // Cross-listing reuse is keyed by input hash, which omits the gallery
+      // photos live escalation uses — live mode relies on the per-listing cache
+      // above instead.
+      const reusable = !jevLive ? this.stmt(`SELECT ai_description_verification_json
+        FROM listings
+        WHERE ai_description_verification_input_hash = ?
+          AND ai_description_verification_model = ?
+          AND ai_description_verification_json IS NOT NULL
+        ORDER BY ai_description_verification_at DESC LIMIT 1`).get(inputHash, activeModel) as { ai_description_verification_json?: string } | undefined : undefined;
+      const shared = parseStoredListingDescriptionVerification(reusable?.ai_description_verification_json);
+      if (shared) {
+        this.updateListingDetailSnapshot(snapshot?.id ?? null, shared.decision, inputHash);
+        this.saveDescriptionVerification({ marketplace, listingId, status: shared.decision, verification: shared, inputHash, model: activeModel });
+        return { done: true, allowed: shared.decision === 'pass', emit: null };
+      }
+      // A fresh AI call follows: the snapshot shows pending while it runs.
+      if (snapshot?.id) this.stmt("UPDATE listing_detail_snapshots SET verification_status = 'pending' WHERE id = ? AND verification_status IS NOT 'pending'").run(snapshot.id);
+      return { done: false, snapshotId: snapshot?.id ?? null };
+    });
+    if (outcome.done) {
+      if (outcome.emit) this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: outcome.emit });
+      return outcome.allowed;
     }
+    const snapshot = outcome.snapshotId === null ? null : { id: outcome.snapshotId };
 
     // P2: same description upgrades unknown negotiability. Runs only on the
     // fresh-verification path — after every cache early-return above — so an
@@ -1808,6 +1998,33 @@ export class ScoutService {
     return verification;
   }
 
+  /**
+   * True when the listing already holds a finished verdict (pass, reject, or
+   * unknown for a page without a description; not an error) from the active
+   * model that is younger than DESCRIPTION_VERIFICATION_FRESH_MS, for a
+   * listing state (title, price, condition, location, url) that was already
+   * captured. Without an AI key verification is a write-free no-op anyway.
+   */
+  private hasFreshDescriptionVerification(candidate: DealNotificationCandidate, notifyContext?: ScanNotifyContext) {
+    const config = notifyContext?.deepSeek ?? this.deepSeekConfig();
+    const jevLive = this.jevLiveConfig();
+    const apiKey = jevLive ? jevLive.apiKey : config.apiKey;
+    if (!apiKey) return false;
+    const activeModel = jevLive ? jevLive.jevModel : config.model;
+    const { listing } = candidate;
+    const row = this.stmt(`SELECT id, ai_description_verification_model AS model, ai_description_verification_status AS status,
+      ai_description_verification_error AS error, ai_description_verification_at AS at
+      FROM listings WHERE marketplace = ? AND listing_id = ?`).get(listing.marketplace, listing.listingId) as { id?: number; model?: string | null; status?: string | null; error?: string | null; at?: string | null } | undefined;
+    if (!row?.id || row.model !== activeModel || row.error) return false;
+    if (row.status !== 'pass' && row.status !== 'reject' && row.status !== 'unknown') return false;
+    const verifiedAt = row.at ? Date.parse(row.at) : Number.NaN;
+    if (!Number.isFinite(verifiedAt) || Date.now() - verifiedAt >= DESCRIPTION_VERIFICATION_FRESH_MS) return false;
+    return Boolean(this.stmt(`SELECT 1 AS found FROM listing_detail_snapshots
+      WHERE listing_id = ? AND title = ? AND price_pln = ? AND url = ? AND condition IS ? AND location IS ? LIMIT 1`).get(
+      row.id, listing.title, listing.price, listing.url, listing.condition ?? null, listing.location ?? null,
+    ));
+  }
+
   /** Read once per scan — see ScanNotifyContext. */
   private scanNotifyContext(): ScanNotifyContext {
     return {
@@ -1842,7 +2059,15 @@ export class ScoutService {
       while (cursor < queue.length) {
         const group = queue[cursor++];
         for (const candidate of group) {
-          if (candidate.requiresDescriptionVerification && !await this.verifyHighPriorityDeal(candidate, context)) continue;
+          // notifyDeal ignores hidden listings, so verifying one would only
+          // fetch its page and spend an AI call for nothing.
+          if (this.isListingHidden(candidate.listing)) continue;
+          if (candidate.requiresDescriptionVerification) {
+            // notifyDeal re-plans after the awaits, since state can change.
+            const plan = this.planDealNotification(candidate.watchId, candidate.listing, candidate.discountPercent, context);
+            if (!plan.channels.length && !plan.digestDue && this.hasFreshDescriptionVerification(candidate, context)) continue;
+            if (!await this.verifyHighPriorityDeal(candidate, context)) continue;
+          }
           await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence, context, candidate.variantLabel ?? null);
         }
       }
@@ -2100,28 +2325,51 @@ export class ScoutService {
     };
   }
 
-  private watches(includeArchived: boolean) {
-    const rows = this.stmt(`SELECT * FROM watches ${includeArchived ? '' : 'WHERE archived_at IS NULL '}ORDER BY created_at DESC`).all() as WatchRow[];
+  /**
+   * Watches with their baseline stats. `onlyWatchId` restricts every query to
+   * one watch (archived or not) for callers that need a single watch's
+   * readiness or groups; the filtered statements are separate fixed shapes
+   * with the id bound as a parameter.
+   */
+  private watches(includeArchived: boolean, onlyWatchId?: string) {
+    const single = onlyWatchId !== undefined;
+    const rows = (single
+      ? this.stmt('SELECT * FROM watches WHERE id = ?').all(onlyWatchId)
+      : this.stmt(`SELECT * FROM watches ${includeArchived ? '' : 'WHERE archived_at IS NULL '}ORDER BY created_at DESC`).all()) as WatchRow[];
     if (!rows.length) return [];
-    const statsRows = this.stmt(`SELECT o.watch_id, COALESCE(wl.variant_key, ?) AS variant_key, COUNT(DISTINCT o.listing_id) AS samples, MIN(o.observed_at) AS first_observed
-      FROM observations o
-      JOIN listings l ON l.id = o.listing_id
-      JOIN watches w ON w.id = o.watch_id
-      LEFT JOIN watch_listings wl ON wl.id = o.watch_listing_id
-      WHERE (? = 1 OR w.archived_at IS NULL)
-        AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)
-        AND (w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
-        AND (w.min_price_pln IS NULL OR o.price_pln >= w.min_price_pln)
-        AND (w.max_price_pln IS NULL OR o.price_pln <= w.max_price_pln)
-      GROUP BY o.watch_id, COALESCE(wl.variant_key, ?)`).all(OTHER_VARIANT_KEY, includeArchived ? 1 : 0, OTHER_VARIANT_KEY) as Array<{ watch_id: string; variant_key: string; samples: number; first_observed: string | null }>;
+    if (single) includeArchived = true;
+    // One row per (watch, listing) association: listing-level filters run once
+    // per association and the earliest in-range observation is an ordered
+    // LIMIT-1 probe of observations_watch_listing, so the cost scales with
+    // associations instead of the whole observation history. Every
+    // observation's watch_listing_id is its (watch_id, listing_id)
+    // association, so this matches the per-observation aggregate exactly.
+    // MATERIALIZED keeps SQLite from flattening the CTE and re-running the
+    // probe per aggregate; HAVING drops variants with no in-range observation.
+    const statsRows = this.stmt(`WITH a AS MATERIALIZED (
+        SELECT wl.watch_id AS watch_id, COALESCE(wl.variant_key, ?1) AS variant_key,
+          (SELECT o.observed_at FROM observations o INDEXED BY observations_watch_listing
+            WHERE o.watch_id = wl.watch_id AND o.listing_id = wl.listing_id
+              AND (w.min_price_pln IS NULL OR o.price_pln >= w.min_price_pln)
+              AND (w.max_price_pln IS NULL OR o.price_pln <= w.max_price_pln)
+            ORDER BY o.observed_at LIMIT 1) AS first_observed
+        FROM watch_listings wl
+        JOIN watches w ON w.id = wl.watch_id
+        JOIN listings l ON l.id = wl.listing_id
+        WHERE (?2 = 1 OR w.archived_at IS NULL)${single ? ' AND wl.watch_id = ?3' : ''}
+          AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)
+          AND (w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
+      )
+      SELECT watch_id, variant_key, COUNT(first_observed) AS samples, MIN(first_observed) AS first_observed
+      FROM a GROUP BY watch_id, variant_key HAVING COUNT(first_observed) > 0`).all(OTHER_VARIANT_KEY, includeArchived ? 1 : 0, ...(single ? [onlyWatchId] : [])) as Array<{ watch_id: string; variant_key: string; samples: number; first_observed: string | null }>;
     // Latest stored typical per variant. Every association in a variant shares
     // the value written by the most recent scan; MAX(last_seen_at) picks that
     // row so a stale pre-regroup value cannot win.
     const typicalRows = this.stmt(`SELECT wl.watch_id, COALESCE(wl.variant_key, ?) AS variant_key, wl.typical_pln AS typical, MAX(wl.last_seen_at) AS last_seen_at
       FROM watch_listings wl
       JOIN watches w ON w.id = wl.watch_id
-      WHERE wl.typical_pln IS NOT NULL${includeArchived ? '' : ' AND w.archived_at IS NULL'}
-      GROUP BY wl.watch_id, COALESCE(wl.variant_key, ?)`).all(OTHER_VARIANT_KEY, OTHER_VARIANT_KEY) as Array<{ watch_id: string; variant_key: string; typical: number }>;
+      WHERE wl.typical_pln IS NOT NULL${includeArchived ? '' : ' AND w.archived_at IS NULL'}${single ? ' AND wl.watch_id = ?' : ''}
+      GROUP BY wl.watch_id, COALESCE(wl.variant_key, ?)`).all(OTHER_VARIANT_KEY, ...(single ? [onlyWatchId] : []), OTHER_VARIANT_KEY) as Array<{ watch_id: string; variant_key: string; typical: number }>;
     const statsByWatch = new Map<string, { samples: number; first_observed: string | null }>();
     const variantsByWatch = new Map<string, Map<string, { samples: number; first_observed: string | null; typical: number | null }>>();
     const variantEntry = (watchId: string, key: string) => {
@@ -2156,13 +2404,13 @@ export class ScoutService {
       JOIN watches w ON w.id = wl.watch_id
       LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id
       WHERE wl.last_seen_at > ?
-        AND (? = 1 OR w.archived_at IS NULL)
+        AND (? = 1 OR w.archived_at IS NULL)${single ? ' AND wl.watch_id = ?' : ''}
         AND COALESCE(a.hidden, 0) = 0
         AND (w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
         AND (w.min_price_pln IS NULL OR l.price_pln >= w.min_price_pln)
         AND (w.max_price_pln IS NULL OR l.price_pln <= w.max_price_pln)
         AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)
-      GROUP BY wl.watch_id, COALESCE(wl.deal_strength, 0)`).all(freshnessCutoff, includeArchived ? 1 : 0) as Array<{ watch_id: string; deal_strength: number; count: number }>;
+      GROUP BY wl.watch_id, COALESCE(wl.deal_strength, 0)`).all(freshnessCutoff, includeArchived ? 1 : 0, ...(single ? [onlyWatchId] : [])) as Array<{ watch_id: string; deal_strength: number; count: number }>;
     const dealCountsByWatch = new Map<string, WatchDealCounts>();
     for (const row of dealRows) {
       const counts = dealCountsByWatch.get(row.watch_id) ?? { exceptional: 0, veryStrong: 0, strong: 0 };
@@ -2182,6 +2430,11 @@ export class ScoutService {
 
   allWatches() {
     return this.watches(true);
+  }
+
+  /** One watch (archived included) with the same stats as allWatches(). */
+  watchById(id: string): Watch | undefined {
+    return this.watches(true, id)[0];
   }
 
   /**
@@ -2338,24 +2591,46 @@ export class ScoutService {
       return score.qualifies || (dealStrength ?? 0) >= 4;
     });
     const candidates = listings.filter((listing) => resolver.get(listing).key === OTHER_VARIANT_KEY && couldBeDeal(listing)).slice(0, VARIANT_JEV_BUDGET);
-    for (const listing of candidates) {
+    // The calls are independent round trips, so they run through the same
+    // bounded pool as the fuzzy rescue. Candidates sharing an input hash are
+    // asked once: sequentially the repeat would have hit the cache the first
+    // one wrote. Assignments are applied in candidate order after the pool.
+    type VariantOutcome = { variantId: string | null; cached: boolean } | null;
+    const byHash = new Map<string, { context: Parameters<ScoutService['jevVariant']>[0]; outcome?: VariantOutcome }>();
+    const hashes = candidates.map((listing) => {
       const context = { query: String(row.query ?? ''), title: listing.title, condition: listing.condition, variants: groups };
       const inputHash = listingVariantInputHash(context);
+      if (!byHash.has(inputHash)) byHash.set(inputHash, { context });
+      return inputHash;
+    });
+    await mapPool([...byHash.entries()], jevCheckConcurrency(), async ([inputHash, task]) => {
       const cached = this.readFuzzyCache(inputHash, live.jevModel, 'variant');
       if (cached) {
-        if (cached.rescued && ids.has(cached.decision)) resolver.setJev(listing, cached.decision);
-        continue;
+        task.outcome = { variantId: cached.rescued && ids.has(cached.decision) ? cached.decision : null, cached: true };
+        return;
       }
       try {
-        const judgment = await this.jevVariant(context, { apiKey: live.apiKey, model: live.jevModel });
+        const judgment = await this.jevVariant(task.context, { apiKey: live.apiKey, model: live.jevModel });
         this.logJevLive('variant', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
         const variantId = judgment.decision === 'variant' && !judgment.unsure ? judgment.variantId : null;
         this.writeFuzzyCache(inputHash, live.jevModel, 'variant', judgment.variantId ?? judgment.decision, judgment.confidence, variantId !== null);
-        if (variantId) resolver.setJev(listing, variantId);
+        task.outcome = { variantId, cached: false };
       } catch (error) {
         this.logJevLive('variant', inputHash, live, { jevError: error instanceof Error ? error.message : String(error) });
+        task.outcome = null;
       }
-    }
+    });
+    const applied = new Set<string>();
+    candidates.forEach((listing, index) => {
+      const outcome = byHash.get(hashes[index])?.outcome;
+      if (!outcome) return;
+      // A repeat reads what the first answer cached, which only counts a
+      // known variant id.
+      const repeat = applied.has(hashes[index]);
+      applied.add(hashes[index]);
+      const variantId = repeat && !outcome.cached && outcome.variantId !== null && !ids.has(outcome.variantId) ? null : outcome.variantId;
+      if (variantId) resolver.setJev(listing, variantId);
+    });
   }
 
   /**
@@ -2391,26 +2666,37 @@ export class ScoutService {
     if (!row) throw new ServiceError('Watch not found', 404);
     const days = Math.max(7, Math.min(180, Math.floor(rangeDays)));
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60_000).toISOString();
-    // Identical WHERE semantics to the previous full fetch; only the row
-    // shipping changes. Raw-row totals stay exact via the aggregate — the
-    // reduced set cannot represent them.
-    const filters = `FROM observations o
-      JOIN listings l ON l.id = o.listing_id
-      WHERE o.watch_id = ?
-        AND o.observed_at >= ?
-        AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND EXISTS (SELECT 1 FROM watches rw WHERE rw.id = r.watch_id AND rw.ai_relevance = 1))
-        AND (? = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
-        AND (? IS NULL OR o.price_pln >= ?)
-        AND (? IS NULL OR o.price_pln <= ?)`;
-    const filterParams = [id, cutoff, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln] as unknown[];
-    const bounds = this.stmt(`SELECT COUNT(*) AS total, MIN(o.observed_at) AS first_at, MAX(o.observed_at) AS last_at ${filters}`).get(...filterParams) as { total?: number; first_at?: string | null; last_at?: string | null };
+    // Driven from the watch's associations: listing-level filters (relevance,
+    // shipping) run once per association and observations are range seeks on
+    // observations_watch_listing. Every observation belongs to its
+    // (watch_id, listing_id) association, so the row set is unchanged.
+    const filters = `NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND EXISTS (SELECT 1 FROM watches rw WHERE rw.id = r.watch_id AND rw.ai_relevance = 1))
+        AND (?3 = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
+        AND (?4 IS NULL OR o.price_pln >= ?4)
+        AND (?5 IS NULL OR o.price_pln <= ?5)`;
+    const filterParams = [id, cutoff, row.shipping_only ? 1 : 0, row.min_price_pln, row.max_price_pln] as unknown[];
     // Daily reduction in SQL: the last observation per listing per day
     // (ISO-8601 UTC timestamps sort correctly under date()). SQLite takes
     // bare columns from the MAX(observed_at) row, so price and typical are
-    // the ones observed last — matching the previous JS-side dedupe.
-    const dailyRows = this.stmt(`SELECT date(o.observed_at) AS day, o.listing_id, l.marketplace, o.price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at
-      ${filters}
+    // the ones observed last — matching the previous JS-side dedupe. COUNT is
+    // not a min/max aggregate, so it leaves that choice intact; adding
+    // MIN(observed_at) here would not.
+    const dailyRows = this.stmt(`SELECT date(o.observed_at) AS day, o.listing_id, l.marketplace, o.price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at, COUNT(*) AS n
+      FROM watch_listings wl
+      JOIN listings l ON l.id = wl.listing_id
+      CROSS JOIN observations o INDEXED BY observations_watch_listing ON o.watch_id = wl.watch_id AND o.listing_id = wl.listing_id AND o.observed_at >= ?2
+      WHERE wl.watch_id = ?1 AND ${filters}
       GROUP BY day, o.listing_id`).all(...filterParams) as Array<Record<string, any>>;
+    // Raw-row totals come from the per-group counts; the window's first and
+    // last observation are ordered LIMIT-1 probes with the same filters.
+    const probe = (direction: 'ASC' | 'DESC') => (this.stmt(`SELECT o.observed_at AS at FROM observations o
+      JOIN listings l ON l.id = o.listing_id
+      JOIN watch_listings wl ON wl.watch_id = o.watch_id AND wl.listing_id = o.listing_id
+      WHERE o.watch_id = ?1 AND o.observed_at >= ?2 AND ${filters}
+      ORDER BY o.observed_at ${direction} LIMIT 1`).get(...filterParams) as { at?: string } | undefined)?.at ?? null;
+    let totalObservations = 0;
+    for (const item of dailyRows) totalObservations += Number(item.n);
+    const bounds = { total: totalObservations, first_at: dailyRows.length ? probe('ASC') : null, last_at: dailyRows.length ? probe('DESC') : null };
     const observations = dailyRows.map((item): WatchAnalyticsObservation => ({
       listingId: Number(item.listing_id),
       marketplace: item.marketplace as Marketplace,
@@ -2482,23 +2768,26 @@ export class ScoutService {
     const marketplace = options.marketplace ?? null;
 
     // Identical relevance/shipping/price semantics to watchAnalytics so the
-    // page never counts listings a watch itself would ignore.
+    // page never counts listings a watch itself would ignore. Driven from the
+    // associations (the result already inner-joined them) so listing-level
+    // filters run per association and observations are range seeks on
+    // observations_watch_listing instead of a full scan.
     const predicates = [
       'w.archived_at IS NULL',
       'o.observed_at >= ?',
-      "NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)",
+      "NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)",
       "(w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))",
       '(w.min_price_pln IS NULL OR o.price_pln >= w.min_price_pln)',
       '(w.max_price_pln IS NULL OR o.price_pln <= w.max_price_pln)',
     ];
     const params: unknown[] = [cutoff];
-    if (watchId) { predicates.push('o.watch_id = ?'); params.push(watchId); }
+    if (watchId) { predicates.push('w.id = ?'); params.push(watchId); }
     if (marketplace) { predicates.push('l.marketplace = ?'); params.push(marketplace); }
     const rows = this.stmt(`SELECT date(o.observed_at) AS day, o.listing_id AS listing_id, o.watch_id AS watch_id, w.name AS watch_name, l.marketplace AS marketplace, o.price_pln AS price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at, wl.first_seen_at AS first_seen_at
-      FROM observations o
-      JOIN listings l ON l.id = o.listing_id
-      JOIN watches w ON w.id = o.watch_id
-      JOIN watch_listings wl ON wl.watch_id = o.watch_id AND wl.listing_id = o.listing_id
+      FROM watches w
+      JOIN watch_listings wl ON wl.watch_id = w.id
+      JOIN listings l ON l.id = wl.listing_id
+      CROSS JOIN observations o INDEXED BY observations_watch_listing ON o.watch_id = wl.watch_id AND o.listing_id = wl.listing_id
       WHERE ${predicates.join(' AND ')}
       GROUP BY day, o.watch_id, o.listing_id`).all(...params) as Array<Record<string, any>>;
     const observations: AnalyticsObservation[] = rows.map((row) => ({
@@ -2660,9 +2949,17 @@ export class ScoutService {
       WHERE l.marketplace = ? AND l.listing_id = ? AND (? IS NULL OR wl.watch_id = ?)
       ORDER BY CASE WHEN wl.id IS NOT NULL THEN 0 ELSE 1 END, wl.last_seen_at DESC LIMIT 1`).get(watchId ?? null, watchId ?? null, marketplace, listingId, watchId ?? null, watchId ?? null) as Record<string, any> | undefined;
     if (!row) throw new ServiceError('Listing detail is not available yet', 404);
-    const watches = new Map(this.allWatches().map((watch) => [watch.id, watch]));
-    const listing = this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100, watches.get(row.watch_id)?.variantGroups ?? []);
-    const history = (this.stmt('SELECT price_pln, observed_at FROM observations WHERE listing_id = ? AND (? IS NULL OR watch_id = ?) ORDER BY observed_at DESC, id DESC LIMIT 120').all(row.id, row.watch_id ?? watchId ?? null, row.watch_id ?? watchId ?? null) as Array<{ price_pln: number; observed_at: string }>).reverse().map((point): PriceHistoryPoint => ({ price: Number(point.price_pln), observedAt: point.observed_at }));
+    // Only the associated watch's readiness and groups are needed.
+    const watch = row.watch_id != null ? this.watchById(String(row.watch_id)) : undefined;
+    const listing = this.listingFromRow(row, watch?.readiness === 100, watch?.variantGroups ?? []);
+    // Split instead of '(? IS NULL OR watch_id = ?)' so the watch-scoped read
+    // seeks observations_watch_listing. The unscoped form is exact because
+    // observations.watch_id is an enforced foreign key to watches.
+    const historyWatchId = row.watch_id ?? watchId ?? null;
+    const historyRows = historyWatchId !== null
+      ? this.stmt('SELECT price_pln, observed_at FROM observations WHERE watch_id = ? AND listing_id = ? ORDER BY observed_at DESC, id DESC LIMIT 120').all(historyWatchId, row.id)
+      : this.stmt('SELECT price_pln, observed_at FROM observations WHERE watch_id IN (SELECT id FROM watches) AND listing_id = ? ORDER BY observed_at DESC, id DESC LIMIT 120').all(row.id);
+    const history = (historyRows as Array<{ price_pln: number; observed_at: string }>).reverse().map((point): PriceHistoryPoint => ({ price: Number(point.price_pln), observedAt: point.observed_at }));
     const snapshotRow = this.stmt(`SELECT title, price_pln, condition, location, url, description, captured_at, verification_status
       FROM listing_detail_snapshots WHERE listing_id = ? ORDER BY captured_at DESC, id DESC LIMIT 1`).get(row.id) as Record<string, any> | undefined;
     const snapshotStatus = snapshotRow?.verification_status === 'pass'
@@ -2729,7 +3026,7 @@ export class ScoutService {
       verificationTrace,
       verificationInputHash,
       verificationModel,
-      ...(watches.get(row.watch_id)?.variantGroups.length ? { variantGroups: watches.get(row.watch_id)!.variantGroups } : {}),
+      ...(watch?.variantGroups.length ? { variantGroups: watch.variantGroups } : {}),
     };
   }
 
@@ -3197,6 +3494,10 @@ export class ScoutService {
       const sources = parseJson<Marketplace[]>(row.sources_json, []);
       const version = this.ensureMarketWatchVersion(row);
       let latestBackoffUntil: string | null = null;
+      // Every source's createScan runs before the first await and the running
+      // set excludes a concurrent run, so all sources see the same ordinal.
+      let ordinal: number | undefined;
+      const scanOrdinal = () => ordinal ??= this.scanOrdinal(String(row.id), 'research');
       await Promise.all(sources.map(async (source) => {
         const paths: string[] = [];
         const onPath: ConnectorPathReporter = (path) => { if (!paths.includes(path)) paths.push(path); };
@@ -3217,7 +3518,7 @@ export class ScoutService {
           // Typo variants come from the immutable criteria version, like every
           // other research criterion, and append one page per variant query.
           const variantQueries = version.typo_variants
-            ? pickVariantBatch(typoVariants(String(version.query ?? row.query)), this.scanOrdinal(String(row.id), 'research'), TYPO_VARIANTS_PER_SCAN)
+            ? pickVariantBatch(typoVariants(String(version.query ?? row.query)), scanOrdinal(), TYPO_VARIANTS_PER_SCAN)
             : [];
           const variantFetches: string[] = [];
           for (const variantQuery of variantQueries) {
@@ -3481,16 +3782,32 @@ export class ScoutService {
     return this.marketListingSnapshot(marketListingId);
   }
 
-  getConnectors(): Connector[] {
+  // Per-source connector_runs counts. Counting walks the whole table (~560k
+  // rows at real scan cadence), so the result is kept and maintained in
+  // place: recordRun (the only INSERT) adds one, the retention prune (the
+  // only DELETE) drops the cache, and a commit from another connection
+  // changes PRAGMA data_version, which forces a recount.
+  private connectorRunCountCache: { version: number; counts: Map<string, number> } | null = null;
+
+  private connectorRunCounts() {
+    const version = Number((this.stmt('PRAGMA data_version').get() as { data_version: number }).data_version);
+    if (!this.connectorRunCountCache || this.connectorRunCountCache.version !== version) {
+      const counts = new Map((this.stmt('SELECT source, COUNT(*) AS count FROM connector_runs GROUP BY source').all() as Array<{ source: string; count: number }>)
+        .map((row) => [String(row.source), Number(row.count)]));
+      this.connectorRunCountCache = { version, counts };
+    }
+    return this.connectorRunCountCache.counts;
+  }
+
+  /** `withCounts: false` skips the run counts (every `requests` is 0) for callers that only read status. */
+  getConnectors(withCounts = true): Connector[] {
     const webhookConfigured = Boolean(this.getSetting('discord_webhook'));
     const ntfyConfigured = Boolean(this.ntfyConfig());
     // Latest row per source comes from one indexed lookup per connector and
-    // the run count from a grouped count (the source-leading index keeps it
-    // b-tree free). The previous window-function query materialized every
-    // connector_runs row — three full scans on every dashboard refresh and
-    // readiness probe.
-    const countBySource = new Map((this.stmt('SELECT source, COUNT(*) AS count FROM connector_runs GROUP BY source').all() as Array<{ source: string; count: number }>)
-      .map((row) => [String(row.source), Number(row.count)]));
+    // the run count from the maintained per-source counts. The previous
+    // window-function query materialized every connector_runs row — three
+    // full scans on every dashboard refresh and readiness probe.
+    const countBySource = withCounts ? this.connectorRunCounts() : new Map<string, number>();
     const latestRun = this.stmt('SELECT * FROM connector_runs WHERE source = ? ORDER BY started_at DESC, id DESC LIMIT 1');
     const latestSuccess = this.stmt("SELECT finished_at FROM connector_runs WHERE source = ? AND status = 'ok' AND finished_at IS NOT NULL ORDER BY started_at DESC, id DESC LIMIT 1");
     const healthBySource = new Map<string, Record<string, any>>();
@@ -3512,7 +3829,15 @@ export class ScoutService {
     });
   }
 
-  dashboard(): DashboardData {
+  /**
+   * `top` (an integer from 1 to 50) serves the home screen widget: every
+   * scalar is computed over the same 500-row feed, `listings` holds only the
+   * strongest `top` rows in WidgetSnapshot.make's order, and `watches` and
+   * `connectors` are empty (connector reads are skipped). Any other value
+   * returns the full dashboard.
+   */
+  dashboard(options: { top?: number } = {}): DashboardData {
+    const top = typeof options.top === 'number' && Number.isInteger(options.top) && options.top >= 1 && options.top <= 50 ? options.top : null;
     const watches = this.getWatches();
     const listings = this.getListings(watches, true);
     const today = new Date();
@@ -3531,9 +3856,9 @@ export class ScoutService {
     }
     const lastScan = parseJson<{ at?: string }>(this.getSetting('last_scan'), {});
     return {
-      watches,
-      listings,
-      connectors: this.getConnectors(),
+      watches: top === null ? watches : [],
+      listings: top === null ? listings : widgetDeals(listings, top),
+      connectors: top === null ? this.getConnectors() : [],
       stats: {
         watching: watches.reduce((count, watch) => count + (watch.enabled ? 1 : 0), 0),
         newToday,
@@ -3546,28 +3871,103 @@ export class ScoutService {
 
   exportData() {
     const rows = (table: string) => this.stmt(`SELECT * FROM ${table}`).all() as Array<Record<string, unknown>>;
-    const settings = rows('settings').map((row) => {
-      const key = String(row.key);
-      return { key, configured: Boolean(row.value), value: /(?:webhook|ntfy_config|api_key)/i.test(key) ? null : row.value };
-    });
-    return {
-      exportedAt: nowIso(),
-      note: 'Encrypted credentials, browser sessions, and raw secret values are intentionally omitted. Use the authenticated database backup command for a complete restore point.',
-      watches: rows('watches'),
-      listings: rows('listings'),
-      observations: rows('observations'),
-      listingRelevance: rows('listing_relevance'),
-      scans: rows('scans'),
-      notificationDeliveries: rows('notification_deliveries'),
-      marketWatches: rows('market_watches'),
-      marketWatchVersions: rows('market_watch_versions'),
-      marketListings: rows('market_listings'),
-      marketPriceObservations: rows('market_price_observations'),
-      listingActions: rows('listing_actions'),
-      notifications: rows('notifications'),
-      connectorRuns: rows('connector_runs'),
-      settings,
+    const data: Record<string, unknown> = { exportedAt: nowIso(), note: EXPORT_NOTE };
+    for (const [key, table] of EXPORT_TABLES) data[key] = rows(table);
+    data.settings = rows('settings').map(redactExportSetting);
+    return data;
+  }
+
+  /**
+   * The /api/export JSON as text chunks, byte-identical to
+   * JSON.stringify(exportData()). Rows stream from a separate read-only
+   * connection inside one read transaction (the same snapshot for every
+   * table) in ~64 KB chunks with an event-loop turn between them, so the
+   * export never materializes the database or blocks SSE and the scheduler.
+   * The reader, BEGIN and the settings read happen synchronously in this
+   * call, so a failure to open the snapshot throws here (and becomes a normal
+   * error response) rather than from the stream after the route has replied.
+   * An in-memory database, or a Node without StatementSync.iterate(), falls
+   * back to exportData().
+   */
+  exportChunks(): AsyncGenerator<string> {
+    return this.openExportSnapshot().chunks;
+  }
+
+  private openExportSnapshot(): { chunks: AsyncGenerator<string>; release: () => void } {
+    const main = (this.db.prepare('PRAGMA database_list').all() as Array<{ name: string; file: string }>).find((row) => row.name === 'main');
+    const reader = main?.file ? new DatabaseSync(main.file, { readOnly: true }) : null;
+    let iterable = false;
+    try {
+      iterable = typeof reader?.prepare('SELECT 1').iterate === 'function';
+    } catch (error) {
+      reader?.close();
+      throw error;
+    }
+    if (!reader || !iterable) {
+      reader?.close();
+      const text = JSON.stringify(this.exportData());
+      return { chunks: (async function* () { yield text; })(), release: () => {} };
+    }
+    let open = false;
+    let released = false;
+    // Idempotent: the generator's finally and the stream's close both call it,
+    // since a generator that never started skips its finally on return().
+    const release = () => {
+      if (released) return;
+      released = true;
+      if (open) { try { reader.exec('ROLLBACK'); } catch { /* the snapshot is released on close */ } }
+      try { reader.close(); } catch { /* best-effort */ }
     };
+    let settings: Array<Record<string, unknown>>;
+    try {
+      reader.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;');
+      reader.exec('BEGIN');
+      open = true;
+      // The first SELECT takes the snapshot every table is read from.
+      settings = (reader.prepare('SELECT * FROM settings').all() as Array<Record<string, unknown>>).map(redactExportSetting);
+    } catch (error) {
+      release();
+      throw error;
+    }
+    const chunks = async function* (): AsyncGenerator<string> {
+      try {
+        let chunk = `{"exportedAt":${JSON.stringify(nowIso())},"note":${JSON.stringify(EXPORT_NOTE)}`;
+        for (const [key, table] of EXPORT_TABLES) {
+          chunk += `,${JSON.stringify(key)}:[`;
+          let first = true;
+          for (const row of reader.prepare(`SELECT * FROM ${table}`).iterate()) {
+            chunk += first ? JSON.stringify(row) : `,${JSON.stringify(row)}`;
+            first = false;
+            if (chunk.length >= EXPORT_CHUNK_CHARS) {
+              yield chunk;
+              chunk = '';
+              await new Promise<void>((resolve) => setImmediate(resolve));
+            }
+          }
+          chunk += ']';
+        }
+        yield `${chunk},"settings":${JSON.stringify(settings)}}`;
+      } finally {
+        // Also runs when the consumer stops early (client abort or timeout).
+        release();
+      }
+    };
+    return { chunks: chunks(), release };
+  }
+
+  /**
+   * exportChunks() as a byte stream for the /api/export route. Opening the
+   * snapshot can throw synchronously (see exportChunks). The stream is
+   * destroyed after maxOpenMs, so a stalled client cannot pin the read
+   * snapshot (and block WAL checkpoints from resetting) indefinitely.
+   */
+  exportStream(maxOpenMs = EXPORT_MAX_OPEN_MS) {
+    const { chunks, release } = this.openExportSnapshot();
+    const stream = Readable.from(chunks, { objectMode: false });
+    const timer = setTimeout(() => stream.destroy(new Error(`Export exceeded ${maxOpenMs} ms and was stopped`)), maxOpenMs);
+    timer.unref?.();
+    stream.once('close', () => { clearTimeout(timer); release(); });
+    return stream;
   }
 
   settings(): SettingsData {
@@ -3691,7 +4091,8 @@ export class ScoutService {
   connectorRunsPage(options: { page?: number; pageSize?: number } = {}) {
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(200, Math.floor(options.pageSize ?? 100)));
-    const total = Number((this.stmt('SELECT COUNT(*) AS count FROM connector_runs').get() as { count?: number }).count ?? 0);
+    let total = 0;
+    for (const count of this.connectorRunCounts().values()) total += count;
     const rows = this.stmt('SELECT * FROM connector_runs ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?').all(pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
     return { runs: rows.map((row) => ({ id: Number(row.id), source: row.source, status: row.status, message: row.message, startedAt: row.started_at, finishedAt: row.finished_at, duration: duration(row.started_at, row.finished_at) })), pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
   }
@@ -3799,6 +4200,11 @@ export class ScoutService {
       // Reference-series fallback is computed once per scan, like the baseline.
       const referenceMedian = row.reference_market_watch_id ? this.referenceBandMedian(String(row.reference_market_watch_id)) : null;
       const backoffBySource = new Map<string, string>();
+      // Every due source's createScan runs before the first await and the
+      // running set excludes a concurrent run, so all sources see the same
+      // ordinal; it is counted once, on first use.
+      let ordinal: number | undefined;
+      const scanOrdinal = () => ordinal ??= this.scanOrdinal(String(row.id), 'watch');
       if (!dueSources.length) {
         const pending = sources.map((source) => storedSourceNext[source]).filter((value): value is string => Boolean(value)).sort();
         if (pending.length) this.stmt('UPDATE watches SET next_scan_at = ?, updated_at = ? WHERE id = ?').run(pending[0], nowIso(), row.id);
@@ -3831,7 +4237,7 @@ export class ScoutService {
           // main page; exact-URL watches pin their own searches instead.
           const variantQueries = matchingExact.length || !row.typo_variants
             ? []
-            : pickVariantBatch(typoVariants(String(row.query)), this.scanOrdinal(String(row.id), 'watch'), TYPO_VARIANTS_PER_SCAN);
+            : pickVariantBatch(typoVariants(String(row.query)), scanOrdinal(), TYPO_VARIANTS_PER_SCAN);
           const variantFetches: string[] = [];
           for (const variantQuery of variantQueries) {
             variantFetches.push(`"${variantQuery}"`);
@@ -4203,21 +4609,97 @@ export class ScoutService {
     return response.text();
   }
 
+  // Locally launched Chromium, shared by renders (each still gets its own
+  // context) and closed BROWSER_IDLE_CLOSE_MS after the last render ends.
+  // Browserless connections stay per render: its TIMEOUT is a hard session
+  // limit, so a cached connection would be killed mid-render.
+  private sharedBrowser: Promise<Browser> | null = null;
+  private activeBrowserRenders = 0;
+  private browserIdleTimer: NodeJS.Timeout | null = null;
+  private browserShutDown = false;
+
+  private async launchLocalBrowser(executablePath: string): Promise<Browser> {
+    const { chromium } = await loadPlaywright();
+    // Pass a minimal environment: the renderer parses third-party pages and
+    // must not inherit SCOUT_SECRET, API tokens, or provider keys.
+    const browserEnv = Object.fromEntries(['PATH', 'HOME', 'TZ', 'LANG', 'XDG_RUNTIME_DIR', 'FONTCONFIG_PATH'].flatMap((key) => (process.env[key] ? [[key, process.env[key] as string]] : [])));
+    return chromium.launch({ executablePath, headless: true, env: browserEnv, args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'] });
+  }
+
+  /** Callers must pair every call with releaseLocalBrowser, even when the launch fails. */
+  private acquireLocalBrowser(executablePath: string): Promise<Browser> {
+    this.activeBrowserRenders += 1;
+    if (this.browserIdleTimer) {
+      clearTimeout(this.browserIdleTimer);
+      this.browserIdleTimer = null;
+    }
+    // After the final close (server shutdown) nothing may launch a new Chromium.
+    if (this.browserShutDown) return Promise.reject(new Error('Scout is shutting down; Chromium is closed'));
+    if (!this.sharedBrowser) {
+      const pending = this.launchLocalBrowser(executablePath).then((browser) => {
+        // A crash or external kill drops the cache; the next render relaunches.
+        browser.on('disconnected', () => {
+          if (this.sharedBrowser === pending) this.sharedBrowser = null;
+        });
+        return browser;
+      });
+      pending.catch(() => {
+        if (this.sharedBrowser === pending) this.sharedBrowser = null;
+      });
+      this.sharedBrowser = pending;
+    }
+    return this.sharedBrowser;
+  }
+
+  private releaseLocalBrowser() {
+    this.activeBrowserRenders -= 1;
+    if (this.activeBrowserRenders > 0 || !this.sharedBrowser || this.browserIdleTimer) return;
+    this.browserIdleTimer = setTimeout(() => {
+      this.browserIdleTimer = null;
+      if (this.activeBrowserRenders === 0) void this.closeBrowser();
+    }, BROWSER_IDLE_CLOSE_MS);
+    this.browserIdleTimer.unref?.();
+  }
+
+  /**
+   * Close the shared local Chromium, if any (idle timeout and server shutdown).
+   * `final` (shutdown) also refuses later launches. Waits at most
+   * BROWSER_CLOSE_TIMEOUT_MS for the launch and close to finish.
+   */
+  async closeBrowser({ final = false }: { final?: boolean } = {}) {
+    if (final) this.browserShutDown = true;
+    if (this.browserIdleTimer) {
+      clearTimeout(this.browserIdleTimer);
+      this.browserIdleTimer = null;
+    }
+    const pending = this.sharedBrowser;
+    this.sharedBrowser = null;
+    if (!pending) return;
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, BROWSER_CLOSE_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    try {
+      await Promise.race([pending.then((browser) => browser.close()).catch(() => undefined), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private async renderInBrowser(url: string, marketplace: Marketplace, storageState?: MarketplaceStorageState): Promise<string> {
     let browser: Browser | undefined;
     let context: BrowserContext | undefined;
-    let ownsBrowser = false;
+    let sharedLocal = false;
     try {
       if (process.env.SCOUT_BROWSER_WS) {
+        const { chromium } = await loadPlaywright();
         browser = await chromium.connectOverCDP(process.env.SCOUT_BROWSER_WS, { timeout: 8_000 });
       } else {
         const executablePath = process.env.SCOUT_CHROMIUM_PATH ?? ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'].find(existsSync);
         if (!executablePath) throw new Error('Chromium is not available; configure SCOUT_BROWSER_WS');
-        // Pass a minimal environment: the renderer parses third-party pages and
-        // must not inherit SCOUT_SECRET, API tokens, or provider keys.
-        const browserEnv = Object.fromEntries(['PATH', 'HOME', 'TZ', 'LANG', 'XDG_RUNTIME_DIR', 'FONTCONFIG_PATH'].flatMap((key) => (process.env[key] ? [[key, process.env[key] as string]] : [])));
-        browser = await chromium.launch({ executablePath, headless: true, env: browserEnv, args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'] });
-        ownsBrowser = true;
+        sharedLocal = true;
+        browser = await this.acquireLocalBrowser(executablePath);
       }
       // Always isolate scans in their own context: reusing the shared default
       // context leaks cookies across marketplaces and concurrent scans.
@@ -4235,7 +4717,13 @@ export class ScoutService {
         try { hostname = new URL(route.request().url()).hostname; } catch { /* unparseable URLs are aborted */ }
         const bare = hostname.replace(/^\[|\]$/g, '');
         const reachable = bare && isSafeNetworkHost(bare) && (bare.includes('.') || bare.includes(':'));
-        return reachable ? route.continue() : route.abort('blockedbyclient');
+        if (!reachable) return route.abort('blockedbyclient');
+        // Only the HTML is read: marketplace CDN photos get a 1x1 GIF instead of
+        // a download. Other hosts' images (challenge platforms) still load.
+        if (route.request().resourceType() === 'image' && isMarketplaceImageUrl(route.request().url())) {
+          return route.fulfill({ status: 200, contentType: 'image/gif', body: ONE_PIXEL_GIF });
+        }
+        return route.continue();
       });
       await context.routeWebSocket(/.*/, (socket) => { socket.close(); });
       const page = await context.newPage();
@@ -4268,7 +4756,8 @@ export class ScoutService {
       try {
         if (context) await context.close();
       } finally {
-        if (browser) await browser.close().catch(() => undefined);
+        if (sharedLocal) this.releaseLocalBrowser();
+        else if (browser) await browser.close().catch(() => undefined);
       }
     }
   }
@@ -4283,6 +4772,7 @@ export class ScoutService {
     this.stmt('DELETE FROM listing_relevance WHERE checked_at < ?').run(cutoff);
     this.stmt('DELETE FROM manual_relevance_cache WHERE checked_at < ?').run(cutoff);
     this.stmt('DELETE FROM connector_runs WHERE started_at < ?').run(cutoff);
+    this.connectorRunCountCache = null;
     this.stmt('DELETE FROM scans WHERE started_at < ?').run(cutoff);
     this.stmt('DELETE FROM notification_deliveries WHERE created_at < ?').run(cutoff);
     this.stmt('DELETE FROM notifications WHERE created_at < ?').run(cutoff);
@@ -4373,10 +4863,15 @@ export class ScoutService {
    * Per-variant inputs every listing in a scan scores against: the latest
    * observed price per listing (the baseline distribution) bucketed by the
    * listing's assigned variant_key, plus each variant's first server-observed
-   * timestamp. Computed once per scan. The window function walks the
-   * (watch_id, listing_id, observed_at, id) index in one linear pass; INDEXED
-   * BY pins that covering index because the planner otherwise sometimes picked
-   * observations_watch_time and re-sorted the watch's full history.
+   * timestamp. Computed once per source scan.
+   *
+   * The query is driven by the watch's associations, so its cost follows the
+   * number of listings rather than the length of the observation history: for
+   * each association two LIMIT-1 seeks into the (watch_id, listing_id,
+   * observed_at, id) index find the newest and the oldest in-bounds
+   * observation. INDEXED BY pins that index for both probes. Each association
+   * is (watch_id, listing_id), which every observation's watch_listing_id
+   * points at, so the rows match the old per-observation window query.
    *
    * With no configured groups every row lands in the single OTHER bucket, so
    * the legacy watch-wide baseline is reproduced unchanged. Each bucket keeps
@@ -4385,42 +4880,53 @@ export class ScoutService {
    */
   private watchBaselines(row: WatchRow): WatchBaselines {
     const groups = parseVariantGroups(row.variant_groups_json);
-    const baselineFilters = `
-      JOIN listings l ON l.id = o.listing_id
-      LEFT JOIN watch_listings wl ON wl.id = o.watch_listing_id
-      WHERE o.watch_id = ?
-        AND (? = 0 OR NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))))
-        AND (? = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
-        AND (? IS NULL OR o.price_pln >= ?)
-        AND (? IS NULL OR o.price_pln <= ?)`;
-    const baselineParams = [
+    const rows = this.stmt(`SELECT o.price_pln, x.variant_key, x.first
+      FROM (
+        SELECT COALESCE(wl.variant_key, ?) AS variant_key,
+          (SELECT o2.id FROM observations o2 INDEXED BY observations_watch_listing
+            WHERE o2.watch_id = wl.watch_id AND o2.listing_id = wl.listing_id
+              AND (? IS NULL OR o2.price_pln >= ?) AND (? IS NULL OR o2.price_pln <= ?)
+            ORDER BY o2.observed_at DESC, o2.id DESC LIMIT 1) AS latest_id,
+          (SELECT o3.observed_at FROM observations o3 INDEXED BY observations_watch_listing
+            WHERE o3.watch_id = wl.watch_id AND o3.listing_id = wl.listing_id
+              AND (? IS NULL OR o3.price_pln >= ?) AND (? IS NULL OR o3.price_pln <= ?)
+            ORDER BY o3.observed_at ASC, o3.id ASC LIMIT 1) AS first
+        FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id
+        WHERE wl.watch_id = ?
+          AND (? = 0 OR NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))))
+          AND (? = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
+      ) x JOIN observations o ON o.id = x.latest_id
+      ORDER BY o.observed_at DESC, o.id DESC`).all(
+      OTHER_VARIANT_KEY,
+      row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln,
+      row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln,
       row.id,
       row.ai_relevance === false || row.ai_relevance === 0 ? 0 : 1,
       row.shipping_only ? 1 : 0,
-      row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln,
-    ] as unknown[];
-    const latest = this.stmt(`SELECT price_pln, variant_key FROM (
-        SELECT o.price_pln, o.observed_at, o.id, COALESCE(wl.variant_key, ?) AS variant_key, ROW_NUMBER() OVER (PARTITION BY o.listing_id ORDER BY o.observed_at DESC, o.id DESC) AS rank
-        FROM observations o INDEXED BY observations_watch_listing ${baselineFilters}
-      ) WHERE rank <= 1 ORDER BY observed_at DESC, id DESC`).all(OTHER_VARIANT_KEY, ...baselineParams) as Array<{ price_pln: number; variant_key: string }>;
-    const firstByVariant = this.stmt(`SELECT COALESCE(wl.variant_key, ?) AS variant_key, MIN(o.observed_at) AS first
-      FROM observations o INDEXED BY observations_watch_listing ${baselineFilters}
-      GROUP BY COALESCE(wl.variant_key, ?)`).all(OTHER_VARIANT_KEY, ...baselineParams, OTHER_VARIANT_KEY) as Array<{ variant_key: string; first: string | null }>;
+    ) as Array<{ price_pln: number; variant_key: string; first: string | null }>;
     const buckets = new Map<string, WatchVariantBucket>();
     const bucketFor = (key: string) => {
       let bucket = buckets.get(key);
       if (!bucket) { bucket = { prices: [], firstObservedAt: null }; buckets.set(key, bucket); }
       return bucket;
     };
-    for (const item of latest) {
+    const firstByVariant = new Map<string, string>();
+    for (const item of rows) {
+      const key = item.variant_key ?? OTHER_VARIANT_KEY;
+      const first = item.first;
+      if (first !== null && first !== undefined) {
+        const known = firstByVariant.get(key);
+        if (known === undefined || first < known) firstByVariant.set(key, first);
+      }
       const price = Number(item.price_pln);
       if (!Number.isFinite(price) || price <= 0) continue;
-      const bucket = bucketFor(item.variant_key ?? OTHER_VARIANT_KEY);
+      const bucket = bucketFor(key);
       // Rows arrive newest-first; 400 preserves the per-model ceiling the
       // watch-wide query used to apply globally.
       if (bucket.prices.length < 400) bucket.prices.push(price);
     }
-    for (const item of firstByVariant) bucketFor(item.variant_key ?? OTHER_VARIANT_KEY).firstObservedAt = item.first ?? null;
+    for (const [key, first] of firstByVariant) bucketFor(key).firstObservedAt = first;
+    for (const bucket of buckets.values()) bucket.stats = priceStats(bucket.prices);
     // Other / unclassified is a mix by definition, so only named variants
     // feed the pooled spread.
     const pooled = groups.length
@@ -4436,16 +4942,16 @@ export class ScoutService {
   private dealScore(
     row: WatchRow,
     price: number,
-    baseline: { prices: number[]; firstObservedAt: string | null },
+    baseline: WatchVariantBucket,
     referenceMedian: number | null,
     pooled: PooledSpread | null = null,
-  ): { score: ReturnType<typeof scoreDeal>; useReference: boolean; dealStrength: number | null } {
+  ): { score: ScoreResult; useReference: boolean; dealStrength: number | null } {
     const observedHours = baseline.firstObservedAt ? Math.max(0, (Date.now() - Date.parse(baseline.firstObservedAt)) / 3_600_000) : 0;
     // The reference-band fallback seeds ranking/display only: while the watch's
     // own history is below the sample floor, its median stands in for the
     // typical. Once own samples reach the floor, own history always wins.
     const useReference = referenceMedian !== null && baseline.prices.length < (pooled ? VARIANT_MIN_SAMPLES : BASELINE_MIN_SAMPLES);
-    const score = scoreDeal(baseline.prices, price, { observedHours, sensitivity: Number(row.sensitivity ?? 1), ...(useReference ? { typicalOverride: referenceMedian } : {}), ...(pooled ? { pooled } : {}) });
+    const score = scoreDealFromStats(baseline.stats ?? priceStats(baseline.prices), price, { observedHours, sensitivity: Number(row.sensitivity ?? 1), ...(useReference ? { typicalOverride: referenceMedian } : {}), ...(pooled ? { pooled } : {}) });
     return { score, useReference, dealStrength: dealStrengthFromDiscount(score.discountPercent) };
   }
 
@@ -4521,10 +5027,14 @@ export class ScoutService {
     return null;
   }
 
-  private queueDailyDigestCandidate(watchId: string, listing: NormalizedListing, typical: number, discountPercent: number, confidence: number, priority: NotificationPriority) {
-    const latest = this.stmt(`SELECT sequence, price_pln AS last_alerted_price_pln, priority AS last_priority
+  private latestDigestCandidate(watchId: string, listing: NormalizedListing) {
+    return this.stmt(`SELECT sequence, price_pln AS last_alerted_price_pln, priority AS last_priority
       FROM daily_digest_candidates WHERE watch_id = ? AND marketplace = ? AND listing_id = ?
       ORDER BY sequence DESC LIMIT 1`).get(watchId, listing.marketplace, listing.listingId) as { sequence?: number; last_alerted_price_pln?: number; last_priority?: NotificationPriority } | undefined;
+  }
+
+  private queueDailyDigestCandidate(watchId: string, listing: NormalizedListing, typical: number, discountPercent: number, confidence: number, priority: NotificationPriority) {
+    const latest = this.latestDigestCandidate(watchId, listing);
     if (!this.shouldAlert(latest, listing.price, priority)) return false;
     const sequence = Number(latest?.sequence ?? 0) + 1;
     this.stmt(`INSERT INTO daily_digest_candidates (
@@ -4776,40 +5286,34 @@ export class ScoutService {
    * The first four arguments are kept backward-compatible for existing
    * integrations/tests. New scan code always supplies watchId explicitly.
    */
-  private async notifyDeal(
-    watchIdOrListing: string | NormalizedListing,
-    listingOrTypical: NormalizedListing | number,
-    typicalOrDiscount: number,
-    discountOrConfidence: number,
-    maybeConfidence?: number,
-    context?: ScanNotifyContext,
-    variantLabel?: string | null,
-  ) {
-    const legacy = typeof watchIdOrListing !== 'string';
-    const watchId = legacy ? '__legacy__' : watchIdOrListing;
-    const listing = (legacy ? watchIdOrListing : listingOrTypical) as NormalizedListing;
-    const typical = (legacy ? listingOrTypical : typicalOrDiscount) as number;
-    const discountPercent = legacy ? typicalOrDiscount : discountOrConfidence;
-    const confidence = legacy ? discountOrConfidence : maybeConfidence!;
+  /**
+   * The write-free part of notifyDeal: whether the listing is hidden, whether
+   * a digest entry would be queued, and which channels would send, with the
+   * alert sequence and keys each would use. A channel reads only its own
+   * alert state and deliveries, so planning every channel before any write
+   * decides exactly what the interleaved loop used to.
+   */
+  private planDealNotification(watchId: string, listing: NormalizedListing, discountPercent: number, context?: ScanNotifyContext, legacy = false) {
     const priority = priorityFromDiscount(discountPercent);
-    if (this.isListingHidden(listing)) return;
+    const channels: Array<{ channel: 'Discord' | 'ntfy'; sequence: number; eventKey: string; deliveryKey: string }> = [];
+    if (this.isListingHidden(listing)) return { hidden: true, priority, encryptedDiscord: null, ntfy: null, digestQualifies: false, digestDue: false, channels };
     const encryptedDiscord = context?.encryptedDiscord ?? this.getSetting('discord_webhook');
     const ntfy = context?.ntfy ?? this.ntfyConfig();
+    const plan = { hidden: false, priority, encryptedDiscord, ntfy, digestQualifies: false, digestDue: false, channels };
     const digest = context?.digest ?? this.dailyDigestConfig();
     const discordMinimum = context?.discordMinimumPriority ?? this.discordMinimumPriority();
     const digestSelected = (channel: DigestChannel) => digest.enabled && (channel === 'Discord' ? digest.discord : digest.ntfy);
     if (!legacy && priority !== 'exceptional') {
-      const qualifiesForDigest = (digestSelected('Discord') && Boolean(encryptedDiscord) && meetsMinimumPriority(priority, discordMinimum))
+      plan.digestQualifies = (digestSelected('Discord') && Boolean(encryptedDiscord) && meetsMinimumPriority(priority, discordMinimum))
         || (digestSelected('ntfy') && Boolean(ntfy) && meetsMinimumPriority(priority, ntfy?.minimumPriority ?? 'exceptional'));
-      if (qualifiesForDigest) this.queueDailyDigestCandidate(watchId, listing, typical, discountPercent, confidence, priority);
+      // queueDailyDigestCandidate's own check: a digest row is added only
+      // when the listing is new to the digest or improved enough.
+      plan.digestDue = plan.digestQualifies && this.shouldAlert(this.latestDigestCandidate(watchId, listing), listing.price, priority);
     }
-    const channels: Array<'Discord' | 'ntfy'> = [];
-    if (encryptedDiscord && meetsMinimumPriority(priority, discordMinimum) && (priority === 'exceptional' || !digestSelected('Discord'))) channels.push('Discord');
-    if (ntfy && meetsMinimumPriority(priority, ntfy.minimumPriority) && (priority === 'exceptional' || !digestSelected('ntfy'))) channels.push('ntfy');
-    if (!channels.length) return;
-
-    const planned: Array<{ channel: 'Discord' | 'ntfy'; eventKey: string; deliveryKey: string; sequence?: number; claim: { id: number; attemptCount: number }; legacy: boolean }> = [];
-    for (const channel of channels) {
+    const eligible: Array<'Discord' | 'ntfy'> = [];
+    if (encryptedDiscord && meetsMinimumPriority(priority, discordMinimum) && (priority === 'exceptional' || !digestSelected('Discord'))) eligible.push('Discord');
+    if (ntfy && meetsMinimumPriority(priority, ntfy.minimumPriority) && (priority === 'exceptional' || !digestSelected('ntfy'))) eligible.push('ntfy');
+    for (const channel of eligible) {
       let sequence = 1;
       let eventKey = notificationKey(listing);
       let deliveryKey = eventKey;
@@ -4827,6 +5331,34 @@ export class ScoutService {
         eventKey = this.notificationEventKey(watchId, listing, sequence);
         deliveryKey = this.notificationDeliveryKey(eventKey, channel);
       }
+      channels.push({ channel, sequence, eventKey, deliveryKey });
+    }
+    return plan;
+  }
+
+  private async notifyDeal(
+    watchIdOrListing: string | NormalizedListing,
+    listingOrTypical: NormalizedListing | number,
+    typicalOrDiscount: number,
+    discountOrConfidence: number,
+    maybeConfidence?: number,
+    context?: ScanNotifyContext,
+    variantLabel?: string | null,
+  ) {
+    const legacy = typeof watchIdOrListing !== 'string';
+    const watchId = legacy ? '__legacy__' : watchIdOrListing;
+    const listing = (legacy ? watchIdOrListing : listingOrTypical) as NormalizedListing;
+    const typical = (legacy ? listingOrTypical : typicalOrDiscount) as number;
+    const discountPercent = legacy ? typicalOrDiscount : discountOrConfidence;
+    const confidence = legacy ? discountOrConfidence : maybeConfidence!;
+    const plan = this.planDealNotification(watchId, listing, discountPercent, context, legacy);
+    if (plan.hidden) return;
+    const { priority, encryptedDiscord, ntfy } = plan;
+    if (plan.digestQualifies) this.queueDailyDigestCandidate(watchId, listing, typical, discountPercent, confidence, priority);
+    if (!plan.channels.length) return;
+
+    const planned: Array<{ channel: 'Discord' | 'ntfy'; eventKey: string; deliveryKey: string; sequence?: number; claim: { id: number; attemptCount: number }; legacy: boolean }> = [];
+    for (const { channel, sequence, eventKey, deliveryKey } of plan.channels) {
       const payload = { ...buildDiscordEmbed({ listing, typical, discountPercent, confidence, variantLabel }), _scout: { watchId, listing, typical, discountPercent, confidence, priority, sequence, variantLabel } };
       this.stmt('INSERT OR IGNORE INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(eventKey, JSON.stringify(payload), 'pending', nowIso());
       const claim = this.claimNotificationDelivery(deliveryKey, channel);
@@ -4903,6 +5435,11 @@ export class ScoutService {
 
   private recordRun(source: string, status: string, message: string, startedAt: string, finishedAt: string | null) {
     const result = this.stmt('INSERT INTO connector_runs (source, status, message, started_at, finished_at) VALUES (?, ?, ?, ?, ?)').run(source, status, message, startedAt, finishedAt);
+    // Every caller runs in autocommit, so the row is committed here. Inside an
+    // open transaction a rollback could drop it, so recount instead.
+    const counts = this.connectorRunCountCache?.counts;
+    if ((this.db as { isTransaction?: boolean }).isTransaction) this.connectorRunCountCache = null;
+    else if (counts) counts.set(source, (counts.get(source) ?? 0) + 1);
     return Number(result.lastInsertRowid);
   }
 

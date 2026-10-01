@@ -186,7 +186,7 @@ struct WatchEditorView: View {
                     let watch = try await client.createWatch(draft)
                     onSaved(watch)
                 }
-                model.refresh()
+                model.refreshUnlessLive()
                 dismiss()
             } catch {
                 self.error = error.localizedDescription
