@@ -130,8 +130,12 @@ public struct ScoutClient: Sendable {
         return try Self.decode(data)
     }
 
-    public func dashboard() async throws -> DashboardData {
-        try await get("/api/dashboard")
+    /// With `top`, the server sends only the `top` listings a widget would
+    /// show (`WidgetSnapshot.ranked`) and no watches or connectors; the stats
+    /// are the same. Servers without that option send everything, which
+    /// `WidgetSnapshot.make` handles the same way.
+    public func dashboard(top: Int? = nil, timeout: TimeInterval = 20) async throws -> DashboardData {
+        try await get("/api/dashboard", query: top.map { [URLQueryItem(name: "top", value: String($0))] } ?? [], timeout: timeout)
     }
 
     public func listings(_ query: ListingsQuery) async throws -> ListingsPage {

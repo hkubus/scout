@@ -305,6 +305,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .search-table { min-width: 900px; display: grid; grid-template-columns: minmax(300px, 2.2fr) 1.1fr .8fr .9fr 1.25fr 34px; align-items: center; gap: 16px; padding: 10px 14px; }
 .search-table--head { min-height: 35px; padding-top: 0; color: var(--muted); font-size: 12px; }
 .search-result-row { min-height: 69px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+.search-result-row { content-visibility: auto; contain-intrinsic-size: auto 69px; }
 .shipping-state { font-size: 11px; font-weight: 600; }
 .shipping-state--yes { color: var(--green); }
 .shipping-state--no { color: var(--orange); }
@@ -409,6 +410,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .log-head, .log-row { display: grid; grid-template-columns: 90px 90px 1fr; align-items: baseline; gap: 14px; padding: 0 14px; }
 .log-head { min-height: 35px; color: var(--muted); font-size: 11px; font-family: inherit; }
 .log-row { min-height: 38px; padding-top: 8px; padding-bottom: 8px; border-top: 1px solid var(--line); font-size: 12px; line-height: 1.5; }
+.log-row { content-visibility: auto; contain-intrinsic-size: auto 38px; }
 .log-time { color: var(--muted); white-space: nowrap; }
 .log-scope { text-transform: uppercase; font-size: 10px; font-weight: 700; letter-spacing: 0.6px; color: var(--muted); }
 .log-scope--watch { color: #159b96; }

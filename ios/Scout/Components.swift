@@ -167,14 +167,10 @@ struct ListingThumbnail: View {
     var size: CGFloat
 
     var body: some View {
-        AsyncImage(url: url) { phase in
-            if let image = phase.image {
-                image.resizable().scaledToFill()
-            } else {
-                ZStack {
-                    Color.secondary.opacity(0.12)
-                    Image(systemName: "photo").foregroundStyle(.tertiary)
-                }
+        PipelineImage(url: url, contentMode: .fill, pointSize: size) {
+            ZStack {
+                Color.secondary.opacity(0.12)
+                Image(systemName: "photo").foregroundStyle(.tertiary)
             }
         }
         .frame(width: size, height: size)
@@ -188,27 +184,21 @@ struct ServerImage<Placeholder: View>: View {
     var client: ScoutClient
     var url: URL
     var contentMode: ContentMode
+    /// The side of the square it fills, or the longest side it fits in.
+    var pointSize: CGFloat
     var placeholder: () -> Placeholder
-    @State private var image: UIImage?
 
-    init(client: ScoutClient, url: URL, contentMode: ContentMode = .fill, @ViewBuilder placeholder: @escaping () -> Placeholder) {
+    init(client: ScoutClient, url: URL, contentMode: ContentMode = .fill, pointSize: CGFloat, @ViewBuilder placeholder: @escaping () -> Placeholder) {
         self.client = client
         self.url = url
         self.contentMode = contentMode
+        self.pointSize = pointSize
         self.placeholder = placeholder
     }
 
     var body: some View {
-        Group {
-            if let image {
-                Image(uiImage: image).resizable().aspectRatio(contentMode: contentMode)
-            } else {
-                placeholder()
-            }
-        }
-        .task(id: url) {
-            image = (try? await client.serverData(url)).flatMap(UIImage.init(data:))
-        }
+        let client = client
+        PipelineImage(url: url, contentMode: contentMode, pointSize: pointSize, fetch: { try await client.serverData($0) }, placeholder: placeholder)
     }
 }
 

@@ -22,6 +22,7 @@ import { watchPresetFromListing, type WatchPreset } from "./presets";
 import { PriceSparkline } from "./PriceSparkline";
 import { listingAge } from "./listingSignals";
 import { DEFAULT_FEE_PRESETS, FLIP_CHANNELS, saleFee, type FeePresets, type FlipChannel } from "./profit";
+import { dayMonth, formatDate } from "./format";
 import type {
   Flip,
   Listing,
@@ -432,8 +433,8 @@ export default function ListingDetailDrawer({
             </div>
             <div className="price-chart-card"><PriceSparkline points={chartPoints} /><div className="price-chart-labels"><span>{formatPln(Math.min(...chartPoints.map((point) => point.price)))}</span><strong>Latest {formatPln(lastPoint.price)}</strong><span>{formatPln(Math.max(...chartPoints.map((point) => point.price)))}</span></div></div>
             <div className="drawer-meta-grid">
-              <div><span>First seen</span><strong>{new Date(detail.firstSeenAt).toLocaleDateString("pl-PL", { day: "2-digit", month: "short" })}</strong></div>
-              <div><span>Last seen</span><strong>{new Date(detail.lastSeenAt).toLocaleDateString("pl-PL", { day: "2-digit", month: "short" })}</strong></div>
+              <div><span>First seen</span><strong>{formatDate(dayMonth, detail.firstSeenAt)}</strong></div>
+              <div><span>Last seen</span><strong>{formatDate(dayMonth, detail.lastSeenAt)}</strong></div>
               <div><span>Shipping</span><strong>{currentListing.shippingAvailable === true ? "Available" : currentListing.shippingAvailable === false ? "Pickup only" : "Unknown"}</strong></div>
               {postedAge ? <div title={postedAge.detail}><span>Posted</span><strong>{postedAge.label.replace(/^Posted /, "")}</strong></div> : null}
               <div><span>Seller</span><strong>{currentListing.sellerType === "business" ? "Business" : currentListing.sellerType === "private" ? "Private" : "Unknown"}{currentListing.promoted ? " · promoted" : ""}</strong></div>

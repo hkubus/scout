@@ -33,6 +33,27 @@ final class ScoutDateTests: XCTestCase {
         XCTAssertNil(ScoutDate.parse("10:24:18"))
         XCTAssertNil(ScoutDate.parse(nil))
     }
+
+    func testParsesMillisecondsOffsetsAndRejectsGarbage() throws {
+        // Fractional seconds can come back a few ulps off, so compare within a millisecond.
+        let millis = try XCTUnwrap(ScoutDate.parse("2026-09-30T08:30:00.123Z"))
+        XCTAssertEqual(millis.timeIntervalSince1970, 1_790_757_000.123, accuracy: 0.001)
+        let offset = try XCTUnwrap(ScoutDate.parse("2026-09-30T10:30:00.500+02:00"))
+        XCTAssertEqual(offset.timeIntervalSince1970, 1_790_757_000.5, accuracy: 0.001)
+        XCTAssertEqual(ScoutDate.parse("2026-09-30T10:30:00+02:00"), Date(timeIntervalSince1970: 1_790_757_000))
+        XCTAssertEqual(ScoutDate.parse(" 2026-09-30T08:30:00Z "), Date(timeIntervalSince1970: 1_790_757_000))
+        XCTAssertNil(ScoutDate.parse("garbage"))
+        XCTAssertNil(ScoutDate.parse(""))
+        XCTAssertNil(ScoutDate.parse("2026-09-30 08:30"))
+    }
+
+    func testParsesConcurrently() async {
+        let dates = await withTaskGroup(of: Date?.self) { group in
+            for _ in 0..<50 { group.addTask { ScoutDate.parse("2026-09-30T08:30:00.000Z") } }
+            return await group.reduce(into: [Date?]()) { $0.append($1) }
+        }
+        XCTAssertEqual(Set(dates), [Date(timeIntervalSince1970: 1_790_757_000)])
+    }
 }
 
 final class ServerSentEventParserTests: XCTestCase {
@@ -74,6 +95,18 @@ final class ClientTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? ScoutAPIError, .server(status: 404, message: "Listing detail is not available yet"))
         }
+    }
+
+    func testDashboardAsksForTheTopListingsOnlyWhenTold() async throws {
+        let requests = RequestLog()
+        let client = ScoutClient(baseURL: URL(string: "https://host/scout")!, transport: RoutingTransport { request in
+            requests.append(request)
+            return (200, #"{"listings":[],"watches":[],"connectors":[],"stats":{"watching":1,"newToday":2,"strongDeals":3},"lastScan":"just now","lastScanTime":"10:00"}"#)
+        })
+        _ = try await client.dashboard()
+        _ = try await client.dashboard(top: 12, timeout: 10)
+        XCTAssertEqual(requests.all.map { $0.url?.absoluteString }, ["https://host/scout/api/dashboard", "https://host/scout/api/dashboard?top=12"])
+        XCTAssertEqual(requests.all.map(\.timeoutInterval), [20, 10])
     }
 
     func testReadinessAccepts503Body() async throws {
@@ -304,6 +337,14 @@ private struct RoutingTransport: HTTPTransport {
     }
 }
 
+private final class RequestLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests: [URLRequest] = []
+
+    func append(_ request: URLRequest) { lock.withLock { requests.append(request) } }
+    var all: [URLRequest] { lock.withLock { requests } }
+}
+
 private struct StubTransport: HTTPTransport {
     var status: Int
     var body: String
@@ -348,6 +389,187 @@ final class WidgetSnapshotTests: XCTestCase {
         XCTAssertTrue(first.hasSameContent(as: second))
         second.deals[0].price += 1
         XCTAssertFalse(first.hasSameContent(as: second))
+    }
+
+    func testContentComparisonIgnoresFieldsWidgetsDontDraw() {
+        let first = WidgetSnapshot.make(from: DemoTransport.dashboard(), now: Date(timeIntervalSince1970: 0))
+        var second = first
+        // A scan re-seeing the listings bumps these on every deal.
+        second.lastScan = "just now"
+        for index in second.deals.indices {
+            second.deals[index].observedAt = "2030-01-01T00:00:00.000Z"
+            second.deals[index].typical = (second.deals[index].typical ?? 100) + 7
+            second.deals[index].dealStrength += 0.3
+        }
+        XCTAssertTrue(first.hasSameContent(as: second))
+
+        // Only the rounded text is drawn: "−20%" and "2000 zł" (half-even, like the widgets).
+        var shown = first
+        shown.deals[0].belowTypical = -20.2
+        shown.deals[0].price = 1999.6
+        var same = shown
+        same.deals[0].belowTypical = -20.4
+        same.deals[0].price = 2000.4
+        XCTAssertTrue(shown.hasSameContent(as: same))
+        same.deals[0].belowTypical = -20.6
+        XCTAssertFalse(shown.hasSameContent(as: same))
+        same = shown
+        same.deals[0].price = 10.5
+        var other = shown
+        other.deals[0].price = 11.4
+        XCTAssertEqual(WidgetFormat.pln(10.5), WidgetFormat.pln(10.4))
+        XCTAssertFalse(same.hasSameContent(as: other))
+        same = shown
+        same.deals[0].belowTypical = 3
+        other = shown
+        other.deals[0].belowTypical = nil
+        XCTAssertTrue(same.hasSameContent(as: other))
+    }
+
+    func testContentComparisonCatchesEveryDrawnChange() {
+        let first = WidgetSnapshot.make(from: DemoTransport.dashboard(), source: "https://a", now: Date(timeIntervalSince1970: 0))
+        let changes: [(String, (inout WidgetSnapshot) -> Void)] = [
+            ("order", { $0.deals.swapAt(0, 1) }),
+            ("dropped deal", { $0.deals.removeLast() }),
+            ("title", { $0.deals[1].title += "!" }),
+            ("price", { $0.deals[1].price += 1 }),
+            ("discount appears", { $0.deals[1].belowTypical = -50 }),
+            ("label", { $0.deals[1].dealLabel = $0.deals[1].dealLabel == .exceptional ? .strong : .exceptional }),
+            ("marketplace", { $0.deals[1].marketplace = $0.deals[1].marketplace == .olx ? .vinted : .olx }),
+            ("photo", { $0.deals[1].imageURL += "?v=2" }),
+            ("link", { $0.deals[1].watchId = "watch-other" }),
+            ("key", { $0.deals[1].key += "-2" }),
+            ("watching", { $0.stats.watching += 1 }),
+            ("new today", { $0.stats.newToday += 1 }),
+            ("strong deals", { $0.stats.strongDeals += 1 }),
+            ("demo", { $0.isDemo.toggle() }),
+            ("source", { $0.source = "https://b" }),
+        ]
+        for (name, change) in changes {
+            var second = first
+            change(&second)
+            XCTAssertFalse(first.hasSameContent(as: second), name)
+        }
+    }
+
+    func testReplacesTheSavedSnapshotOnDrawnChangesOrAfterTheRefreshFloor() {
+        let saved = WidgetSnapshot.make(from: DemoTransport.dashboard(), now: Date(timeIntervalSince1970: 1_000))
+        func rescan(after seconds: TimeInterval) -> WidgetSnapshot {
+            var next = saved
+            next.generatedAt = saved.generatedAt.addingTimeInterval(seconds)
+            next.lastScan = "just now"
+            next.deals[0].observedAt = "2030-01-01T00:00:00.000Z"
+            return next
+        }
+        XCTAssertTrue(WidgetSnapshot.shouldReplace(nil, with: saved))
+        XCTAssertFalse(WidgetSnapshot.shouldReplace(saved, with: rescan(after: 60)))
+        XCTAssertFalse(WidgetSnapshot.shouldReplace(saved, with: rescan(after: 15 * 60 - 1)))
+        XCTAssertTrue(WidgetSnapshot.shouldReplace(saved, with: rescan(after: 15 * 60)))
+        XCTAssertTrue(WidgetSnapshot.shouldReplace(saved, with: rescan(after: 60), refreshAfter: 30))
+        var changed = rescan(after: 1)
+        changed.deals[0].price += 5
+        XCTAssertTrue(WidgetSnapshot.shouldReplace(saved, with: changed))
+    }
+
+    func testSavesSnapshotsAndConnectionsOnlyWhenTheyChange() throws {
+        let suite = "scout-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let snapshot = WidgetSnapshot.make(from: DemoTransport.dashboard(), source: "https://a", now: Date(timeIntervalSince1970: 1_000))
+        XCTAssertTrue(SharedStore.saveSnapshot(snapshot, refreshAfter: 900, in: defaults))
+        var rescanned = snapshot
+        rescanned.generatedAt.addTimeInterval(60)
+        rescanned.lastScan = "just now"
+        XCTAssertFalse(SharedStore.saveSnapshot(rescanned, refreshAfter: 900, in: defaults))
+        XCTAssertEqual(SharedStore.loadSnapshot(from: defaults)?.generatedAt, snapshot.generatedAt)
+        rescanned.generatedAt.addTimeInterval(900)
+        XCTAssertTrue(SharedStore.saveSnapshot(rescanned, refreshAfter: 900, in: defaults))
+        XCTAssertEqual(SharedStore.loadSnapshot(from: defaults)?.generatedAt, rescanned.generatedAt)
+
+        let server = URL(string: "https://a")!
+        XCTAssertFalse(SharedStore.saveConnection(serverURL: nil, isDemo: false, in: defaults))
+        XCTAssertTrue(SharedStore.saveConnection(serverURL: server, isDemo: false, in: defaults))
+        // Switching servers drops the old server's snapshot.
+        XCTAssertNil(SharedStore.loadSnapshot(from: defaults))
+        XCTAssertTrue(SharedStore.saveSnapshot(snapshot, refreshAfter: 900, in: defaults))
+        XCTAssertFalse(SharedStore.saveConnection(serverURL: server, isDemo: false, in: defaults))
+        XCTAssertNotNil(SharedStore.loadSnapshot(from: defaults))
+        XCTAssertTrue(SharedStore.saveConnection(serverURL: server, isDemo: true, in: defaults))
+        XCTAssertTrue(SharedStore.saveConnection(serverURL: URL(string: "https://b")!, isDemo: true, in: defaults))
+    }
+
+    func testFreshnessNeedsTheSameSourceAndARecentFetch() {
+        let now = Date(timeIntervalSince1970: 10_000)
+        let snapshot = WidgetSnapshot.make(from: DemoTransport.dashboard(), source: "https://a", now: now.addingTimeInterval(-30))
+        XCTAssertTrue(snapshot.isFresh(for: "https://a", maxAge: 60, now: now))
+        XCTAssertFalse(snapshot.isFresh(for: "https://a", maxAge: 30, now: now))
+        XCTAssertFalse(snapshot.isFresh(for: "https://b", maxAge: 60, now: now))
+        XCTAssertFalse(snapshot.isFresh(for: nil, maxAge: 60, now: now))
+        // A clock that moved backwards doesn't make an old snapshot look new.
+        XCTAssertFalse(snapshot.isFresh(for: "https://a", maxAge: 60, now: now.addingTimeInterval(-60)))
+    }
+
+    func testReusesThumbnailsByPhotoAddress() {
+        var fresh = WidgetSnapshot.make(from: DemoTransport.dashboard(), source: "https://a")
+        for index in fresh.deals.indices { fresh.deals[index].imageURL = "https://img/\(index).jpg" }
+        var cached = fresh
+        cached.deals = Array(cached.deals.reversed())
+        cached.deals[0].thumbnail = Data([1])
+        let lastPhoto = cached.deals[0].imageURL
+        cached.deals[1].thumbnail = Data([2])
+        cached.deals[1].imageURL = "https://img/other.jpg"
+        var older = fresh
+        older.deals[0].thumbnail = Data([3])
+
+        var snapshot = fresh
+        XCTAssertEqual(snapshot.dealsMissingThumbnails(limit: 3), [0, 1, 2])
+        snapshot.reuseThumbnails(from: [nil, cached, older])
+        XCTAssertEqual(snapshot.deals.last?.imageURL, lastPhoto)
+        XCTAssertEqual(snapshot.deals.last?.thumbnail, Data([1]))
+        XCTAssertEqual(snapshot.deals[0].thumbnail, Data([3]))
+        XCTAssertEqual(snapshot.deals.dropFirst().dropLast().compactMap(\.thumbnail), [])
+        XCTAssertEqual(snapshot.dealsMissingThumbnails(limit: 3), [1, 2])
+        XCTAssertEqual(snapshot.dealsMissingThumbnails(limit: 1), [])
+        XCTAssertEqual(snapshot.dealsMissingThumbnails(limit: 0), [])
+        XCTAssertEqual(snapshot.dealsMissingThumbnails(limit: 6), Array(1..<snapshot.deals.count - 1))
+        // A thumbnail already attached is kept.
+        snapshot.deals[1].thumbnail = Data([9])
+        snapshot.reuseThumbnails(from: [cached])
+        XCTAssertEqual(snapshot.deals[1].thumbnail, Data([9]))
+        // Deals without a photo never need one downloaded.
+        XCTAssertEqual(WidgetSnapshot.make(from: DemoTransport.dashboard()).dealsMissingThumbnails(limit: 6), [])
+    }
+
+    func testThumbnailCountFollowsWhatEachWidgetDraws() {
+        XCTAssertEqual(WidgetLayout.systemSmall.thumbnailCount(drawsThumbnails: true), 1)
+        XCTAssertEqual(WidgetLayout.systemMedium.thumbnailCount(drawsThumbnails: true), 3)
+        XCTAssertEqual(WidgetLayout.systemLarge.thumbnailCount(drawsThumbnails: true), 6)
+        XCTAssertEqual(WidgetLayout.other.thumbnailCount(drawsThumbnails: true), 3)
+        for layout in [WidgetLayout.systemSmall, .systemMedium, .systemLarge, .other] {
+            XCTAssertEqual(layout.thumbnailCount(drawsThumbnails: false), 0)
+        }
+    }
+
+    func testDemoTopDashboardMatchesTheWidgetsPick() async throws {
+        let transport = DemoTransport()
+        let client = ScoutClient(baseURL: DemoTransport.baseURL, transport: transport)
+        let full = try await client.dashboard()
+        let top = try await client.dashboard(top: 3)
+        XCTAssertEqual(top.listings, Array(WidgetSnapshot.ranked(full.listings).prefix(3)))
+        XCTAssertEqual(top.watches, [])
+        XCTAssertEqual(top.connectors, [])
+        XCTAssertEqual(top.stats, full.stats)
+        XCTAssertEqual(top.lastScan, full.lastScan)
+        XCTAssertEqual(top.lastScanTime, full.lastScanTime)
+        let now = Date()
+        let widgetTop = try await client.dashboard(top: 12, timeout: 10)
+        XCTAssertEqual(WidgetSnapshot.make(from: widgetTop, now: now), WidgetSnapshot.make(from: full, now: now))
+        // Anything but an integer from 1 to 50 gets the full dashboard.
+        for value in ["0", "51", "-1", "x", "", "2.5"] {
+            let url = client.url("/api/dashboard", query: [URLQueryItem(name: "top", value: value)])
+            let (data, _) = try await transport.send(URLRequest(url: url))
+            XCTAssertEqual(try JSONDecoder().decode(DashboardData.self, from: data), full, value)
+        }
     }
 
     func testDefaultGroupIsAlwaysACandidate() {
@@ -733,5 +955,184 @@ final class ListingSignalTests: XCTestCase {
         XCTAssertEqual(SearchFilters(query: "rtx", sources: [.olx], olxCategory: gpu).normalized().olxCategory, gpu)
         XCTAssertNil(SearchFilters(query: "rtx", sources: [.vinted], olxCategory: gpu).normalized().olxCategory)
         XCTAssertEqual(WatchDraft(search: SearchFilters(query: "rtx", sources: [.olx], ownerType: .private, olxCategory: gpu)).sellerType, .private)
+    }
+}
+
+final class LiveUpdatesTests: XCTestCase {
+    private func event(_ name: String, _ data: String = "{}") -> ServerSentEvent {
+        ServerSentEvent(event: name, data: data)
+    }
+
+    func testEachEventInvalidatesOnlyWhatItChanges() {
+        let scan = LiveInvalidation(event: event("scan", #"{"refresh":true,"watchId":"w1"}"#))
+        XCTAssertEqual([scan.feed, scan.watches, scan.triage, scan.server, scan.research, scan.allWatches], [true, true, false, true, false, false])
+        XCTAssertEqual(scan.watchIDs, ["w1"])
+
+        let watch = LiveInvalidation(event: event("watch", #"{"id":"w2","archived":true}"#))
+        XCTAssertEqual([watch.feed, watch.watches, watch.triage, watch.server, watch.research, watch.allWatches], [true, true, false, false, false, false])
+        XCTAssertEqual(watch.watchIDs, ["w2"])
+
+        // A delete names no watch, so every watch detail is stale.
+        let deleted = LiveInvalidation(event: event("watch", #"{"refresh":true}"#))
+        XCTAssertTrue(deleted.allWatches)
+        XCTAssertTrue(deleted.watchIDs.isEmpty)
+
+        // Rows patch themselves; deal counts (hidden) and analytics reload.
+        let action = LiveInvalidation(event: event("listing-action", #"{"key":"OLX:1","decision":"buy","hidden":false}"#))
+        XCTAssertEqual([action.feed, action.watches, action.triage, action.server, action.research], [false, true, true, false, false])
+        XCTAssertTrue(LiveInvalidation(event: event("listing-action", "not json")).feed)
+
+        let notification = LiveInvalidation(event: event("notification", #"{"refresh":true}"#))
+        var serverOnly = LiveInvalidation()
+        serverOnly.server = true
+        XCTAssertEqual(notification, serverOnly)
+
+        let market = LiveInvalidation(event: event("market-watch", #"{"refresh":true,"id":"m1"}"#))
+        XCTAssertEqual([market.feed, market.watches, market.research, market.allMarketWatches], [false, false, true, false])
+        XCTAssertEqual(market.marketWatchIDs, ["m1"])
+        XCTAssertTrue(LiveInvalidation(event: event("market-watch", #"{"refresh":true}"#)).allMarketWatches)
+
+        XCTAssertTrue(LiveInvalidation(event: event("ai-description-verification", #"{"key":"OLX:1","status":"match"}"#)).isEmpty)
+        var flipsOnly = LiveInvalidation()
+        flipsOnly.flips = true
+        XCTAssertEqual(LiveInvalidation(event: event("flips", #"{"id":7}"#)), flipsOnly)
+        XCTAssertTrue(LiveInvalidation(event: event("search", "{}")).isEmpty)
+        XCTAssertTrue(LiveInvalidation(event: event("ready")).isEmpty)
+    }
+
+    func testMergesBurstsAndCoversEverythingOnReconnect() {
+        var pending = LiveInvalidation(event: event("scan", #"{"watchId":"w1"}"#))
+        pending.formUnion(LiveInvalidation(event: event("scan", #"{"watchId":"w2"}"#)))
+        pending.formUnion(LiveInvalidation(event: event("notification")))
+        XCTAssertEqual(pending.watchIDs, ["w1", "w2"])
+        XCTAssertTrue(pending.server && pending.feed && !pending.research)
+        var everything = pending
+        everything.formUnion(.everything)
+        XCTAssertEqual(everything.watchIDs, ["w1", "w2"])
+        XCTAssertTrue(everything.feed && everything.watches && everything.triage && everything.server && everything.research && everything.allWatches && everything.allMarketWatches && everything.flips)
+    }
+
+    func testDecodesListingActions() throws {
+        let action = try XCTUnwrap(ListingActionEvent(event: event("listing-action", #"{"key":"Allegro Lokalnie:344821","decision":null,"hidden":true}"#)))
+        XCTAssertEqual(action, ListingActionEvent(key: "Allegro Lokalnie:344821", decision: nil, hidden: true))
+        XCTAssertEqual(ListingActionEvent(event: event("listing-action", #"{"key":"OLX:1","decision":"pass","hidden":false}"#))?.decision, .pass)
+        XCTAssertNil(ListingActionEvent(event: event("scan", #"{"key":"OLX:1","decision":"pass","hidden":false}"#)))
+        XCTAssertNil(ListingActionEvent(event: event("listing-action", #"{"key":"OLX:1"}"#)))
+        XCTAssertNotEqual(action, ListingActionEvent(key: action.key, decision: action.decision, hidden: action.hidden, sequence: 1))
+    }
+
+    func testPatchesDecisionsInPlaceAndReloadsOnHiddenChanges() throws {
+        var rows = DemoTransport.dashboard().listings
+        // The same listing under a second watch.
+        var twin = rows[1]
+        twin.associationId = "twin"
+        rows.append(twin)
+        let key = rows[1].key
+
+        let buy = ListingActionEvent(key: key, decision: .buy, hidden: false)
+        let patched = try XCTUnwrap(buy.patched(rows))
+        XCTAssertEqual(patched.filter { $0.key == key }.map(\.decision), [.buy, .buy])
+        XCTAssertEqual(patched.map(\.rowID), rows.map(\.rowID))
+        for (before, after) in zip(rows, patched) where before.key != key {
+            XCTAssertEqual(before, after)
+        }
+        // Clearing the decision.
+        XCTAssertEqual(try XCTUnwrap(ListingActionEvent(key: key, decision: nil, hidden: false).patched(patched)).filter { $0.key == key }.map(\.decision), [nil, nil])
+
+        // Hiding or unhiding changes stats and deal counts, so reload.
+        XCTAssertNil(ListingActionEvent(key: key, decision: .buy, hidden: true).patched(rows))
+        var hiddenRows = rows
+        hiddenRows[1].hidden = true
+        XCTAssertNil(ListingActionEvent(key: key, decision: nil, hidden: false).patched(hiddenRows))
+        XCTAssertNotNil(ListingActionEvent(key: key, decision: .pass, hidden: true).patched(hiddenRows.filter { $0.rowID != "twin" }))
+        // A listing that isn't loaded may now belong in the list.
+        XCTAssertNil(ListingActionEvent(key: "OLX:unknown", decision: .buy, hidden: false).patched(rows))
+        XCTAssertNil(buy.patched([]))
+    }
+
+    func testListingsTriagePatchesDropsOrReloadsOnlyWhenARowMayEnter() throws {
+        var rows = DemoTransport.dashboard().listings
+        var twin = rows[1]
+        twin.associationId = "twin"
+        rows.append(twin)
+        let key = rows[1].key
+        let visible = ListingFilter()
+
+        // Loaded and still admitted: patched in place, nothing removed.
+        let buy = ListingActionEvent(key: key, decision: .buy, hidden: false)
+        guard case let .patched(bought, removed) = buy.triage(rows, filter: visible) else { return XCTFail() }
+        XCTAssertEqual(removed, 0)
+        XCTAssertEqual(bought.map(\.rowID), rows.map(\.rowID))
+        XCTAssertEqual(bought.filter { $0.key == key }.map(\.decision), [.buy, .buy])
+
+        // Hiding under the visible filter drops both rows locally, no reload.
+        let hide = ListingActionEvent(key: key, decision: nil, hidden: true)
+        guard case let .patched(left, hiddenCount) = hide.triage(rows, filter: visible) else { return XCTFail() }
+        XCTAssertEqual(hiddenCount, 2)
+        XCTAssertFalse(left.contains { $0.key == key })
+        XCTAssertEqual(left.count, rows.count - 2)
+
+        // Under "all", hiding patches the flag and keeps the rows.
+        guard case let .patched(all, kept) = hide.triage(rows, filter: ListingFilter(visibility: .all)) else { return XCTFail() }
+        XCTAssertEqual(kept, 0)
+        XCTAssertEqual(all.filter { $0.key == key }.map(\.hidden), [true, true])
+
+        // A decision filter drops rows whose decision changed away from it.
+        let buys = ListingFilter(decision: .buy, visibility: .all)
+        guard case let .patched(_, passed) = ListingActionEvent(key: key, decision: .pass, hidden: false).triage(bought, filter: buys) else { return XCTFail() }
+        XCTAssertEqual(passed, 2)
+
+        // Not loaded: reload only when the new state passes the filters.
+        let other = "OLX:unknown"
+        XCTAssertEqual(ListingActionEvent(key: other, decision: nil, hidden: false).triage(rows, filter: visible), .reload)
+        XCTAssertEqual(ListingActionEvent(key: other, decision: nil, hidden: true).triage(rows, filter: visible), .unchanged)
+        XCTAssertEqual(ListingActionEvent(key: other, decision: nil, hidden: false).triage(rows, filter: ListingFilter(visibility: .hidden)), .unchanged)
+        XCTAssertEqual(ListingActionEvent(key: other, decision: nil, hidden: true).triage(rows, filter: ListingFilter(visibility: .hidden)), .reload)
+        XCTAssertEqual(ListingActionEvent(key: other, decision: .pass, hidden: false).triage(rows, filter: buys), .unchanged)
+        XCTAssertEqual(ListingActionEvent(key: other, decision: .buy, hidden: true).triage(rows, filter: buys), .reload)
+        XCTAssertEqual(ListingActionEvent(key: other, decision: .buy, hidden: false).triage([], filter: visible), .reload)
+    }
+
+    func testReloadsOnlyWhenTheKeyChangedOrLiveDataMayBeStale() {
+        let loadedAt = Date(timeIntervalSince1970: 1_000)
+        func should(_ key: Int, visible: Bool = true, live: Bool = true, loaded: Int? = 1, at: Date? = loadedAt, now: TimeInterval = 1_060) -> Bool {
+            ReloadPolicy.shouldLoad(key: key, isVisible: visible, isLive: live, loadedKey: loaded, loadedAt: at, now: Date(timeIntervalSince1970: now))
+        }
+        XCTAssertFalse(should(1), "re-appearing with nothing new keeps the data")
+        XCTAssertTrue(should(2), "an event changed the key")
+        XCTAssertFalse(should(2, visible: false), "hidden screens never load")
+        XCTAssertTrue(should(1, loaded: nil, at: nil), "first appearance")
+        XCTAssertTrue(should(1, live: false), "without live updates changes are unknown")
+        XCTAssertFalse(should(1, now: 1_119))
+        XCTAssertTrue(should(1, now: 1_120), "at most two minutes old")
+        XCTAssertTrue(should(1, now: 900), "the clock moved back")
+    }
+
+    func testPagedRefreshKeepsTheLoadedWindow() {
+        XCTAssertEqual(ReloadPolicy.pagesToKeep(loadedRows: 0, maxRows: 500), 1)
+        XCTAssertEqual(ReloadPolicy.pagesToKeep(loadedRows: 50, maxRows: 500), 1)
+        XCTAssertEqual(ReloadPolicy.pagesToKeep(loadedRows: 51, maxRows: 500), 2)
+        XCTAssertEqual(ReloadPolicy.pagesToKeep(loadedRows: 150, maxRows: 500), 3)
+        XCTAssertEqual(ReloadPolicy.pagesToKeep(loadedRows: 900, maxRows: 500), 10)
+        XCTAssertEqual(ReloadPolicy.pagesToKeep(loadedRows: 900, maxRows: 400), 8)
+    }
+}
+
+final class ImageSizingTests: XCTestCase {
+    func testDecodesAtTheDrawnSizeWithoutUpscaling() {
+        // A 68 pt thumbnail at 3x from an 800 × 800 Vinted photo.
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: 800, height: 800, pixels: 204, fill: true), 204)
+        // Filling a square from 4:3: the short side must reach 204 px.
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: 4000, height: 3000, pixels: 204, fill: true), 272)
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: 3000, height: 4000, pixels: 204, fill: true), 272)
+        // Fitting: the long side is the limit.
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: 4000, height: 3000, pixels: 1290, fill: false), 1290)
+        // OLX's 320 × 240 is already close to thumbnail size.
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: 320, height: 240, pixels: 204, fill: true), 272)
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: 320, height: 240, pixels: 1290, fill: false), 320)
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: 200, height: 100, pixels: 204, fill: true), 200)
+        // Unknown size: the drawn size.
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: nil, height: 100, pixels: 204, fill: true), 204)
+        XCTAssertEqual(ImageSizing.maxPixelSize(width: 0, height: 0, pixels: 0, fill: false), 1)
     }
 }

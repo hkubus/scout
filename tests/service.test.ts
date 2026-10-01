@@ -8,7 +8,8 @@ import { parseMarketplaceStorageState } from '../server/marketplace-sessions';
 import { DeepSeekError } from '../server/ai';
 import { listingDescriptionVerificationInputHash, listingRelevanceInputHash } from '../server/ai';
 import { VisionError } from '../server/vision';
-import { ScoutService, ServiceError, decryptSecret, olxCategoryFromJson, olxCategoryToJson, encryptSecret, escapeDiscordMarkdown, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
+import { ScoutService, ServiceError, dashboardTopParam, decryptSecret, olxCategoryFromJson, olxCategoryToJson, encryptSecret, escapeDiscordMarkdown, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
+import { OTHER_VARIANT_KEY } from '../server/variants';
 
 // Pin the legacy DeepSeek path for pre-existing tests: live Jev is the
 // production default whenever a key is available, but these tests assert
@@ -42,6 +43,57 @@ test('starts with truthful empty dashboard data and unconfigured notifications',
     assert.equal(context.service.dashboard().watches.length, 0);
     assert.equal(context.service.settings().webhookConfigured, false);
     assert.equal(context.service.notifications().length, 0);
+  } finally { context.close(); }
+});
+
+test('serves the widget dashboard form with the widget ordering and unchanged stats', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const fresh = new Date().toISOString();
+    // Mixed strengths, discounts (with ties and missing typicals), triage
+    // decisions, hidden rows and AI-filtered rows.
+    context.db.prepare(`UPDATE watch_listings SET last_seen_at = ?, deal_strength = (id % 6), deal_label = 'Deal',
+      typical_pln = CASE WHEN id % 4 = 0 THEN NULL ELSE 400 + (id % 3) * 50 END, typical_source = 'own-history'`).run(fresh);
+    context.db.prepare('UPDATE listings SET price_pln = 300 + (id % 5) * 25, last_seen_at = ?').run(fresh);
+    const actions = context.db.prepare('INSERT INTO listing_actions (marketplace, listing_id, decision, note, hidden, updated_at) VALUES (?, ?, ?, ?, ?, ?)');
+    const picks = context.db.prepare('SELECT marketplace, listing_id FROM listings ORDER BY id').all() as Array<{ marketplace: string; listing_id: string }>;
+    picks.forEach((listing, index) => {
+      if (index % 9 === 0) actions.run(listing.marketplace, listing.listing_id, 'pass', '', 0, fresh);
+      else if (index % 11 === 0) actions.run(listing.marketplace, listing.listing_id, null, '', 1, fresh);
+      else if (index % 13 === 0) actions.run(listing.marketplace, listing.listing_id, 'buy', '', 0, fresh);
+    });
+    const full = context.service.dashboard();
+    assert.ok(full.listings.length > 20);
+    assert.ok(full.listings.some((listing) => listing.aiFiltered));
+    assert.ok(full.listings.some((listing) => listing.decision === 'pass'));
+    // Missing or invalid values return the full dashboard unchanged.
+    for (const top of [undefined, 0, 51, 1.5, Number.NaN, -3]) assert.deepEqual(context.service.dashboard({ top }), full);
+    assert.deepEqual(context.service.dashboard({}), full);
+    // Reference: WidgetSnapshot.make (filter, then stable sort by strength
+    // desc, belowTypical asc, observedAt desc).
+    const expected = full.listings
+      .map((listing, index) => ({ listing, index }))
+      .filter(({ listing }) => listing.hidden !== true && listing.aiFiltered !== true && listing.decision !== 'pass')
+      .sort((a, b) => (b.listing.dealStrength - a.listing.dealStrength)
+        || ((a.listing.belowTypical ?? 0) - (b.listing.belowTypical ?? 0))
+        || (a.listing.observedAt < b.listing.observedAt ? 1 : a.listing.observedAt > b.listing.observedAt ? -1 : 0)
+        || (a.index - b.index))
+      .map(({ listing }) => listing);
+    for (const top of [1, 6, 12, 50]) {
+      const compact = context.service.dashboard({ top });
+      assert.deepEqual(Object.keys(compact), Object.keys(full));
+      assert.deepEqual(compact.listings, expected.slice(0, top));
+      assert.deepEqual(compact.stats, full.stats);
+      assert.equal(compact.lastScan, full.lastScan);
+      assert.equal(compact.lastScanTime, full.lastScanTime);
+      assert.deepEqual(compact.watches, []);
+      assert.deepEqual(compact.connectors, []);
+    }
+    assert.equal(dashboardTopParam('12'), 12);
+    assert.equal(dashboardTopParam('1'), 1);
+    assert.equal(dashboardTopParam('50'), 50);
+    for (const value of [undefined, '', '0', '51', '1.5', '-1', ' 6', '6a', '1e1', '100', ['6'], 6]) assert.equal(dashboardTopParam(value), undefined);
   } finally { context.close(); }
 });
 
@@ -96,6 +148,60 @@ test('reports the latest connector state from batched health queries', () => {
     const connector = context.service.getConnectors().find((item) => item.name === 'OLX');
     assert.deepEqual({ status: connector?.status, detail: connector?.detail, requests: connector?.requests }, { status: 'Degraded', detail: 'Latest failure', requests: 2 });
     assert.notEqual(connector?.lastSuccess, 'Never');
+  } finally { context.close(); }
+});
+
+test('keeps cached connector run counts exact across inserts, rollbacks, prune and other connections', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'scout-connector-counts-'));
+  const databasePath = join(directory, 'scout.sqlite');
+  const db = openDatabase(databasePath);
+  const other = openDatabase(databasePath);
+  try {
+    const service = new ScoutService(db, () => {}, { suggestVariantGroups: async () => [] });
+    const actual = () => Object.fromEntries((db.prepare('SELECT source, COUNT(*) AS count FROM connector_runs GROUP BY source').all() as Array<{ source: string; count: number }>).map((row) => [row.source, Number(row.count)]));
+    const reported = () => Object.fromEntries(service.getConnectors().filter((connector) => connector.requests > 0).map((connector) => [connector.name, connector.requests]));
+    const total = () => Number((db.prepare('SELECT COUNT(*) AS count FROM connector_runs').get() as { count: number }).count);
+    const record = (source: string, startedAt: string) => (service as any).recordRun(source, 'ok', 'run', startedAt, startedAt);
+    const old = new Date(Date.now() - 200 * 24 * 60 * 60_000).toISOString();
+    record('OLX', old);
+    assert.deepEqual(reported(), actual());
+    // Cached now: in-process inserts are counted without a recount.
+    record('OLX', new Date().toISOString());
+    record('Vinted', new Date().toISOString());
+    assert.deepEqual(reported(), { OLX: 2, Vinted: 1 });
+    assert.deepEqual(reported(), actual());
+    db.exec('BEGIN');
+    record('Vinted', new Date().toISOString());
+    db.exec('ROLLBACK');
+    assert.deepEqual(reported(), actual());
+    other.prepare('INSERT INTO connector_runs (source, status, message, started_at, finished_at) VALUES (?, ?, ?, ?, ?)').run('Allegro Lokalnie', 'ok', 'other', old, old);
+    assert.deepEqual(reported(), actual());
+    assert.equal(service.connectorRunsPage({ pageSize: 2 }).pagination.total, total());
+    (service as any).pruneRetention();
+    assert.deepEqual(reported(), actual());
+    assert.deepEqual(actual(), { OLX: 1, Vinted: 1 });
+    assert.equal(service.connectorRunsPage({ pageSize: 1 }).pagination.total, 2);
+    assert.equal(service.connectorRunsPage({ pageSize: 1 }).pagination.hasNext, true);
+    // Readiness reads only statuses and skips the counts.
+    assert.deepEqual(service.readiness().connectors.degraded, []);
+    assert.equal(service.getConnectors(false).every((connector) => connector.requests === 0), true);
+  } finally {
+    other.close();
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('serves connector history and unfinished-scan checks from indexes', () => {
+  const context = fixture();
+  try {
+    const plan = (sql: string) => (context.db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as Array<{ detail: string }>).map((row) => row.detail).join(' | ');
+    const page = plan('SELECT * FROM connector_runs ORDER BY started_at DESC, id DESC LIMIT 100 OFFSET 0');
+    assert.match(page, /connector_runs_recent/);
+    assert.doesNotMatch(page, /TEMP B-TREE/);
+    assert.match(plan("SELECT COUNT(*) AS count FROM scans WHERE status = 'running' OR status = 'interrupted'"), /scans_unfinished/);
+    assert.match(plan("UPDATE scans SET status = 'interrupted' WHERE status IN ('running', 'interrupted') AND status = 'running'"), /scans_unfinished/);
+    assert.match(plan("DELETE FROM listings WHERE last_seen_at < '2000' AND NOT EXISTS (SELECT 1 FROM observations WHERE observations.listing_id = listings.id)"), /observations_listing/);
   } finally { context.close(); }
 });
 
@@ -754,6 +860,254 @@ test('fetches and verifies descriptions for very strong and exceptional deals be
   }
 });
 
+test('repeat verification of an unchanged deal rewrites no verification or snapshot rows', async () => {
+  let verificationRequests = 0;
+  const context = fixture({
+    classifyListingRelevance: async () => ({ relevant: true }),
+    verifyListingDescription: async () => {
+      verificationRequests += 1;
+      return { decision: 'reject', confidence: 0.98, summary: 'Broken.', issues: ['Broken screen.'], evidence: ['broken'] };
+    },
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(null, { status: 204 })) as typeof fetch;
+  try {
+    const baselineAt = new Date(Date.now() - 8 * 60 * 60_000).toISOString();
+    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' } });
+    seedWatch(context.db, 'idempotent-watch');
+    const insertListing = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+    const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    for (let index = 0; index < 30; index += 1) {
+      insertListing.run('OLX', `baseline-${index}`, `CPU reference ${index}`, 1000, `https://www.olx.pl/d/oferta/baseline-${index}`, baselineAt, baselineAt);
+      const listing = context.db.prepare('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get('OLX', `baseline-${index}`) as { id: number };
+      insertObservation.run(listing.id, 'idempotent-watch', 1000, baselineAt);
+    }
+    (context.service as any).fetchPublicPage = async () => '<div data-testid="description">Broken screen, sold for parts.</div>';
+    let price = 700;
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'repeat-deal', url: 'https://www.olx.pl/d/oferta/repeat-deal', title: 'CPU repeat deal', created_time: baselineAt, params: [{ key: 'price', value: { value: price, currency: 'PLN', negotiable: false } }] },
+    ], metadata: { visible_total_count: 1 } } });
+    const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('idempotent-watch');
+    const state = () => ({ ...(context.db.prepare(`SELECT ai_description_verification_at AS at, ai_description_verification_status AS status, ai_description_verification_input_hash AS hash
+      FROM listings WHERE listing_id = 'repeat-deal'`).get() as Record<string, unknown>) });
+    const snapshots = () => (context.db.prepare('SELECT id, price_pln, verification_status, verification_input_hash FROM listing_detail_snapshots ORDER BY id').all() as Array<Record<string, unknown>>).map((item) => ({ ...item }));
+    const updates: string[] = [];
+    const service = context.service as any;
+    const originalStmt = service.stmt.bind(service);
+    service.stmt = (sql: string) => {
+      const statement = originalStmt(sql);
+      if (!/^\s*UPDATE (listings SET\s+ai_description|listing_detail_snapshots)/.test(sql)) return statement;
+      return { ...statement, run: (...params: unknown[]) => { const result = statement.run(...params); if (Number(result.changes)) updates.push(sql.trim().slice(0, 40)); return result; }, get: statement.get.bind(statement), all: statement.all.bind(statement) };
+    };
+
+    await service.runWatch(row);
+    assert.equal(verificationRequests, 1);
+    const first = state();
+    assert.equal(first.status, 'reject');
+    const firstSnapshots = snapshots();
+    assert.equal(firstSnapshots.length, 1);
+    assert.equal(firstSnapshots[0].verification_status, 'reject');
+
+    updates.length = 0;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await service.runWatch(row);
+    assert.equal(verificationRequests, 1);
+    assert.deepEqual(updates, [], 'a cached verdict for an unchanged state writes nothing');
+    assert.deepEqual(state(), first);
+    assert.deepEqual(snapshots(), firstSnapshots);
+
+    // A new price is a new snapshot state; the description (and so the
+    // verification input) is unchanged, so the cached verdict still applies.
+    price = 650;
+    await service.runWatch(row);
+    assert.equal(verificationRequests, 1);
+    const afterDrop = snapshots();
+    assert.equal(afterDrop.length, 2);
+    assert.equal(afterDrop[1].price_pln, 650);
+    assert.equal(afterDrop[1].verification_status, 'reject');
+    assert.equal(afterDrop[1].verification_input_hash, first.hash);
+    assert.deepEqual(afterDrop[0], firstSnapshots[0]);
+    assert.deepEqual(state(), first);
+
+    // Without an AI key every scan takes the not-configured path; only the
+    // first one changes the stored status.
+    context.service.saveSettings({ ai: { clearApiKey: true } });
+    assert.equal(service.deepSeekConfig().apiKey, null);
+    await service.runWatch(row);
+    const notConfigured = state();
+    assert.equal(notConfigured.status, 'not-configured');
+    updates.length = 0;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await service.runWatch(row);
+    assert.deepEqual(updates, []);
+    assert.deepEqual(state(), notConfigured);
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.close();
+  }
+});
+
+// A watch with a ready 30-listing baseline at 1000 PLN whose OLX search
+// returns the given deals; the detail page fetch is counted.
+function standingDealScenario(context: ReturnType<typeof fixture>, watchId: string, deals: Array<{ id: string; price: number }>) {
+  const baselineAt = new Date(Date.now() - 8 * 60 * 60_000).toISOString();
+  seedWatch(context.db, watchId);
+  const insertListing = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+  const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+  for (let index = 0; index < 30; index += 1) {
+    insertListing.run('OLX', `${watchId}-baseline-${index}`, `CPU reference ${index}`, 1000, `https://www.olx.pl/d/oferta/${watchId}-baseline-${index}`, baselineAt, baselineAt);
+    const listing = context.db.prepare('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get('OLX', `${watchId}-baseline-${index}`) as { id: number };
+    insertObservation.run(listing.id, watchId, 1000, baselineAt);
+  }
+  const state = { fetches: 0, deals };
+  const service = context.service as any;
+  service.fetchPublicPage = async () => { state.fetches += 1; return '<div data-testid="description">Fully working CPU, tested.</div>'; };
+  service.fetchOlxApi = async () => ({ status: 200, json: { data: state.deals.map((deal) => (
+    { id: deal.id, url: `https://www.olx.pl/d/oferta/${deal.id}`, title: `CPU ${deal.id}`, created_time: baselineAt, params: [{ key: 'price', value: { value: deal.price, currency: 'PLN', negotiable: false } }] }
+  )), metadata: { visible_total_count: state.deals.length } } });
+  // Re-running the originally loaded row keeps every source due, as a
+  // scheduler tick would after the interval.
+  const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get(watchId);
+  return { state, scan: () => service.runWatch(row) as Promise<void> };
+}
+
+test('skips description verification for hidden deal candidates', async () => {
+  let verificationRequests = 0;
+  const context = fixture({
+    classifyListingRelevance: async () => ({ relevant: true }),
+    verifyListingDescription: async () => { verificationRequests += 1; return { decision: 'pass', confidence: 0.9, summary: 'Working.', issues: [], evidence: ['works'] }; },
+  });
+  const originalFetch = globalThis.fetch;
+  let webhookPosts = 0;
+  globalThis.fetch = (async () => { webhookPosts += 1; return new Response(null, { status: 204 }); }) as typeof fetch;
+  try {
+    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' }, webhook: 'https://discord.com/api/webhooks/123/token' });
+    const scenario = standingDealScenario(context, 'hidden-deal-watch', [{ id: 'hidden-deal', price: 650 }]);
+    context.db.prepare('INSERT INTO listing_actions (marketplace, listing_id, decision, note, hidden, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run('OLX', 'hidden-deal', null, '', 1, new Date().toISOString());
+    await scenario.scan();
+    assert.equal(scenario.state.fetches, 0);
+    assert.equal(verificationRequests, 0);
+    assert.equal(webhookPosts, 0);
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM listing_detail_snapshots').get() as { count: number }).count, 0);
+    context.service.updateListingAction('OLX:hidden-deal', { hidden: false });
+    await scenario.scan();
+    assert.equal(scenario.state.fetches, 1);
+    assert.equal(verificationRequests, 1);
+    assert.equal(webhookPosts, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.close();
+  }
+});
+
+test('re-verifies a standing deal only when it can alert or its verdict is older than six hours', async () => {
+  let verificationRequests = 0;
+  const context = fixture({
+    classifyListingRelevance: async () => ({ relevant: true }),
+    verifyListingDescription: async () => { verificationRequests += 1; return { decision: 'pass', confidence: 0.9, summary: 'Working.', issues: [], evidence: ['works'] }; },
+  });
+  const originalFetch = globalThis.fetch;
+  const posts: string[] = [];
+  globalThis.fetch = (async (input) => { posts.push(new URL(String(input)).host); return new Response(null, { status: 204 }); }) as typeof fetch;
+  try {
+    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' }, webhook: 'https://discord.com/api/webhooks/123/token' });
+    const scenario = standingDealScenario(context, 'standing-watch', [{ id: 'standing-deal', price: 750 }]);
+    const count = (host: string) => posts.filter((item) => item === host).length;
+    const verifiedAt = () => String((context.db.prepare("SELECT ai_description_verification_at AS at FROM listings WHERE listing_id = 'standing-deal'").get() as { at: string }).at);
+
+    await scenario.scan();
+    assert.deepEqual([scenario.state.fetches, verificationRequests, count('discord.com')], [1, 1, 1]);
+    // Already alerted at this price and the verdict is fresh: no page fetch.
+    await scenario.scan();
+    await scenario.scan();
+    assert.deepEqual([scenario.state.fetches, verificationRequests, count('discord.com')], [1, 1, 1]);
+
+    // A newly configured channel makes it alertable: verified (cached verdict) and sent.
+    context.service.saveSettings({ ntfy: { serverUrl: 'https://ntfy.sh', topic: 'scout-deals', token: 'tk_secret', minimumPriority: 'very-strong' } });
+    await scenario.scan();
+    assert.deepEqual([scenario.state.fetches, verificationRequests, count('ntfy.sh')], [2, 1, 1]);
+    await scenario.scan();
+    assert.equal(scenario.state.fetches, 2);
+
+    // A price drop of at least 5% is verified immediately and alerts again.
+    scenario.state.deals = [{ id: 'standing-deal', price: 700 }];
+    await scenario.scan();
+    assert.deepEqual([scenario.state.fetches, verificationRequests, count('discord.com'), count('ntfy.sh')], [3, 1, 2, 2]);
+    await scenario.scan();
+    assert.equal(scenario.state.fetches, 3);
+
+    // After six hours the standing deal is re-verified once and the verdict
+    // timestamp renewed, without an AI call or an alert.
+    const stale = new Date(Date.now() - 7 * 60 * 60_000).toISOString();
+    context.db.prepare("UPDATE listings SET ai_description_verification_at = ? WHERE listing_id = 'standing-deal'").run(stale);
+    await scenario.scan();
+    assert.deepEqual([scenario.state.fetches, verificationRequests, count('discord.com'), count('ntfy.sh')], [4, 1, 2, 2]);
+    assert.ok(Date.now() - Date.parse(verifiedAt()) < 60_000);
+    await scenario.scan();
+    assert.equal(scenario.state.fetches, 4);
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.close();
+  }
+});
+
+test('verifies a new strong deal once even with no notification channel', async () => {
+  let verificationRequests = 0;
+  const context = fixture({
+    classifyListingRelevance: async () => ({ relevant: true }),
+    verifyListingDescription: async () => { verificationRequests += 1; return { decision: 'pass', confidence: 0.9, summary: 'Working.', issues: [], evidence: ['works'] }; },
+  });
+  try {
+    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' } });
+    const scenario = standingDealScenario(context, 'quiet-watch', [{ id: 'quiet-deal', price: 750 }]);
+    await scenario.scan();
+    assert.deepEqual([scenario.state.fetches, verificationRequests], [1, 1]);
+    assert.equal((context.db.prepare("SELECT ai_description_verification_status AS status FROM listings WHERE listing_id = 'quiet-deal'").get() as { status: string }).status, 'pass');
+    await scenario.scan();
+    assert.deepEqual([scenario.state.fetches, verificationRequests], [1, 1]);
+    // A retitled listing is a new state and is verified again.
+    const service = context.service as any;
+    const fetchOlx = service.fetchOlxApi;
+    service.fetchOlxApi = async () => { const response = await fetchOlx(); response.json.data[0].title = 'CPU quiet-deal, box included'; return response; };
+    await scenario.scan();
+    assert.equal(scenario.state.fetches, 2);
+  } finally { context.close(); }
+});
+
+test('verifies OLX deals from the offers-API description without fetching the offer page', async () => {
+  const descriptions: Array<string | null> = [];
+  const context = fixture({
+    classifyListingRelevance: async () => ({ relevant: true }),
+    verifyListingDescription: async (input) => { descriptions.push(input.description); return { decision: 'pass', confidence: 0.9, summary: 'Working.', issues: [], evidence: ['works'] }; },
+  });
+  try {
+    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' } });
+    const scenario = standingDealScenario(context, 'olx-hint-watch', [{ id: 'api-deal', price: 700 }, { id: 'page-deal', price: 720 }]);
+    const service = context.service as any;
+    const fetchOlx = service.fetchOlxApi;
+    let apiDescription = '<p>Procesor sprawny,<br>testowany &amp; z pudełkiem.</p>';
+    service.fetchOlxApi = async () => {
+      const response = await fetchOlx();
+      response.json.data[0].description = apiDescription;
+      response.json.data[0].photos = [{ link: 'https://ireland.apollo.olxcdn.com:443/v1/files/api-deal-PL/image;s={width}x{height}' }];
+      return response;
+    };
+    await scenario.scan();
+    // Only the offer without an API description falls back to its page.
+    assert.equal(scenario.state.fetches, 1);
+    assert.deepEqual([...descriptions].sort(), ['Fully working CPU, tested.', 'Procesor sprawny, testowany & z pudełkiem.'].sort());
+    const snapshot = context.db.prepare(`SELECT s.description FROM listing_detail_snapshots s JOIN listings l ON l.id = s.listing_id WHERE l.listing_id = 'api-deal'`).all() as Array<{ description: string }>;
+    assert.deepEqual(snapshot.map((row) => row.description), ['Procesor sprawny, testowany & z pudełkiem.']);
+
+    // An edited description with a retitle is a new state, still verified without a page fetch.
+    apiDescription = '<p>Procesor uszkodzony.</p>';
+    service.fetchOlxApi = ((inner: () => Promise<any>) => async () => { const response = await inner(); response.json.data[0].title = 'CPU api-deal, damaged'; return response; })(service.fetchOlxApi);
+    await scenario.scan();
+    assert.equal(scenario.state.fetches, 1);
+    assert.ok(descriptions.includes('Procesor uszkodzony.'));
+  } finally { context.close(); }
+});
+
 test('holds a high-priority alert when OpenRouter verification output is malformed', async () => {
   let verificationRequests = 0;
   const context = fixture({
@@ -905,6 +1259,60 @@ test('filters and caches irrelevant listings per watch', async () => {
   } finally { context.close(); }
 });
 
+test('does not rewrite unchanged gate-skipped relevance rows and flushes one transaction per pass', async () => {
+  let requests = 0;
+  const context = fixture({ classifyListingRelevance: async () => { requests += 1; return { relevant: true }; } });
+  try {
+    const now = new Date().toISOString();
+    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-flash' } });
+    seedWatch(context.db, 'skip-watch', { query: 'gpu' });
+    const listings = Array.from({ length: 14 }, (_, index) => ({ marketplace: 'OLX' as const, listingId: `skip-${index}`, title: `RTX card ${index}`, price: 2000 + index, currency: 'PLN' as const, url: `https://www.olx.pl/d/oferta/skip-${index}`, observedAt: now }));
+    const service = context.service as any;
+    let transactions = 0;
+    const originalTransaction = service.transaction.bind(service);
+    service.transaction = (callback: () => unknown) => { transactions += 1; return originalTransaction(callback); };
+    const rows = () => (context.db.prepare("SELECT listing_id, input_hash, model, relevance_status, reason, checked_at FROM listing_relevance WHERE watch_id = 'skip-watch' ORDER BY listing_id").all() as Array<Record<string, unknown>>).map((row) => ({ ...row }));
+    const changes = () => Number((context.db.prepare('SELECT total_changes() AS n').get() as { n: number }).n);
+    const search = { query: 'gpu', includedTerms: '', excludedTerms: '' };
+    let strong = new Set<string>();
+    const gate = (listing: { listingId: string }) => strong.has(listing.listingId);
+
+    const first = await service.filterListingsByAiRelevance(listings, search, 'skip-watch', true, gate);
+    assert.equal(first.skipped, 14);
+    assert.equal(transactions, 1, 'all rows land in one transaction');
+    const written = rows();
+    assert.equal(written.length, 14);
+    assert.ok(written.every((row) => row.relevance_status === 'unknown'));
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    transactions = 0;
+    const before = changes();
+    const repeat = await service.filterListingsByAiRelevance(listings, search, 'skip-watch', true, gate);
+    assert.equal(repeat.skipped, 14);
+    assert.equal(changes(), before, 'identical unknown rows are not rewritten');
+    assert.equal(transactions, 0);
+    assert.deepEqual(rows(), written);
+
+    // A retitled listing has a new input hash and is rewritten; a listing
+    // that became strong gets its AI call.
+    const retitled = listings.map((listing, index) => index === 3 ? { ...listing, title: 'RTX card renamed' } : listing);
+    strong = new Set(['skip-5']);
+    await service.filterListingsByAiRelevance(retitled, search, 'skip-watch', true, gate);
+    assert.equal(requests, 1);
+    const after = rows();
+    const changed = after.filter((row, index) => JSON.stringify(row) !== JSON.stringify(written[index])).map((row) => row.listing_id);
+    assert.deepEqual(changed, ['skip-3', 'skip-5']);
+    assert.equal(after.find((row) => row.listing_id === 'skip-5')!.relevance_status, 'relevant');
+
+    // A model change rewrites every skipped row once.
+    context.service.saveSettings({ ai: { apiKey: 'sk-deepseek-secret', model: 'deepseek-v4-pro' } } as any);
+    strong = new Set();
+    const beforeModel = changes();
+    await service.filterListingsByAiRelevance(retitled, search, 'skip-watch', true, gate);
+    assert.ok(changes() - beforeModel >= 13);
+  } finally { context.close(); }
+});
+
 test('applies the same AI relevance gate to one-off marketplace search', async () => {
   let requests = 0;
   const context = fixture({
@@ -1041,6 +1449,331 @@ test('price-filtered watches scope history and baseline samples to their range',
   } finally { context.close(); }
 });
 
+// The pre-rewrite per-observation stats aggregate, kept as the oracle for the
+// association-driven query in watches().
+const LEGACY_WATCH_STATS_SQL = `SELECT o.watch_id, COALESCE(wl.variant_key, ?) AS variant_key, COUNT(DISTINCT o.listing_id) AS samples, MIN(o.observed_at) AS first_observed
+  FROM observations o
+  JOIN listings l ON l.id = o.listing_id
+  JOIN watches w ON w.id = o.watch_id
+  LEFT JOIN watch_listings wl ON wl.id = o.watch_listing_id
+  WHERE (? = 1 OR w.archived_at IS NULL)
+    AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)
+    AND (w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
+    AND (w.min_price_pln IS NULL OR o.price_pln >= w.min_price_pln)
+    AND (w.max_price_pln IS NULL OR o.price_pln <= w.max_price_pln)
+  GROUP BY o.watch_id, COALESCE(wl.variant_key, ?)`;
+
+// Several watches exercising every stats filter: AI relevance on/off,
+// shipping-only, price bounds, variant keys, an archived watch and
+// associations whose observations all fall outside the price range.
+function seedWatchStatsScenario(db: any) {
+  const hoursAgo = (hours: number) => new Date(Date.now() - hours * 3_600_000).toISOString();
+  seedWatch(db, 'stats-plain');
+  seedWatch(db, 'stats-bounded');
+  seedWatch(db, 'stats-shipping');
+  seedWatch(db, 'stats-no-ai');
+  seedWatch(db, 'stats-archived');
+  db.prepare('UPDATE watches SET min_price_pln = 100, max_price_pln = 300 WHERE id = ?').run('stats-bounded');
+  db.prepare('UPDATE watches SET shipping_only = 1 WHERE id = ?').run('stats-shipping');
+  db.prepare('UPDATE watches SET ai_relevance = 0 WHERE id = ?').run('stats-no-ai');
+  db.prepare('UPDATE watches SET archived_at = ? WHERE id = ?').run(hoursAgo(1), 'stats-archived');
+  db.prepare('UPDATE watches SET variant_groups_json = ? WHERE id IN (?, ?)').run(JSON.stringify([{ id: 'a', label: 'A', terms: 'a', exclude: '' }, { id: 'b', label: 'B', terms: 'b', exclude: '' }]), 'stats-plain', 'stats-bounded');
+  const insertListing = db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, shipping_available, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+  const insertObservation = db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+  const link = db.prepare('UPDATE observations SET watch_listing_id = (SELECT id FROM watch_listings WHERE watch_id = observations.watch_id AND listing_id = observations.listing_id) WHERE watch_listing_id IS NULL');
+  const irrelevant = db.prepare(`INSERT INTO listing_relevance (watch_id, marketplace, listing_id, input_hash, model, relevant, reason, checked_at, relevance_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const watches = ['stats-plain', 'stats-bounded', 'stats-shipping', 'stats-no-ai', 'stats-archived'];
+  for (let index = 0; index < 40; index += 1) {
+    const marketplace = index % 5 === 0 ? 'Vinted' : 'OLX';
+    const listingId = `stats-${index}`;
+    insertListing.run(marketplace, listingId, `CPU ${index}`, 50 + index * 10, index % 3 === 0 ? 0 : 1, `https://example.test/${listingId}`, hoursAgo(80), hoursAgo(1));
+    const listing = db.prepare('SELECT id FROM listings WHERE listing_id = ?').get(listingId) as { id: number };
+    for (const [slot, watchId] of watches.entries()) {
+      if ((index + slot) % 4 === 3) continue;
+      // Prices drift across the bounded range so some associations are only
+      // partly in range and a few never are.
+      for (let step = 0; step < 3; step += 1) insertObservation.run(listing.id, watchId, 40 + index * 8 + step * 60, hoursAgo(72 - index - step * 5 - slot));
+      const variant = index % 7 === 0 ? null : ['a', 'b', 'other'][index % 3];
+      db.prepare('UPDATE watch_listings SET variant_key = ? WHERE watch_id = ? AND listing_id = ?').run(variant, watchId, listing.id);
+      if (index % 6 === 1) irrelevant.run(watchId, marketplace, listingId, `hash-${index}`, 'model', 0, 'no', hoursAgo(1), 'irrelevant');
+      else if (index % 6 === 2) irrelevant.run(watchId, marketplace, listingId, `hash-${index}`, 'model', 0, 'no', hoursAgo(1), 'relevant');
+      else if (index % 6 === 3) irrelevant.run(watchId, marketplace, listingId, `hash-${index}`, 'model', 1, 'yes', hoursAgo(1), 'unknown');
+    }
+  }
+  link.run();
+}
+
+function captureRows(db: any, marker: string) {
+  const captured: unknown[][] = [];
+  const proxy = new Proxy(db, {
+    get(target, property) {
+      if (property === 'prepare') return (sql: string) => {
+        const statement = target.prepare(sql);
+        if (!sql.includes(marker)) return statement;
+        return new Proxy(statement, {
+          get(inner, key) {
+            if (key === 'all') return (...params: unknown[]) => { const rows = inner.all(...params); captured.push(rows); return rows; };
+            const value = Reflect.get(inner, key);
+            return typeof value === 'function' ? value.bind(inner) : value;
+          },
+        });
+      };
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  return { proxy, captured };
+}
+
+test('association-driven watch stats match the per-observation aggregate', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const { proxy, captured } = captureRows(context.db, 'WITH a AS MATERIALIZED');
+    const service = new ScoutService(proxy, () => {});
+    const sortRows = (rows: any[]) => rows.map((row) => ({ ...row })).sort((a, b) => `${a.watch_id}|${a.variant_key}`.localeCompare(`${b.watch_id}|${b.variant_key}`));
+    for (const includeArchived of [0, 1]) {
+      captured.length = 0;
+      const watches = includeArchived ? service.allWatches() : service.getWatches();
+      assert.equal(watches.length, includeArchived ? 5 : 4);
+      const legacy = context.db.prepare(LEGACY_WATCH_STATS_SQL).all(OTHER_VARIANT_KEY, includeArchived, OTHER_VARIANT_KEY);
+      assert.ok(legacy.length > 8);
+      assert.equal(captured.length, 1);
+      assert.deepEqual(sortRows(captured[0] as any[]), sortRows(legacy as any[]));
+    }
+  } finally { context.close(); }
+});
+
+test('single-watch stats equal the matching entry of the full watch list', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const fresh = new Date().toISOString();
+    context.db.prepare("UPDATE watch_listings SET deal_strength = (id % 6), typical_pln = 400 + (id % 3), last_seen_at = ? WHERE id % 2 = 0").run(fresh);
+    const all = context.service.allWatches();
+    assert.equal(all.length, 5);
+    for (const watch of all) assert.deepEqual(context.service.watchById(watch.id), watch);
+    assert.equal(context.service.watchById('missing-watch'), undefined);
+    // Listing detail reads readiness and groups of its own (here archived) watch.
+    const listing = context.db.prepare("SELECT l.marketplace, l.listing_id FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE wl.watch_id = 'stats-plain' ORDER BY wl.id LIMIT 1").get() as { marketplace: string; listing_id: string };
+    context.db.prepare('UPDATE watches SET archived_at = ? WHERE id = ?').run(fresh, 'stats-plain');
+    const detail = context.service.listingDetail(`${listing.marketplace}:${listing.listing_id}`, 'stats-plain');
+    assert.deepEqual(detail.variantGroups, context.service.allWatches().find((watch) => watch.id === 'stats-plain')!.variantGroups);
+  } finally { context.close(); }
+});
+
+test('listing detail price history matches the unsplit history query', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const legacy = context.db.prepare('SELECT price_pln, observed_at FROM observations WHERE listing_id = ? AND (? IS NULL OR watch_id = ?) ORDER BY observed_at DESC, id DESC LIMIT 120');
+    const expected = (listingId: number, watchId: string | null) => (legacy.all(listingId, watchId, watchId) as Array<{ price_pln: number; observed_at: string }>).reverse().map((point) => ({ price: Number(point.price_pln), observedAt: point.observed_at }));
+    const rows = context.db.prepare('SELECT l.id, l.marketplace, l.listing_id, wl.watch_id FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE l.id % 5 = 0').all() as Array<{ id: number; marketplace: string; listing_id: string; watch_id: string }>;
+    assert.ok(rows.length > 5);
+    for (const row of rows) {
+      const detail = context.service.listingDetail(`${row.marketplace}:${row.listing_id}`, row.watch_id);
+      assert.ok(detail.history.length > 0);
+      assert.deepEqual(detail.history, expected(row.id, row.watch_id));
+    }
+    // A listing without any association (e.g. a manual search result).
+    const now = new Date().toISOString();
+    context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run('OLX', 'unassociated', 'CPU', 100, 'https://example.test/unassociated', now, now);
+    const manual = context.db.prepare("SELECT id FROM listings WHERE listing_id = 'unassociated'").get() as { id: number };
+    assert.deepEqual(context.service.listingDetail('OLX:unassociated').history, expected(manual.id, null));
+  } finally { context.close(); }
+});
+
+test('association-driven analytics rows match the observation-driven query in order', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const { proxy, captured } = captureRows(context.db, 'CROSS JOIN observations o INDEXED BY observations_watch_listing ON o.watch_id = wl.watch_id AND o.listing_id = wl.listing_id\n      WHERE');
+    const service = new ScoutService(proxy, () => {});
+    const legacy = (options: { days: number; watchId?: string; marketplace?: string }) => {
+      const predicates = [
+        'w.archived_at IS NULL',
+        'o.observed_at >= ?',
+        "NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)",
+        "(w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))",
+        '(w.min_price_pln IS NULL OR o.price_pln >= w.min_price_pln)',
+        '(w.max_price_pln IS NULL OR o.price_pln <= w.max_price_pln)',
+      ];
+      const params: Array<string | number> = [new Date(Date.now() - options.days * 24 * 60 * 60_000).toISOString()];
+      if (options.watchId) { predicates.push('o.watch_id = ?'); params.push(options.watchId); }
+      if (options.marketplace) { predicates.push('l.marketplace = ?'); params.push(options.marketplace); }
+      return context.db.prepare(`SELECT date(o.observed_at) AS day, o.listing_id AS listing_id, o.watch_id AS watch_id, w.name AS watch_name, l.marketplace AS marketplace, o.price_pln AS price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at, wl.first_seen_at AS first_seen_at
+        FROM observations o
+        JOIN listings l ON l.id = o.listing_id
+        JOIN watches w ON w.id = o.watch_id
+        JOIN watch_listings wl ON wl.watch_id = o.watch_id AND wl.listing_id = o.listing_id
+        WHERE ${predicates.join(' AND ')}
+        GROUP BY day, o.watch_id, o.listing_id`).all(...params);
+    };
+    for (const options of [{ days: 30 }, { days: 7 }, { days: 30, watchId: 'stats-bounded' }, { days: 30, marketplace: 'OLX' as const }, { days: 30, watchId: 'stats-shipping', marketplace: 'Vinted' as const }]) {
+      captured.length = 0;
+      service.analytics(options);
+      assert.equal(captured.length, 1);
+      const expected = legacy(options);
+      assert.ok(expected.length > 0 || options.marketplace === 'Vinted');
+      // Same rows, same order; the bare columns come from the MAX(observed_at) row.
+      assert.deepEqual((captured[0] as any[]).map((row) => ({ ...row })), (expected as any[]).map((row) => ({ ...row })));
+    }
+  } finally { context.close(); }
+});
+
+test('watch analytics daily rows and bounds match the observation-driven queries', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const { proxy, captured } = captureRows(context.db, 'COUNT(*) AS n');
+    const service = new ScoutService(proxy, () => {});
+    const filters = `FROM observations o
+      JOIN listings l ON l.id = o.listing_id
+      WHERE o.watch_id = ?
+        AND o.observed_at >= ?
+        AND NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND EXISTS (SELECT 1 FROM watches rw WHERE rw.id = r.watch_id AND rw.ai_relevance = 1))
+        AND (? = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
+        AND (? IS NULL OR o.price_pln >= ?)
+        AND (? IS NULL OR o.price_pln <= ?)`;
+    const legacyBounds = context.db.prepare(`SELECT COUNT(*) AS total, MIN(o.observed_at) AS first_at, MAX(o.observed_at) AS last_at ${filters}`);
+    const legacyDaily = context.db.prepare(`SELECT date(o.observed_at) AS day, o.listing_id, l.marketplace, o.price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at
+      ${filters}
+      GROUP BY day, o.listing_id`);
+    const watches = context.db.prepare('SELECT id, shipping_only, min_price_pln, max_price_pln FROM watches').all() as Array<Record<string, any>>;
+    // An out-of-range window exercises the empty case.
+    context.db.prepare('UPDATE watches SET min_price_pln = 100000 WHERE id = ?').run('stats-archived');
+    watches.find((watch) => watch.id === 'stats-archived')!.min_price_pln = 100000;
+    for (const watch of watches) {
+      for (const days of [7, 30]) {
+        captured.length = 0;
+        const analytics = service.watchAnalytics(watch.id, days);
+        assert.equal(captured.length, 1);
+        const params = [watch.id, new Date(Date.now() - days * 24 * 60 * 60_000).toISOString(), watch.shipping_only ? 1 : 0, watch.min_price_pln, watch.min_price_pln, watch.max_price_pln, watch.max_price_pln];
+        const bounds = legacyBounds.get(...params) as { total: number; first_at: string | null; last_at: string | null };
+        assert.equal(analytics.totalObservations, Number(bounds.total));
+        assert.equal(analytics.firstObservedAt, bounds.first_at);
+        assert.equal(analytics.lastObservedAt, bounds.last_at);
+        assert.deepEqual((captured[0] as any[]).map(({ n: _n, ...row }) => row), (legacyDaily.all(...params) as any[]).map((row) => ({ ...row })));
+      }
+    }
+  } finally { context.close(); }
+});
+
+// The pre-rewrite per-observation baseline queries and bucketing, kept as the
+// oracle for the association-driven watchBaselines.
+function legacyWatchBaselines(db: any, row: Record<string, any>) {
+  const filters = `
+      JOIN listings l ON l.id = o.listing_id
+      LEFT JOIN watch_listings wl ON wl.id = o.watch_listing_id
+      WHERE o.watch_id = ?
+        AND (? = 0 OR NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = o.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))))
+        AND (? = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
+        AND (? IS NULL OR o.price_pln >= ?)
+        AND (? IS NULL OR o.price_pln <= ?)`;
+  const params = [row.id, row.ai_relevance === 0 ? 0 : 1, row.shipping_only ? 1 : 0, row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln];
+  const latest = db.prepare(`SELECT price_pln, variant_key FROM (
+      SELECT o.price_pln, o.observed_at, o.id, COALESCE(wl.variant_key, ?) AS variant_key, ROW_NUMBER() OVER (PARTITION BY o.listing_id ORDER BY o.observed_at DESC, o.id DESC) AS rank
+      FROM observations o INDEXED BY observations_watch_listing ${filters}
+    ) WHERE rank <= 1 ORDER BY observed_at DESC, id DESC`).all(OTHER_VARIANT_KEY, ...params) as Array<{ price_pln: number; variant_key: string }>;
+  const firstByVariant = db.prepare(`SELECT COALESCE(wl.variant_key, ?) AS variant_key, MIN(o.observed_at) AS first
+    FROM observations o INDEXED BY observations_watch_listing ${filters}
+    GROUP BY COALESCE(wl.variant_key, ?)`).all(OTHER_VARIANT_KEY, ...params, OTHER_VARIANT_KEY) as Array<{ variant_key: string; first: string | null }>;
+  const buckets = new Map<string, { prices: number[]; firstObservedAt: string | null }>();
+  const bucketFor = (key: string) => {
+    let bucket = buckets.get(key);
+    if (!bucket) { bucket = { prices: [], firstObservedAt: null }; buckets.set(key, bucket); }
+    return bucket;
+  };
+  for (const item of latest) {
+    const price = Number(item.price_pln);
+    if (!Number.isFinite(price) || price <= 0) continue;
+    const bucket = bucketFor(item.variant_key ?? OTHER_VARIANT_KEY);
+    if (bucket.prices.length < 400) bucket.prices.push(price);
+  }
+  for (const item of firstByVariant) bucketFor(item.variant_key ?? OTHER_VARIANT_KEY).firstObservedAt = item.first ?? null;
+  return buckets;
+}
+
+test('association-driven watch baselines match the per-observation queries', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const hoursAgo = (hours: number) => new Date(Date.now() - hours * 3_600_000).toISOString();
+    // A full bucket (more than 400 priced listings, so the cap and newest-first order
+    // matter), plus non-positive prices that must be skipped while still
+    // counting towards a variant's first observation.
+    seedWatch(context.db, 'stats-full');
+    context.db.prepare('UPDATE watches SET variant_groups_json = ? WHERE id = ?').run(JSON.stringify([{ id: 'a', label: 'A', terms: 'a', exclude: '' }]), 'stats-full');
+    const insertListing = context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, shipping_available, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    const findListing = context.db.prepare('SELECT id FROM listings WHERE listing_id = ?');
+    const setVariant = context.db.prepare('UPDATE watch_listings SET variant_key = ? WHERE watch_id = ? AND listing_id = ?');
+    context.db.exec('BEGIN');
+    for (let index = 0; index < 560; index += 1) {
+      const listingId = `full-${index}`;
+      insertListing.run('OLX', listingId, `GPU ${index}`, 100 + index, 1, `https://example.test/${listingId}`, hoursAgo(90), hoursAgo(1));
+      const listing = findListing.get(listingId) as { id: number };
+      // Same-timestamp rows across listings exercise the id tie-break.
+      insertObservation.run(listing.id, 'stats-full', index % 9 === 0 ? 0 : 100 + index, hoursAgo(80 - (index % 50)));
+      insertObservation.run(listing.id, 'stats-full', index % 11 === 0 ? 0 : 90 + (index % 40), hoursAgo(20 - (index % 17)));
+      setVariant.run(index % 10 === 0 ? 'a' : null, 'stats-full', listing.id);
+    }
+    context.db.exec('COMMIT');
+    context.db.prepare('UPDATE observations SET watch_listing_id = (SELECT id FROM watch_listings WHERE watch_id = observations.watch_id AND listing_id = observations.listing_id) WHERE watch_listing_id IS NULL').run();
+    const service = context.service as any;
+    const rows = context.db.prepare('SELECT * FROM watches ORDER BY id').all() as Array<Record<string, any>>;
+    const variants: Array<Record<string, unknown>> = [{}, { min_price_pln: 150 }, { max_price_pln: 250 }, { min_price_pln: 120, max_price_pln: 260 }, { shipping_only: 1 }, { ai_relevance: 0 }, { min_price_pln: 100000 }];
+    let compared = 0;
+    for (const base of rows) {
+      for (const override of variants) {
+        const row = { ...base, ...override };
+        const actual = service.watchBaselines(row).buckets as Map<string, { prices: number[]; firstObservedAt: string | null }>;
+        const expected = legacyWatchBaselines(context.db, row);
+        const normalize = (buckets: Map<string, { prices: number[]; firstObservedAt: string | null }>) => [...buckets.entries()].map(([key, { prices, firstObservedAt }]) => [key, { prices, firstObservedAt }] as const).sort(([a], [b]) => a.localeCompare(b));
+        assert.deepEqual(normalize(actual), normalize(expected), `${row.id} ${JSON.stringify(override)}`);
+        compared += actual.size;
+      }
+    }
+    assert.ok(compared > 50);
+    const full = service.watchBaselines(rows.find((row) => row.id === 'stats-full')).buckets.get(OTHER_VARIANT_KEY);
+    assert.equal(full.prices.length, 400);
+  } finally { context.close(); }
+});
+
+test('counts the typo-variant scan ordinal once per watch run and matches the kind-filtered count', async () => {
+  const context = fixture();
+  try {
+    const service = context.service as any;
+    seedWatch(context.db, 'typo-ordinal', { query: 'kindle', sources: '["OLX","Vinted"]' });
+    context.db.prepare('UPDATE watches SET typo_variants = 1 WHERE id = ?').run('typo-ordinal');
+    const insertScan = context.db.prepare("INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, 'OLX', 'completed', ?)");
+    for (let index = 0; index < 7; index += 1) insertScan.run('typo-ordinal', 'watch', new Date(Date.now() - index * 60_000).toISOString());
+    const legacyOrdinal = (id: string, kind: string) => Number((context.db.prepare('SELECT COUNT(*) AS count FROM scans WHERE watch_id = ? AND watch_kind = ?').get(id, kind) as { count: number }).count);
+    const originalOrdinal = service.scanOrdinal.bind(service);
+    const ordinals: number[] = [];
+    service.scanOrdinal = (id: string, kind: 'watch' | 'research') => {
+      const value = originalOrdinal(id, kind);
+      assert.equal(value, legacyOrdinal(id, kind));
+      ordinals.push(value);
+      return value;
+    };
+    const queries: Record<string, string[]> = {};
+    service.fetchSearchPages = async (source: string, query: string) => { (queries[source] ??= []).push(query); return []; };
+    await service.runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('typo-ordinal'), { forceAll: true });
+    // Both sources' scans exist before either asks, so one count serves both.
+    assert.deepEqual(ordinals, [9]);
+    assert.ok(queries.OLX.length > 1);
+    assert.deepEqual(queries.Vinted, queries.OLX);
+
+    // An id shared with a research watch falls back to the kind-filtered count.
+    const now = new Date().toISOString();
+    context.db.prepare('INSERT INTO market_watches (id, name, query, sources_json, interval_hours, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run('typo-ordinal', 'Twin', 'kindle', '["OLX"]', 24, 0, now, now, now);
+    for (let index = 0; index < 4; index += 1) context.db.prepare("INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES ('typo-ordinal', 'research', 'OLX', 'completed', ?)").run(now);
+    assert.equal(originalOrdinal('typo-ordinal', 'watch'), 9);
+    assert.equal(originalOrdinal('typo-ordinal', 'research'), 4);
+  } finally { context.close(); }
+});
+
 test('market research filters match terms, price, condition, and shipping, from any town', () => {
   const listings = [
     { marketplace: 'OLX' as const, listingId: 'match', title: 'RTX 4070 12GB Founders Edition', price: 1800, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/match', condition: 'New', location: 'Warszawa', shippingAvailable: true, observedAt: new Date().toISOString() },
@@ -1124,7 +1857,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals', '031_flips', '032_flip_listings']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals', '030_perf_indexes', '031_flips', '032_flip_listings']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -1613,7 +2346,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 33);
+    assert.equal(after.migrations.count, 34);
   } finally { context.close(); }
 });
 
@@ -2666,6 +3399,77 @@ test('asks Jev to place Other listings that could be deals, before the relevance
   }
 });
 
+test('asks Jev variant questions through a bounded pool, once per distinct input, and applies picks in order', async () => {
+  const restore = liveJevEnv();
+  const asked: string[] = [];
+  let inFlight = 0;
+  let peak = 0;
+  const context = fixture({
+    classifyWatchVariantWithJev: async (ctx: any) => {
+      asked.push(ctx.title);
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      inFlight -= 1;
+      return { variantId: ctx.title.endsWith('v3') ? null : 'pro', decision: ctx.title.endsWith('v3') ? 'none' : 'variant', confidence: 0.9, unsure: false };
+    },
+    classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.95, unsure: false }),
+  });
+  try {
+    seedVariantWatch(context.db, context.service, 'pooled-variant-watch', 'iphone');
+    (context.service as any).processDealCandidates = async () => {};
+    // Ten candidates (the per-scan budget), two of them repeating the first
+    // title, so eight distinct questions.
+    const offers = Array.from({ length: 10 }, (_, index) => ({ id: `pooled-${index}`, title: `iPhone trzynastka Pro 128GB v${index >= 8 ? 0 : index}`, price: 1900 + index }));
+    (context.service as any).fetchOlxApi = olxListings(offers);
+    await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('pooled-variant-watch'));
+    assert.equal(asked.length, 8);
+    assert.equal(new Set(asked).size, 8);
+    assert.ok(peak > 1, 'calls overlap');
+    assert.ok(peak <= 6, `at most the Jev concurrency is in flight (peak ${peak})`);
+    const placed = (context.db.prepare(`SELECT l.listing_id, wl.variant_key, wl.variant_source FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id
+      WHERE l.listing_id LIKE 'pooled-%' ORDER BY l.listing_id`).all() as Array<Record<string, unknown>>).map((item) => ({ ...item }));
+    assert.deepEqual(placed, offers.map((offer, index) => index === 3
+      ? { listing_id: offer.id, variant_key: '__other__', variant_source: 'rule' }
+      : { listing_id: offer.id, variant_key: 'pro', variant_source: 'jev' }));
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('runs relevance checks through a bounded pool and keeps the input order and budget', async () => {
+  const restore = liveJevEnv();
+  let inFlight = 0;
+  let peak = 0;
+  const asked: string[] = [];
+  const context = fixture({
+    classifyListingRelevanceWithJev: async (ctx: any) => {
+      asked.push(ctx.title);
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      // The first listing is slow; the others must not wait for it.
+      await new Promise((resolve) => setTimeout(resolve, ctx.title.endsWith(' 0') ? 80 : 5));
+      inFlight -= 1;
+      return { relevant: !ctx.title.includes('case'), p: 0.95, unsure: false };
+    },
+  });
+  try {
+    seedWatch(context.db, 'pool-relevance-watch', { query: 'gpu' });
+    const now = new Date().toISOString();
+    const listings = Array.from({ length: 45 }, (_, index) => ({ marketplace: 'OLX' as const, listingId: `pool-${index}`, title: `${index % 5 === 2 ? 'GPU case' : 'RTX card'} ${index}`, price: 2000 + index, currency: 'PLN' as const, url: `https://www.olx.pl/d/oferta/pool-${index}`, observedAt: now }));
+    const result = await (context.service as any).filterListingsByAiRelevance(listings, { query: 'gpu', includedTerms: '', excludedTerms: '' }, 'pool-relevance-watch', true);
+    assert.ok(peak > 1 && peak <= 6, `peak ${peak}`);
+    // The per-scan budget of 40 goes to the first 40 listings in input order.
+    assert.deepEqual([...asked].sort(), listings.slice(0, 40).map((listing) => listing.title).sort());
+    assert.equal(result.unknown, 5);
+    assert.deepEqual(result.listings.map((listing: { listingId: string }) => listing.listingId), listings.filter((listing, index) => index >= 40 || !listing.title.includes('case')).map((listing) => listing.listingId));
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
 test('keeps unsure or failed Jev variant answers in Other, caching answers but retrying failures', async () => {
   const restore = liveJevEnv();
   let calls = 0;
@@ -2904,4 +3708,144 @@ test('private-only watches ask OLX for private sellers, skip promoted ads, and k
     // First seen today but posted long ago: not "new today".
     assert.equal(context.service.dashboard().stats.newToday, 0);
   } finally { context.close(); }
+});
+
+test('the final closeBrowser refuses relaunches and does not wait on a wedged Chromium', async (t) => {
+  const previousPath = process.env.SCOUT_CHROMIUM_PATH;
+  const previousWs = process.env.SCOUT_BROWSER_WS;
+  process.env.SCOUT_CHROMIUM_PATH = '/nonexistent/chromium';
+  delete process.env.SCOUT_BROWSER_WS;
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const context = fixture();
+  const service = context.service as any;
+  let launches = 0;
+  service.launchLocalBrowser = async () => {
+    launches += 1;
+    return {
+      on: () => {},
+      // A wedged Chromium: close() never settles.
+      close: () => new Promise<void>(() => {}),
+      newContext: async () => {
+        let target = '';
+        return {
+          route: async () => {},
+          routeWebSocket: async () => {},
+          close: async () => {},
+          newPage: async () => ({ goto: async (url: string) => { target = url; return { status: () => 200, ok: () => true }; }, waitForTimeout: async () => {}, url: () => target, content: async () => '<html></html>', close: async () => {} }),
+        };
+      },
+    };
+  };
+  try {
+    await service.renderInBrowser('https://www.olx.pl/d/oferta/a', 'OLX');
+    assert.equal(launches, 1);
+    let closed = false;
+    const closing = service.closeBrowser({ final: true }).then(() => { closed = true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(closed, false);
+    t.mock.timers.tick(5_000);
+    await closing;
+    assert.equal(closed, true);
+    // A scan still in flight after shutdown cannot start a new Chromium.
+    await assert.rejects(service.renderInBrowser('https://www.olx.pl/d/oferta/b', 'OLX'), /shutting down/);
+    assert.equal(launches, 1);
+    assert.equal(service.activeBrowserRenders, 0);
+    assert.equal(service.sharedBrowser, null);
+  } finally {
+    if (previousPath === undefined) delete process.env.SCOUT_CHROMIUM_PATH; else process.env.SCOUT_CHROMIUM_PATH = previousPath;
+    if (previousWs !== undefined) process.env.SCOUT_BROWSER_WS = previousWs;
+    context.close();
+  }
+});
+
+test('shares one locally launched Chromium across renders with a context each, and closes it when idle', async (t) => {
+  const previousPath = process.env.SCOUT_CHROMIUM_PATH;
+  const previousWs = process.env.SCOUT_BROWSER_WS;
+  process.env.SCOUT_CHROMIUM_PATH = '/nonexistent/chromium';
+  delete process.env.SCOUT_BROWSER_WS;
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const context = fixture();
+  const service = context.service as any;
+  const log = { launches: 0, contexts: 0, contextsClosed: 0, browsersClosed: 0 };
+  const routes: Array<(route: any) => unknown> = [];
+  const browsers: Array<{ disconnect: () => void }> = [];
+  let failLaunch = false;
+  service.launchLocalBrowser = async () => {
+    log.launches += 1;
+    if (failLaunch) throw new Error('launch failed');
+    const listeners: Array<() => void> = [];
+    const browser = {
+      on: (event: string, listener: () => void) => { if (event === 'disconnected') listeners.push(listener); },
+      close: async () => { log.browsersClosed += 1; },
+      newContext: async () => {
+        log.contexts += 1;
+        let target = '';
+        return {
+          route: async (_pattern: string, handler: (route: any) => unknown) => { routes.push(handler); },
+          routeWebSocket: async () => {},
+          close: async () => { log.contextsClosed += 1; },
+          newPage: async () => ({
+            goto: async (url: string) => { target = url; await new Promise<void>((resolve) => setImmediate(resolve)); return { status: () => 200, ok: () => true }; },
+            waitForTimeout: async () => {},
+            url: () => target,
+            content: async () => `<html>${target}</html>`,
+            close: async () => {},
+          }),
+        };
+      },
+    };
+    browsers.push({ disconnect: () => listeners.forEach((listener) => listener()) });
+    return browser;
+  };
+  const render = (id: string) => service.renderInBrowser(`https://www.olx.pl/d/oferta/${id}`, 'OLX') as Promise<string>;
+  try {
+    // Two concurrent renders: one launch, two isolated contexts.
+    assert.deepEqual(await Promise.all([render('a'), render('b')]), ['<html>https://www.olx.pl/d/oferta/a</html>', '<html>https://www.olx.pl/d/oferta/b</html>']);
+    assert.deepEqual(log, { launches: 1, contexts: 2, contextsClosed: 2, browsersClosed: 0 });
+    t.mock.timers.tick(19_000);
+    await render('c');
+    t.mock.timers.tick(19_000);
+    assert.deepEqual(log, { launches: 1, contexts: 3, contextsClosed: 3, browsersClosed: 0 });
+    // 20 s after the last render the browser closes; the next render relaunches.
+    t.mock.timers.tick(1_000);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(log.browsersClosed, 1);
+    await render('d');
+    assert.equal(log.launches, 2);
+    // A disconnected browser is dropped and relaunched.
+    browsers.at(-1)!.disconnect();
+    await render('e');
+    assert.equal(log.launches, 3);
+    // A failed launch is not cached.
+    await service.closeBrowser();
+    failLaunch = true;
+    await assert.rejects(render('f'), /launch failed/);
+    failLaunch = false;
+    await render('g');
+    assert.equal(log.launches, 5);
+    assert.equal(service.activeBrowserRenders, 0);
+
+    // Marketplace CDN images get a 1x1 GIF; everything else keeps the host guard.
+    const outcomes: string[] = [];
+    const route = (url: string, resourceType: string) => ({
+      request: () => ({ url: () => url, resourceType: () => resourceType }),
+      fulfill: async (response: { status: number; contentType: string; body: Buffer }) => { outcomes.push(`fulfill ${response.contentType} ${response.body.length}`); },
+      continue: async () => { outcomes.push('continue'); },
+      abort: async () => { outcomes.push('abort'); },
+    });
+    const handler = routes.at(-1)!;
+    await handler(route('https://ireland.apollo.olxcdn.com/v1/files/x-PL/image;s=1000x750', 'image'));
+    await handler(route('https://ireland.apollo.olxcdn.com/v1/files/app.js', 'script'));
+    await handler(route('https://challenges.cloudflare.com/cdn-cgi/challenge.png', 'image'));
+    await handler(route('http://localhost:3000/x.png', 'image'));
+    assert.deepEqual(outcomes, ['fulfill image/gif 42', 'continue', 'continue', 'abort']);
+
+    await service.closeBrowser();
+    assert.equal(log.browsersClosed, 3);
+  } finally {
+    await service.closeBrowser();
+    if (previousPath === undefined) delete process.env.SCOUT_CHROMIUM_PATH; else process.env.SCOUT_CHROMIUM_PATH = previousPath;
+    if (previousWs !== undefined) process.env.SCOUT_BROWSER_WS = previousWs;
+    context.close();
+  }
 });

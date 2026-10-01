@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import { ExternalLink, Eye, EyeOff, RefreshCw, Search, Tag } from "lucide-react";
 import { marketplaceColors } from "./data";
+import { listingRowKey, sameListingFields } from "./listingRows";
 import type { Listing } from "./types";
 import { listingAge } from "./listingSignals";
 
@@ -18,7 +19,9 @@ function safeImageUrl(value: string | null | undefined) {
   }
 }
 
-export default function ListingTable({
+// Memoized: App re-renders (toasts, connection, busy watches) and refetches
+// that change only some rows should not reconcile all ~500 rows.
+export default memo(function ListingTable({
   listings,
   compact = false,
   isLoading = false,
@@ -65,11 +68,11 @@ export default function ListingTable({
         <span role="columnheader" aria-label="Actions" />
       </div>
       {listings.map((listing) => (
-        <ListingRow key={listing.associationId ?? listing.id} listing={listing} onSelect={onSelect} onToggleHidden={onToggleHidden} />
+        <ListingRow key={listingRowKey(listing)} listing={listing} onSelect={onSelect} onToggleHidden={onToggleHidden} />
       ))}
     </div>
   );
-}
+});
 
 function ListingThumbnail({ listing }: { listing: Listing }) {
   const [failed, setFailed] = useState(false);
@@ -83,7 +86,11 @@ function ListingThumbnail({ listing }: { listing: Listing }) {
   );
 }
 
-function ListingRow({ listing, onSelect, onToggleHidden }: { listing: Listing; onSelect?: (listing: Listing) => void; onToggleHidden?: (listing: Listing) => void }) {
+type ListingRowProps = { listing: Listing; onSelect?: (listing: Listing) => void; onToggleHidden?: (listing: Listing) => void };
+
+// A refetch replaces every row object; rows whose fields are unchanged skip
+// (their handlers then receive an equal-content object, which is harmless).
+const ListingRow = memo(function ListingRow({ listing, onSelect, onToggleHidden }: ListingRowProps) {
   const aiFiltered = Boolean(listing.aiFiltered);
   const hidden = Boolean(listing.hidden);
   return (
@@ -165,7 +172,10 @@ function ListingRow({ listing, onSelect, onToggleHidden }: { listing: Listing; o
       </div>
     </div>
   );
-}
+}, (previous: ListingRowProps, next: ListingRowProps) =>
+  previous.onSelect === next.onSelect
+  && previous.onToggleHidden === next.onToggleHidden
+  && sameListingFields(previous.listing, next.listing));
 
 export function ListingSignalChips({ listing }: { listing: Listing }) {
   const age = listingAge(listing);

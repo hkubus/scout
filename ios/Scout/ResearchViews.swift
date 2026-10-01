@@ -10,15 +10,24 @@ struct ResearchListingsRoute: Hashable {
     var name: String?
 }
 
+/// The Research screen's data. MarketView owns it, so switching to Analytics
+/// and back shows it again without a reload.
+@MainActor
+@Observable
+final class ResearchStore {
+    var data: MarketResearchData?
+    var error: String?
+    let memory = LoadMemory()
+}
+
 struct ResearchView: View {
     @Environment(AppModel.self) private var model
-    @State private var data: MarketResearchData?
-    @State private var error: String?
+    var store: ResearchStore
     @State private var editor: MarketWatchEditorRequest?
 
     var body: some View {
         List {
-            if let data {
+            if let data = store.data {
                 Section {
                     StatGrid(items: stats(data))
                 } footer: {
@@ -67,7 +76,7 @@ struct ResearchView: View {
                 }
             }
         }
-        .overlay { LoadingOverlay(isLoaded: data != nil, error: error, retry: load) }
+        .overlay { LoadingOverlay(isLoaded: store.data != nil, error: store.error, retry: { await load() }) }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -81,7 +90,7 @@ struct ResearchView: View {
             MarketWatchEditorView(request: request)
         }
         .refreshable { await load() }
-        .task(id: model.refreshToken) { await load() }
+        .reloadOnChange(of: model.researchToken, memory: store.memory) { await load() }
     }
 
     private func stats(_ data: MarketResearchData) -> [StatGrid.Item] {
@@ -98,13 +107,16 @@ struct ResearchView: View {
         ]
     }
 
-    private func load() async {
-        guard let client = model.client else { return }
+    @discardableResult
+    private func load() async -> Bool {
+        guard let client = model.client else { return false }
         do {
-            data = try await client.marketResearch(page: 1, pageSize: 1)
-            error = nil
+            store.data = try await client.marketResearch(page: 1, pageSize: 1)
+            store.error = nil
+            return true
         } catch {
-            if !error.isCancellation { self.error = error.localizedDescription }
+            if !error.isCancellation { store.error = error.localizedDescription }
+            return false
         }
     }
 
@@ -189,9 +201,27 @@ struct ResearchWatchDetailView: View {
     @State private var scanMessage: String?
     @State private var editor: MarketWatchEditorRequest?
     @State private var confirmingDelete = false
+    /// The changes the shown summary was fetched for; a range change alone
+    /// only needs a new trend.
+    @State private var loadedVersion: WatchVersion?
 
     init(watch: MarketWatch) {
         _watch = State(initialValue: watch)
+    }
+
+    /// Changes to this research watch, including ones that name no watch.
+    private struct WatchVersion: Hashable {
+        var changes: Int
+        var allMarketWatches: Int
+    }
+
+    private struct LoadKey: Hashable {
+        var days: Int
+        var version: WatchVersion
+    }
+
+    private var version: WatchVersion {
+        WatchVersion(changes: model.marketWatchChanges[watch.id, default: 0], allMarketWatches: model.allMarketWatchesToken)
     }
 
     var body: some View {
@@ -302,8 +332,11 @@ struct ResearchWatchDetailView: View {
         .sheet(item: $editor) { request in
             MarketWatchEditorView(request: request)
         }
-        .refreshable { await load() }
-        .task(id: "\(days)-\(model.refreshToken)") { await load() }
+        .refreshable {
+            loadedVersion = nil
+            await load()
+        }
+        .reloadOnChange(of: LoadKey(days: days, version: version)) { await load() }
     }
 
     private func trendStats(_ trend: MarketWatchTrend) -> [StatGrid.Item] {
@@ -322,16 +355,26 @@ struct ResearchWatchDetailView: View {
         ]
     }
 
-    private func load() async {
-        guard let client = model.client else { return }
+    @discardableResult
+    private func load() async -> Bool {
+        guard let client = model.client else { return false }
+        let id = watch.id
+        let days = days
+        let version = version
         do {
-            trend = try await client.marketWatchTrend(id: watch.id, days: days)
-            if let fresh = try await client.marketResearch(page: 1, pageSize: 1).watches.first(where: { $0.id == watch.id }) {
-                watch = fresh
+            async let loadedTrend = client.marketWatchTrend(id: id, days: days)
+            if loadedVersion != version {
+                if let fresh = try await client.marketResearch(page: 1, pageSize: 1).watches.first(where: { $0.id == id }) {
+                    watch = fresh
+                }
+                loadedVersion = version
             }
+            trend = try await loadedTrend
             error = nil
+            return true
         } catch {
             if !error.isCancellation { self.error = error.localizedDescription }
+            return false
         }
     }
 
@@ -352,6 +395,7 @@ struct ResearchWatchDetailView: View {
         Task { @MainActor in
             do {
                 try await client.setMarketWatchEnabled(id: watch.id, enabled: enabled)
+                loadedVersion = nil
                 await load()
             } catch {
                 model.report(error)
@@ -364,7 +408,7 @@ struct ResearchWatchDetailView: View {
         Task { @MainActor in
             do {
                 try await client.deleteMarketWatch(id: watch.id)
-                model.refresh()
+                model.refreshUnlessLive()
                 dismiss()
             } catch {
                 model.report(error)
@@ -384,10 +428,12 @@ struct ResearchListingsView: View {
     @State private var pagination: Pagination?
     @State private var loadingMore = false
     @State private var error: String?
+    /// The status filter the rows were loaded for.
+    @State private var loadedStatus: MarketListingStatus??
 
     private struct LoadKey: Hashable {
         var status: MarketListingStatus?
-        var refreshToken: Int
+        var researchToken: Int
     }
 
     var body: some View {
@@ -408,7 +454,7 @@ struct ResearchListingsView: View {
             }
         }
         .listStyle(.plain)
-        .overlay { LoadingOverlay(isLoaded: pagination != nil, error: error, retry: reload) }
+        .overlay { LoadingOverlay(isLoaded: pagination != nil, error: error, retry: { await reload() }) }
         .navigationTitle(route.name ?? "Saved listings")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -425,18 +471,31 @@ struct ResearchListingsView: View {
             }
         }
         .refreshable { await reload() }
-        .task(id: LoadKey(status: status, refreshToken: model.refreshToken)) { await reload() }
+        .reloadOnChange(of: LoadKey(status: status, researchToken: model.researchToken)) { await reload() }
     }
 
-    private func reload() async {
-        guard let client = model.client else { return }
+    /// Loads page 1 for a new status filter. For the same one it refetches
+    /// every page already loaded in one request, so a refresh keeps the rows
+    /// and scroll position.
+    @discardableResult
+    private func reload() async -> Bool {
+        guard let client = model.client else { return false }
+        let status = status
+        let pages = loadedStatus == .some(status) ? ReloadPolicy.pagesToKeep(loadedRows: listings.count, maxRows: 400) : 1
         do {
-            let page = try await client.marketResearch(page: 1, pageSize: 50, watchId: route.watchId, status: status)
+            let page = try await client.marketResearch(page: 1, pageSize: pages * 50, watchId: route.watchId, status: status)
             listings = page.listings
-            pagination = page.pagination ?? Pagination(page: 1, pageSize: 50, total: page.listings.count, hasNext: false)
+            if let loaded = page.pagination {
+                pagination = Pagination(page: pages, pageSize: 50, total: loaded.total, hasNext: loaded.total > pages * 50)
+            } else {
+                pagination = Pagination(page: 1, pageSize: 50, total: page.listings.count, hasNext: false)
+            }
+            loadedStatus = .some(status)
             error = nil
+            return true
         } catch {
             if !error.isCancellation { self.error = error.localizedDescription }
+            return false
         }
     }
 
@@ -529,12 +588,8 @@ struct ResearchListingDetailView: View {
         List {
             Section {
                 if let url = listing.imageURL {
-                    AsyncImage(url: url) { phase in
-                        if let image = phase.image {
-                            image.resizable().scaledToFit()
-                        } else {
-                            Color.secondary.opacity(0.1)
-                        }
+                    PipelineImage(url: url, contentMode: .fit, pointSize: ImagePipeline.headerPoints) {
+                        Color.secondary.opacity(0.1)
                     }
                     .frame(maxWidth: .infinity, minHeight: 180, maxHeight: 300)
                     .listRowInsets(EdgeInsets())
@@ -598,7 +653,7 @@ struct ResearchListingDetailView: View {
             NavigationStack {
                 Group {
                     if let client = model.client {
-                        ServerImage(client: client, url: enlarged.url, contentMode: .fit) { ProgressView() }
+                        ServerImage(client: client, url: enlarged.url, contentMode: .fit, pointSize: ImagePipeline.fullScreenPoints) { ProgressView() }
                     }
                 }
                 .toolbar {
@@ -621,13 +676,13 @@ struct ResearchListingDetailView: View {
                 if let location = snapshot.location { LabeledContent("Location", value: location) }
                 if !snapshot.images.isEmpty, let client = model.client {
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
+                        LazyHStack(spacing: 8) {
                             ForEach(snapshot.images.sorted { $0.position < $1.position }) { image in
                                 let url = client.marketSnapshotImageURL(imageId: image.id)
                                 Button {
                                     enlargedImage = EnlargedImage(url: url)
                                 } label: {
-                                    ServerImage(client: client, url: url) {
+                                    ServerImage(client: client, url: url, pointSize: 96) {
                                         ZStack {
                                             Color.secondary.opacity(0.12)
                                             Image(systemName: "photo").foregroundStyle(.tertiary)

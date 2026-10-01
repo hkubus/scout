@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxSearchApiUrl, olxSearchPathSegments, parseOlxCategoryFacets, parseVintedPageSignals, parseOlxFriendlyLinks, resolveOlxSearchPath, type OlxSearchPathParams, buildVintedSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createVintedJsonAdapter, dedupeKey, normalizeListing, parseAllegroBatchEnrichmentApi, parseAllegroCards, parseListingAvailability, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseOlxListingAvailabilityApi, parseOlxOffersApi, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, parseVintedCatalogApi, parseVintedItemPageAvailability, validateSearchUrl, type ConnectorAdapter } from '../server/marketplaces';
+import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxSearchApiUrl, olxSearchPathSegments, parseOlxCategoryFacets, parseVintedPageSignals, parseOlxFriendlyLinks, resolveOlxSearchPath, type OlxSearchPathParams, buildVintedSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createVintedJsonAdapter, dedupeKey, normalizeListing, parseAllegroBatchEnrichmentApi, parseAllegroCards, parseListingAvailability, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseOlxListingAvailabilityApi, parseOlxOffersApi, parseOlxCards, parsePolishPrice, parsePriceNegotiability, parseSearchPage, parseShippingAvailability, parseStructuredListings, parseVintedCards, parseVintedCatalogApi, parseVintedItemPageAvailability, validateSearchUrl, type ConnectorAdapter, listingDescriptionText, olxDetailHint } from '../server/marketplaces';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { median, pruneBefore, scoreDeal } from '../server/scoring';
@@ -200,6 +200,30 @@ test('maps OLX offers API payloads onto normalized listings', () => {
   assert.equal(listing.promoted, null);
   assert.equal(listing.sellerType, null);
   assert.equal(listing.url, 'https://www.olx.pl/d/oferta/iphon-13-128gb-100-baterii-black-CID99-ID1bVYyE.html');
+});
+
+test('keeps the OLX offers-API description and gallery in a side channel normalized like the detail page', () => {
+  const fixture = JSON.parse(readFileSync(resolve(import.meta.dirname, 'fixtures-olx-api.json'), 'utf8'));
+  const [listing] = parseOlxOffersApi(fixture.search);
+  const hint = olxDetailHint(listing);
+  assert.equal(hint?.description, 'Witam, sprzedam iPhone 13 128GB. Stan bardzo dobry.');
+  assert.equal(hint?.imageUrls[0], 'https://ireland.apollo.olxcdn.com/v1/files/nl9i997bhz1g1-PL/image;s=1000x750');
+  // Never serialized with the listing and lost on a clone.
+  assert.equal(JSON.stringify(listing).includes('Witam'), false);
+  assert.equal(olxDetailHint({ ...listing }), undefined);
+
+  // The same text through parseListingDescription (the page path) normalizes identically.
+  const raw = '<p>Sprzedam konsolę &amp; pad.<br />Stan: <b>bardzo dobry</b></p>\n\n<p>Odbiór   Kraków</p>';
+  const photos = Array.from({ length: 15 }, (_, index) => ({ link: `https://ireland.apollo.olxcdn.com:443/v1/files/photo-${index}-PL/image;s={width}x{height}` }));
+  const [rich] = parseOlxOffersApi({ data: [{ id: 7, url: 'https://www.olx.pl/d/oferta/x-ID7.html', title: 'PS5', description: raw, photos: [...photos, { link: 'https://evil.example/x.jpg' }, photos[0]], params: [{ key: 'price', value: { value: 900, currency: 'PLN' } }] }] });
+  assert.equal(olxDetailHint(rich)?.description, parseListingDescription(`<div data-testid="ad_description">${raw}</div>`, 'OLX'));
+  assert.equal(olxDetailHint(rich)?.description, listingDescriptionText(raw, 'OLX'));
+  assert.equal(olxDetailHint(rich)?.imageUrls.length, 12);
+  assert.ok(olxDetailHint(rich)?.imageUrls.every((url, index) => url === `https://ireland.apollo.olxcdn.com/v1/files/photo-${index}-PL/image;s=1000x750`));
+
+  const [bare] = parseOlxOffersApi({ data: [{ id: 8, url: 'https://www.olx.pl/d/oferta/x-ID8.html', title: 'PS5', description: '  <p> </p> ', params: [{ key: 'price', value: { value: 900, currency: 'PLN' } }] }] });
+  assert.deepEqual(olxDetailHint(bare), { description: null, imageUrls: [] });
+  assert.equal(listingDescriptionText('Kup teraz Konsola za 900 zł i odbierz w mieście Kraków.', 'Allegro Lokalnie'), null);
 });
 
 test('treats zero visible totals and exhausted pages as explicit empty OLX searches', () => {

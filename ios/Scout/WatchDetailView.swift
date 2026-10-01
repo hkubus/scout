@@ -10,9 +10,29 @@ struct WatchDetailView: View {
     @State private var error: String?
     @State private var scanMessage: String?
     @State private var editor: WatchEditorRequest?
+    /// The watch changes the shown watch was fetched for; a range change
+    /// alone only needs new analytics.
+    @State private var loadedVersion: WatchVersion?
 
     init(watch: Watch) {
         _watch = State(initialValue: watch)
+    }
+
+    /// Changes to this watch: its scans and edits, edits that name no watch
+    /// (deletes), and triage, which changes its deal counts.
+    private struct WatchVersion: Hashable {
+        var changes: Int
+        var allWatches: Int
+        var triage: Int
+    }
+
+    private struct LoadKey: Hashable {
+        var days: Int
+        var version: WatchVersion
+    }
+
+    private var version: WatchVersion {
+        WatchVersion(changes: model.watchChanges[watch.id, default: 0], allWatches: model.allWatchesToken, triage: model.triageToken)
     }
 
     var body: some View {
@@ -157,20 +177,33 @@ struct WatchDetailView: View {
         .sheet(item: $editor) { request in
             WatchEditorView(request: request) { _ in }
         }
-        .refreshable { await load() }
-        .task(id: "\(days)-\(model.refreshToken)") { await load() }
+        .refreshable {
+            loadedVersion = nil
+            await load()
+        }
+        .reloadOnChange(of: LoadKey(days: days, version: version)) { await load() }
     }
 
-    private func load() async {
-        guard let client = model.client else { return }
+    @discardableResult
+    private func load() async -> Bool {
+        guard let client = model.client else { return false }
+        let id = watch.id
+        let days = days
+        let version = version
         do {
-            analytics = try await client.watchAnalytics(id: watch.id, days: days)
-            if let fresh = try await client.watches(includeArchived: true).first(where: { $0.id == watch.id }) {
-                watch = fresh
+            async let loadedAnalytics = client.watchAnalytics(id: id, days: days)
+            if loadedVersion != version {
+                if let fresh = try await client.watches(includeArchived: true).first(where: { $0.id == id }) {
+                    watch = fresh
+                }
+                loadedVersion = version
             }
+            analytics = try await loadedAnalytics
             error = nil
+            return true
         } catch {
             if !error.isCancellation { self.error = error.localizedDescription }
+            return false
         }
     }
 
@@ -191,8 +224,9 @@ struct WatchDetailView: View {
         Task { @MainActor in
             do {
                 try await client.updateWatch(id: watch.id, patch: WatchPatch(archived: archived))
+                loadedVersion = nil
                 await load()
-                model.refresh()
+                model.refreshUnlessLive()
             } catch {
                 model.report(error)
             }
@@ -205,6 +239,7 @@ struct WatchDetailView: View {
         Task { @MainActor in
             do {
                 try await client.updateWatch(id: watch.id, patch: WatchPatch(enabled: enabled))
+                loadedVersion = nil
                 await load()
             } catch {
                 model.report(error)

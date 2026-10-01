@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ComponentProps, type ComponentType, type FormEvent } from "react";
 import {
   AlertTriangle,
   ArrowRight,
@@ -26,8 +26,12 @@ import {
   Wallet,
   WifiOff,
 } from "lucide-react";
-import { api, UNAUTHORIZED_EVENT, type AuthSession } from "./api";
+import { api, ApiError, forgetInFlightGets, UNAUTHORIZED_EVENT, type AuthSession } from "./api";
 import { emptyDashboard } from "./data";
+import { reconnectPending, subscribe, subscribeStatus, type StreamStatus } from "./events";
+import { isListingActionEvent, patchListingRows } from "./listingActions";
+import { reuseUnchangedListings } from "./listingRows";
+import { allLiveResources, dashboardResources, eventResources, planFlush, streamDecidesConnection, type LiveResource } from "./liveRefresh";
 import ListingTable from "./ListingTable";
 import type { WatchPreset } from "./presets";
 import type {
@@ -53,50 +57,113 @@ const navItems: Array<{ id: View; label: string; icon: typeof Grid2X2 }> = [
   { id: "settings", label: "Settings", icon: Settings2 },
 ];
 
-const loadMarketResearchPage = () => import("./MarketResearchPage");
-const loadAnalyticsPage = () => import("./AnalyticsPage");
-const loadSettingsPage = () => import("./SettingsPage");
-const loadConnectorsPage = () => import("./ConnectorsPage");
-const loadLogsPage = () => import("./LogsPage");
-const loadSearchPage = () => import("./SearchPage");
-const loadListingsPage = () => import("./ListingsPage");
-const loadFlipsPage = () => import("./FlipsPage");
-const LazyFlipsPage = lazy(loadFlipsPage);
-const LazyMarketResearchPage = lazy(loadMarketResearchPage);
-const LazyAnalyticsPage = lazy(loadAnalyticsPage);
-const LazySettingsPage = lazy(loadSettingsPage);
-const LazyConnectorsPage = lazy(loadConnectorsPage);
-const LazyLogsPage = lazy(loadLogsPage);
-const LazySearchPage = lazy(loadSearchPage);
-const LazyListingsPage = lazy(loadListingsPage);
-const LazyListingDetailDrawer = lazy(() => import("./ListingDetailDrawer"));
-const loadWatchesPage = () => import("./WatchesPage");
-const LazyWatchesPage = lazy(loadWatchesPage);
-const LazyWatchAnalyticsDialog = lazy(() => loadWatchesPage().then((module) => ({ default: module.WatchAnalyticsDialog })));
-const loadDialogs = () => import("./Dialogs");
-const LazyWatchDialog = lazy(() => loadDialogs().then((module) => ({ default: module.WatchDialog })));
-const LazyPriceFilterDialog = lazy(() => loadDialogs().then((module) => ({ default: module.PriceFilterDialog })));
-const LazyHistoryDialog = lazy(() => loadDialogs().then((module) => ({ default: module.HistoryDialog })));
+/**
+ * React.lazy suspends on its first render even when the chunk is already
+ * loaded, and React then holds the reveal ~300 ms after the fallback. Once
+ * preload() has resolved, this renders the module's component directly, so a
+ * preloaded route, drawer or dialog mounts in the same commit. The type is
+ * pinned per mounted instance: switching a mounted Lazy to the loaded
+ * component would remount it and lose its state.
+ */
+function lazyWithPreload<C extends ComponentType<any>>(loader: () => Promise<{ default: C }>) {
+  let Loaded: C | null = null;
+  let pending: Promise<{ default: C }> | null = null;
+  const preload = () => {
+    pending ??= loader().then((module) => {
+      Loaded = module.default;
+      return module;
+    });
+    // A failed chunk load can be retried by the next preload or render.
+    pending.catch(() => { pending = null; });
+    return pending;
+  };
+  const Lazy = lazy(preload);
+  function Preloadable(props: ComponentProps<C>) {
+    const [Impl] = useState(() => (Loaded ?? Lazy) as ComponentType<ComponentProps<C>>);
+    return <Impl {...props} />;
+  }
+  return Object.assign(Preloadable, { preload });
+}
 
-const routeLoaders: Partial<Record<View, () => Promise<unknown>>> = {
-  search: loadSearchPage,
-  watches: loadWatchesPage,
-  "market-research": loadMarketResearchPage,
-  analytics: loadAnalyticsPage,
-  listings: loadListingsPage,
-  flips: loadFlipsPage,
-  connectors: loadConnectorsPage,
-  logs: loadLogsPage,
-  settings: loadSettingsPage,
+const LazyMarketResearchPage = lazyWithPreload(() => import("./MarketResearchPage"));
+const LazyAnalyticsPage = lazyWithPreload(() => import("./AnalyticsPage"));
+const LazySettingsPage = lazyWithPreload(() => import("./SettingsPage"));
+const LazyConnectorsPage = lazyWithPreload(() => import("./ConnectorsPage"));
+const LazyLogsPage = lazyWithPreload(() => import("./LogsPage"));
+const LazySearchPage = lazyWithPreload(() => import("./SearchPage"));
+const LazyListingsPage = lazyWithPreload(() => import("./ListingsPage"));
+const LazyFlipsPage = lazyWithPreload(() => import("./FlipsPage"));
+const LazyListingDetailDrawer = lazyWithPreload(() => import("./ListingDetailDrawer"));
+const loadWatchesPage = () => import("./WatchesPage");
+const LazyWatchesPage = lazyWithPreload(loadWatchesPage);
+const LazyWatchAnalyticsDialog = lazyWithPreload(() => loadWatchesPage().then((module) => ({ default: module.WatchAnalyticsDialog })));
+const loadDialogs = () => import("./Dialogs");
+const LazyWatchDialog = lazyWithPreload(() => loadDialogs().then((module) => ({ default: module.WatchDialog })));
+const LazyPriceFilterDialog = lazyWithPreload(() => loadDialogs().then((module) => ({ default: module.PriceFilterDialog })));
+const LazyHistoryDialog = lazyWithPreload(() => loadDialogs().then((module) => ({ default: module.HistoryDialog })));
+
+const routePages: Partial<Record<View, { preload: () => Promise<unknown> }>> = {
+  search: LazySearchPage,
+  watches: LazyWatchesPage,
+  "market-research": LazyMarketResearchPage,
+  analytics: LazyAnalyticsPage,
+  listings: LazyListingsPage,
+  flips: LazyFlipsPage,
+  connectors: LazyConnectorsPage,
+  logs: LazyLogsPage,
+  settings: LazySettingsPage,
 };
 
 const preloadView = (view: View) => {
-  void routeLoaders[view]?.();
+  void routePages[view]?.preload().catch(() => {});
 };
+
+/**
+ * Fetch every remaining route, drawer and dialog chunk once the browser is
+ * idle after `delayMs` (skipped on Save-Data), so they do not compete with
+ * the first view's own data request.
+ */
+let idlePreloadScheduled = false;
+function preloadRestWhenIdle(delayMs: number) {
+  if (idlePreloadScheduled) return;
+  idlePreloadScheduled = true;
+  if ((navigator as Navigator & { connection?: { saveData?: boolean } }).connection?.saveData) return;
+  const run = () => {
+    for (const component of [...Object.values(routePages), LazyListingDetailDrawer, LazyWatchAnalyticsDialog, LazyWatchDialog, LazyPriceFilterDialog, LazyHistoryDialog]) {
+      void component?.preload().catch(() => {});
+    }
+  };
+  window.setTimeout(() => {
+    if (typeof window.requestIdleCallback === "function") window.requestIdleCallback(run, { timeout: 3000 });
+    else run();
+  }, delayMs);
+}
 
 function viewFromLocation(): View {
   const raw = window.location.pathname.split(/[?#]/)[0].replace(/\/+$/, "").replace(/^\//, "") as View;
   return navItems.some((item) => item.id === raw) ? raw : "overview";
+}
+
+const initialView = viewFromLocation();
+/** Whether the first view renders the dashboard (see planFlush). */
+const initialViewNeedsDashboard = planFlush(initialView, new Set(allLiveResources), false, false).dashboard;
+// A deep-linked route's chunk loads alongside the session check, so it mounts without suspending.
+preloadView(initialView);
+
+// Boot requests start with the module, in parallel: the session check and,
+// when the first view shows it, the dashboard. ScoutApp's first refresh takes
+// the dashboard promise exactly once (in flight or already settled). A 401 on
+// a signed-out load is ignored while the session check decides (see App).
+// A tab opened in the background skips the dashboard: it could be shown hours
+// later, and a hidden tab fetches when it is shown.
+const bootSession = api.authSession();
+bootSession.catch(() => {});
+let bootDashboard: Promise<DashboardData> | null = initialViewNeedsDashboard && !document.hidden ? api.dashboard() : null;
+bootDashboard?.catch(() => {});
+function takeBootDashboard() {
+  const pending = bootDashboard;
+  bootDashboard = null;
+  return pending;
 }
 
 const errorMessage = (error: unknown) =>
@@ -130,18 +197,20 @@ function App() {
   const [auth, setAuth] = useState<"checking" | "login" | "ready">("checking");
   const [session, setSession] = useState<AuthSession | null>(null);
   useEffect(() => {
-    const controller = new AbortController();
-    api.authSession(controller.signal).then((value) => {
+    let active = true;
+    bootSession.then((value) => {
+      if (!active) return;
       setSession(value);
       setAuth(value.authenticated ? "ready" : "login");
     }).catch(() => {
       // Unreachable server: render the app so it shows its offline state.
-      if (!controller.signal.aborted) setAuth("ready");
+      if (active) setAuth("ready");
     });
-    const onUnauthorized = () => setAuth("login");
+    // The session check decides the first screen; a boot prefetch's 401 must not pre-empt it.
+    const onUnauthorized = () => setAuth((current) => (current === "checking" ? current : "login"));
     window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
     return () => {
-      controller.abort();
+      active = false;
       window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
     };
   }, []);
@@ -228,8 +297,6 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
   const [marketRefreshKey, setMarketRefreshKey] = useState(0);
   const [analyticsRefreshKey, setAnalyticsRefreshKey] = useState(0);
   const [listingsRefreshKey, setListingsRefreshKey] = useState(0);
-  const [logsRefreshKey, setLogsRefreshKey] = useState(0);
-  const [flipsRefreshKey, setFlipsRefreshKey] = useState(0);
   const [selectedWatchId, setSelectedWatchId] = useState<string | null>(
     null,
   );
@@ -249,58 +316,164 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
       setToast({ message, type }),
     [],
   );
+  // Live refresh (see liveRefresh.ts): server events only mark resources
+  // stale in refs, so they do not re-render the app by themselves. flush()
+  // refetches what the visible view shows and leaves the rest stale until a
+  // view that needs it is shown; hidden tabs wait until they are visible.
+  const viewRef = useRef(view);
+  const dirty = useRef(new Set<LiveResource>(allLiveResources));
+  const dashboardLoaded = useRef(false);
+  const dashboardFetches = useRef(0);
+  const connectorsSequence = useRef(0);
+  const streamStatus = useRef<StreamStatus | null>(null);
+  const flushTimer = useRef<number | null>(null);
+  const flushRef = useRef<() => Promise<void>>(async () => {});
+  const scheduleFlush = useCallback(() => {
+    if (flushTimer.current !== null) return;
+    flushTimer.current = window.setTimeout(() => {
+      flushTimer.current = null;
+      void flushRef.current();
+    }, 100);
+  }, []);
   const refreshData = useCallback(
     async (showLoader = false) => {
       const sequence = ++refreshSequence.current;
+      for (const resource of dashboardResources) dirty.current.delete(resource);
+      dashboardFetches.current += 1;
       if (showLoader) setIsLoading(true);
+      const boot = takeBootDashboard();
       try {
-        const next = await api.dashboard();
+        const next = await (boot ?? api.dashboard());
         if (sequence !== refreshSequence.current) return;
-        setData(next);
+        dashboardLoaded.current = true;
+        // Unchanged rows keep their identity, so Overview's filtered list and rows skip.
+        setData((previous) => {
+          const listings = reuseUnchangedListings(previous.listings, next.listings);
+          return listings === next.listings ? next : { ...next, listings };
+        });
         setConnection("online");
+        // Events that arrived while this request was in flight need a fresh one.
+        if (dirty.current.has("dashboard")) scheduleFlush();
       } catch (error) {
+        // The boot request's 401 fired while the session check was still deciding.
+        if (boot && error instanceof ApiError && error.status === 401) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
         if (sequence !== refreshSequence.current) return;
+        for (const resource of dashboardResources) dirty.current.add(resource);
         setConnection("offline");
         if (showLoader) notify(errorMessage(error), "error");
       } finally {
+        dashboardFetches.current -= 1;
         if (sequence === refreshSequence.current) {
           setIsLoading(false);
         }
       }
     },
-    [notify],
+    [notify, scheduleFlush],
   );
+  const flush = useCallback(async () => {
+    if (document.hidden) return;
+    const plan = planFlush(viewRef.current, dirty.current, dashboardLoaded.current, dashboardFetches.current > 0);
+    for (const resource of plan.clear) dirty.current.delete(resource);
+    // A failed dashboard fetch shows the offline banner; on views that do not
+    // refetch the dashboard, the live stream decides it again.
+    if (streamDecidesConnection(viewRef.current, plan) && dashboardFetches.current === 0 && streamStatus.current === "online") {
+      setConnection((current) => (current === "offline" ? "online" : current));
+    }
+    if (plan.page === "listings") setListingsRefreshKey((value) => value + 1);
+    if (plan.page === "analytics") setAnalyticsRefreshKey((value) => value + 1);
+    if (plan.page === "market") setMarketRefreshKey((value) => value + 1);
+    const pending: Array<Promise<unknown>> = [];
+    if (plan.dashboard) pending.push(refreshData(!dashboardLoaded.current));
+    if (plan.connectors) {
+      // Only the newest request applies, so an older one landing late cannot overwrite it.
+      const sequence = ++connectorsSequence.current;
+      pending.push(api.connectors().then(
+        (result) => {
+          if (sequence === connectorsSequence.current) setData((previous) => ({ ...previous, connectors: result.connectors }));
+        },
+        () => { dirty.current.add("connectors"); },
+      ));
+    }
+    await Promise.all(pending);
+  }, [refreshData]);
+  flushRef.current = flush;
 
   useEffect(() => {
-    void refreshData(true);
-  }, [refreshData]);
+    viewRef.current = view;
+    void flush();
+  }, [flush, view]);
+  // Once the first view has rendered its data, fetch the other chunks in the
+  // background. Pages that load their own data get a head start instead.
   useEffect(() => {
-    const source = new EventSource("/events");
-    let refreshTimer: number | null = null;
-    const refresh = () => {
-      setAnalyticsRefreshKey((value) => value + 1);
-      if (refreshTimer !== null) return;
-      refreshTimer = window.setTimeout(() => {
-        refreshTimer = null;
-        void refreshData(false);
-        setListingsRefreshKey((value) => value + 1);
-      }, 100);
+    if (initialViewNeedsDashboard ? !isLoading : true) preloadRestWhenIdle(initialViewNeedsDashboard ? 0 : 2500);
+  }, [isLoading]);
+  useEffect(() => {
+    const onVisibility = () => {
+      // A stream released while hidden reopens now; its "ready" reconciles
+      // everything once, so flushing here too would fetch the dashboard twice.
+      if (!document.hidden && !reconnectPending()) void flush();
     };
-    source.addEventListener("ready", () => setConnection("online"));
-    source.addEventListener("scan", refresh);
-    source.addEventListener("watch", refresh);
-    source.addEventListener("notification", refresh);
-    source.addEventListener("listing-action", refresh);
-    source.addEventListener("ai-description-verification", refresh);
-    source.addEventListener("market-watch", () => { setMarketRefreshKey((value) => value + 1); setAnalyticsRefreshKey((value) => value + 1); });
-    source.addEventListener("log", () => setLogsRefreshKey((value) => value + 1));
-    source.addEventListener("flips", () => setFlipsRefreshKey((value) => value + 1));
-    source.onerror = () => setConnection("offline");
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [flush]);
+  useEffect(() => {
+    const markDirty = (resources: readonly LiveResource[]) => {
+      for (const resource of resources) dirty.current.add(resource);
+      // Refetches must not share a GET that started before this event.
+      forgetInFlightGets();
+      scheduleFlush();
+    };
+    // Triage clicks (in any tab) patch the loaded rows at once and reconcile
+    // stats and pages once, 2 s after the last click of a burst.
+    let triageTimer: number | null = null;
+    const onListingAction = (payload: unknown) => {
+      if (!isListingActionEvent(payload)) return;
+      setData((previous) => {
+        const listings = patchListingRows(previous.listings, payload);
+        return listings === previous.listings ? previous : { ...previous, listings };
+      });
+      for (const resource of eventResources["listing-action"]) dirty.current.add(resource);
+      forgetInFlightGets();
+      if (triageTimer !== null) window.clearTimeout(triageTimer);
+      triageTimer = window.setTimeout(() => {
+        triageTimer = null;
+        void flushRef.current();
+      }, 2000);
+    };
+    const unsubscribers = [
+      // A stream that comes back after a gap (server restart, hidden tab) may have missed events.
+      subscribeStatus((status, reconnected) => {
+        streamStatus.current = status;
+        setConnection(status);
+        if (reconnected) markDirty(allLiveResources);
+      }),
+      ...Object.entries(eventResources)
+        .filter(([event]) => event !== "listing-action")
+        .map(([event, resources]) => subscribe(event, () => markDirty(resources))),
+      subscribe("listing-action", onListingAction),
+    ];
     return () => {
-      if (refreshTimer !== null) window.clearTimeout(refreshTimer);
-      source.close();
+      if (flushTimer.current !== null) window.clearTimeout(flushTimer.current);
+      if (triageTimer !== null) window.clearTimeout(triageTimer);
+      flushTimer.current = null;
+      for (const unsubscribe of unsubscribers) unsubscribe();
     };
-  }, [refreshData]);
+  }, [scheduleFlush]);
+  /** After a watch mutation: refetch what this view shows, mark the rest stale. */
+  const refreshAfterWatchChange = async () => {
+    for (const resource of eventResources.watch) dirty.current.add(resource);
+    if (viewRef.current !== "watches") {
+      // Watches refetches its own list when it is next shown.
+      setAllWatches(null);
+      return flush();
+    }
+    try {
+      const result = await api.watches(true);
+      setAllWatches(result.watches);
+    } catch (error) {
+      notify(errorMessage(error), "error");
+    }
+  };
   useEffect(() => {
     if (view !== "watches") return;
     void api.watches(true).then((result) => setAllWatches(result.watches)).catch((error) => notify(errorMessage(error), "error"));
@@ -408,8 +581,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     withBusyWatch(watch, async () => {
       try {
         await api.updateWatch(watch.id, { enabled: !watch.enabled });
-        await refreshData(false);
-        setWatchRefreshKey((value) => value + 1);
+        await refreshAfterWatchChange();
         notify(
           watch.enabled ? `${watch.name} paused.` : `${watch.name} resumed.`,
         );
@@ -421,8 +593,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     withBusyWatch(watch, async () => {
       try {
         await api.updateWatch(watch.id, { shippingOnly: !watch.shippingOnly });
-        await refreshData(false);
-        setWatchRefreshKey((value) => value + 1);
+        await refreshAfterWatchChange();
         notify(
           `Shipping-only filter ${watch.shippingOnly ? "disabled" : "enabled"} for ${watch.name}.`,
         );
@@ -434,8 +605,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     withBusyWatch(watch, async () => {
       try {
         await api.updateWatch(watch.id, { aiRelevance: !watch.aiRelevance });
-        await refreshData(false);
-        setWatchRefreshKey((value) => value + 1);
+        await refreshAfterWatchChange();
         notify(
           `AI relevance filter ${watch.aiRelevance ? "disabled" : "enabled"} for ${watch.name}.`,
         );
@@ -451,8 +621,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     withBusyWatch(watch, async () => {
       try {
         await api.updateWatch(watch.id, { minPrice, maxPrice });
-        await refreshData(false);
-        setWatchRefreshKey((value) => value + 1);
+        await refreshAfterWatchChange();
         setEditingWatch(null);
         notify(`Price filter updated for ${watch.name}.`);
       } catch (error) {
@@ -469,10 +638,8 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     return withBusyWatch(fullWatch, async () => {
       try {
         await api.updateWatch(fullWatch.id, { name: fullWatch.name, query: fullWatch.query, terms: fullWatch.terms, excluded: fullWatch.excluded, sources: fullWatch.sources, condition: fullWatch.condition, interval: fullWatch.interval, sourceIntervals: fullWatch.sourceIntervals, exactUrls: fullWatch.exactUrls, sensitivity: fullWatch.sensitivity, shippingOnly: fullWatch.shippingOnly, typoVariants: fullWatch.typoVariants, variantGroups: fullWatch.variantGroups, variantGroupsAuto: fullWatch.variantGroupsAuto, aiRelevance: fullWatch.aiRelevance, referenceMarketWatchId: fullWatch.referenceMarketWatchId, minPrice: fullWatch.minPrice, maxPrice: fullWatch.maxPrice, olxCategory: fullWatch.olxCategory ?? null, sellerType: fullWatch.sellerType ?? null, ignorePromoted: fullWatch.ignorePromoted ?? false, enabled: fullWatch.enabled });
-        await refreshData(false);
+        await refreshAfterWatchChange();
         setEditingFullWatch(null);
-        setAllWatches(null);
-        setWatchRefreshKey((value) => value + 1);
         notify(`${fullWatch.name} updated.`);
       } catch (error) {
         notify(errorMessage(error), "error");
@@ -487,9 +654,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         return;
       try {
         await api.updateWatch(watch.id, { archived: !archived });
-        await refreshData(false);
-        setAllWatches(null);
-        setWatchRefreshKey((value) => value + 1);
+        await refreshAfterWatchChange();
         notify(`${watch.name} ${archived ? "restored" : "archived"}. Its history is still retained.`);
       } catch (error) {
         notify(errorMessage(error), "error");
@@ -500,8 +665,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
       if (!window.confirm(`Permanently delete “${watch.name}”? All observations and analytics will be removed.`)) return;
       try {
         await api.deleteWatch(watch.id);
-        await refreshData(false);
-        setWatchRefreshKey((value) => value + 1);
+        await refreshAfterWatchChange();
         notify(`${watch.name} permanently deleted.`);
       } catch (error) {
         notify(errorMessage(error), "error");
@@ -526,6 +690,11 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
       current?.id === listing.id ? { ...current, decision: listing.decision, note: listing.note, hidden: listing.hidden } : current,
     );
   }, []);
+  // Stable, so the memoized SearchPage skips App re-renders (toasts, connection).
+  const saveSearchAsWatch = useCallback((preset: WatchPreset) => {
+    setWatchPreset(preset);
+    setShowWatchDialog(true);
+  }, []);
   const toggleListingHidden = useCallback(async (listing: Listing) => {
     const nextHidden = !listing.hidden;
     try {
@@ -533,8 +702,10 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
       const result = await api.updateListingAction(listing.marketplaceListingKey ?? listing.id, { hidden: nextHidden });
       updateListingAction({ ...listing, decision: result.action.decision, note: result.action.note, hidden: result.action.hidden });
       notify(nextHidden ? "Listing hidden from the overview and alerts." : "Listing unhidden.");
+      return result.action;
     } catch (error) {
       notify(errorMessage(error), "error");
+      return null;
     }
   }, [notify, updateListingAction]);
 
@@ -592,7 +763,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         ) : null}
         {view === "search" ? (
           <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading search…</div>}>
-            <LazySearchPage onSelectListing={setSelectedListing} onSaveWatch={(preset) => { setWatchPreset(preset); setShowWatchDialog(true); }} />
+            <LazySearchPage onSelectListing={setSelectedListing} onSaveWatch={saveSearchAsWatch} />
           </Suspense>
         ) : null}
         {view === "watches" ? (
@@ -638,7 +809,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         ) : null}
         {view === "flips" ? (
           <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading flips…</div>}>
-            <LazyFlipsPage refreshKey={flipsRefreshKey} onToast={notify} />
+            <LazyFlipsPage onToast={notify} />
           </Suspense>
         ) : null}
         {view === "connectors" ? (
@@ -654,7 +825,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         ) : null}
         {view === "logs" ? (
           <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading logs…</div>}>
-            <LazyLogsPage refreshKey={logsRefreshKey} onToast={notify} />
+            <LazyLogsPage onToast={notify} />
           </Suspense>
         ) : null}
         {view === "settings" ? (
