@@ -29,12 +29,6 @@ struct ResearchView: View {
         List {
             if let data = store.data {
                 Section {
-                    StatGrid(items: stats(data))
-                } footer: {
-                    Text("A listing counts as no longer available only after three verified checks. A missing or blocked search result alone is never treated as a sale.")
-                }
-
-                Section("Research watches") {
                     if data.watches.isEmpty {
                         ContentUnavailableView {
                             Label("No research watches yet", systemImage: "chart.bar.doc.horizontal")
@@ -65,13 +59,10 @@ struct ResearchView: View {
                             .tint(watch.enabled ? Color.orange : Color.scoutGreen)
                         }
                     }
-                }
-
-                if !data.watches.isEmpty {
-                    Section {
-                        NavigationLink(value: ResearchListingsRoute(watchId: nil, name: nil)) {
-                            Label("Saved listings", systemImage: "tray.full")
-                        }
+                } header: {
+                    if !data.watches.isEmpty {
+                        Text(verbatim: summary(data))
+                            .textCase(nil)
                     }
                 }
             }
@@ -93,18 +84,9 @@ struct ResearchView: View {
         .reloadOnChange(of: model.researchToken, memory: store.memory) { await load() }
     }
 
-    private func stats(_ data: MarketResearchData) -> [StatGrid.Item] {
-        let band = data.aggregates?.saleBand
-        return [
-            StatGrid.Item(title: "Research watches", value: "\(data.watches.count)", detail: "\(data.watches.filter(\.enabled).count) active"),
-            StatGrid.Item(title: "Live listings", value: "\(data.aggregates?.activeCount ?? 0)", detail: "currently observed"),
-            StatGrid.Item(title: "Ended listings", value: "\(data.aggregates?.endedCount ?? 0)", detail: "verified unavailable"),
-            StatGrid.Item(
-                title: "Probable-sale median",
-                value: band?.median.map(Format.pln) ?? "Learning",
-                detail: band?.median != nil ? "estimate · \(band?.eligibleCount ?? 0) probable sales" : "\(band?.eligibleCount ?? 0) eligible so far"
-            ),
-        ]
+    /// One line instead of a stat grid; a probable-sale median across unrelated products would mean nothing.
+    private func summary(_ data: MarketResearchData) -> String {
+        "\(data.watches.filter(\.enabled).count) of \(data.watches.count) active · \(data.aggregates?.activeCount ?? 0) live · \(data.aggregates?.endedCount ?? 0) ended"
     }
 
     @discardableResult
@@ -148,26 +130,21 @@ private struct ResearchWatchRow: View {
     var watch: MarketWatch
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .firstTextBaseline) {
                 Text(watch.name)
                     .font(.headline)
                     .lineLimit(1)
                 Spacer()
-                WatchStatusBadge(status: watch.enabled ? "Active" : "Paused")
+                if !watch.enabled { WatchStatusBadge(status: "Paused") }
             }
             HStack(spacing: 10) {
-                ForEach(watch.sources, id: \.self) { MarketplaceTag(marketplace: $0) }
-            }
-            HStack(spacing: 12) {
-                Text("\(watch.totalListings) tracked · \(watch.endedListings) ended")
-                Spacer(minLength: 0)
                 SaleBandLabel(band: watch.saleBand)
+                Spacer(minLength: 0)
+                Text(verbatim: "\(watch.totalListings) tracked · \(watch.endedListings) ended")
+                    .foregroundStyle(.secondary)
             }
             .font(.caption)
-            Text(verbatim: "Every \(watch.intervalHours) h · last \(watch.lastScan) · next \(watch.nextScan)")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
         }
         .padding(.vertical, 2)
         .opacity(watch.enabled ? 1 : 0.6)
@@ -198,7 +175,7 @@ struct ResearchWatchDetailView: View {
     @State private var trend: MarketWatchTrend?
     @State private var days = 90
     @State private var error: String?
-    @State private var scanMessage: String?
+    @State private var scanQueued = false
     @State private var editor: MarketWatchEditorRequest?
     @State private var confirmingDelete = false
     /// The changes the shown summary was fetched for; a range change alone
@@ -228,11 +205,21 @@ struct ResearchWatchDetailView: View {
         List {
             Section {
                 HStack {
-                    WatchStatusBadge(status: watch.enabled ? "Active" : "Paused")
+                    WatchStatusBadge(status: scanQueued ? "Scan queued" : watch.enabled ? "Active" : "Paused")
                     Spacer()
                     Text("\(watch.totalListings) tracked · \(watch.activeListings) live · \(watch.endedListings) ended")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+                if let band = watch.saleBand {
+                    LabeledContent("Probable sale") {
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text(band.median.map(Format.pln) ?? "Learning").monospacedDigit()
+                            Text(verbatim: bandDetail(band))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
                 NavigationLink(value: ResearchListingsRoute(watchId: watch.id, name: watch.name)) {
                     Label("Saved listings", systemImage: "tray.full")
@@ -248,50 +235,36 @@ struct ResearchWatchDetailView: View {
                 .pickerStyle(.segmented)
                 if let trend {
                     PriceBandChart(points: trend.points.compactMap { PriceBandPoint($0) }, reference: trend.probableSaleMedian)
-                        .frame(height: 200)
+                        .frame(height: 190)
                         .padding(.vertical, 6)
-                    StatGrid(items: trendStats(trend))
                 } else if let error {
                     Text(error).foregroundStyle(.secondary)
                 } else {
                     ProgressView().frame(maxWidth: .infinity)
                 }
             } header: {
-                Text("Asking prices vs probable sales")
+                Text("Asking prices")
             } footer: {
-                Text("The solid line is the median asking price of live listings, with the middle 50% shaded. The dashed line is the probable-sale median, estimated from listings verified as no longer available. It's an estimate, not a confirmed sale price.")
+                Text("Dashed line: the probable-sale estimate.")
             }
 
-            if let band = watch.saleBand {
-                Section("Probable-sale band") {
-                    LabeledContent("Median", value: band.median.map(Format.pln) ?? "Learning")
-                    if let low = band.p25, let high = band.p75 {
-                        LabeledContent("Middle 50%", value: "\(Format.pln(low)) – \(Format.pln(high))")
+            Section {
+                DisclosureGroup("Search settings") {
+                    LabeledContent("Query", value: watch.query)
+                    if !watch.terms.isEmpty { LabeledContent("Must include", value: watch.terms) }
+                    if !watch.excluded.isEmpty { LabeledContent("Excludes", value: watch.excluded) }
+                    LabeledContent("Marketplaces", value: watch.sources.map(\.rawValue).joined(separator: ", "))
+                    if watch.condition != "Any" { LabeledContent("Condition", value: watch.condition) }
+                    if watch.minPrice != nil || watch.maxPrice != nil {
+                        LabeledContent("Price", value: "\(watch.minPrice.map(Format.pln) ?? "any") – \(watch.maxPrice.map(Format.pln) ?? "any")")
                     }
-                    LabeledContent("Probable sales", value: "\(band.eligibleCount) of \(band.sampleCount) ended")
-                    if band.excludedStale > 0 {
-                        LabeledContent("Excluded as stale", value: "\(band.excludedStale)")
-                    }
-                    LabeledContent("Window", value: "\(band.windowDays) days")
+                    if watch.shippingOnly { LabeledContent("Shipping", value: "Required") }
+                    LabeledContent("Snapshot every", value: "\(watch.intervalHours) h · next \(watch.nextScan)")
                 }
-            }
-
-            Section("Search") {
-                LabeledContent("Query", value: watch.query)
-                if !watch.terms.isEmpty { LabeledContent("Must include", value: watch.terms) }
-                if !watch.excluded.isEmpty { LabeledContent("Excludes", value: watch.excluded) }
-                LabeledContent("Marketplaces", value: watch.sources.map(\.rawValue).joined(separator: ", "))
-                LabeledContent("Condition", value: watch.condition)
-                if watch.minPrice != nil || watch.maxPrice != nil {
-                    LabeledContent("Price", value: "\(watch.minPrice.map(Format.pln) ?? "any") – \(watch.maxPrice.map(Format.pln) ?? "any")")
-                }
-                if watch.shippingOnly { LabeledContent("Shipping", value: "Required") }
-                LabeledContent("Snapshot every", value: "\(watch.intervalHours) h")
-                LabeledContent("Last snapshot", value: watch.lastScan)
-                LabeledContent("Next snapshot", value: watch.nextScan)
             }
         }
         .navigationTitle(watch.name)
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
@@ -321,11 +294,6 @@ struct ResearchWatchDetailView: View {
         } message: {
             Text("Its snapshots and saved listings are deleted too.")
         }
-        .alert("Scan", isPresented: Binding(get: { scanMessage != nil }, set: { if !$0 { scanMessage = nil } })) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(scanMessage ?? "")
-        }
         .sheet(item: $editor) { request in
             MarketWatchEditorView(request: request)
         }
@@ -336,20 +304,12 @@ struct ResearchWatchDetailView: View {
         .reloadOnChange(of: LoadKey(days: days, version: version)) { await load() }
     }
 
-    private func trendStats(_ trend: MarketWatchTrend) -> [StatGrid.Item] {
-        let last = trend.points.last { $0.medianPrice != nil }
-        let band: String
-        if let low = last?.lowerPrice, let high = last?.upperPrice {
-            band = "\(Format.pln(low)) – \(Format.pln(high))"
-        } else {
-            band = "—"
-        }
-        return [
-            StatGrid.Item(title: "Live median", value: last?.medianPrice.map(Format.pln) ?? "—", detail: "latest observed day"),
-            StatGrid.Item(title: "Live band", value: band, detail: "middle 50% of asking prices"),
-            StatGrid.Item(title: "Probable-sale median", value: trend.probableSaleMedian.map(Format.pln) ?? "Learning", detail: "estimate"),
-            StatGrid.Item(title: "Observations", value: "\(trend.totalObservations)", detail: "in the last \(trend.rangeDays) days"),
-        ]
+    /// "1 050–1 350 zł · 102 of 181 ended", the middle half and how many sales it rests on.
+    private func bandDetail(_ band: SaleBand) -> String {
+        var parts: [String] = []
+        if let low = band.p25, let high = band.p75 { parts.append("\(Format.pln(low)) – \(Format.pln(high))") }
+        parts.append("\(band.eligibleCount) of \(band.sampleCount) ended")
+        return parts.joined(separator: " · ")
     }
 
     @discardableResult
@@ -379,7 +339,10 @@ struct ResearchWatchDetailView: View {
         guard let client = model.client else { return }
         Task { @MainActor in
             do {
-                scanMessage = try await client.scanMarketWatch(id: watch.id).message
+                _ = try await client.scanMarketWatch(id: watch.id)
+                scanQueued = true
+                try? await Task.sleep(for: .seconds(6))
+                scanQueued = false
             } catch {
                 model.report(error)
             }
@@ -601,34 +564,31 @@ struct ResearchListingDetailView: View {
                     Text(Format.pln(listing.lastPrice))
                         .font(.largeTitle.weight(.bold))
                         .monospacedDigit()
-                    Text(listing.status == "ended" ? "Last asking price. Not a confirmed sale." : "Current asking price")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                    if listing.status == "ended" {
+                        Text("Last asking price, not a confirmed sale")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 .padding(.vertical, 4)
             }
 
-            if history.count > 1 {
+            if Set(history.map(\.price)).count > 1 {
                 Section("Price history") {
                     PriceHistoryChart(points: history, typical: nil)
-                        .frame(height: 170)
-                        .padding(.vertical, 6)
+                        .frame(height: 120)
+                        .padding(.vertical, 4)
                 }
             }
 
             Section("Details") {
                 LabeledContent("Research watch", value: listing.watchName)
-                LabeledContent("First price", value: Format.pln(listing.firstPrice))
-                LabeledContent("Lowest price", value: Format.pln(listing.lowestPrice))
-                LabeledContent("Change", value: listing.priceChangePercent == 0 ? "—" : String(format: "%+.1f%%", listing.priceChangePercent))
-                LabeledContent("Observations", value: "\(listing.observations)")
-                LabeledContent("First seen", value: Format.day(listing.firstSeenAt))
-                LabeledContent("Last seen", value: Format.day(listing.lastSeenAt))
-                if let endedAt = listing.endedAt {
-                    LabeledContent("Ended", value: Format.day(endedAt))
+                if listing.priceChangePercent != 0 {
+                    LabeledContent("Price", value: "\(Format.pln(listing.firstPrice)) → \(Format.pln(listing.lastPrice)) (\(String(format: "%+.1f%%", listing.priceChangePercent)))")
                 }
+                LabeledContent("Seen", value: "\(Format.day(listing.firstSeenAt)) – \(Format.day(listing.endedAt ?? listing.lastSeenAt))")
                 if let reason = listing.endedReason {
-                    LabeledContent("Reason", value: reason)
+                    LabeledContent("Ended because", value: reason)
                 }
             }
 
@@ -667,10 +627,6 @@ struct ResearchListingDetailView: View {
     private var savedCopy: some View {
         Section {
             if let snapshot {
-                LabeledContent("Captured", value: Format.day(snapshot.capturedAt))
-                LabeledContent("Price then", value: Format.pln(snapshot.price))
-                if let condition = snapshot.condition { LabeledContent("Condition", value: condition) }
-                if let location = snapshot.location { LabeledContent("Location", value: location) }
                 if !snapshot.images.isEmpty, let client = model.client {
                     ScrollView(.horizontal, showsIndicators: false) {
                         LazyHStack(spacing: 8) {
@@ -715,9 +671,7 @@ struct ResearchListingDetailView: View {
                 ProgressView().frame(maxWidth: .infinity)
             }
         } header: {
-            Text("Saved copy")
-        } footer: {
-            Text("A saved copy keeps the description and photos after the listing disappears.")
+            Text(verbatim: snapshot.map { "Saved copy · \(Format.day($0.capturedAt))" } ?? "Saved copy")
         }
     }
 

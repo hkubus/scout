@@ -1,12 +1,15 @@
 import SwiftUI
 import ScoutKit
 
-/// The web overview: headline stats and the freshest scored listings.
+/// How many deals the tab shows; the rest are one tap away in All listings.
+private let topDealCount = 25
+
+/// The web's Top deals: Strong+ listings still worth a look, one status line.
 struct DealsView: View {
     @Environment(AppModel.self) private var model
     @State private var dashboard: DashboardData?
     @State private var error: String?
-    @State private var scanMessage: String?
+    @State private var scanQueued = false
     /// Bumped when triage needs a reload rather than a row patch.
     @State private var triageReloads = 0
 
@@ -14,33 +17,12 @@ struct DealsView: View {
         NavigationStack {
             List {
                 if let dashboard {
+                    let deals = topDeals(dashboard.listings)
                     Section {
-                        HStack(spacing: 0) {
-                            StatTile(value: dashboard.stats.watching, title: "Watching")
-                            Divider()
-                            StatTile(value: dashboard.stats.newToday, title: "New today")
-                            Divider()
-                            StatTile(value: dashboard.stats.strongDeals, title: "Strong deals")
+                        if deals.isEmpty {
+                            ContentUnavailableView("No strong deals right now", systemImage: "tag", description: Text("Listings at least 12% below their typical price show up here."))
                         }
-                        .padding(.vertical, 4)
-                    } footer: {
-                        VStack(alignment: .leading, spacing: 4) {
-                            ConnectionIndicator()
-                            Text("Last scan \(dashboard.lastScan). Prices are asking prices, not completed sales.")
-                        }
-                    }
-
-                    Section {
-                        NavigationLink(value: AllListingsRoute()) {
-                            Label("All listings", systemImage: "list.bullet.rectangle")
-                        }
-                    }
-
-                    Section("Latest") {
-                        if dashboard.listings.isEmpty {
-                            ContentUnavailableView("No deals yet", systemImage: "tag", description: Text("Scored listings appear here as your watches learn typical prices."))
-                        }
-                        ForEach(dashboard.listings, id: \.rowID) { listing in
+                        ForEach(deals, id: \.rowID) { listing in
                             NavigationLink(value: ListingLink(listing)) {
                                 ListingRow(listing: listing)
                             }
@@ -48,6 +30,12 @@ struct DealsView: View {
                                 replace(updated)
                             }
                         }
+                        NavigationLink(value: AllListingsRoute()) {
+                            Text("All listings")
+                        }
+                    } header: {
+                        Text(status(dashboard))
+                            .textCase(nil)
                     }
                 }
             }
@@ -55,9 +43,8 @@ struct DealsView: View {
             .navigationTitle("Deals")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button(action: scanAll) {
-                        Label("Scan all watches", systemImage: "arrow.triangle.2.circlepath")
-                    }
+                    Button("Scan now", action: scanAll)
+                        .disabled(scanQueued)
                 }
             }
             .refreshable { await load() }
@@ -65,13 +52,34 @@ struct DealsView: View {
             .onChange(of: model.listingAction) { _, action in
                 if let action { apply(action) }
             }
-            .alert("Scan", isPresented: Binding(get: { scanMessage != nil }, set: { if !$0 { scanMessage = nil } })) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(scanMessage ?? "")
-            }
             .scoutDestinations()
         }
+    }
+
+    /// Not hidden, not filtered by AI, not passed (the widget's rule) and
+    /// Strong or better; untriaged rows lead within a tier.
+    private func topDeals(_ listings: [Listing]) -> [Listing] {
+        let candidates = listings.filter {
+            $0.hidden != true && $0.aiFiltered != true && $0.decision != .pass && $0.dealStrength >= 3
+        }
+        let sorted = candidates.sorted { left, right in
+            if left.dealStrength != right.dealStrength { return left.dealStrength > right.dealStrength }
+            if (left.decision == nil) != (right.decision == nil) { return left.decision == nil }
+            return left.observedAt > right.observedAt
+        }
+        return Array(sorted.prefix(topDealCount))
+    }
+
+    /// "12 strong · 3 new today · scanned 5 min ago", plus the connection when it is not live.
+    private func status(_ dashboard: DashboardData) -> String {
+        var parts = ["\(dashboard.stats.strongDeals) strong", "\(dashboard.stats.newToday) new today"]
+        parts.append(scanQueued ? "scan queued" : "scanned \(dashboard.lastScan)")
+        switch model.connection {
+        case .offline: parts.append("offline")
+        case .demo: parts.append("demo data")
+        case .live, .connecting: break
+        }
+        return parts.joined(separator: " · ")
     }
 
     @discardableResult
@@ -118,31 +126,18 @@ struct DealsView: View {
         self.dashboard = dashboard
     }
 
+    /// Confirms in the status line instead of a blocking alert.
     private func scanAll() {
         guard let client = model.client else { return }
         Task { @MainActor in
             do {
-                scanMessage = try await client.queueScan().message
+                _ = try await client.queueScan()
+                scanQueued = true
+                try? await Task.sleep(for: .seconds(6))
+                scanQueued = false
             } catch {
                 model.report(error)
             }
         }
-    }
-}
-
-private struct StatTile: View {
-    var value: Int
-    var title: String
-
-    var body: some View {
-        VStack(spacing: 2) {
-            Text("\(value)")
-                .font(.title2.weight(.bold))
-                .monospacedDigit()
-            Text(title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity)
     }
 }

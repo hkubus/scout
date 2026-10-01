@@ -2,9 +2,9 @@
 
 A native SwiftUI client for a self-hosted Scout server. It covers:
 
-- the deal feed;
+- the top deals (Strong or better, untriaged first);
 - live marketplace search, like the web Search page, with "Save as watch";
-- the paginated listing history with triage (buy / watch / pass / hide);
+- the paginated listing history with triage (buy / maybe / pass / hide);
 - listing detail with price history and the AI description check;
 - creating, editing, archiving, pausing, and scanning watches, plus asking-price analytics;
 - market research watches with probable-sale estimates, saved listings, and saved copies;
@@ -62,9 +62,9 @@ Free Apple ID limits: apps must be refreshed every 7 days, and SideStore's refre
 
 To add a widget, long-press the Home Screen, tap **Edit → Add Widget**, and search for Scout. The widgets fetch `/api/dashboard` about every 15 minutes, and the app refreshes them whenever it loads new data. They show the last saved data, marked "Offline", when the server can't be reached, for example when the VPN is off.
 
-The widgets find your server through an App Group they share with the app. CI signs the IPA ad hoc with that entitlement so SideStore registers the group. SideStore renames the group for your Apple ID, and ScoutKit's `SharedStore` finds the renamed ID through the `ALTAppGroups` key that SideStore writes into Info.plist. If the group isn't available anyway (Settings → Widgets says so), long-press the widget, choose **Edit Widget**, and enter the server address there.
+The widgets find your server through an App Group they share with the app. CI signs the IPA ad hoc with that entitlement so SideStore registers the group. SideStore renames the group for your Apple ID, and ScoutKit's `SharedStore` finds the renamed ID through the `ALTAppGroups` key that SideStore writes into Info.plist. If the group isn't available anyway (the Settings footer says so), long-press the widget, choose **Edit Widget**, and enter the server address there.
 
-**Settings → Widgets → Preview widgets** shows every widget size with current data.
+In demo mode, **Settings → Preview widgets** shows every widget size; the CI screenshots use it.
 
 ## Deep links
 

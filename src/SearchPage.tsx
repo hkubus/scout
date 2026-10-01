@@ -1,16 +1,14 @@
 import { memo, useEffect, useRef, useState, type FormEvent } from "react";
-import { AlertTriangle, Bell, Check, ExternalLink, ListFilter, LoaderCircle, Search, Tag } from "lucide-react";
+import { AlertTriangle, Bell, Check, ExternalLink, ListFilter, LoaderCircle, Search, SlidersHorizontal } from "lucide-react";
 import { api } from "./api";
 import { marketplaceColors } from "./data";
 import { subscribe } from "./events";
 import { listingRowKey, reuseUnchangedListings, sameListingFields } from "./listingRows";
 import type { WatchPreset } from "./presets";
 import { OlxCategoryPicker } from "./OlxCategoryPicker";
-import { ListingSignalChips } from "./ListingTable";
+import { listingAge } from "./listingSignals";
+import { formatPln, ListingThumbnail, PageHeader } from "./ui";
 import type { Listing, Marketplace, OlxCategory, SearchFilters, SearchSourceStatus } from "./types";
-
-const formatPln = (value: number | null) =>
-  value === null ? "Learning" : `${value.toLocaleString("pl-PL")} zł`;
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
@@ -26,34 +24,6 @@ function mergeListings(current: Listing[], incoming: Listing[]) {
   const byId = new Map(current.map((listing) => [listing.id, listing]));
   for (const listing of incoming) byId.set(listing.id, listing);
   return [...byId.values()].sort((a, b) => a.price - b.price);
-}
-
-function safeImageUrl(value: string | null | undefined) {
-  if (!value) return null;
-  if (value.startsWith("data:image/")) return value;
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" ? url.toString() : null;
-  } catch {
-    return null;
-  }
-}
-
-function PageHeader({ title, description }: { title: string; description?: string }) {
-  return (
-    <header className="page-header page-header--inner">
-      <div>
-        <h1>{title}</h1>
-        {description ? <p>{description}</p> : null}
-      </div>
-    </header>
-  );
-}
-
-function ListingThumbnail({ listing }: { listing: Listing }) {
-  const [failed, setFailed] = useState(false);
-  const image = safeImageUrl(listing.image);
-  return image && !failed ? <img src={image} alt="" loading="lazy" onError={() => setFailed(true)} /> : <div className="listing-thumb-placeholder"><Tag size={20} /></div>;
 }
 
 // Memoized with stable props from App, so App re-renders (toasts, connection) skip the page.
@@ -72,6 +42,7 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
   const [aiRelevance, setAiRelevance] = useState(
     () => localStorage.getItem("scout-search-ai-relevance") !== "0",
   );
+  const [filtersOpen, setFiltersOpen] = useState(false);
   const [sources, setSources] = useState<Marketplace[]>([
     "OLX",
     "Allegro Lokalnie",
@@ -110,6 +81,10 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
     page: targetPage,
     aiRelevance,
   });
+  // Counted on the collapsed Filters button, so hidden filters are never a surprise.
+  const activeFilters = [minPrice, maxPrice, terms.trim(), excluded.trim()].filter(Boolean).length
+    + (condition !== "Any" ? 1 : 0) + (ownerType !== "Any" ? 1 : 0) + (shippingOnly ? 1 : 0)
+    + (olxCategory && sources.includes("OLX") ? 1 : 0) + (aiRelevance ? 0 : 1);
   const toggleSource = (source: Marketplace) =>
     setSources((current) =>
       current.includes(source)
@@ -184,12 +159,11 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
       setLoadingMore(false);
     }
   };
+  // Per-source progress matters while searching; afterwards only failures do.
+  const visibleStatuses = loading ? sourceStatuses : sourceStatuses.filter((status) => status.status === "error" || status.status === "searching");
   return (
     <>
-      <PageHeader
-        title="Search"
-        description="Search all marketplaces now without creating a watch or changing its price history."
-      />
+      <PageHeader title="Search" />
       <form className="manual-search-panel" onSubmit={submit}>
         <div className="manual-search-query">
           <Search size={19} />
@@ -214,78 +188,8 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
             {loading ? "Searching…" : "Search all"}
           </button>
         </div>
-        <div className="search-filter-grid">
-          <label className="field-label">
-            Minimum price <span>PLN</span>
-            <input
-              type="number"
-              min="0"
-              step="1"
-              placeholder="No minimum"
-              value={minPrice}
-              onChange={(event) => setMinPrice(event.target.value)}
-            />
-          </label>
-          <label className="field-label">
-            Maximum price <span>PLN</span>
-            <input
-              type="number"
-              min="1"
-              step="1"
-              placeholder="No maximum"
-              value={maxPrice}
-              onChange={(event) => setMaxPrice(event.target.value)}
-            />
-          </label>
-          <label className="field-label">
-            Condition
-            <select
-              value={condition}
-              onChange={(event) => setCondition(event.target.value)}
-            >
-              <option>Any</option>
-              <option>New</option>
-              <option>Used</option>
-            </select>
-          </label>
-          <label className="field-label">
-            Seller <span>OLX, Vinted</span>
-            <select
-              value={ownerType}
-              onChange={(event) => setOwnerType(event.target.value)}
-            >
-              <option>Any</option>
-              <option>Private</option>
-              <option>Business</option>
-            </select>
-          </label>
-        </div>
-        <div className="search-advanced-row">
-          <label className="field-label">
-            Included terms
-            <input
-              placeholder="e.g. oled, 512gb"
-              value={terms}
-              onChange={(event) => setTerms(event.target.value)}
-            />
-          </label>
-          <label className="field-label">
-            Excluded terms
-            <input
-              placeholder="e.g. broken, parts"
-              value={excluded}
-              onChange={(event) => setExcluded(event.target.value)}
-            />
-          </label>
-        </div>
-        {sources.includes("OLX") ? (
-          <div className="search-olx-category">
-            <OlxCategoryPicker query={query} value={olxCategory} onChange={setOlxCategory} />
-          </div>
-        ) : null}
         <div className="search-options-row">
           <div>
-            <span className="filter-label">Sources</span>
             <div className="source-options">
               {(["OLX", "Allegro Lokalnie", "Vinted"] as Marketplace[]).map(
                 (source) => (
@@ -304,35 +208,79 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
               )}
             </div>
           </div>
-          <label className="check-option">
-            <input
-              type="checkbox"
-              checked={shippingOnly}
-              onChange={(event) => setShippingOnly(event.target.checked)}
-            />
-            <span>
-              <strong>Shipping only</strong>
-              <small>Hide pickup-only and unknown delivery results</small>
-            </span>
-          </label>
-          <label className="check-option">
-            <input
-              type="checkbox"
-              checked={aiRelevance}
-              onChange={(event) => {
-                setAiRelevance(event.target.checked);
-                localStorage.setItem(
-                  "scout-search-ai-relevance",
-                  event.target.checked ? "1" : "0",
-                );
-              }}
-            />
-            <span>
-              <strong>AI relevance filtering</strong>
-              <small>Hide accessories, parts, and unrelated matches; off is faster</small>
-            </span>
-          </label>
+          <button
+            type="button"
+            className={`outline-button${activeFilters ? " active-filter" : ""}`}
+            aria-expanded={filtersOpen}
+            aria-controls="search-filters"
+            onClick={() => setFiltersOpen((open) => !open)}
+          >
+            <SlidersHorizontal size={15} />
+            Filters{activeFilters ? ` (${activeFilters})` : ""}
+          </button>
         </div>
+        {filtersOpen ? (
+          <div id="search-filters" className="search-filters">
+            <div className="search-filter-grid">
+              <label className="field-label">
+                Minimum price <span className="field-hint-inline">PLN</span>
+                <input type="number" min="0" step="1" placeholder="No minimum" value={minPrice} onChange={(event) => setMinPrice(event.target.value)} />
+              </label>
+              <label className="field-label">
+                Maximum price <span className="field-hint-inline">PLN</span>
+                <input type="number" min="1" step="1" placeholder="No maximum" value={maxPrice} onChange={(event) => setMaxPrice(event.target.value)} />
+              </label>
+              <label className="field-label">
+                Condition
+                <select value={condition} onChange={(event) => setCondition(event.target.value)}>
+                  <option>Any</option>
+                  <option>New</option>
+                  <option>Used</option>
+                </select>
+              </label>
+              <label className="field-label" title="OLX and Vinted only">
+                Seller
+                <select value={ownerType} onChange={(event) => setOwnerType(event.target.value)}>
+                  <option>Any</option>
+                  <option>Private</option>
+                  <option>Business</option>
+                </select>
+              </label>
+            </div>
+            <div className="search-advanced-row">
+              <label className="field-label">
+                Included terms
+                <input placeholder="e.g. oled, 512gb" value={terms} onChange={(event) => setTerms(event.target.value)} />
+              </label>
+              <label className="field-label">
+                Excluded terms
+                <input placeholder="e.g. broken, parts" value={excluded} onChange={(event) => setExcluded(event.target.value)} />
+              </label>
+            </div>
+            {sources.includes("OLX") ? (
+              <div className="search-olx-category">
+                <OlxCategoryPicker query={query} value={olxCategory} onChange={setOlxCategory} />
+              </div>
+            ) : null}
+            <div className="search-checks">
+              <label className="check-option" title="Hide pickup-only and unknown delivery results">
+                <input type="checkbox" checked={shippingOnly} onChange={(event) => setShippingOnly(event.target.checked)} />
+                <strong>Shipping only</strong>
+              </label>
+              <label className="check-option" title="Hide accessories, parts and unrelated matches; off is faster">
+                <input
+                  type="checkbox"
+                  checked={aiRelevance}
+                  onChange={(event) => {
+                    setAiRelevance(event.target.checked);
+                    localStorage.setItem("scout-search-ai-relevance", event.target.checked ? "1" : "0");
+                  }}
+                />
+                <strong>AI relevance filtering</strong>
+              </label>
+            </div>
+          </div>
+        ) : null}
         {!validPrices ? (
           <div className="form-error" role="alert">
             <AlertTriangle size={15} />
@@ -340,12 +288,12 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
           </div>
         ) : null}
       </form>
-      {sourceStatuses.length ? (
+      {visibleStatuses.length ? (
         <div
           className="search-source-statuses"
           aria-label="Marketplace search status"
         >
-          {sourceStatuses.map((status) => (
+          {visibleStatuses.map((status) => (
             <div
               key={status.source}
               className={`search-source-status search-source-status--${status.status}`}
@@ -454,8 +402,10 @@ const SearchResultRow = memo(function SearchResultRow({ listing, onSelect }: Sea
         <ListingThumbnail listing={listing} />
         <div>
           <strong>{listing.title}</strong>
-          <span>{listing.subtitle || "No extra details"}</span>
-          <ListingSignalChips listing={listing} />
+          <span className="listing-item-meta">
+            <span>{listing.subtitle || "No extra details"}</span>
+            <SignalChips listing={listing} />
+          </span>
         </div>
       </button>
       <div className="marketplace-cell" role="cell">
@@ -494,6 +444,16 @@ const SearchResultRow = memo(function SearchResultRow({ listing, onSelect }: Sea
   );
 }, (previous: SearchResultRowProps, next: SearchResultRowProps) =>
   previous.onSelect === next.onSelect && sameListingFields(previous.listing, next.listing));
+
+function SignalChips({ listing }: { listing: Listing }) {
+  const age = listingAge(listing);
+  return (
+    <>
+      {age ? <em className={`decision-chip decision-chip--age decision-chip--age-${age.freshness}`} title={age.detail}>{age.label.replace("Posted ", "").replace(" ago", "")}</em> : null}
+      {listing.sellerType === "business" ? <em className="decision-chip decision-chip--business" title="The marketplace marks this seller as a business account">Business</em> : null}
+    </>
+  );
+}
 
 function PriceNegotiability({ listing }: { listing: Listing }) {
   const supported = listing.marketplace === "OLX" || listing.marketplace === "Allegro Lokalnie";

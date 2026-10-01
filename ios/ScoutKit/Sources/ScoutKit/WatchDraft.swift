@@ -113,8 +113,8 @@ public struct WatchDraft: Hashable, Sendable {
     }
 
     /// Why the server would reject this draft, if it would.
+    /// The name is optional: an empty one becomes the query (see `normalized`).
     public var validationError: String? {
-        if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Give the watch a name." }
         if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Enter what Scout should search for." }
         if sources.isEmpty { return "Pick at least one marketplace." }
         if !(5...1440).contains(interval) { return "The scan interval must be between 5 and 1440 minutes." }
@@ -126,8 +126,9 @@ public struct WatchDraft: Hashable, Sendable {
 
     func normalized() -> WatchDraft {
         var copy = self
-        copy.name = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(120))
         copy.query = String(query.trimmingCharacters(in: .whitespacesAndNewlines).prefix(240))
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        copy.name = String((name.isEmpty ? copy.query : name).prefix(120))
         copy.terms = terms.trimmingCharacters(in: .whitespacesAndNewlines)
         copy.excluded = excluded.trimmingCharacters(in: .whitespacesAndNewlines)
         let place = location.trimmingCharacters(in: .whitespacesAndNewlines)

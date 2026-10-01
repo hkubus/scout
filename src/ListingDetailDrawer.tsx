@@ -1,20 +1,16 @@
 import { useEffect, useState } from "react";
 import {
   AlertTriangle,
-  Calculator,
   Bell,
   Check,
   CheckCircle2,
   ExternalLink,
   Eye,
   EyeOff,
-  Info,
-  Layers,
   LoaderCircle,
   PackageCheck,
+  Pencil,
   Scale,
-  ShieldCheck,
-  Tag,
   X,
 } from "lucide-react";
 import { api } from "./api";
@@ -23,6 +19,7 @@ import { PriceSparkline } from "./PriceSparkline";
 import { listingAge } from "./listingSignals";
 import { DEFAULT_FEE_PRESETS, FLIP_CHANNELS, saleFee, type FeePresets, type FlipChannel } from "./profit";
 import { dayMonth, formatDate } from "./format";
+import { decisionLabels, discountDisplay, formatPln, ListingThumbnail } from "./ui";
 import type {
   Flip,
   Listing,
@@ -31,28 +28,8 @@ import type {
   VerificationComparison,
 } from "./types";
 
-const formatPln = (value: number | null) =>
-  value === null ? "Learning" : `${value.toLocaleString("pl-PL")} zł`;
-
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
-
-function safeImageUrl(value: string | null | undefined) {
-  if (!value) return null;
-  if (value.startsWith("data:image/")) return value;
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" ? url.toString() : null;
-  } catch {
-    return null;
-  }
-}
-
-function ListingThumbnail({ listing }: { listing: Listing }) {
-  const [failed, setFailed] = useState(false);
-  const image = safeImageUrl(listing.image);
-  return image && !failed ? <img src={image} alt="" loading="lazy" onError={() => setFailed(true)} /> : <div className="listing-thumb-placeholder"><Tag size={20} /></div>;
-}
 
 export default function ListingDetailDrawer({
   listing,
@@ -90,6 +67,7 @@ export default function ListingDetailDrawer({
   const [saving, setSaving] = useState(false);
   const [comparison, setComparison] = useState<VerificationComparison | null>(null);
   const [comparing, setComparing] = useState(false);
+  const [editingEstimate, setEditingEstimate] = useState(false);
   const [storedListing, setStoredListing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const currentListing = detail.listing;
@@ -106,8 +84,9 @@ export default function ListingDetailDrawer({
   // ROI is profit relative to what you spend; margin is profit relative to the sale price.
   const expectedRoi = expectedProfit === null || totalCost <= 0 ? null : (expectedProfit / totalCost) * 100;
   const expectedMargin = expectedProfit === null || expectedResale === null || expectedResale <= 0 ? null : (expectedProfit / expectedResale) * 100;
-  const typicalSavings = currentListing.typical === null ? null : currentListing.typical - totalCost;
   const showDescriptionSafeguard = currentListing.dealStrength >= 4 || Boolean(detail.descriptionSnapshot);
+  const verificationStatus = currentListing.aiDescriptionVerificationStatus;
+  const discount = discountDisplay(currentListing);
 
   useEffect(() => {
     let active = true;
@@ -250,7 +229,15 @@ export default function ListingDetailDrawer({
   const chartPoints = detail.history.length
     ? detail.history
     : [{ price: currentListing.price, observedAt: currentListing.observedAt }];
-  const lastPoint = chartPoints[chartPoints.length - 1];
+  const priceChanged = new Set(chartPoints.map((point) => point.price)).size > 1;
+  const facts = [
+    currentListing.shippingAvailable === true ? "Shipping" : currentListing.shippingAvailable === false ? "Pickup only" : null,
+    currentListing.sellerType === "business" ? "Business seller" : currentListing.sellerType === "private" ? "Private seller" : null,
+    currentListing.promoted ? "Promoted" : null,
+    currentListing.condition || null,
+    currentListing.location || null,
+  ].filter(Boolean);
+  const toggleDecision = (option: ListingDecision) => void saveAction(decision === option ? null : option);
   return (
     <div
       className="listing-drawer-backdrop"
@@ -274,200 +261,203 @@ export default function ListingDetailDrawer({
             </div>
             <div className="drawer-hero-copy">
               <strong className="drawer-price">{formatPln(currentListing.price)}</strong>
-              <span>{currentListing.typical === null ? "Baseline is still learning" : `${Math.abs(currentListing.belowTypical ?? 0).toFixed(1)}% below typical`}{currentListing.typicalSource === "reference-band" ? " · series baseline" : ""}</span>
-              <small>{currentListing.condition || "Condition not specified"}{currentListing.location ? ` · ${currentListing.location}` : ""}</small>
+              <span className="drawer-typical">
+                {currentListing.typical === null ? "Typical price is still learning" : (
+                  <>
+                    typical {formatPln(currentListing.typical)}
+                    {currentListing.typicalSource === "reference-band" ? <span title="From the watch's research series while its own typical is learning"> (research)</span> : null}
+                    {" · "}
+                    <b className={`discount-cell--${discount.tone}`}>{discount.tone === "none" ? `${discount.text} vs typical` : `${discount.text} below`}</b>
+                  </>
+                )}
+              </span>
+              {postedAge ? <small title={postedAge.detail}>{postedAge.label}</small> : null}
               {currentListing.variantLabel ? <em className="decision-chip decision-chip--variant" title="Model variant this listing is scored against, not the watch-wide blend">{currentListing.variantLabel}</em> : null}
             </div>
           </div>
+          {facts.length ? <p className="drawer-facts">{facts.join(" · ")}</p> : null}
+          {verificationStatus && verificationStatus !== "not-configured" ? <VerificationLine status={verificationStatus} /> : null}
 
-          {detail.variantGroups?.length && currentListing.watchId ? <section className="drawer-section">
-            <div className="drawer-section-heading">
-              <div><span className="drawer-section-kicker">Scored within</span><h3>Model variant</h3></div>
-              <Layers size={17} />
-            </div>
-            <label className="field-label">
-              Variant
-              <select
-                value={currentListing.variantSource === "manual" ? currentListing.variantKey ?? "" : ""}
-                disabled={saving}
-                onChange={(event) => void changeVariant(event.target.value || null)}
-              >
-                <option value="">Automatic{currentListing.variantSource !== "manual" ? ` — ${currentListing.variantLabel ?? "Other / unclassified"}` : ""}</option>
-                {detail.variantGroups.map((group) => <option key={group.id} value={group.id}>{group.label}</option>)}
-              </select>
-            </label>
-            <p className="drawer-section-copy">
-              {currentListing.variantSource === "manual"
-                ? "Set manually — scans keep this variant until you switch back to automatic."
-                : currentListing.variantSource === "jev"
-                  ? "Placed by AI because no variant's terms matched the title."
-                  : currentListing.variantKey && detail.variantGroups.some((group) => group.id === currentListing.variantKey)
-                    ? "Matched by the variant's terms."
-                    : "No variant's terms matched, so this listing is scored with Other / unclassified. Pick a variant to score it against that model."}
-            </p>
-          </section> : null}
+          <div className="decision-grid" role="group" aria-label="Decision">
+            {(["buy", "watch", "pass"] as ListingDecision[]).map((option) => {
+              const Icon = option === "buy" ? Check : option === "watch" ? Bell : X;
+              return (
+                <button
+                  type="button"
+                  key={option}
+                  className={`decision-button decision-button--${option} ${decision === option ? "decision-button--active" : ""}`}
+                  aria-pressed={decision === option}
+                  title={decision === option ? "Click again to clear" : undefined}
+                  disabled={saving}
+                  onClick={() => toggleDecision(option)}
+                >
+                  <Icon size={16} />{decisionLabels[option]}
+                </button>
+              );
+            })}
+          </div>
 
-          {showDescriptionSafeguard ? <section className="drawer-section drawer-section--verification">
-            <div className="drawer-section-heading">
-              <div><span className="drawer-section-kicker">High-priority deal safeguard</span><h3>Description verification</h3></div>
-              <ShieldCheck size={17} />
-            </div>
-            {currentListing.aiDescriptionVerificationStatus === "pass" ? <div className="description-verification-result description-verification-result--pass"><CheckCircle2 size={15} /><strong>Passed</strong><span>The description supports a functional item.</span></div> : null}
-            {currentListing.aiDescriptionVerificationStatus === "reject" ? <div className="description-verification-result description-verification-result--reject"><AlertTriangle size={15} /><strong>Alert held</strong><span>The description contains a material issue.</span></div> : null}
-            {currentListing.aiDescriptionVerificationStatus === "unknown" ? <div className="description-verification-result description-verification-result--unknown"><AlertTriangle size={15} /><strong>Alert held</strong><span>The listing could not be verified safely.</span></div> : null}
-            {currentListing.aiDescriptionVerificationStatus === "fallback" ? <div className="description-verification-result description-verification-result--unknown"><AlertTriangle size={15} /><strong>Alert sent without AI check</strong><span>OpenRouter verification failed, so deterministic scoring was used.</span></div> : null}
-            {currentListing.aiDescriptionVerificationStatus === "pending" ? <div className="description-verification-result description-verification-result--pending"><LoaderCircle size={15} className="spin" /><strong>Checking</strong><span>Fetching the detail page and description.</span></div> : null}
-            {currentListing.aiDescriptionVerificationStatus === "not-configured" || !currentListing.aiDescriptionVerificationStatus ? <p className="drawer-section-copy">OpenRouter is not configured for this safeguard, so the high-priority alert follows deterministic scoring.</p> : null}
-            {detail.descriptionSnapshot ? <div className="listing-description-snapshot">
-              <div className="listing-description-snapshot-heading"><strong>Saved listing state</strong><span>{new Date(detail.descriptionSnapshot.capturedAt).toLocaleString("pl-PL")}</span></div>
-              <div className="listing-description-snapshot-meta"><span>{formatPln(detail.descriptionSnapshot.price)}</span>{detail.descriptionSnapshot.condition ? <span>{detail.descriptionSnapshot.condition}</span> : null}{detail.descriptionSnapshot.location ? <span>{detail.descriptionSnapshot.location}</span> : null}</div>
-              <p>{detail.descriptionSnapshot.description || "No description was exposed on the detail page."}</p>
-            </div> : <p className="drawer-section-copy">No detail snapshot has been saved yet.</p>}
-            {currentListing.aiDescriptionVerification?.summary ? <p className="drawer-section-copy">{currentListing.aiDescriptionVerification.summary}</p> : null}
-            {currentListing.aiDescriptionVerification?.issues.length ? <div className="ai-normalization-warning"><AlertTriangle size={14} />{currentListing.aiDescriptionVerification.issues.join(" · ")}</div> : null}
-            {currentListing.aiDescriptionVerification?.evidence.length ? <p className="drawer-section-copy">Evidence: {currentListing.aiDescriptionVerification.evidence.join(" · ")}</p> : null}
-            {currentListing.aiDescriptionVerificationError ? <div className="ai-normalization-error"><AlertTriangle size={14} />{currentListing.aiDescriptionVerificationError}</div> : null}
-          </section> : null}
-
-          {showDescriptionSafeguard ? <section className="drawer-section drawer-section--ai">
-            <div className="drawer-section-heading">
-              <div><span className="drawer-section-kicker">Jev vs LLM</span><h3>What each engine returned</h3></div>
-              <Scale size={17} />
-            </div>
-            <p className="drawer-section-copy">Jev returns a typed judgment only (decision + confidence). The LLM returns a full verification (decision + confidence + summary + issues + evidence).</p>
-            {detail.verificationInputHash ? <p className="drawer-section-copy">Input hash <strong>{detail.verificationInputHash.slice(0, 12)}…</strong>{detail.verificationModel ? <> · stored model <strong>{detail.verificationModel}</strong></> : null}</p> : null}
-            {detail.verificationTrace?.length ? (
-              <div className="ai-normalization-tags" style={{ flexDirection: "column", alignItems: "stretch", gap: 8 }}>
-                {detail.verificationTrace.map((entry) => (
-                  <div key={entry.id} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                    <span><strong>Jev</strong> · {entry.jevModel} · {new Date(entry.createdAt).toLocaleString("pl-PL")}{entry.note ? ` · ${entry.note}` : ""}</span>
-                    <span>{entry.jevError ? `Jev error: ${entry.jevError}` : `answer: ${JSON.stringify(entry.jevAnswer)}${entry.jevConfidence !== null ? ` · confidence ${entry.jevConfidence.toFixed(2)}` : ""}${entry.jevUnsure ? " · unsure" : ""}`}</span>
-                    {(entry.visionVerdict || entry.visionError || entry.deepseekDecision) ? (
-                      <span>Vision: {entry.visionError ? entry.visionError : `${entry.visionVerdict ?? "—"}${entry.visionConfidence !== null && entry.visionConfidence !== undefined ? ` (${entry.visionConfidence.toFixed(2)})` : ""}${entry.visionImagesSeen !== null && entry.visionImagesSeen !== undefined ? ` · ${entry.visionImagesSeen} photo(s)` : ""}`} · LLM: {entry.deepseekDecision ?? "—"}{entry.agreement !== null && entry.agreement !== undefined ? (entry.agreement ? " · agree" : " · disagree") : ""}</span>
-                    ) : null}
-                  </div>
-                ))}
-              </div>
-            ) : <p className="drawer-section-copy">No stored Jev trace for this description yet — run a comparison below.</p>}
-            {storedListing ? <button className="outline-button ai-normalize-button" type="button" disabled={comparing} onClick={() => void compareJevVsLlm()}>{comparing ? <LoaderCircle size={15} className="spin" /> : <Scale size={15} />}{comparing ? "Comparing…" : comparison ? "Re-run comparison" : "Compare Jev vs LLM"}</button> : <span className="drawer-muted">Comparison is available after a listing is saved by a watch.</span>}
-            {comparison ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
-                <div className="ai-normalization-tags" style={{ flexDirection: "column", alignItems: "stretch" }}>
-                  <span><strong>Jev</strong> · {comparison.jevModel}</span>
-                  {comparison.jev.ok
-                    ? <span>decision <strong>{comparison.jev.judgment.decision}</strong> · confidence {comparison.jev.judgment.confidence === null ? "null" : comparison.jev.judgment.confidence.toFixed(2)}{comparison.jev.judgment.unsure ? " · unsure → would escalate to vision" : " · firm"}</span>
-                    : <span>Jev error: {comparison.jev.error}</span>}
-                  <details><summary className="drawer-muted">Raw Jev JSON</summary><pre style={{ whiteSpace: "pre-wrap", fontSize: 12, margin: "4px 0 0" }}>{JSON.stringify(comparison.jev.ok ? comparison.jev.raw : { error: comparison.jev.error }, null, 2)}</pre></details>
-                </div>
-                <div className="ai-normalization-tags" style={{ flexDirection: "column", alignItems: "stretch" }}>
-                  <span><strong>LLM</strong> · {comparison.llmModel}</span>
-                  {comparison.llm.ok
-                    ? <>
-                      <span>decision <strong>{comparison.llm.verification.decision}</strong> · confidence {comparison.llm.verification.confidence.toFixed(2)}</span>
-                      <span>{comparison.llm.verification.summary}</span>
-                      {comparison.llm.verification.issues.length ? <span>Issues: {comparison.llm.verification.issues.join(" · ")}</span> : null}
-                      {comparison.llm.verification.evidence.length ? <span>Evidence: {comparison.llm.verification.evidence.join(" · ")}</span> : null}
-                    </>
-                    : <span>LLM error: {comparison.llm.error}</span>}
-                  <details><summary className="drawer-muted">Raw LLM JSON</summary><pre style={{ whiteSpace: "pre-wrap", fontSize: 12, margin: "4px 0 0" }}>{JSON.stringify(comparison.llm.ok ? comparison.llm.raw : { error: comparison.llm.error }, null, 2)}</pre></details>
-                </div>
-              </div>
-            ) : null}
-          </section> : null}
-
-          <section className="drawer-section drawer-section--decision">
-            <div className="drawer-section-heading">
-              <div><span className="drawer-section-kicker">Triage</span><h3>What do you want to do?</h3></div>
-              {hidden ? <span className="decision-chip decision-chip--hidden"><EyeOff size={11} />Hidden</span> : null}
-              {decision ? <span className={`decision-chip decision-chip--${decision}`}>{decision === "buy" ? "Buy" : decision === "watch" ? "Watch" : "Pass"}</span> : null}
-            </div>
-            <div className="decision-grid">
-              {(["buy", "watch", "pass"] as ListingDecision[]).map((option) => {
-                const Icon = option === "buy" ? Check : option === "watch" ? Bell : X;
-                const label = option === "buy" ? "Buy" : option === "watch" ? "Watch" : "Pass";
-                return (
-                  <button
-                    type="button"
-                    key={option}
-                    className={`decision-button decision-button--${option} ${decision === option ? "decision-button--active" : ""}`}
-                    disabled={saving}
-                    onClick={() => void saveAction(option)}
-                  >
-                    <Icon size={16} />{label}
-                  </button>
-                );
-              })}
-            </div>
-            {decision ? <button className="clear-decision" type="button" disabled={saving} onClick={() => void saveAction(null)}>Clear decision</button> : null}
-            <button
-              className="outline-button drawer-save-note"
-              type="button"
-              disabled={saving}
-              title={hidden ? "Show this listing again in the overview and alerts" : "Remove this listing from the overview and alerts without deleting its history"}
-              onClick={() => void saveAction(decision, !hidden)}
-            >
-              {saving ? <LoaderCircle size={15} className="spin" /> : hidden ? <Eye size={15} /> : <EyeOff size={15} />}
-              {hidden ? "Unhide listing" : "Hide listing"}
-            </button>
-            {onCreateWatch ? (
-              <button className="outline-button drawer-save-note" type="button" onClick={() => onCreateWatch(watchPresetFromListing(currentListing))}>
-                <Bell size={15} />
-                Save as watch
+          <section className="drawer-estimate">
+            <div className="drawer-estimate-line">
+              {expectedProfit === null ? (
+                <span>Add a resale price to estimate profit.</span>
+              ) : (
+                <span>
+                  ≈ <strong className={expectedProfit >= 0 ? "result-positive" : "result-negative"}>{expectedProfit >= 0 ? "+" : "−"}{formatPln(Math.abs(Math.round(expectedProfit)))}</strong>
+                  {expectedRoi !== null ? ` (ROI ${expectedRoi.toFixed(0)}%)` : ""} if resold at {formatPln(expectedResale)} on {sellOn}
+                </span>
+              )}
+              <button type="button" className="icon-button" aria-expanded={editingEstimate} aria-label="Edit the estimate" title="Edit costs, resale price and channel" onClick={() => setEditingEstimate((open) => !open)}>
+                <Pencil size={15} />
               </button>
+            </div>
+            {editingEstimate ? (
+              <div className="calculator-fields">
+                <label className="field-label">Shipping / fees (zł)<input type="number" min="0" step="1" value={shippingCost} onChange={(event) => setShippingCost(event.target.value)} placeholder="0" /></label>
+                <label className="field-label">Other cost (zł)<input type="number" min="0" step="1" value={extraCost} onChange={(event) => setExtraCost(event.target.value)} placeholder="0" /></label>
+                <label className="field-label">Expected resale (zł)<input type="number" min="0" step="1" value={resalePrice} onChange={(event) => setResalePrice(event.target.value)} placeholder="Add estimate" /></label>
+                <label className="field-label" title={resaleFee ? `Seller fee ${formatPln(Math.round(resaleFee))}` : "No seller fee"}>Sell on<select value={sellOn} onChange={(event) => setSellOn(event.target.value as FlipChannel)}>{FLIP_CHANNELS.map((channel) => <option key={channel}>{channel}</option>)}</select></label>
+                <p className="drawer-muted">Cost {formatPln(totalCost)}{resaleFee ? ` · seller fee ${formatPln(Math.round(resaleFee))}` : ""}{expectedMargin !== null ? ` · margin ${expectedMargin.toFixed(0)}%` : ""}. An estimate from asking prices, not sales.</p>
+              </div>
             ) : null}
-            <label className="drawer-note-label">
-              Note
-              <textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="e.g. Ask for a battery-health screenshot" />
-            </label>
-            <button className="outline-button drawer-save-note" type="button" disabled={saving} onClick={() => void saveAction()}>
-              {saving ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />}
-              {saving ? "Saving…" : "Save note"}
-            </button>
-            {error ? <div className="form-error" role="alert"><AlertTriangle size={15} />{error}</div> : null}
-          </section>
-
-          <section className="drawer-section">
-            <div className="drawer-section-heading">
-              <div><span className="drawer-section-kicker">Evidence</span><h3>Price history</h3></div>
-              {loading ? <LoaderCircle size={16} className="spin" /> : <span className="drawer-muted">{detail.history.length ? `${detail.history.length} observations` : "First look"}</span>}
-            </div>
-            <div className="price-chart-card"><PriceSparkline points={chartPoints} /><div className="price-chart-labels"><span>{formatPln(Math.min(...chartPoints.map((point) => point.price)))}</span><strong>Latest {formatPln(lastPoint.price)}</strong><span>{formatPln(Math.max(...chartPoints.map((point) => point.price)))}</span></div></div>
-            <div className="drawer-meta-grid">
-              <div><span>First seen</span><strong>{formatDate(dayMonth, detail.firstSeenAt)}</strong></div>
-              <div><span>Last seen</span><strong>{formatDate(dayMonth, detail.lastSeenAt)}</strong></div>
-              <div><span>Shipping</span><strong>{currentListing.shippingAvailable === true ? "Available" : currentListing.shippingAvailable === false ? "Pickup only" : "Unknown"}</strong></div>
-              {postedAge ? <div title={postedAge.detail}><span>Posted</span><strong>{postedAge.label.replace(/^Posted /, "")}</strong></div> : null}
-              <div><span>Seller</span><strong>{currentListing.sellerType === "business" ? "Business" : currentListing.sellerType === "private" ? "Private" : "Unknown"}{currentListing.promoted ? " · promoted" : ""}</strong></div>
-            </div>
-          </section>
-
-          <section className="drawer-section drawer-section--calculator">
-            <div className="drawer-section-heading">
-              <div><span className="drawer-section-kicker">Scenario</span><h3>Total cost & resale</h3></div>
-              <Calculator size={17} />
-            </div>
-            <p className="drawer-section-copy">Estimate what this deal costs after delivery and what is left if you resell it.</p>
-            <div className="calculator-fields">
-              <label className="field-label">Shipping / fees <span>PLN</span><input type="number" min="0" step="1" value={shippingCost} onChange={(event) => setShippingCost(event.target.value)} placeholder="0" /></label>
-              <label className="field-label">Other cost <span>PLN</span><input type="number" min="0" step="1" value={extraCost} onChange={(event) => setExtraCost(event.target.value)} placeholder="0" /></label>
-              <label className="field-label">Expected resale <span>PLN</span><input type="number" min="0" step="1" value={resalePrice} onChange={(event) => setResalePrice(event.target.value)} placeholder="Add estimate" /></label>
-              <label className="field-label">Sell on <span>{resaleFee ? `fee ${formatPln(Math.round(resaleFee))}` : feePresets[sellOn].percent || feePresets[sellOn].fixed ? `${feePresets[sellOn].percent.toLocaleString("pl-PL")}% seller fee` : "no seller fee"}</span><select value={sellOn} onChange={(event) => setSellOn(event.target.value as FlipChannel)}>{FLIP_CHANNELS.map((channel) => <option key={channel}>{channel}</option>)}</select></label>
-            </div>
-            <div className="calculator-results">
-              <div><span>Total cost</span><strong>{formatPln(totalCost)}</strong></div>
-              <div><span>Expected profit</span><strong className={expectedProfit === null ? "" : expectedProfit >= 0 ? "result-positive" : "result-negative"}>{expectedProfit === null ? "Add resale" : formatPln(expectedProfit)}</strong></div>
-              <div><span>ROI on cost</span><strong className={expectedRoi === null ? "" : expectedRoi >= 0 ? "result-positive" : "result-negative"}>{expectedRoi === null ? "—" : `${expectedRoi.toFixed(1)}%`}</strong></div>
-              <div><span>Margin on sale</span><strong className={expectedMargin === null ? "" : expectedMargin >= 0 ? "result-positive" : "result-negative"}>{expectedMargin === null ? "—" : `${expectedMargin.toFixed(1)}%`}</strong></div>
-            </div>
             <button type="button" className="outline-button drawer-flip-button" disabled={addingFlip || flipAdded} onClick={() => void addFlip()}>
               {addingFlip ? <LoaderCircle size={15} className="spin" /> : flipAdded ? <Check size={15} /> : <PackageCheck size={15} />}
               {flipAdded ? "Added to Flips" : "I bought this"}
             </button>
-            {typicalSavings !== null ? <div className={`calculator-callout ${typicalSavings >= 0 ? "calculator-callout--positive" : "calculator-callout--negative"}`}><Info size={15} />{typicalSavings >= 0 ? `${formatPln(typicalSavings)} below the learned typical price after extra costs.` : `${formatPln(Math.abs(typicalSavings))} above the learned typical price after extra costs.`}</div> : null}
           </section>
+
+          <label className="drawer-note-label">
+            Note
+            <textarea
+              value={note}
+              rows={2}
+              onChange={(event) => setNote(event.target.value)}
+              // Saved when you leave the field, like the decision buttons.
+              onBlur={() => { if (note !== detail.action.note && !saving) void saveAction(); }}
+              placeholder="e.g. Ask for a battery-health screenshot"
+            />
+          </label>
+          {error ? <div className="form-error" role="alert"><AlertTriangle size={15} />{error}</div> : null}
+
+          <section className="drawer-section">
+            <div className="drawer-section-heading">
+              <h3>Price history</h3>
+              {loading ? <LoaderCircle size={16} className="spin" /> : <span className="drawer-muted">Seen {formatDate(dayMonth, detail.firstSeenAt)} – {formatDate(dayMonth, detail.lastSeenAt)}</span>}
+            </div>
+            {priceChanged ? (
+              <div className="price-chart-card">
+                <PriceSparkline points={chartPoints} reference={currentListing.typical} />
+                <div className="price-chart-labels">
+                  <span>{formatPln(Math.min(...chartPoints.map((point) => point.price)))}</span>
+                  <strong>{currentListing.typical !== null ? "– – typical" : `${chartPoints.length} observations`}</strong>
+                  <span>{formatPln(Math.max(...chartPoints.map((point) => point.price)))}</span>
+                </div>
+              </div>
+            ) : (
+              <p className="drawer-section-copy">{loading ? "Loading…" : `Unchanged at ${formatPln(currentListing.price)} since Scout first saw it.`}</p>
+            )}
+          </section>
+
+          {detail.variantGroups?.length && currentListing.watchId ? (
+            <section className="drawer-section">
+              <label className="field-label drawer-inline-field">
+                Model variant
+                <select
+                  value={currentListing.variantSource === "manual" ? currentListing.variantKey ?? "" : ""}
+                  disabled={saving}
+                  title={currentListing.variantSource === "manual"
+                    ? "Set manually; scans keep this variant until you switch back to automatic."
+                    : currentListing.variantSource === "jev"
+                      ? "Placed by AI because no variant's terms matched the title."
+                      : "Matched by the variant's terms, or Other / unclassified when none matched."}
+                  onChange={(event) => void changeVariant(event.target.value || null)}
+                >
+                  <option value="">Automatic{currentListing.variantSource !== "manual" ? ` (${currentListing.variantLabel ?? "Other / unclassified"})` : ""}</option>
+                  {detail.variantGroups.map((group) => <option key={group.id} value={group.id}>{group.label}</option>)}
+                </select>
+              </label>
+            </section>
+          ) : null}
+
+          {showDescriptionSafeguard && (detail.descriptionSnapshot || currentListing.aiDescriptionVerification) ? (
+            <details className="drawer-details">
+              <summary>Description check details</summary>
+              {currentListing.aiDescriptionVerification?.summary ? <p className="drawer-section-copy">{currentListing.aiDescriptionVerification.summary}</p> : null}
+              {currentListing.aiDescriptionVerification?.issues.length ? <div className="ai-normalization-warning"><AlertTriangle size={14} />{currentListing.aiDescriptionVerification.issues.join(" · ")}</div> : null}
+              {currentListing.aiDescriptionVerification?.evidence.length ? <p className="drawer-section-copy">Evidence: {currentListing.aiDescriptionVerification.evidence.join(" · ")}</p> : null}
+              {currentListing.aiDescriptionVerificationError ? <div className="ai-normalization-error"><AlertTriangle size={14} />{currentListing.aiDescriptionVerificationError}</div> : null}
+              {detail.descriptionSnapshot ? <div className="listing-description-snapshot">
+                <div className="listing-description-snapshot-heading"><strong>Saved description</strong><span>{new Date(detail.descriptionSnapshot.capturedAt).toLocaleString("pl-PL")}</span></div>
+                <div className="listing-description-snapshot-meta"><span>{formatPln(detail.descriptionSnapshot.price)}</span>{detail.descriptionSnapshot.condition ? <span>{detail.descriptionSnapshot.condition}</span> : null}{detail.descriptionSnapshot.location ? <span>{detail.descriptionSnapshot.location}</span> : null}</div>
+                <p>{detail.descriptionSnapshot.description || "No description was exposed on the detail page."}</p>
+              </div> : null}
+            </details>
+          ) : null}
+
+          {showDescriptionSafeguard && storedListing ? (
+            <details className="drawer-details">
+              <summary>AI diagnostics (Jev vs LLM)</summary>
+              {detail.verificationInputHash ? <p className="drawer-section-copy">Input hash <strong>{detail.verificationInputHash.slice(0, 12)}…</strong>{detail.verificationModel ? <> · stored model <strong>{detail.verificationModel}</strong></> : null}</p> : null}
+              {detail.verificationTrace?.length ? (
+                <div className="ai-normalization-tags" style={{ flexDirection: "column", alignItems: "stretch", gap: 8 }}>
+                  {detail.verificationTrace.map((entry) => (
+                    <div key={entry.id} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <span><strong>Jev</strong> · {entry.jevModel} · {new Date(entry.createdAt).toLocaleString("pl-PL")}{entry.note ? ` · ${entry.note}` : ""}</span>
+                      <span>{entry.jevError ? `Jev error: ${entry.jevError}` : `answer: ${JSON.stringify(entry.jevAnswer)}${entry.jevConfidence !== null ? ` · confidence ${entry.jevConfidence.toFixed(2)}` : ""}${entry.jevUnsure ? " · unsure" : ""}`}</span>
+                      {(entry.visionVerdict || entry.visionError || entry.deepseekDecision) ? (
+                        <span>Vision: {entry.visionError ? entry.visionError : `${entry.visionVerdict ?? "—"}${entry.visionConfidence !== null && entry.visionConfidence !== undefined ? ` (${entry.visionConfidence.toFixed(2)})` : ""}${entry.visionImagesSeen !== null && entry.visionImagesSeen !== undefined ? ` · ${entry.visionImagesSeen} photo(s)` : ""}`} · LLM: {entry.deepseekDecision ?? "—"}{entry.agreement !== null && entry.agreement !== undefined ? (entry.agreement ? " · agree" : " · disagree") : ""}</span>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              ) : <p className="drawer-section-copy">No stored Jev trace for this description yet.</p>}
+              <button className="outline-button ai-normalize-button" type="button" disabled={comparing} onClick={() => void compareJevVsLlm()}>{comparing ? <LoaderCircle size={15} className="spin" /> : <Scale size={15} />}{comparing ? "Comparing…" : comparison ? "Re-run comparison" : "Compare Jev vs LLM"}</button>
+              {comparison ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
+                  <div className="ai-normalization-tags" style={{ flexDirection: "column", alignItems: "stretch" }}>
+                    <span><strong>Jev</strong> · {comparison.jevModel}</span>
+                    {comparison.jev.ok
+                      ? <span>decision <strong>{comparison.jev.judgment.decision}</strong> · confidence {comparison.jev.judgment.confidence === null ? "null" : comparison.jev.judgment.confidence.toFixed(2)}{comparison.jev.judgment.unsure ? " · unsure → would escalate to vision" : " · firm"}</span>
+                      : <span>Jev error: {comparison.jev.error}</span>}
+                    <details><summary className="drawer-muted">Raw Jev JSON</summary><pre style={{ whiteSpace: "pre-wrap", fontSize: 12, margin: "4px 0 0" }}>{JSON.stringify(comparison.jev.ok ? comparison.jev.raw : { error: comparison.jev.error }, null, 2)}</pre></details>
+                  </div>
+                  <div className="ai-normalization-tags" style={{ flexDirection: "column", alignItems: "stretch" }}>
+                    <span><strong>LLM</strong> · {comparison.llmModel}</span>
+                    {comparison.llm.ok
+                      ? <>
+                        <span>decision <strong>{comparison.llm.verification.decision}</strong> · confidence {comparison.llm.verification.confidence.toFixed(2)}</span>
+                        <span>{comparison.llm.verification.summary}</span>
+                        {comparison.llm.verification.issues.length ? <span>Issues: {comparison.llm.verification.issues.join(" · ")}</span> : null}
+                        {comparison.llm.verification.evidence.length ? <span>Evidence: {comparison.llm.verification.evidence.join(" · ")}</span> : null}
+                      </>
+                      : <span>LLM error: {comparison.llm.error}</span>}
+                    <details><summary className="drawer-muted">Raw LLM JSON</summary><pre style={{ whiteSpace: "pre-wrap", fontSize: 12, margin: "4px 0 0" }}>{JSON.stringify(comparison.llm.ok ? comparison.llm.raw : { error: comparison.llm.error }, null, 2)}</pre></details>
+                  </div>
+                </div>
+              ) : null}
+            </details>
+          ) : null}
         </div>
         <div className="listing-drawer-footer">
-          <span>{currentListing.observed}</span>
+          <div className="listing-drawer-footer-actions">
+            <button
+              className="outline-button"
+              type="button"
+              disabled={saving}
+              aria-label={hidden ? "Unhide listing" : "Hide listing"}
+              title={hidden ? "Show this listing again in the overview and alerts" : "Remove this listing from the overview and alerts without deleting its history"}
+              onClick={() => void saveAction(decision, !hidden)}
+            >
+              {hidden ? <Eye size={15} /> : <EyeOff size={15} />}
+              <span>{hidden ? "Unhide" : "Hide"}</span>
+            </button>
+            {onCreateWatch ? (
+              <button className="outline-button" type="button" aria-label="Save as watch" title="Create a watch from this listing" onClick={() => onCreateWatch(watchPresetFromListing(currentListing))}>
+                <Bell size={15} />
+                <span>Save as watch</span>
+              </button>
+            ) : null}
+          </div>
           <a className="primary-button" href={currentListing.url} target="_blank" rel="noopener noreferrer"><ExternalLink size={16} />Open listing</a>
         </div>
       </aside>
@@ -475,3 +465,12 @@ export default function ListingDetailDrawer({
   );
 }
 
+/** The description check as one line, shown only when it actually ran. */
+function VerificationLine({ status }: { status: NonNullable<Listing["aiDescriptionVerificationStatus"]> }) {
+  if (status === "pass") return <div className="description-verification-result description-verification-result--pass"><CheckCircle2 size={15} /><strong>Description looks fine</strong></div>;
+  if (status === "reject") return <div className="description-verification-result description-verification-result--reject"><AlertTriangle size={15} /><strong>Alert held:</strong><span>the description mentions a material issue.</span></div>;
+  if (status === "unknown") return <div className="description-verification-result description-verification-result--unknown"><AlertTriangle size={15} /><strong>Alert held:</strong><span>the description could not be checked.</span></div>;
+  if (status === "fallback") return <div className="description-verification-result description-verification-result--unknown"><AlertTriangle size={15} /><strong>Alerted without an AI check</strong><span>(the check failed).</span></div>;
+  if (status === "pending") return <div className="description-verification-result description-verification-result--pending"><LoaderCircle size={15} className="spin" /><strong>Checking the description…</strong></div>;
+  return null;
+}

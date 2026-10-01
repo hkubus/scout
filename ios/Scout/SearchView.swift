@@ -23,9 +23,11 @@ struct SearchView: View {
     var body: some View {
         NavigationStack {
             List {
-                if !statuses.isEmpty {
+                // Progress while searching; afterwards only a marketplace that failed.
+                let shownStatuses = searching ? statuses : statuses.filter { $0.status == "error" }
+                if !shownStatuses.isEmpty {
                     Section {
-                        ForEach(statuses, id: \.source) { SourceStatusRow(status: $0) }
+                        ForEach(shownStatuses, id: \.source) { SourceStatusRow(status: $0) }
                     }
                 }
                 if let error {
@@ -232,7 +234,7 @@ private struct SearchResultRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             ListingThumbnail(url: listing.imageURL, size: 60)
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text(listing.title)
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(2)
@@ -246,22 +248,21 @@ private struct SearchResultRow: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                HStack(spacing: 8) {
-                    MarketplaceTag(marketplace: listing.marketplace)
-                    Label(shipping, systemImage: listing.shippingAvailable == true ? "shippingbox" : "figure.walk")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .labelStyle(.titleAndIcon)
-                }
-                if !details.isEmpty {
-                    Text(details)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
+                Text(verbatim: meta)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
         }
         .padding(.vertical, 2)
+    }
+
+    /// Marketplace, delivery, condition and place on one line.
+    private var meta: String {
+        ([listing.marketplace.rawValue, shipping, listing.condition, listing.location] as [String?])
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: " · ")
     }
 
     /// Only OLX and Allegro Lokalnie say whether the price is negotiable.
@@ -274,16 +275,12 @@ private struct SearchResultRow: View {
         }
     }
 
-    private var shipping: String {
+    private var shipping: String? {
         switch listing.shippingAvailable {
-        case true?: "Shipping"
-        case false?: "Pickup only"
-        case nil: "Delivery unknown"
+        case true?: "shipping"
+        case false?: "pickup only"
+        case nil: nil
         }
-    }
-
-    private var details: String {
-        [listing.condition, listing.location].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
     }
 }
 

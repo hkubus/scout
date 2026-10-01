@@ -606,7 +606,8 @@ final class WatchDraftTests: XCTestCase {
     }
 
     func testValidation() {
-        XCTAssertEqual(WatchDraft(query: "x").validationError, "Give the watch a name.")
+        XCTAssertNil(WatchDraft(query: "x").validationError)
+        XCTAssertEqual(WatchDraft(name: "x", query: " ").validationError, "Enter what Scout should search for.")
         XCTAssertEqual(WatchDraft(name: "x", query: "x", sources: []).validationError, "Pick at least one marketplace.")
         XCTAssertEqual(WatchDraft(name: "x", query: "x", interval: 2).validationError, "The scan interval must be between 5 and 1440 minutes.")
         XCTAssertEqual(WatchDraft(name: "x", query: "x", minPrice: 10, maxPrice: 5).validationError, "The minimum price can't exceed the maximum.")

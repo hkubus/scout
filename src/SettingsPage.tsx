@@ -1,39 +1,38 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
   ArrowRight,
   Check,
-  Clock3,
   Database,
-  Info,
   LoaderCircle,
   LogOut,
   Moon,
   Send,
   Settings2,
   ShieldCheck,
-  SlidersHorizontal,
   RefreshCw,
   Sun,
   Trash2,
-  Zap,
 } from "lucide-react";
 import { api } from "./api";
 import type { Marketplace, NotificationPriority, SettingsData, Theme } from "./types";
+import { PageHeader } from "./ui";
 
 type Toast = { type: "success" | "error" | "info" };
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
 
-function PageHeader({ title, description }: { title: string; description?: string }) {
+/** A settings card: a one-line title, an optional status, and its fields. */
+function Section({ title, status, wide = false, children }: { title: string; status?: { on: boolean; label: string }; wide?: boolean; children: ReactNode }) {
   return (
-    <header className="page-header page-header--inner">
-      <div>
-        <h1>{title}</h1>
-        {description ? <p>{description}</p> : null}
+    <section className={`settings-section${wide ? " settings-section--wide" : ""}`}>
+      <div className="settings-section-heading">
+        <h2>{title}</h2>
+        {status ? <span className={`settings-status ${status.on ? "" : "settings-status--idle"}`}><i />{status.label}</span> : null}
       </div>
-    </header>
+      {children}
+    </section>
   );
 }
 
@@ -377,21 +376,9 @@ export default function SettingsPage({
   const settingsLoaded = settings !== null;
   return (
     <>
-      <PageHeader
-        title="Settings"
-        description="Keep Scout quiet, safe, and easy to operate on your home server."
-      />
+      <PageHeader title="Settings" />
       <div className="settings-grid">
-        <section className="settings-section">
-          <div className="settings-section-heading">
-            <div className="settings-symbol">
-              <Sun size={18} />
-            </div>
-            <div>
-              <h2>Appearance</h2>
-              <p>Choose how the dashboard looks on this device.</p>
-            </div>
-          </div>
+        <Section title="Appearance">
           <div className="theme-options">
             {(["light", "dark", "system"] as Theme[]).map((choice) => (
               <button
@@ -399,492 +386,273 @@ export default function SettingsPage({
                 className={`theme-option ${theme === choice ? "theme-option--selected" : ""}`}
                 onClick={() => onTheme(choice)}
               >
-                {choice === "light" ? (
-                  <Sun size={18} />
-                ) : choice === "dark" ? (
-                  <Moon size={18} />
-                ) : (
-                  <Settings2 size={18} />
-                )}
+                {choice === "light" ? <Sun size={17} /> : choice === "dark" ? <Moon size={17} /> : <Settings2 size={17} />}
                 <span>{choice[0].toUpperCase() + choice.slice(1)}</span>
-                {theme === choice ? <Check size={16} /> : null}
+                {theme === choice ? <Check size={15} /> : null}
               </button>
             ))}
           </div>
-        </section>
-        <section className="settings-section">
-          <div className="settings-section-heading">
-            <div className="settings-symbol">
-              <SlidersHorizontal size={18} />
-            </div>
-            <div>
-              <h2>Scan defaults</h2>
-              <p>New watches use these values unless overridden.</p>
-            </div>
-          </div>
+        </Section>
+        <Section title="Scanning">
           <div className="field-row">
             <label className="field-label">
-              Default polling interval <span>minutes</span>
-              <input
-                type="number"
-                min="5"
-                max="1440"
-                value={interval}
-                onChange={(event) => setIntervalValue(event.target.value)}
-              />
+              New watches check every (min)
+              <input type="number" min="5" max="1440" value={interval} onChange={(event) => setIntervalValue(event.target.value)} />
             </label>
-            <label className="field-label">
-              Night polling interval <span>22:00–08:00 · server local time</span>
-              <input
-                type="number"
-                min="5"
-                max="1440"
-                value={nightInterval}
-                onChange={(event) => setNightInterval(event.target.value)}
-              />
+            <label className="field-label" title="22:00–08:00, server local time. A floor: watches that already run slower are not sped up.">
+              At night, at most every (min)
+              <input type="number" min="5" max="1440" value={nightInterval} onChange={(event) => setNightInterval(event.target.value)} />
             </label>
           </div>
-          <div className="field-help">
-            <Info size={15} />
-            Night polling is a floor: watches that already run slower will not
-            be accelerated. The default is 30 minutes overnight.
-          </div>
-        </section>
-        <section className="settings-section settings-section--wide">
-          <div className="settings-section-heading">
-            <div className="settings-symbol settings-symbol--blue">
-              <Zap size={18} />
-            </div>
-            <div>
-              <h2>AI listing intelligence</h2>
-              <p>Jev filters out accessories, parts, and unrelated matches, with a vision model as fallback when unsure.</p>
-            </div>
-            <span className={`settings-status ${aiConfigured ? "" : "settings-status--idle"}`}>
-              <i />
-              {settingsLoaded ? aiConfigured ? (settings?.ai?.source === "environment" ? "Environment" : "Configured") : "Not configured" : "Loading…"}
-            </span>
-          </div>
-          <div className="field-row">
-            <label className="field-label">
-              OpenRouter model <span>uses JSON output</span>
-              <input
-                autoComplete="off"
-                disabled={!settingsLoaded}
-                value={aiModel}
-                onChange={(event) => setAiModel(event.target.value)}
-                placeholder="deepseek/deepseek-v4-flash"
-              />
+        </Section>
+        <Section title="Notifications" wide>
+          <div className="settings-subsection">
+            <label className="settings-toggle">
+              <input type="checkbox" checked={dailyDigestEnabled} disabled={!settingsLoaded || saving} onChange={(event) => setDailyDigestEnabled(event.target.checked)} />
+              <span>
+                <strong>Daily digest</strong>
+                <small>Strong and Very strong deals arrive once a day; Exceptional deals stay immediate. Empty digests are skipped.</small>
+              </span>
             </label>
-            <label className="field-label">
-              API token <span>{settings?.ai?.source === "environment" ? "environment token is active" : "encrypted at rest"}</span>
-              <input
-                type="password"
-                autoComplete="new-password"
-                disabled={!settingsLoaded}
-                value={aiApiKey}
-                onChange={(event) => setAiApiKey(event.target.value)}
-                placeholder={settings?.ai?.source === "settings" ? "Saved token" : "sk-or-v1-…"}
-              />
-            </label>
-          </div>
-          <div className="settings-actions">
-            {settings?.ai?.source === "settings" ? <button className="outline-button danger-outline" disabled={saving} onClick={() => void clearAiApiKey()}><Trash2 size={15} />Remove saved token</button> : null}
-          </div>
-          <div className="security-note">
-            <ShieldCheck size={17} />
-            <span>The token is encrypted with SCOUT_SECRET and never returned to the browser. Headless deployments can use SCOUT_OPENROUTER_API_KEY and SCOUT_OPENROUTER_MODEL instead.</span>
-          </div>
-        </section>
-        <section className="settings-section settings-section--wide">
-          <div className="settings-section-heading">
-            <div className="settings-symbol settings-symbol--blue">
-              <ShieldCheck size={18} />
-            </div>
-            <div>
-              <h2>Marketplace accounts</h2>
-              <p>
-                Use a session from your own logged-in browser to keep requests
-                associated with your account.
-              </p>
-            </div>
-          </div>
-          <div className="session-status-list">
-            {(settings?.marketplaceSessions ?? []).map((session) => (
-              <div className="session-status-row" key={session.marketplace}>
-                <i className={session.connected ? "session-dot session-dot--connected" : "session-dot"} />
-                <div>
-                  <strong>{session.marketplace}{session.label ? ` · ${session.label}` : ""}</strong>
-                  <span>{session.detail}</span>
+            {dailyDigestEnabled ? (
+              <div className="field-row">
+                <label className="field-label">
+                  Delivery time <span className="field-hint-inline">server time</span>
+                  <input type="time" value={dailyDigestTime} disabled={!settingsLoaded || saving} onChange={(event) => setDailyDigestTime(event.target.value)} />
+                </label>
+                <div className="field-label">
+                  <span>Send to</span>
+                  <div className="source-options">
+                    <button type="button" aria-pressed={dailyDigestDiscord} className={`source-option ${dailyDigestDiscord ? "source-option--selected" : ""}`} disabled={!settingsLoaded || saving} onClick={() => setDailyDigestDiscord((value) => !value)}>
+                      <i style={{ background: "#5865f2" }} />Discord{dailyDigestDiscord ? <Check size={15} /> : null}
+                    </button>
+                    <button type="button" aria-pressed={dailyDigestNtfy} className={`source-option ${dailyDigestNtfy ? "source-option--selected" : ""}`} disabled={!settingsLoaded || saving} onClick={() => setDailyDigestNtfy((value) => !value)}>
+                      <i style={{ background: "#4f9da6" }} />ntfy{dailyDigestNtfy ? <Check size={15} /> : null}
+                    </button>
+                  </div>
                 </div>
-                {session.createdAt ? (
-                  <button
-                    className="link-button danger-link"
-                    disabled={savingSession}
-                    onClick={() => void removeMarketplaceSession(session.marketplace)}
-                  >
-                    Remove
-                  </button>
-                ) : null}
               </div>
-            ))}
-          </div>
-          <div className="field-row">
-            <label className="field-label">
-              Marketplace
-              <select value={sessionMarketplace} onChange={(event) => setSessionMarketplace(event.target.value as Marketplace)}>
-                {(["OLX", "Allegro Lokalnie", "Vinted"] as Marketplace[]).map((marketplace) => <option key={marketplace}>{marketplace}</option>)}
-              </select>
-            </label>
-            <label className="field-label">
-              Label <span>optional</span>
-              <input value={sessionLabel} onChange={(event) => setSessionLabel(event.target.value)} placeholder="e.g. personal account" maxLength={80} />
-            </label>
-          </div>
-          <label className="field-label">
-            Playwright storage-state JSON
-            <textarea
-              value={storageStateInput}
-              onChange={(event) => { setStorageStateInput(event.target.value); setStorageStateFile(""); }}
-              placeholder={'{"cookies":[...],"origins":[...]}' }
-              spellCheck={false}
-              autoComplete="off"
-            />
-          </label>
-          <div className="settings-actions">
-            <label className="outline-button file-button">
-              <input
-                type="file"
-                accept="application/json,.json"
-                onChange={async (event) => {
-                  const file = event.currentTarget.files?.[0];
-                  if (!file) return;
-                  try {
-                    setStorageStateInput(await file.text());
-                    setStorageStateFile(file.name);
-                  } catch {
-                    onToast("Could not read the storage-state file.", "error");
-                  }
-                }}
-              />
-              {storageStateFile || "Choose JSON file"}
-            </label>
-            <button className="primary-button" disabled={savingSession || !settingsLoaded} onClick={() => void saveMarketplaceSession()}>
-              {savingSession ? <LoaderCircle size={16} className="spin" /> : <ShieldCheck size={16} />}
-              {savingSession ? "Saving…" : "Save session"}
-            </button>
-          </div>
-          <div className="security-note">
-            <ShieldCheck size={17} />
-            <span>
-              Log in manually, export Playwright storage state, and import it
-              here. Scout encrypts it with SCOUT_SECRET and never returns it.
-              Do not paste a raw Cookie header or share the JSON.
-            </span>
-          </div>
-        </section>
-        <section className={`settings-section settings-section--wide ${dailyDigestEnabled ? "settings-section--active" : ""}`}>
-          <div className="settings-section-heading">
-            <div className="settings-symbol settings-symbol--blue">
-              <Clock3 size={18} />
-            </div>
-            <div>
-              <h2>Daily deal digest</h2>
-              <p>Bundle Strong and Very strong deals into one quiet daily summary. Exceptional deals remain immediate.</p>
-            </div>
-            <span className={`settings-status ${dailyDigestEnabled ? "" : "settings-status--idle"}`}>
-              <i />
-              {settingsLoaded ? dailyDigestEnabled ? "Enabled" : "Off" : "Loading…"}
-            </span>
-          </div>
-          <label className="settings-toggle">
-            <input type="checkbox" checked={dailyDigestEnabled} disabled={!settingsLoaded || saving} onChange={(event) => setDailyDigestEnabled(event.target.checked)} />
-            <span>
-              <strong>Send a daily digest</strong>
-              <small>Empty digests are suppressed. Delivery uses the server's local timezone.</small>
-            </span>
-          </label>
-          <div className="field-row">
-            <label className="field-label">
-              Delivery time <span>server local time</span>
-              <input type="time" value={dailyDigestTime} disabled={!settingsLoaded || saving} onChange={(event) => setDailyDigestTime(event.target.value)} />
-            </label>
-            <div className="field-label">
-              <span>Delivery channels</span>
-              <div className="source-options">
-                <button type="button" aria-pressed={dailyDigestDiscord} className={`source-option ${dailyDigestDiscord ? "source-option--selected" : ""}`} disabled={!settingsLoaded || saving} onClick={() => setDailyDigestDiscord((value) => !value)}>
-                  <i style={{ background: "#5865f2" }} />Discord{dailyDigestDiscord ? <Check size={15} /> : null}
-                </button>
-                <button type="button" aria-pressed={dailyDigestNtfy} className={`source-option ${dailyDigestNtfy ? "source-option--selected" : ""}`} disabled={!settingsLoaded || saving} onClick={() => setDailyDigestNtfy((value) => !value)}>
-                  <i style={{ background: "#4f9da6" }} />ntfy{dailyDigestNtfy ? <Check size={15} /> : null}
-                </button>
-              </div>
-            </div>
-          </div>
-          <div className="field-help">
-            <Info size={15} />
-            Each channel keeps its own minimum-priority filter. A meaningful price drop or priority increase can add a listing to a later digest; unchanged repeats are suppressed.
-          </div>
-          {settings?.dailyDigest?.lastSentAt ? (
-            <div className="settings-inline-note">Last digest delivered {new Date(settings.dailyDigest.lastSentAt).toLocaleString("pl-PL")}.</div>
-          ) : null}
-        </section>
-        <section className="settings-section settings-section--wide">
-          <div className="settings-section-heading">
-            <div className="settings-symbol settings-symbol--blue">
-              <Send size={18} />
-            </div>
-            <div>
-              <h2>Discord notifications</h2>
-              <p>
-                One idempotent embed per qualifying listing. The webhook is
-                encrypted at rest.
-              </p>
-            </div>
-            <span
-              className={`settings-status ${configured ? "" : "settings-status--idle"}`}
-            >
-              <i />
-              {settingsLoaded
-                ? configured
-                  ? "Configured"
-                  : "Not configured"
-                : "Loading…"}
-            </span>
-          </div>
-          <label className="field-label">
-            Webhook URL
-            <input
-              type="url"
-              autoComplete="off"
-              disabled={!settingsLoaded}
-              placeholder={
-                configured
-                  ? (settings?.webhookMasked ?? "Saved webhook")
-                  : "https://discord.com/api/webhooks/…"
-              }
-              value={webhook}
-              onChange={(event) => setWebhook(event.target.value)}
-            />
-          </label>
-          <label className="field-label">
-            Minimum deal priority <span>Discord channel filter</span>
-            <select value={discordMinimumPriority} onChange={(event) => setDiscordMinimumPriority(event.target.value as NotificationPriority)}>
-              <option value="strong">Strong and above</option>
-              <option value="very-strong">Very strong and above</option>
-              <option value="exceptional">Exceptional only</option>
-            </select>
-          </label>
-          <div className="settings-actions">
-            <button
-              className="outline-button"
-              disabled={testing || !configured}
-              onClick={testWebhook}
-            >
-              {testing ? (
-                <LoaderCircle size={15} className="spin" />
-              ) : (
-                <Send size={15} />
-              )}
-              {testing ? "Sending…" : "Send test notification"}
-            </button>
-            {configured ? (
-              <button
-                className="outline-button danger-outline"
-                disabled={saving}
-                onClick={clearWebhook}
-              >
-                <Trash2 size={15} />
-                Remove webhook
-              </button>
             ) : null}
-            <button className="link-button" onClick={onHistory}>
-              View notification history <ArrowRight size={16} />
-            </button>
+            {settings?.dailyDigest?.lastSentAt ? (
+              <div className="settings-inline-note">Last digest delivered {new Date(settings.dailyDigest.lastSentAt).toLocaleString("pl-PL")}.</div>
+            ) : null}
           </div>
-          <div className="security-note">
-            <ShieldCheck size={17} />
-            <span>
-              Secret encryption uses the deployment secret. The stored webhook
-              is never returned to the browser.
-            </span>
-          </div>
-        </section>
-        <section className="settings-section settings-section--wide">
-          <div className="settings-section-heading">
-            <div className="settings-symbol settings-symbol--blue">
-              <Send size={18} />
+          <div className="settings-subsection">
+            <div className="settings-subsection-heading">
+              <h3>Discord</h3>
+              <span className={`settings-status ${configured ? "" : "settings-status--idle"}`}><i />{settingsLoaded ? configured ? "Configured" : "Not configured" : "Loading…"}</span>
             </div>
-            <div>
-              <h2>ntfy notifications</h2>
-              <p>
-                Send only the priority tier you choose to an ntfy topic. The
-                default is Exceptional only, keeping this channel quiet.
-              </p>
+            <div className="field-row">
+              <label className="field-label" title="Encrypted at rest and never returned to the browser">
+                Webhook URL
+                <input
+                  type="url"
+                  autoComplete="off"
+                  disabled={!settingsLoaded}
+                  placeholder={configured ? (settings?.webhookMasked ?? "Saved webhook") : "https://discord.com/api/webhooks/…"}
+                  value={webhook}
+                  onChange={(event) => setWebhook(event.target.value)}
+                />
+              </label>
+              <label className="field-label">
+                Send deals from
+                <select value={discordMinimumPriority} onChange={(event) => setDiscordMinimumPriority(event.target.value as NotificationPriority)}>
+                  <option value="strong">Strong and above</option>
+                  <option value="very-strong">Very strong and above</option>
+                  <option value="exceptional">Exceptional only</option>
+                </select>
+              </label>
             </div>
-            <span className={`settings-status ${ntfyConfigured ? "" : "settings-status--idle"}`}>
-              <i />
-              {settingsLoaded ? ntfyConfigured ? "Configured" : "Not configured" : "Loading…"}
-            </span>
+            <div className="settings-actions">
+              <button className="outline-button" disabled={testing || !configured} onClick={testWebhook}>
+                {testing ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}
+                {testing ? "Sending…" : "Send test"}
+              </button>
+              {configured ? (
+                <button className="outline-button danger-outline" disabled={saving} onClick={clearWebhook}>
+                  <Trash2 size={15} />
+                  Remove webhook
+                </button>
+              ) : null}
+            </div>
           </div>
-          <div className="field-row">
-            <label className="field-label">
-              Server URL
-              <input
-                type="url"
-                autoComplete="off"
-                disabled={!settingsLoaded}
-                value={ntfyServerUrl}
-                onChange={(event) => setNtfyServerUrl(event.target.value)}
-                placeholder="https://ntfy.sh"
-              />
-            </label>
-            <label className="field-label">
-              Topic
-              <input
-                autoComplete="off"
-                disabled={!settingsLoaded}
-                value={ntfyTopic}
-                onChange={(event) => setNtfyTopic(event.target.value)}
-                placeholder={ntfyConfigured ? (settings?.ntfy?.topicMasked ?? "Saved topic") : "e.g. scout-deals"}
-              />
-            </label>
-          </div>
-          <div className="field-row">
-            <label className="field-label">
-              Access token <span>optional</span>
-              <input
-                type="password"
-                autoComplete="new-password"
-                disabled={!settingsLoaded}
-                value={ntfyToken}
-                onChange={(event) => setNtfyToken(event.target.value)}
-                placeholder={settings?.ntfy?.tokenConfigured ? "Saved token" : "tk_…"}
-              />
-            </label>
-            <label className="field-label">
-              Minimum deal priority <span>ntfy channel filter</span>
-              <select value={ntfyMinimumPriority} onChange={(event) => setNtfyMinimumPriority(event.target.value as NotificationPriority)}>
-                <option value="strong">Strong and above</option>
-                <option value="very-strong">Very strong and above</option>
-                <option value="exceptional">Exceptional only</option>
-              </select>
-            </label>
-          </div>
-          <label className="check-option">
-            <input
-              type="checkbox"
-              disabled={!settingsLoaded || !ntfyCanOpenInApp}
-              checked={ntfyOpenInApp}
-              onChange={(event) => setNtfyOpenInApp(event.target.checked)}
-            />
-            <span>
+          <div className="settings-subsection">
+            <div className="settings-subsection-heading">
+              <h3>ntfy</h3>
+              <span className={`settings-status ${ntfyConfigured ? "" : "settings-status--idle"}`}><i />{settingsLoaded ? ntfyConfigured ? "Configured" : "Not configured" : "Loading…"}</span>
+            </div>
+            <div className="field-row">
+              <label className="field-label">
+                Server URL
+                <input type="url" autoComplete="off" disabled={!settingsLoaded} value={ntfyServerUrl} onChange={(event) => setNtfyServerUrl(event.target.value)} placeholder="https://ntfy.sh" />
+              </label>
+              <label className="field-label" title="Topic names behave like passwords; the topic and token are encrypted at rest">
+                Topic
+                <input autoComplete="off" disabled={!settingsLoaded} value={ntfyTopic} onChange={(event) => setNtfyTopic(event.target.value)} placeholder={ntfyConfigured ? (settings?.ntfy?.topicMasked ?? "Saved topic") : "e.g. scout-deals"} />
+              </label>
+            </div>
+            <div className="field-row">
+              <label className="field-label">
+                Access token <span className="field-hint-inline">optional</span>
+                <input type="password" autoComplete="new-password" disabled={!settingsLoaded} value={ntfyToken} onChange={(event) => setNtfyToken(event.target.value)} placeholder={settings?.ntfy?.tokenConfigured ? "Saved token" : "tk_…"} />
+              </label>
+              <label className="field-label">
+                Send deals from
+                <select value={ntfyMinimumPriority} onChange={(event) => setNtfyMinimumPriority(event.target.value as NotificationPriority)}>
+                  <option value="strong">Strong and above</option>
+                  <option value="very-strong">Very strong and above</option>
+                  <option value="exceptional">Exceptional only</option>
+                </select>
+              </label>
+            </div>
+            <label className="check-option settings-check" title="Tapping an alert opens the listing in the Scout iOS app; its Open listing button still goes to the marketplace. Leave off if you read ntfy on desktop or Android.">
+              <input type="checkbox" disabled={!settingsLoaded || !ntfyCanOpenInApp} checked={ntfyOpenInApp} onChange={(event) => setNtfyOpenInApp(event.target.checked)} />
               <strong>Open alerts in the Scout iOS app</strong>
-              <small>Tapping an alert opens the listing in the app; an "Open listing" button still goes to the marketplace. Leave off if you read ntfy on desktop or Android.</small>
-            </span>
-          </label>
-          <div className="settings-actions">
-            <button className="outline-button" disabled={testingNtfy || !ntfyConfigured} onClick={testNtfy}>
-              {testingNtfy ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}
-              {testingNtfy ? "Sending…" : "Send test notification"}
-            </button>
-            {ntfyConfigured ? (
-              <button className="outline-button danger-outline" disabled={saving} onClick={clearNtfy}>
-                <Trash2 size={15} />
-                Remove ntfy
+            </label>
+            <div className="settings-actions">
+              <button className="outline-button" disabled={testingNtfy || !ntfyConfigured} onClick={testNtfy}>
+                {testingNtfy ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}
+                {testingNtfy ? "Sending…" : "Send test"}
               </button>
-            ) : null}
-          </div>
-          <div className="security-note">
-            <ShieldCheck size={17} />
-            <span>
-              The topic and optional access token are encrypted at rest. Topic
-              names behave like passwords, so avoid sharing them publicly.
-            </span>
-          </div>
-        </section>
-        <section
-          className="settings-section settings-section--wide"
-        >
-          <div className="settings-section-heading">
-            <div className="settings-symbol settings-symbol--blue"><Database size={18} /></div>
-            <div><h2>Data recovery</h2><p>Export readable history or create a WAL-aware SQLite restore point.</p></div>
-          </div>
-          <div className="settings-actions">
-            <button className="outline-button" disabled={recoveryBusy || resettingAi || !settingsLoaded} onClick={() => void exportData()}><Database size={15} />Download safe export</button>
-            <button className="outline-button" disabled={recoveryBusy || resettingAi || !settingsLoaded} onClick={() => void createBackup()}><ShieldCheck size={15} />Create database backup</button>
-            <button className="outline-button danger-outline" disabled={recoveryBusy || resettingAi || !settingsLoaded} onClick={() => void resetAiResults()}>{resettingAi ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}Reset AI results</button>
-          </div>
-          <div className="security-note"><ShieldCheck size={17} /><span>Exports omit encrypted credentials and marketplace sessions. Backups include the encrypted database and should be stored with the deployment secret.</span></div>
-        </section>
-        <section className="settings-section settings-section--wide">
-          <div className="settings-section-heading">
-            <div className="settings-symbol settings-symbol--blue"><RefreshCw size={18} /></div>
-            <div><h2>System update</h2><p>Pull latest code, rebuild, and restart the Scout service.</p></div>
-          </div>
-          <div className="settings-actions">
-            <button className="outline-button" disabled={updating || !settingsLoaded} onClick={() => void runSystemUpdate()}>{updating ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}{updating ? "Updating…" : "Update Scout"}</button>
-          </div>
-          {updateOutput ? (
-            <pre className="security-note" style={{ whiteSpace: "pre-wrap", maxHeight: 240, overflow: "auto" }}>{updateOutput}</pre>
-          ) : (
-            <div className="security-note"><Info size={17} /><span>Runs git pull, npm run build, then systemctl restart scout. The UI will briefly go offline.</span></div>
-          )}
-        </section>
-        <section
-          className={`settings-section warning-section ${settings?.publicExposureWarning ? "warning-section--active" : ""}`}
-        >
-          <div className="settings-section-heading">
-            <div className="settings-symbol settings-symbol--amber">
-              <AlertTriangle size={18} />
-            </div>
-            <div>
-              <h2>Access control</h2>
-              <p>
-                {!settingsLoaded
-                  ? "Checking exposure configuration…"
-                  : settings.authEnabled
-                    ? "Sign-in is required for the dashboard, API, live events, and MCP."
-                    : settings.publicExposureWarning
-                      ? "Scout is listening beyond loopback with authentication turned off (SCOUT_AUTH=off)."
-                      : "Authentication is off. Scout listens on loopback and refuses proxied requests unless SCOUT_AUTH=off; configure credentials before publishing it through a reverse proxy or tunnel."}
-              </p>
+              {ntfyConfigured ? (
+                <button className="outline-button danger-outline" disabled={saving} onClick={clearNtfy}>
+                  <Trash2 size={15} />
+                  Remove ntfy
+                </button>
+              ) : null}
+              <button className="link-button" onClick={onHistory}>
+                Notification history <ArrowRight size={16} />
+              </button>
             </div>
           </div>
-          <div className="warning-copy">
-            {settings?.authEnabled
-              ? "Serve Scout over HTTPS (for example behind a reverse proxy with SCOUT_TRUST_PROXY set) so session cookies and API tokens are never sent in clear text."
-              : "Without SCOUT_PASSWORD_HASH or SCOUT_API_TOKENS, keep Scout behind your trusted LAN or VPN and do not expose it to the public internet."}
-          </div>
-          {settings?.authEnabled ? (
-            <button
-              className="outline-button danger-outline"
-              onClick={() => {
-                if (!window.confirm("Sign out every browser session, including this one?")) return;
-                void api.logoutAll().finally(() => window.location.reload());
-              }}
-            >
-              <LogOut size={15} />Sign out everywhere
-            </button>
-          ) : null}
-        </section>
+        </Section>
       </div>
+      {settings?.publicExposureWarning ? (
+        <div className="form-error settings-warning" role="alert">
+          <AlertTriangle size={15} />
+          Scout is listening beyond loopback with sign-in turned off (SCOUT_AUTH=off). Keep it behind a trusted LAN or VPN.
+        </div>
+      ) : null}
+      <details className="settings-setup">
+        <summary>Server setup: AI, marketplace accounts, backups, updates and access</summary>
+        <div className="settings-grid">
+          <Section title="AI listing checks" wide status={{ on: aiConfigured, label: settingsLoaded ? aiConfigured ? (settings?.ai?.source === "environment" ? "From environment" : "Configured") : "Not configured" : "Loading…" }}>
+            <div className="field-row">
+              <label className="field-label">
+                OpenRouter model
+                <input autoComplete="off" disabled={!settingsLoaded} value={aiModel} onChange={(event) => setAiModel(event.target.value)} placeholder="deepseek/deepseek-v4-flash" />
+              </label>
+              <label className="field-label" title="Encrypted with SCOUT_SECRET and never returned to the browser. Headless deployments can set SCOUT_OPENROUTER_API_KEY and SCOUT_OPENROUTER_MODEL instead.">
+                API token <span className="field-hint-inline">{settings?.ai?.source === "environment" ? "environment token active" : "encrypted"}</span>
+                <input type="password" autoComplete="new-password" disabled={!settingsLoaded} value={aiApiKey} onChange={(event) => setAiApiKey(event.target.value)} placeholder={settings?.ai?.source === "settings" ? "Saved token" : "sk-or-v1-…"} />
+              </label>
+            </div>
+            {settings?.ai?.source === "settings" ? <div className="settings-actions"><button className="outline-button danger-outline" disabled={saving} onClick={() => void clearAiApiKey()}><Trash2 size={15} />Remove saved token</button></div> : null}
+          </Section>
+          <Section title="Marketplace accounts" wide>
+            <div className="session-status-list">
+              {(settings?.marketplaceSessions ?? []).map((session) => (
+                <div className="session-status-row" key={session.marketplace}>
+                  <i className={session.connected ? "session-dot session-dot--connected" : "session-dot"} />
+                  <div>
+                    <strong>{session.marketplace}{session.label ? ` · ${session.label}` : ""}</strong>
+                    <span>{session.detail}</span>
+                  </div>
+                  {session.createdAt ? (
+                    <button className="link-button danger-link" disabled={savingSession} onClick={() => void removeMarketplaceSession(session.marketplace)}>
+                      Remove
+                    </button>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+            <div className="field-row">
+              <label className="field-label">
+                Marketplace
+                <select value={sessionMarketplace} onChange={(event) => setSessionMarketplace(event.target.value as Marketplace)}>
+                  {(["OLX", "Allegro Lokalnie", "Vinted"] as Marketplace[]).map((marketplace) => <option key={marketplace}>{marketplace}</option>)}
+                </select>
+              </label>
+              <label className="field-label">
+                Label <span className="field-hint-inline">optional</span>
+                <input value={sessionLabel} onChange={(event) => setSessionLabel(event.target.value)} placeholder="e.g. personal account" maxLength={80} />
+              </label>
+            </div>
+            <label className="field-label" title="Log in manually, export Playwright storage state and import it here. Scout encrypts it with SCOUT_SECRET and never returns it. Do not paste a raw Cookie header.">
+              Playwright storage-state JSON
+              <textarea
+                value={storageStateInput}
+                onChange={(event) => { setStorageStateInput(event.target.value); setStorageStateFile(""); }}
+                placeholder={'{"cookies":[...],"origins":[...]}' }
+                spellCheck={false}
+                autoComplete="off"
+              />
+            </label>
+            <div className="settings-actions">
+              <label className="outline-button file-button">
+                <input
+                  type="file"
+                  accept="application/json,.json"
+                  onChange={async (event) => {
+                    const file = event.currentTarget.files?.[0];
+                    if (!file) return;
+                    try {
+                      setStorageStateInput(await file.text());
+                      setStorageStateFile(file.name);
+                    } catch {
+                      onToast("Could not read the storage-state file.", "error");
+                    }
+                  }}
+                />
+                {storageStateFile || "Choose JSON file"}
+              </label>
+              <button className="outline-button" disabled={savingSession || !settingsLoaded} onClick={() => void saveMarketplaceSession()}>
+                {savingSession ? <LoaderCircle size={16} className="spin" /> : <ShieldCheck size={16} />}
+                {savingSession ? "Saving…" : "Save session"}
+              </button>
+            </div>
+          </Section>
+          <Section title="Data">
+            <div className="settings-actions settings-actions--stack">
+              <button className="outline-button" title="Readable history without credentials or marketplace sessions" disabled={recoveryBusy || resettingAi || !settingsLoaded} onClick={() => void exportData()}><Database size={15} />Download export</button>
+              <button className="outline-button" title="A WAL-aware SQLite copy beside the database; store it with the deployment secret" disabled={recoveryBusy || resettingAi || !settingsLoaded} onClick={() => void createBackup()}><ShieldCheck size={15} />Create database backup</button>
+              <button className="outline-button danger-outline" disabled={recoveryBusy || resettingAi || !settingsLoaded} onClick={() => void resetAiResults()}>{resettingAi ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}Reset AI results</button>
+            </div>
+          </Section>
+          <Section title="Update and access">
+            <div className="settings-actions settings-actions--stack">
+              <button className="outline-button" title="Runs git pull, npm run build, then systemctl restart scout" disabled={updating || !settingsLoaded} onClick={() => void runSystemUpdate()}>{updating ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}{updating ? "Updating…" : "Update Scout"}</button>
+              {settings?.authEnabled ? (
+                <button
+                  className="outline-button danger-outline"
+                  onClick={() => {
+                    if (!window.confirm("Sign out every browser session, including this one?")) return;
+                    void api.logoutAll().finally(() => window.location.reload());
+                  }}
+                >
+                  <LogOut size={15} />Sign out everywhere
+                </button>
+              ) : null}
+            </div>
+            {updateOutput ? <pre className="settings-update-output">{updateOutput}</pre> : null}
+            <p className="settings-inline-note">
+              {!settingsLoaded
+                ? "Checking access…"
+                : settings.authEnabled
+                  ? "Sign-in is required. Serve Scout over HTTPS so cookies and tokens never travel in clear text."
+                  : "Sign-in is off. Keep Scout on a trusted LAN or VPN, or set SCOUT_PASSWORD_HASH / SCOUT_API_TOKENS before exposing it."}
+            </p>
+          </Section>
+        </div>
+      </details>
+      {/* Sticky, so the one Save button stays in reach from every section. */}
       <div className="settings-footer">
-        <span>Changes are stored locally on this server.</span>
-        <button
-          className="primary-button"
-          disabled={saving || !settings}
-          onClick={save}
-        >
-          {saving ? (
-            <LoaderCircle size={18} className="spin" />
-          ) : (
-            <Check size={18} />
-          )}
+        <span>Theme and the marketplace, data and update buttons apply at once.</span>
+        <button className="primary-button" disabled={saving || !settings} onClick={save}>
+          {saving ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}
           {saving ? "Saving…" : "Save settings"}
         </button>
       </div>
     </>
   );
 }
-
-

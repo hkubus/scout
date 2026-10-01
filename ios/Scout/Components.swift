@@ -48,40 +48,27 @@ extension Color {
         )
     }
 
-    static let scoutBlue = Color(hex: "#1d61e8")
-    static let dealOrange = Color(hex: "#f15a35")
-    static let dealAmber = Color(hex: "#f4b734")
-    static let dealBlue = Color(hex: "#87a7e8")
+    // One palette for the app and its widgets (WidgetPalette, in Shared).
+    static let scoutBlue = WidgetPalette.blue
+    static let dealOrange = WidgetPalette.orange
+    static let dealAmber = WidgetPalette.amber
+    static let dealBlue = WidgetPalette.lightBlue
     static let scoutGreen = Color(hex: "#3aab61")
 }
 
 extension Marketplace {
-    var color: Color {
-        switch self {
-        case .olx: Color(hex: "#159b96")
-        case .allegroLokalnie: Color(hex: "#f27526")
-        case .vinted: Color(hex: "#55a9b0")
-        default: .secondary
-        }
-    }
+    var color: Color { WidgetPalette.color(for: self) }
 }
 
 extension DealLabel {
-    var color: Color {
-        switch self {
-        case .exceptional: .dealOrange
-        case .veryStrong: .dealAmber
-        case .strong: .dealBlue
-        default: .secondary
-        }
-    }
+    var color: Color { WidgetPalette.color(for: self) }
 }
 
 extension ListingDecision {
     var title: String {
         switch self {
         case .buy: "Buy"
-        case .watch: "Watch"
+        case .watch: "Maybe"
         case .pass: "Pass"
         }
     }
@@ -89,7 +76,7 @@ extension ListingDecision {
     var symbol: String {
         switch self {
         case .buy: "cart.fill"
-        case .watch: "eye.fill"
+        case .watch: "bookmark.fill"
         case .pass: "xmark.circle.fill"
         }
     }
@@ -100,37 +87,6 @@ extension ListingDecision {
         case .watch: .scoutBlue
         case .pass: .secondary
         }
-    }
-}
-
-/// Five rising bars like the web UI's deal-strength meter.
-struct DealBars: View {
-    var strength: Double
-    var label: DealLabel
-
-    var body: some View {
-        HStack(alignment: .bottom, spacing: 2) {
-            ForEach(0..<5, id: \.self) { index in
-                RoundedRectangle(cornerRadius: 1.5)
-                    .fill(Double(index) < strength.rounded() ? label.color : Color.secondary.opacity(0.2))
-                    .frame(width: 4, height: 7 + CGFloat(index) * 2)
-            }
-        }
-        .accessibilityElement()
-        .accessibilityLabel("Deal strength \(Int(strength)) of 5")
-    }
-}
-
-struct DealBadge: View {
-    var label: DealLabel
-
-    var body: some View {
-        Text(label.rawValue)
-            .font(.caption.weight(.semibold))
-            .padding(.horizontal, 7)
-            .padding(.vertical, 2)
-            .foregroundStyle(label == .watch ? Color.secondary : label.color)
-            .background(label.color.opacity(0.14), in: Capsule())
     }
 }
 
@@ -187,13 +143,15 @@ struct ServerImage<Placeholder: View>: View {
     }
 }
 
+/// Three lines like the web table's stacked row: title, the price against
+/// typical, then where and when.
 struct ListingRow: View {
     var listing: Listing
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            ListingThumbnail(url: listing.imageURL, size: 68)
-            VStack(alignment: .leading, spacing: 4) {
+            ListingThumbnail(url: listing.imageURL, size: 64)
+            VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(listing.title)
                         .font(.subheadline.weight(.semibold))
@@ -210,34 +168,34 @@ struct ListingRow: View {
                     Text(Format.pln(listing.price))
                         .font(.headline)
                         .monospacedDigit()
+                    // Only a real discount is coloured; at or above typical stays quiet.
+                    if let below = listing.belowTypical, below < 0 {
+                        Text("−\(Int(abs(below).rounded()))%")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(listing.dealStrength >= 3 ? listing.dealLabel.color : .primary)
+                    }
                     if let typical = listing.typical {
                         Text("typ. \(Format.pln(typical))")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                 }
-                HStack(spacing: 6) {
-                    DealBars(strength: listing.dealStrength, label: listing.dealLabel)
-                    if let below = listing.belowTypical, below < 0 {
-                        Text("−\(Int(abs(below).rounded()))%")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(listing.dealLabel.color)
-                    }
-                    MarketplaceTag(marketplace: listing.marketplace)
-                    Spacer(minLength: 0)
-                    Text(listing.observedDate.map(Format.relative) ?? listing.observed)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                if listing.aiFiltered == true {
-                    Label("AI marked as not relevant", systemImage: "sparkles")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
+                Text(meta)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
         }
         .padding(.vertical, 2)
         .opacity(listing.aiFiltered == true ? 0.55 : 1)
+    }
+
+    private var meta: String {
+        var parts = [listing.marketplace.rawValue]
+        if listing.shippingAvailable == false { parts.append("pickup only") }
+        if listing.aiFiltered == true { parts.append("filtered by AI") }
+        parts.append(listing.observedDate.map(Format.relative) ?? listing.observed)
+        return parts.joined(separator: " · ")
     }
 }
 
