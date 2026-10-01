@@ -1,4 +1,4 @@
-import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, NotificationPriority, NotificationRecord, OlxCategoryOption, PriceHistoryPoint, SearchFilters, SettingsData, VariantSuggestions, VerificationComparison, Watch, WatchAnalytics } from './types';
+import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, NotificationPriority, NotificationRecord, OlxCategoryOption, PriceHistoryPoint, SearchFilters, SettingsData, VariantSuggestions, VerificationComparison, Watch, WatchAnalytics, Connector } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -15,6 +15,15 @@ export const UNAUTHORIZED_EVENT = 'scout:unauthorized';
 export type AuthSession = { authEnabled: boolean; authenticated: boolean; passwordLogin: boolean; tokenLogin?: boolean };
 
 const inFlightGets = new Map<string, Promise<unknown>>();
+
+/**
+ * Stop sharing the GETs in flight now: a server event can make their responses
+ * stale, so a request made after it must not get one of them. Callers that
+ * already hold one keep it.
+ */
+export function forgetInFlightGets() {
+  inFlightGets.clear();
+}
 
 function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) return Promise.reject(signal.reason ?? new DOMException('The operation was aborted', 'AbortError'));
@@ -76,6 +85,7 @@ export const api = {
   logout: () => request<{ ok: true }>('/api/auth/logout', { method: 'POST' }),
   logoutAll: () => request<{ ok: true }>('/api/auth/logout-all', { method: 'POST' }),
   dashboard: (signal?: AbortSignal) => request<DashboardData>('/api/dashboard', { signal }),
+  connectors: (signal?: AbortSignal) => request<{ connectors: Connector[] }>('/api/connectors', { signal }),
   listings: (options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string; sort?: 'newest' | 'strongest' | 'price'; decision?: ListingDecision; visibility?: 'visible' | 'hidden' | 'all' } = {}, signal?: AbortSignal) => {
     const params = new URLSearchParams();
     if (options.page !== undefined) params.set('page', String(options.page));

@@ -26,6 +26,7 @@ import { AnalyticsTrendChart, formatAnalyticsDate, formatAnalyticsPrice } from "
 import { marketWatchInputFromListing } from "./presets";
 import { OlxCategoryPicker } from "./OlxCategoryPicker";
 import { PriceSparkline } from "./PriceSparkline";
+import { dayMonthYear, formatDate, mediumDateShortTime } from "./format";
 import type {
   Marketplace,
   MarketListingSnapshot,
@@ -412,7 +413,7 @@ function MarketResearchTable({ listings, onViewSnapshot, rowBusy, onSaveCopy, on
           <strong data-label="Last price" role="cell">{formatPln(listing.lastPrice)}{listing.status === "ended" ? <small>last asking price · not a confirmed sale</small> : null}</strong>
           <span data-label="Change" role="cell" className={listing.priceChangePercent < 0 ? "price-down" : listing.priceChangePercent > 0 ? "price-up" : ""}>{listing.priceChangePercent === 0 ? "—" : `${listing.priceChangePercent > 0 ? "+" : ""}${listing.priceChangePercent.toFixed(1)}%`}</span>
           <span data-label="Observations" role="cell">{listing.observations}</span>
-          <span data-label="Last seen / ended" role="cell">{new Date(listing.endedAt ?? listing.lastSeenAt).toLocaleDateString("pl-PL", { day: "2-digit", month: "short", year: "numeric" })}</span>
+          <span data-label="Last seen / ended" role="cell">{formatDate(dayMonthYear, listing.endedAt ?? listing.lastSeenAt)}</span>
           <span role="cell" className="research-row-actions">
             <button
               className="icon-button"
@@ -517,7 +518,7 @@ function MarketListingSnapshotModal({ listing, onClose, onToast, onSaved, onWatc
           ) : snapshot ? (
             <>
               <div className="snapshot-meta">
-                <span>Saved {new Date(snapshot.capturedAt).toLocaleString("pl-PL", { dateStyle: "medium", timeStyle: "short" })}</span>
+                <span>Saved {formatDate(mediumDateShortTime, snapshot.capturedAt)}</span>
                 {snapshot.condition ? <span>Condition: {snapshot.condition}</span> : null}
                 {snapshot.location ? <span>Location: {snapshot.location}</span> : null}
                 <span>{snapshot.images.length} image{snapshot.images.length === 1 ? "" : "s"} stored</span>

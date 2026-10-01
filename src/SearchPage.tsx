@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { memo, useEffect, useRef, useState, type FormEvent } from "react";
 import { AlertTriangle, Bell, Check, ExternalLink, ListFilter, LoaderCircle, Search, Tag } from "lucide-react";
 import { api } from "./api";
 import { marketplaceColors } from "./data";
 import { subscribe } from "./events";
+import { listingRowKey, reuseUnchangedListings, sameListingFields } from "./listingRows";
 import type { WatchPreset } from "./presets";
 import { OlxCategoryPicker } from "./OlxCategoryPicker";
 import type { Listing, Marketplace, OlxCategory, SearchFilters, SearchSourceStatus } from "./types";
@@ -54,7 +55,8 @@ function ListingThumbnail({ listing }: { listing: Listing }) {
   return image && !failed ? <img src={image} alt="" loading="lazy" onError={() => setFailed(true)} /> : <div className="listing-thumb-placeholder"><Tag size={20} /></div>;
 }
 
-export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectListing: (listing: Listing) => void; onSaveWatch: (preset: WatchPreset) => void }) {
+// Memoized with stable props from App, so App re-renders (toasts, connection) skip the page.
+export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSelectListing: (listing: Listing) => void; onSaveWatch: (preset: WatchPreset) => void }) {
   const [query, setQuery] = useState("");
   const [terms, setTerms] = useState("");
   const [excluded, setExcluded] = useState("");
@@ -147,7 +149,8 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
     try {
       const result = await api.search({ ...buildFilters(1), searchId }, controller.signal);
       if (sequence !== searchSequence.current || controller.signal.aborted) return;
-      setListings(result.listings);
+      // The response reconciles the streamed rows; unchanged ones keep their identity and skip.
+      setListings((current) => reuseUnchangedListings(current, result.listings));
       setSourceStatuses(result.sources);
       setExhausted(result.listings.length === 0);
     } catch (searchError) {
@@ -414,9 +417,10 @@ export default function SearchPage({ onSelectListing, onSaveWatch }: { onSelectL
       </section>
     </>
   );
-}
+});
 
-function SearchResultsTable({ listings, onSelect }: { listings: Listing[]; onSelect: (listing: Listing) => void }) {
+// Memoized: typing in the search form re-renders SearchPage, but not the results.
+const SearchResultsTable = memo(function SearchResultsTable({ listings, onSelect }: { listings: Listing[]; onSelect: (listing: Listing) => void }) {
   return (
     <div className="search-table-wrap" role="table" aria-label="Manual search results">
       <div className="search-table search-table--head" role="row">
@@ -428,56 +432,66 @@ function SearchResultsTable({ listings, onSelect }: { listings: Listing[]; onSel
         <span role="columnheader" />
       </div>
       {listings.map((listing) => (
-        <div className="search-table search-result-row" role="row" key={listing.associationId ?? listing.id}>
-          <button
-            type="button"
-            className="listing-item listing-item--button"
-            onClick={() => onSelect(listing)}
-            aria-label={`View details for ${listing.title}`}
-          >
-            <ListingThumbnail listing={listing} />
-            <div>
-              <strong>{listing.title}</strong>
-              <span>{listing.subtitle || "No extra details"}</span>
-            </div>
-          </button>
-          <div className="marketplace-cell" role="cell">
-            <i style={{ background: marketplaceColors[listing.marketplace] }} />
-            {listing.marketplace}
-          </div>
-          <div className="price-cell search-price-cell" role="cell">
-            <strong>{formatPln(listing.price)}</strong>
-            <PriceNegotiability listing={listing} />
-          </div>
-          <span
-            className={`shipping-state shipping-state--${listing.shippingAvailable === true ? "yes" : listing.shippingAvailable === false ? "no" : "unknown"}`}
-            role="cell"
-          >
-            {listing.shippingAvailable === true
-              ? "Available"
-              : listing.shippingAvailable === false
-                ? "Pickup only"
-                : "Unknown"}
-          </span>
-          <span role="cell">
-            {[listing.condition, listing.location]
-              .filter(Boolean)
-              .join(" · ") || "—"}
-          </span>
-          <a
-            href={listing.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="external-link"
-            aria-label={`Open ${listing.title}`}
-          >
-            <ExternalLink size={17} />
-          </a>
-        </div>
+        <SearchResultRow key={listingRowKey(listing)} listing={listing} onSelect={onSelect} />
       ))}
     </div>
   );
-}
+});
+
+type SearchResultRowProps = { listing: Listing; onSelect: (listing: Listing) => void };
+
+// Streamed batches and "Load more" keep existing objects (mergeListings), so only new or changed rows render.
+const SearchResultRow = memo(function SearchResultRow({ listing, onSelect }: SearchResultRowProps) {
+  return (
+    <div className="search-table search-result-row" role="row">
+      <button
+        type="button"
+        className="listing-item listing-item--button"
+        onClick={() => onSelect(listing)}
+        aria-label={`View details for ${listing.title}`}
+      >
+        <ListingThumbnail listing={listing} />
+        <div>
+          <strong>{listing.title}</strong>
+          <span>{listing.subtitle || "No extra details"}</span>
+        </div>
+      </button>
+      <div className="marketplace-cell" role="cell">
+        <i style={{ background: marketplaceColors[listing.marketplace] }} />
+        {listing.marketplace}
+      </div>
+      <div className="price-cell search-price-cell" role="cell">
+        <strong>{formatPln(listing.price)}</strong>
+        <PriceNegotiability listing={listing} />
+      </div>
+      <span
+        className={`shipping-state shipping-state--${listing.shippingAvailable === true ? "yes" : listing.shippingAvailable === false ? "no" : "unknown"}`}
+        role="cell"
+      >
+        {listing.shippingAvailable === true
+          ? "Available"
+          : listing.shippingAvailable === false
+            ? "Pickup only"
+            : "Unknown"}
+      </span>
+      <span role="cell">
+        {[listing.condition, listing.location]
+          .filter(Boolean)
+          .join(" · ") || "—"}
+      </span>
+      <a
+        href={listing.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="external-link"
+        aria-label={`Open ${listing.title}`}
+      >
+        <ExternalLink size={17} />
+      </a>
+    </div>
+  );
+}, (previous: SearchResultRowProps, next: SearchResultRowProps) =>
+  previous.onSelect === next.onSelect && sameListingFields(previous.listing, next.listing));
 
 function PriceNegotiability({ listing }: { listing: Listing }) {
   const supported = listing.marketplace === "OLX" || listing.marketplace === "Allegro Lokalnie";
