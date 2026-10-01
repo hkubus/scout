@@ -3,6 +3,7 @@ import { ExternalLink, Eye, EyeOff, RefreshCw, Search, Tag } from "lucide-react"
 import { marketplaceColors } from "./data";
 import { listingRowKey, sameListingFields } from "./listingRows";
 import type { Listing } from "./types";
+import { listingAge } from "./listingSignals";
 
 const formatPln = (value: number | null) =>
   value === null ? "Learning" : `${value.toLocaleString("pl-PL")} zł`;
@@ -105,6 +106,7 @@ const ListingRow = memo(function ListingRow({ listing, onSelect, onToggleHidden 
         <div>
           <strong>{listing.title}</strong>
           <span>{listing.subtitle || listing.watch}</span>
+          <ListingSignalChips listing={listing} />
           {listing.decision ? (
             <em className={`decision-chip decision-chip--${listing.decision}`}>
               {listing.decision === "buy" ? "Buy" : listing.decision === "watch" ? "Watch" : "Pass"}
@@ -174,6 +176,17 @@ const ListingRow = memo(function ListingRow({ listing, onSelect, onToggleHidden 
   previous.onSelect === next.onSelect
   && previous.onToggleHidden === next.onToggleHidden
   && sameListingFields(previous.listing, next.listing));
+
+export function ListingSignalChips({ listing }: { listing: Listing }) {
+  const age = listingAge(listing);
+  return (
+    <>
+      {age ? <em className={`decision-chip decision-chip--age decision-chip--age-${age.freshness}`} title={age.detail}>{age.label}</em> : null}
+      {listing.promoted ? <em className="decision-chip decision-chip--promoted" title="Paid placement or highlight">Promoted</em> : null}
+      {listing.sellerType === "business" ? <em className="decision-chip decision-chip--business" title="The marketplace marks this seller as a business account">Business</em> : null}
+    </>
+  );
+}
 
 function DealBars({ strength }: { strength: number }) {
   return (

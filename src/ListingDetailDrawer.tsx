@@ -19,6 +19,7 @@ import {
 import { api } from "./api";
 import { watchPresetFromListing, type WatchPreset } from "./presets";
 import { PriceSparkline } from "./PriceSparkline";
+import { listingAge } from "./listingSignals";
 import { dayMonth, formatDate } from "./format";
 import type {
   Listing,
@@ -81,6 +82,7 @@ export default function ListingDetailDrawer({
   const [storedListing, setStoredListing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const currentListing = detail.listing;
+  const postedAge = listingAge(currentListing);
   const marketplaceListingKey = currentListing.marketplaceListingKey ?? currentListing.id;
   const toFiniteCost = (value: string) => {
     const parsed = Number(value);
@@ -392,6 +394,8 @@ export default function ListingDetailDrawer({
               <div><span>First seen</span><strong>{formatDate(dayMonth, detail.firstSeenAt)}</strong></div>
               <div><span>Last seen</span><strong>{formatDate(dayMonth, detail.lastSeenAt)}</strong></div>
               <div><span>Shipping</span><strong>{currentListing.shippingAvailable === true ? "Available" : currentListing.shippingAvailable === false ? "Pickup only" : "Unknown"}</strong></div>
+              {postedAge ? <div title={postedAge.detail}><span>Posted</span><strong>{postedAge.label.replace(/^Posted /, "")}</strong></div> : null}
+              <div><span>Seller</span><strong>{currentListing.sellerType === "business" ? "Business" : currentListing.sellerType === "private" ? "Private" : "Unknown"}{currentListing.promoted ? " · promoted" : ""}</strong></div>
             </div>
           </section>
 

@@ -13,7 +13,21 @@ export interface NormalizedListing {
   shippingAvailable?: boolean | null;
   priceNegotiable?: boolean | null;
   observedAt: string;
+  /**
+   * When the seller first posted the offer (OLX `created_time`). Distinct from
+   * `observedAt`: OLX's "newest" order is really "most recently refreshed",
+   * so a months-old listing can sit at the top of page 1.
+   */
+  postedAt?: string | null;
+  /** Last time the seller refreshed or paid to bump the offer (OLX). */
+  refreshedAt?: string | null;
+  /** A paid placement or highlight; null when the marketplace does not say. */
+  promoted?: boolean | null;
+  /** From the marketplace's own business-account flag; null when unknown. */
+  sellerType?: SellerType | null;
 }
+
+export type SellerType = 'private' | 'business';
 
 export type ListingAvailability =
   | { status: 'live' }
@@ -236,7 +250,15 @@ export function normalizeListing(input: Omit<Partial<NormalizedListing>, 'market
     shippingAvailable: input.marketplace === 'Vinted' ? true : input.shippingAvailable ?? null,
     priceNegotiable: input.priceNegotiable ?? null,
     observedAt: input.observedAt ?? new Date().toISOString(),
+    postedAt: validTimestamp(input.postedAt),
+    refreshedAt: validTimestamp(input.refreshedAt),
+    promoted: typeof input.promoted === 'boolean' ? input.promoted : null,
+    sellerType: input.sellerType === 'private' || input.sellerType === 'business' ? input.sellerType : null,
   };
+}
+
+function validTimestamp(value: unknown) {
+  return typeof value === 'string' && value && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : null;
 }
 
 export function dedupeKey(listing: Pick<NormalizedListing, 'marketplace' | 'listingId'>) {
@@ -406,8 +428,31 @@ function vintedCardPriceIndex(label: string) {
   return last >= 2 && VINTED_LABEL_PRICE.test(segments[last - 1]) ? last - 1 : last;
 }
 
+/**
+ * Vinted's catalog page embeds each card's data as (escaped) JSON:
+ * `"productItem":{"id":…,"isPromoted":false,…,"user":{…,"isBusiness":false}}`.
+ * The flags are read per item id so a card never borrows its neighbour's.
+ */
+export function parseVintedPageSignals(html: string) {
+  const text = html.includes('\\"productItem\\"') ? html.replace(/\\"/g, '"') : html;
+  const signals = new Map<string, { promoted: boolean | null; sellerType: SellerType | null }>();
+  const starts = [...text.matchAll(/"productItem":\{"id":(\d+)/g)];
+  starts.forEach((match, index) => {
+    const end = starts[index + 1]?.index ?? Math.min(text.length, (match.index ?? 0) + 20_000);
+    const chunk = text.slice(match.index, end);
+    const promoted = chunk.match(/"isPromoted":(true|false)/)?.[1];
+    const business = chunk.match(/"user":\{[^{}]*?"isBusiness":(true|false)/)?.[1];
+    signals.set(match[1], {
+      promoted: promoted === undefined ? null : promoted === 'true',
+      sellerType: business === undefined ? null : business === 'true' ? 'business' : 'private',
+    });
+  });
+  return signals;
+}
+
 /** Parse Vinted's server-rendered public product overlays and accessible labels. */
 export function parseVintedCards(html: string) {
+  const signals = parseVintedPageSignals(html);
   const anchors = [...html.matchAll(/<a[^>]*data-testid=["']product-item-id-(\d+)--overlay-link["'][^>]*>/gi)];
   const listings: NormalizedListing[] = [];
   for (const anchor of anchors) {
@@ -425,7 +470,8 @@ export function parseVintedCards(html: string) {
     const imageTag = imageTags.at(-1)?.[0];
     const condition = label.match(/,\s*Stan:\s*([^,]+)/i)?.[1]?.trim();
     try {
-      listings.push(normalizeListing({ marketplace: 'Vinted', listingId, title, price, url: new URL(href, 'https://www.vinted.pl').toString(), imageUrl: imageTag ? attribute(imageTag, 'src') : undefined, condition, priceNegotiable: parsePriceNegotiabilityFromMarkup(`${tag} ${label}`) }));
+      const signal = signals.get(listingId);
+      listings.push(normalizeListing({ marketplace: 'Vinted', listingId, title, price, url: new URL(href, 'https://www.vinted.pl').toString(), imageUrl: imageTag ? attribute(imageTag, 'src') : undefined, condition, priceNegotiable: parsePriceNegotiabilityFromMarkup(`${tag} ${label}`), promoted: signal?.promoted, sellerType: signal?.sellerType }));
     } catch { /* malformed or off-domain cards are ignored */ }
   }
   return listings;
@@ -1029,8 +1075,19 @@ function parseOlxOffer(offer: unknown): NormalizedListing | null {
   const rock = isRecord(offer.delivery) && isRecord(offer.delivery.rock) ? offer.delivery.rock : undefined;
   const shippingAvailable = rock && typeof rock.active === 'boolean' ? rock.active : null;
   const priceNegotiable = priceValue && typeof priceValue.negotiable === 'boolean' ? priceValue.negotiable : null;
-  const observedAt = typeof offer.created_time === 'string' && offer.created_time ? offer.created_time : undefined;
-  const listing = normalizeListing({ marketplace: 'OLX', listingId, title, price, url, imageUrl, condition, location, shippingAvailable, priceNegotiable, observedAt });
+  // Any paid placement counts: top-of-results slots, highlighting, or the
+  // "urgent" badge. Bumps without these show up as a later refreshedAt.
+  const promotion = isRecord(offer.promotion) ? offer.promotion : undefined;
+  const promotionFlags = promotion ? [promotion.top_ad, promotion.highlighted, promotion.urgent].filter((flag): flag is boolean => typeof flag === 'boolean') : [];
+  const promoted = promotionFlags.length ? promotionFlags.some(Boolean) : null;
+  const sellerType = typeof offer.business === 'boolean' ? (offer.business ? 'business' : 'private') : null;
+  const listing = normalizeListing({
+    marketplace: 'OLX', listingId, title, price, url, imageUrl, condition, location, shippingAvailable, priceNegotiable,
+    postedAt: typeof offer.created_time === 'string' ? offer.created_time : null,
+    refreshedAt: typeof offer.last_refresh_time === 'string' ? offer.last_refresh_time : null,
+    promoted,
+    sellerType,
+  });
   const imageUrls: string[] = [];
   for (const photo of photos) {
     if (imageUrls.length >= OLX_DETAIL_HINT_IMAGES) break;
@@ -1334,7 +1391,13 @@ function parseVintedCatalogItem(item: unknown): NormalizedListing | null {
   const photo = isRecord(item.photo) ? item.photo : undefined;
   const imageUrl = typeof photo?.url === 'string' ? photo.url : undefined;
   const condition = typeof item.status === 'string' && item.status.trim() ? item.status.trim() : undefined;
-  return normalizeListing({ marketplace: 'Vinted', listingId, title, price, url, imageUrl, condition, priceNegotiable: null });
+  const user = isRecord(item.user) ? item.user : undefined;
+  const business = typeof user?.business === 'boolean' ? user.business : typeof user?.is_business === 'boolean' ? user.is_business : undefined;
+  return normalizeListing({
+    marketplace: 'Vinted', listingId, title, price, url, imageUrl, condition, priceNegotiable: null,
+    promoted: typeof item.promoted === 'boolean' ? item.promoted : null,
+    sellerType: business === undefined ? null : business ? 'business' : 'private',
+  });
 }
 
 /**
