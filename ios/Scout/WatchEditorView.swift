@@ -72,7 +72,7 @@ struct WatchEditorView: View {
                     }
                 }
 
-                Section("Filters") {
+                Section {
                     Picker("Condition", selection: $draft.condition) {
                         ForEach(conditionOptions, id: \.self) { Text($0).tag($0) }
                     }
@@ -81,6 +81,28 @@ struct WatchEditorView: View {
                     TextField("Maximum price (zł)", text: $maxPrice)
                         .keyboardType(.numberPad)
                     Toggle("Require shipping", isOn: $draft.shippingOnly)
+                    if draft.sources.contains(.olx) {
+                        OlxCategoryField(query: draft.query, category: $draft.olxCategory)
+                    }
+                } header: {
+                    Text("Filters")
+                } footer: {
+                    if draft.sources.contains(.olx) {
+                        Text("OLX searches every category by default, so a GPU query is mostly whole PCs. Pick the item's own category for a cleaner typical price.")
+                    }
+                }
+
+                Section {
+                    Picker("Seller", selection: $draft.sellerType) {
+                        Text("Any seller").tag(SellerType?.none)
+                        Text("Private only").tag(SellerType?.some(SellerType.private))
+                        Text("Business only").tag(SellerType?.some(SellerType.business))
+                    }
+                    Toggle("Skip promoted listings", isOn: $draft.ignorePromoted)
+                } header: {
+                    Text("Sellers")
+                } footer: {
+                    Text("OLX filters seller type itself. On Vinted a listing is skipped only when it's known to be the other type. Promoted listings are paid placements, mostly dealers. Skipped listings don't count toward the typical price or alerts.")
                 }
 
                 Section {

@@ -73,6 +73,8 @@ final class AppModel {
     private(set) var serverToken = 0
     /// Research watches and saved listings.
     private(set) var researchToken = 0
+    /// The flip ledger.
+    private(set) var flipsToken = 0
     /// Per watch, from scans and watch changes; `allWatchesToken` covers
     /// changes that name no watch.
     private(set) var watchChanges: [String: Int] = [:]
@@ -126,6 +128,9 @@ final class AppModel {
         case "analytics":
             selectedTab = .market
             marketSection = .analytics
+        case "flips":
+            selectedTab = .market
+            marketSection = .flips
         case "watches": selectedTab = .watches
         case "settings": selectedTab = .settings
         case "watch":
@@ -233,6 +238,7 @@ final class AppModel {
         if scope.triage { triageToken += 1 }
         if scope.server { serverToken += 1 }
         if scope.research { researchToken += 1 }
+        if scope.flips { flipsToken += 1 }
         if scope.allWatches { allWatchesToken += 1 }
         if scope.allMarketWatches { allMarketWatchesToken += 1 }
         for id in scope.watchIDs { watchChanges[id, default: 0] += 1 }

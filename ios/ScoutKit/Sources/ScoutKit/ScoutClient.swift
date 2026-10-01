@@ -194,6 +194,52 @@ public struct ScoutClient: Sendable {
         try await send("POST", "/api/search", body: filters.normalized(), timeout: 90)
     }
 
+    /// OLX's per-category hit counts for a query (one metadata request).
+    public func olxCategories(query: String) async throws -> [OlxCategoryOption] {
+        let trimmed = String(query.trimmingCharacters(in: .whitespacesAndNewlines).prefix(240))
+        let response: OlxCategoriesResponse = try await get("/api/marketplaces/olx/categories", query: [URLQueryItem(name: "query", value: trimmed)])
+        return response.categories
+    }
+
+    // MARK: Flips
+
+    public func flips() async throws -> FlipsData {
+        try await get("/api/flips")
+    }
+
+    public func createFlip(_ draft: FlipDraft) async throws -> Flip {
+        let response: FlipResponse = try await send("POST", "/api/flips", body: draft.normalized())
+        return response.flip
+    }
+
+    /// Saves the buy side; the sale, if any, is kept.
+    public func updateFlip(id: Int, draft: FlipDraft) async throws -> Flip {
+        let response: FlipResponse = try await send("PATCH", "/api/flips/\(id)", body: draft.normalized())
+        return response.flip
+    }
+
+    /// Records or edits the sale. Without a fee the server applies the
+    /// channel's preset and stores it with the sale.
+    public func recordSale(flipId: Int, sale: FlipSale) async throws -> Flip {
+        let response: FlipResponse = try await send("PATCH", "/api/flips/\(flipId)", body: FlipSaleBody(sale: sale))
+        return response.flip
+    }
+
+    /// Removes a recorded sale; the flip goes back to unsold.
+    public func removeSale(flipId: Int) async throws -> Flip {
+        let response: FlipResponse = try await send("PATCH", "/api/flips/\(flipId)", body: FlipUnsellBody())
+        return response.flip
+    }
+
+    public func deleteFlip(id: Int) async throws {
+        let _: OkResponse = try await send("DELETE", "/api/flips/\(id)", body: EmptyBody())
+    }
+
+    public func saveFeePresets(_ presets: FeePresets) async throws -> FeePresets {
+        let response: FeePresetsResponse = try await send("PUT", "/api/flips/fee-presets", body: presets)
+        return response.feePresets
+    }
+
     // MARK: Analytics and market research
 
     public func analytics(days: Int = 30, watchId: String? = nil, marketplace: Marketplace? = nil) async throws -> AnalyticsData {
@@ -373,6 +419,9 @@ private struct EmptyBody: Encodable {}
 private struct ConnectorsResponse: Decodable { var connectors: [Connector] }
 private struct ListingActionResponse: Decodable { var action: ListingAction }
 private struct ScanBody: Encodable { var watchId: String? }
+private struct OlxCategoriesResponse: Decodable { var categories: [OlxCategoryOption] }
+private struct FlipResponse: Decodable { var flip: Flip }
+private struct FeePresetsResponse: Decodable { var feePresets: FeePresets }
 
 private struct ListingActionBody: Encodable {
     var key: String
