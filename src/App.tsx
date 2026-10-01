@@ -5,8 +5,6 @@ import {
   BarChart3,
   Bell,
   CheckCircle2,
-  ChevronDown,
-  Grid2X2,
   Info,
   LoaderCircle,
   LogIn,
@@ -14,15 +12,11 @@ import {
   Menu,
   PanelLeftClose,
   PanelLeftOpen,
-  PlugZap,
   Plus,
   RefreshCw,
-  ScrollText,
   Search,
   Settings2,
-  SlidersHorizontal,
   Tag,
-  TrendingUp,
   Wallet,
   WifiOff,
 } from "lucide-react";
@@ -33,9 +27,9 @@ import { isListingActionEvent, patchListingRows } from "./listingActions";
 import { reuseUnchangedListings } from "./listingRows";
 import { allLiveResources, dashboardResources, eventResources, planFlush, streamDecidesConnection, type LiveResource } from "./liveRefresh";
 import ListingTable from "./ListingTable";
+import type { ListingsPreset } from "./ListingsPage";
 import type { WatchPreset } from "./presets";
 import type {
-  Connector,
   DashboardData,
   Listing,
   Marketplace,
@@ -43,19 +37,24 @@ import type {
   View,
   Watch,
 } from "./types";
+import { PageHeader, SelectControl } from "./ui";
 
-const navItems: Array<{ id: View; label: string; icon: typeof Grid2X2 }> = [
-  { id: "overview", label: "Overview", icon: Grid2X2 },
-  { id: "search", label: "Search", icon: Search },
-  { id: "watches", label: "Watches", icon: Bell },
-  { id: "market-research", label: "Market research", icon: BarChart3 },
-  { id: "analytics", label: "Analytics", icon: TrendingUp },
-  { id: "listings", label: "Listings", icon: Tag },
-  { id: "flips", label: "Flips", icon: Wallet },
-  { id: "connectors", label: "Connectors", icon: PlugZap },
-  { id: "logs", label: "Logs", icon: ScrollText },
-  { id: "settings", label: "Settings", icon: Settings2 },
+/**
+ * Six sections, mirroring the iOS tabs. A section with several pages shows
+ * them as tabs; each page keeps its own URL.
+ */
+const navSections: Array<{ label: string; icon: typeof Tag; views: Array<{ id: View; label: string }> }> = [
+  { label: "Deals", icon: Tag, views: [{ id: "overview", label: "Top deals" }, { id: "listings", label: "All listings" }] },
+  { label: "Search", icon: Search, views: [{ id: "search", label: "Search" }] },
+  { label: "Watches", icon: Bell, views: [{ id: "watches", label: "Watches" }] },
+  { label: "Market", icon: BarChart3, views: [{ id: "market-research", label: "Research" }, { id: "analytics", label: "Analytics" }] },
+  { label: "Flips", icon: Wallet, views: [{ id: "flips", label: "Flips" }] },
+  { label: "System", icon: Settings2, views: [{ id: "settings", label: "Settings" }, { id: "connectors", label: "Connectors" }, { id: "logs", label: "Logs" }] },
 ];
+const sectionFor = (view: View) => navSections.find((section) => section.views.some((item) => item.id === view)) ?? navSections[0];
+
+/** The shell's one phone breakpoint; styles.css uses the same width. */
+const MOBILE_SHELL_QUERY = "(max-width: 800px)";
 
 /**
  * React.lazy suspends on its first render even when the chunk is already
@@ -99,7 +98,6 @@ const LazyWatchesPage = lazyWithPreload(loadWatchesPage);
 const LazyWatchAnalyticsDialog = lazyWithPreload(() => loadWatchesPage().then((module) => ({ default: module.WatchAnalyticsDialog })));
 const loadDialogs = () => import("./Dialogs");
 const LazyWatchDialog = lazyWithPreload(() => loadDialogs().then((module) => ({ default: module.WatchDialog })));
-const LazyPriceFilterDialog = lazyWithPreload(() => loadDialogs().then((module) => ({ default: module.PriceFilterDialog })));
 const LazyHistoryDialog = lazyWithPreload(() => loadDialogs().then((module) => ({ default: module.HistoryDialog })));
 
 const routePages: Partial<Record<View, { preload: () => Promise<unknown> }>> = {
@@ -129,7 +127,7 @@ function preloadRestWhenIdle(delayMs: number) {
   idlePreloadScheduled = true;
   if ((navigator as Navigator & { connection?: { saveData?: boolean } }).connection?.saveData) return;
   const run = () => {
-    for (const component of [...Object.values(routePages), LazyListingDetailDrawer, LazyWatchAnalyticsDialog, LazyWatchDialog, LazyPriceFilterDialog, LazyHistoryDialog]) {
+    for (const component of [...Object.values(routePages), LazyListingDetailDrawer, LazyWatchAnalyticsDialog, LazyWatchDialog, LazyHistoryDialog]) {
       void component?.preload().catch(() => {});
     }
   };
@@ -141,7 +139,7 @@ function preloadRestWhenIdle(delayMs: number) {
 
 function viewFromLocation(): View {
   const raw = window.location.pathname.split(/[?#]/)[0].replace(/\/+$/, "").replace(/^\//, "") as View;
-  return navItems.some((item) => item.id === raw) ? raw : "overview";
+  return navSections.some((section) => section.views.some((item) => item.id === raw)) ? raw : "overview";
 }
 
 const initialView = viewFromLocation();
@@ -291,15 +289,13 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
   >("loading");
   const [showWatchDialog, setShowWatchDialog] = useState(false);
   const [watchPreset, setWatchPreset] = useState<WatchPreset | null>(null);
-  const [editingWatch, setEditingWatch] = useState<Watch | null>(null);
   const [editingFullWatch, setEditingFullWatch] = useState<Watch | null>(null);
   const [showHistory, setShowHistory] = useState(false);
   const [marketRefreshKey, setMarketRefreshKey] = useState(0);
   const [analyticsRefreshKey, setAnalyticsRefreshKey] = useState(0);
   const [listingsRefreshKey, setListingsRefreshKey] = useState(0);
-  const [selectedWatchId, setSelectedWatchId] = useState<string | null>(
-    null,
-  );
+  // Remounts Listings with these filters whenever another page opens it.
+  const [listingsPreset, setListingsPreset] = useState<{ key: number; filters: ListingsPreset }>({ key: 0, filters: {} });
   const [analyticsWatch, setAnalyticsWatch] = useState<Watch | null>(null);
   const [selectedListing, setSelectedListing] = useState<Listing | null>(null);
   const [busyWatchIds, setBusyWatchIds] = useState<Set<string>>(
@@ -478,12 +474,35 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     if (view !== "watches") return;
     void api.watches(true).then((result) => setAllWatches(result.watches)).catch((error) => notify(errorMessage(error), "error"));
   }, [notify, view, watchRefreshKey]);
+  // An open listing drawer owns one history entry, so Back closes it.
+  const drawerHistory = useRef(false);
   useEffect(() => {
-    const onPopState = () => setView(viewFromLocation());
+    const onPopState = () => {
+      if (drawerHistory.current) {
+        drawerHistory.current = false;
+        setSelectedListing(null);
+        return;
+      }
+      setView(viewFromLocation());
+    };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
-  const modalOpen = Boolean(showWatchDialog || editingWatch || analyticsWatch || showHistory || selectedListing);
+  const openListing = useCallback((listing: Listing) => {
+    if (!drawerHistory.current) {
+      window.history.pushState({ scoutDrawer: true }, "");
+      drawerHistory.current = true;
+    }
+    setSelectedListing(listing);
+  }, []);
+  const closeListing = useCallback(() => {
+    setSelectedListing(null);
+    if (drawerHistory.current) {
+      drawerHistory.current = false;
+      window.history.back();
+    }
+  }, []);
+  const modalOpen = Boolean(showWatchDialog || editingFullWatch || analyticsWatch || showHistory || selectedListing);
   useEffect(() => {
     if (!modalOpen) return;
     const dialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]'));
@@ -517,7 +536,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
       dialog.removeEventListener("keydown", onKeyDown);
       if (main) main.inert = false;
       if (sidebar) {
-        const mobileHidden = window.matchMedia("(max-width: 900px)").matches && !sidebarOpen;
+        const mobileHidden = window.matchMedia(MOBILE_SHELL_QUERY).matches && !sidebarOpen;
         sidebar.inert = mobileHidden;
         sidebar.setAttribute("aria-hidden", String(mobileHidden));
       }
@@ -530,8 +549,8 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     return () => window.clearTimeout(timeout);
   }, [toast]);
 
-  const openView = (nextView: View) => {
-    if (nextView === "listings") setSelectedWatchId(null);
+  const openView = (nextView: View, preset: ListingsPreset = {}) => {
+    if (nextView === "listings") setListingsPreset((current) => ({ key: current.key + 1, filters: preset }));
     setView(nextView);
     window.history.pushState({}, "", nextView === "overview" ? "/" : `/${nextView}`);
     setSidebarOpen(false);
@@ -613,22 +632,6 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         notify(errorMessage(error), "error");
       }
     });
-  const updatePriceRange = async (
-    watch: Watch,
-    minPrice: number | null,
-    maxPrice: number | null,
-  ) =>
-    withBusyWatch(watch, async () => {
-      try {
-        await api.updateWatch(watch.id, { minPrice, maxPrice });
-        await refreshAfterWatchChange();
-        setEditingWatch(null);
-        notify(`Price filter updated for ${watch.name}.`);
-      } catch (error) {
-        notify(errorMessage(error), "error");
-        throw error;
-      }
-    });
   const updateWatch = async (watch: Omit<Watch, "id"> & { id?: string }) => {
     if (!watch.id) {
       notify("Watch id is missing.", "error");
@@ -673,10 +676,8 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     });
   const scanWatch = (watch: Watch) =>
     withBusyWatch(watch, async () => requestScan(watch.id));
-  const showWatchListings = (watch: Watch) => {
-    setSelectedWatchId(watch.id);
-    openView("listings");
-  };
+  const showWatchListings = (watch: Watch, strongOnly = false) =>
+    openView("listings", { watchId: watch.id, watchName: watch.name, ...(strongOnly ? { minStrength: 3, sort: "Strongest" as const } : {}) });
   const updateListingAction = useCallback((listing: Listing) => {
     setData((previous) => ({
       ...previous,
@@ -730,15 +731,18 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
       <main
         className={`main-content ${sidebarCollapsed ? "main-content--wide" : ""}`}
       >
-        <button
-          className="mobile-menu"
-          aria-label="Open navigation"
-          aria-expanded={sidebarOpen}
-          aria-controls="primary-navigation"
-          onClick={() => setSidebarOpen(true)}
-        >
-          <Menu size={21} />
-        </button>
+        <div className="mobile-bar">
+          <button
+            className="mobile-menu"
+            aria-label="Open navigation"
+            aria-expanded={sidebarOpen}
+            aria-controls="primary-navigation"
+            onClick={() => setSidebarOpen(true)}
+          >
+            <Menu size={21} />
+          </button>
+          <strong>{sectionFor(view).label}</strong>
+        </div>
         {connection === "offline" ? (
           <div className="offline-banner" role="alert">
             <WifiOff size={17} />
@@ -749,6 +753,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
             <button onClick={() => refreshData(true)}>Retry</button>
           </div>
         ) : null}
+        <SectionTabs view={view} onNavigate={openView} />
         {view === "overview" ? (
         <Overview
           data={data}
@@ -757,13 +762,13 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
           onNewWatch={() => { setWatchPreset(null); setShowWatchDialog(true); }}
           onNavigate={openView}
           onScan={() => requestScan()}
-          onSelectListing={setSelectedListing}
+          onSelectListing={openListing}
           onToggleHidden={toggleListingHidden}
         />
         ) : null}
         {view === "search" ? (
           <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading search…</div>}>
-            <LazySearchPage onSelectListing={setSelectedListing} onSaveWatch={saveSearchAsWatch} />
+            <LazySearchPage onSelectListing={openListing} onSaveWatch={saveSearchAsWatch} />
           </Suspense>
         ) : null}
         {view === "watches" ? (
@@ -776,7 +781,6 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
               onToggleShipping={toggleShipping}
               onToggleAiRelevance={toggleAiRelevance}
               onEdit={setEditingFullWatch}
-              onPriceEdit={setEditingWatch}
               onArchive={archiveWatch}
               onDelete={deleteWatch}
               onScan={scanWatch}
@@ -798,11 +802,11 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         {view === "listings" ? (
           <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading listings…</div>}>
             <LazyListingsPage
+              key={listingsPreset.key}
               listings={data.listings}
               refreshKey={listingsRefreshKey}
-              selectedWatchId={selectedWatchId}
-              onClearWatch={() => setSelectedWatchId(null)}
-              onSelectListing={setSelectedListing}
+              preset={listingsPreset.filters}
+              onSelectListing={openListing}
               onToggleHidden={toggleListingHidden}
             />
           </Suspense>
@@ -819,6 +823,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
               scanning={scanning}
               onScan={() => requestScan()}
               onHistory={() => setShowHistory(true)}
+              onOpenSettings={() => openView("settings")}
               onToast={notify}
             />
           </Suspense>
@@ -850,15 +855,6 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         </Suspense>
       ) : null}
       {editingFullWatch ? <Suspense fallback={<div className="modal-backdrop"><div className="table-loading"><LoaderCircle size={18} className="spin" />Loading watch editor…</div></div>}><LazyWatchDialog key={editingFullWatch.id} initialWatch={editingFullWatch} onClose={() => setEditingFullWatch(null)} onSubmit={updateWatch} /></Suspense> : null}
-      {editingWatch ? (
-        <Suspense fallback={<div className="modal-backdrop"><div className="table-loading"><LoaderCircle size={18} className="spin" />Loading price filter…</div></div>}>
-          <LazyPriceFilterDialog
-            watch={editingWatch}
-            onClose={() => setEditingWatch(null)}
-            onSubmit={(min, max) => updatePriceRange(editingWatch, min, max)}
-          />
-        </Suspense>
-      ) : null}
       {analyticsWatch ? (
         <Suspense fallback={<div className="modal-backdrop"><div className="table-loading"><LoaderCircle size={18} className="spin" />Loading analytics…</div></div>}>
           <LazyWatchAnalyticsDialog
@@ -876,11 +872,11 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         <Suspense fallback={<div className="modal-backdrop"><div className="table-loading"><LoaderCircle size={18} className="spin" />Loading listing…</div></div>}>
           <LazyListingDetailDrawer
             listing={selectedListing}
-            onClose={() => setSelectedListing(null)}
+            onClose={closeListing}
             onUpdated={updateListingAction}
             onFlipAdded={(flip) => notify(`${flip.title} added to Flips.`)}
             onCreateWatch={(preset) => {
-              setSelectedListing(null);
+              closeListing();
               setWatchPreset(preset);
               setShowWatchDialog(true);
             }}
@@ -925,7 +921,7 @@ function Sidebar({
 }) {
   const sidebarRef = useRef<HTMLElement>(null);
   useEffect(() => {
-    const media = window.matchMedia("(max-width: 900px)");
+    const media = window.matchMedia(MOBILE_SHELL_QUERY);
     const updateAccessibility = () => {
       const mobileHidden = media.matches && !open;
       if (sidebarRef.current) {
@@ -937,6 +933,7 @@ function Sidebar({
     media.addEventListener("change", updateAccessibility);
     return () => media.removeEventListener("change", updateAccessibility);
   }, [open]);
+  const current = sectionFor(view);
   return (
     <aside
       ref={sidebarRef}
@@ -950,35 +947,32 @@ function Sidebar({
         {collapsed ? null : <span className="brand-name">Scout</span>}
       </div>
       <nav id="primary-navigation" className="sidebar-nav" aria-label="Primary navigation">
-        {navItems.map(({ id, label, icon: Icon }) => (
-          <button
-            key={id}
-            className={`nav-item ${view === id ? "nav-item--active" : ""}`}
-            onClick={() => onNavigate(id)}
-            onMouseEnter={() => preloadView(id)}
-            onFocus={() => preloadView(id)}
-            title={collapsed ? label : undefined}
-            aria-current={view === id ? "page" : undefined}
-          >
-            <Icon size={22} strokeWidth={1.9} />
-            {collapsed ? null : <span>{label}</span>}
-          </button>
-        ))}
+        {navSections.map((section) => {
+          const { label, icon: Icon } = section;
+          const target = section.views[0].id;
+          const active = section === current;
+          return (
+            <button
+              key={label}
+              className={`nav-item ${active ? "nav-item--active" : ""}`}
+              onClick={() => onNavigate(target)}
+              onMouseEnter={() => preloadView(target)}
+              onFocus={() => preloadView(target)}
+              title={collapsed ? label : undefined}
+              aria-current={active ? "page" : undefined}
+            >
+              <Icon size={22} strokeWidth={1.9} />
+              {collapsed ? null : <span>{label}</span>}
+            </button>
+          );
+        })}
       </nav>
       <div className="sidebar-footer">
-        {collapsed ? null : (
+        {/* Only worth a line when something is wrong. */}
+        {collapsed || connection === "online" ? null : (
           <div className="running-state">
             <span className={`status-dot status-dot--${connection}`} />
-            <div>
-              <strong>
-                {connection === "online"
-                  ? "Scout is running"
-                  : connection === "loading"
-                    ? "Connecting…"
-                    : "Scout is offline"}
-              </strong>
-              <span>v1.0.0</span>
-            </div>
+            <strong>{connection === "loading" ? "Connecting…" : "Scout is offline"}</strong>
           </div>
         )}
         {onLogout ? (
@@ -987,7 +981,7 @@ function Sidebar({
           </button>
         ) : null}
         <button
-          className="collapse-button"
+          className="collapse-button collapse-button--sidebar"
           onClick={onCollapse}
           aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
         >
@@ -1001,6 +995,30 @@ function Sidebar({
     </aside>
   );
 }
+
+/** The pages of the current section (Deals, Market, System) as tabs. */
+function SectionTabs({ view, onNavigate }: { view: View; onNavigate: (view: View) => void }) {
+  const section = sectionFor(view);
+  if (section.views.length < 2) return null;
+  return (
+    <nav className="section-tabs" aria-label={`${section.label} pages`}>
+      {section.views.map((item) => (
+        <button
+          key={item.id}
+          className={`section-tab${item.id === view ? " section-tab--active" : ""}`}
+          aria-current={item.id === view ? "page" : undefined}
+          onClick={() => onNavigate(item.id)}
+          onMouseEnter={() => preloadView(item.id)}
+        >
+          {item.label}
+        </button>
+      ))}
+    </nav>
+  );
+}
+
+/** How many deals Overview shows; the rest are one click away in Listings. */
+const TOP_DEALS = 20;
 
 function Overview({
   data,
@@ -1016,91 +1034,67 @@ function Overview({
   isLoading: boolean;
   scanning: boolean;
   onNewWatch: () => void;
-  onNavigate: (view: View) => void;
+  onNavigate: (view: View, preset?: ListingsPreset) => void;
   onScan: () => void;
   onSelectListing: (listing: Listing) => void;
   onToggleHidden: (listing: Listing) => void;
 }) {
   const [marketplace, setMarketplace] = useState<"All" | Marketplace>("All");
-  const [strength, setStrength] = useState<"All" | "Strong" | "Exceptional">(
-    "All",
-  );
-  const [sort, setSort] = useState<"Newest" | "Deal">("Deal");
-  const visibleListings = useMemo(
-    () =>
-      data.listings
-        .filter((listing) => !listing.hidden)
-        .filter(
-          (listing) =>
-            marketplace === "All" || listing.marketplace === marketplace,
-        )
-        .filter(
-          (listing) =>
-            strength === "All" ||
-            (strength === "Exceptional"
-              ? listing.dealStrength >= 5
-              : listing.dealStrength >= 3),
-        )
-        .slice()
-        .sort((a, b) => {
-          const aFiltered = a.aiFiltered ? 1 : 0;
-          const bFiltered = b.aiFiltered ? 1 : 0;
-          if (aFiltered !== bFiltered) return aFiltered - bFiltered;
-          if (sort === "Deal") {
-            if (b.dealStrength !== a.dealStrength)
-              return b.dealStrength - a.dealStrength;
-            return (
-              (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0)
-            );
-          }
-          return (
-            (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0)
-          );
-        }),
-    [data.listings, marketplace, strength, sort],
-  );
+  // Strong+ deals still worth a look: not hidden, not filtered by AI, not
+  // passed (the widget's rule). Untriaged rows lead within a tier.
+  const { topDeals, total, aiFilteredCount } = useMemo(() => {
+    let aiFilteredCount = 0;
+    const candidates: Listing[] = [];
+    for (const listing of data.listings) {
+      if (listing.hidden) continue;
+      if (listing.aiFiltered) {
+        aiFilteredCount += 1;
+        continue;
+      }
+      if (listing.decision === "pass" || listing.dealStrength < 3) continue;
+      if (marketplace !== "All" && listing.marketplace !== marketplace) continue;
+      candidates.push(listing);
+    }
+    candidates.sort((a, b) => {
+      if (b.dealStrength !== a.dealStrength) return b.dealStrength - a.dealStrength;
+      const aTriaged = a.decision ? 1 : 0;
+      const bTriaged = b.decision ? 1 : 0;
+      if (aTriaged !== bTriaged) return aTriaged - bTriaged;
+      return (Date.parse(b.firstSeenAt ?? b.observedAt) || 0) - (Date.parse(a.firstSeenAt ?? a.observedAt) || 0);
+    });
+    return { topDeals: candidates.slice(0, TOP_DEALS), total: candidates.length, aiFilteredCount };
+  }, [data.listings, marketplace]);
+  const troubled = data.connectors.filter((connector) => connector.status === "Degraded" || connector.status === "Warning");
   return (
     <>
-      <header className="page-header overview-header">
-        <h1>Good deals, before they’re gone.</h1>
+      <PageHeader title="Deals">
+        <button className="outline-button" disabled={scanning || data.watches.length === 0} onClick={onScan}>
+          {scanning ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}
+          {scanning ? "Queueing…" : "Scan now"}
+        </button>
         <button className="primary-button" onClick={onNewWatch}>
-          <Plus size={19} strokeWidth={2.3} />
+          <Plus size={18} strokeWidth={2.3} />
           New watch
         </button>
-      </header>
-      <section className="overview-stats" aria-label="Overview statistics">
-        <Stat
-          label="Watching"
-          value={data.stats.watching.toString()}
-          detail="watches"
-        />
-        <Stat
-          label="New today"
-          value={data.stats.newToday.toString()}
-          detail="listings"
-        />
-        <Stat
-          label="Strong deals"
-          value={data.stats.strongDeals.toString()}
-          detail="high confidence"
-        />
-        <Stat
-          label="Last scan"
-          value={data.lastScan}
-          detail={data.lastScanTime}
-        />
-        <div className="manage-callout">
-          <SlidersHorizontal size={25} />
-          <span>
-            Polling intervals are
-            <br />
-            configurable per watch.
-            <button className="text-link" onClick={() => onNavigate("watches")}>
-              Manage watches
-            </button>
-          </span>
-        </div>
-      </section>
+      </PageHeader>
+      <div className="overview-summary" aria-label="Overview statistics">
+        <button type="button" onClick={() => onNavigate("listings", { minStrength: 3, sort: "Strongest" })}>
+          <strong>{data.stats.strongDeals}</strong> strong deals
+        </button>
+        <span>
+          <strong>{data.stats.newToday}</strong> new today
+        </span>
+        <button type="button" onClick={() => onNavigate("watches")}>
+          <strong>{data.stats.watching}</strong> active {data.stats.watching === 1 ? "watch" : "watches"}
+        </button>
+        <span title={data.lastScanTime ? `Last scan at ${data.lastScanTime}` : undefined}>last scan {data.lastScan}</span>
+        {troubled.length ? (
+          <button type="button" className="overview-summary-warning" onClick={() => onNavigate("connectors")}>
+            <AlertTriangle size={14} />
+            {troubled.map((connector) => `${connector.name} ${connector.status.toLowerCase()}`).join(", ")}
+          </button>
+        ) : null}
+      </div>
       {!isLoading && data.watches.length === 0 ? (
         <div className="setup-banner">
           <div>
@@ -1118,220 +1112,41 @@ function Overview({
       ) : null}
       <section className="fresh-section">
         <div className="section-heading-row">
-          <h2>Fresh matches</h2>
+          <h2>Top deals</h2>
           <div className="filters">
             <SelectControl
-              value={marketplace === "All" ? "All marketplaces" : marketplace}
-              options={[
-                "All marketplaces",
-                "OLX",
-                "Allegro Lokalnie",
-                "Vinted",
-              ]}
-              onChange={(value) =>
-                setMarketplace(
-                  value === "All marketplaces" ? "All" : (value as Marketplace),
-                )
-              }
-            />
-            <SelectControl
-              value={
-                strength === "All"
-                  ? "All strengths"
-                  : strength === "Strong"
-                    ? "Strong+"
-                    : "Exceptional"
-              }
-              options={["All strengths", "Strong+", "Exceptional"]}
-              onChange={(value) =>
-                setStrength(
-                  value === "All strengths"
-                    ? "All"
-                    : value === "Exceptional"
-                      ? "Exceptional"
-                      : "Strong",
-                )
-              }
-            />
-            <SelectControl
-              value={sort === "Newest" ? "Newest first" : "Strongest first"}
-              options={["Newest first", "Strongest first"]}
-              onChange={(value) =>
-                setSort(value === "Newest first" ? "Newest" : "Deal")
-              }
+              label="Marketplace"
+              value={marketplace}
+              options={[{ value: "All", label: "All marketplaces" }, "OLX", "Allegro Lokalnie", "Vinted"]}
+              onChange={(value) => setMarketplace(value as "All" | Marketplace)}
             />
           </div>
         </div>
         <ListingTable
-          listings={visibleListings}
+          listings={topDeals}
           isLoading={isLoading}
-          compact
           onSelect={onSelectListing}
           onToggleHidden={onToggleHidden}
+          empty={
+            <div className="empty-state">
+              <Search size={25} />
+              <strong>No strong deals right now</strong>
+              <span>Listings at least 12% below their typical price show up here.</span>
+            </div>
+          }
         />
         <div className="section-footer">
-          <button
-            className="link-button"
-            onClick={() => onNavigate("listings")}
-          >
-            View all matches <ArrowRight size={17} />
+          <button className="link-button" onClick={() => onNavigate("listings", { minStrength: 3, sort: "Strongest" })}>
+            {total > topDeals.length ? `All ${total} strong deals` : "All listings"} <ArrowRight size={17} />
           </button>
-          <button
-            className="scan-button"
-            disabled={scanning || data.watches.length === 0}
-            onClick={onScan}
-          >
-            {scanning ? (
-              <LoaderCircle size={15} className="spin" />
-            ) : (
-              <RefreshCw size={15} />
-            )}
-            {scanning ? "Queueing…" : "Scan now"}
-          </button>
+          {aiFilteredCount ? (
+            <button className="link-button link-button--muted" onClick={() => onNavigate("listings", { visibility: "AI" })}>
+              {aiFilteredCount} filtered by AI
+            </button>
+          ) : null}
         </div>
       </section>
-      <section className="overview-panels">
-        <LearningPanel
-          watches={data.watches}
-          onManage={() => onNavigate("watches")}
-        />
-        <ConnectorPanel
-          connectors={data.connectors}
-          onManage={() => onNavigate("connectors")}
-        />
-      </section>
     </>
-  );
-}
-
-function Stat({
-  label,
-  value,
-  detail,
-}: {
-  label: string;
-  value: string;
-  detail: string;
-}) {
-  return (
-    <div className="stat">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <small>{detail}</small>
-    </div>
-  );
-}
-function SelectControl({
-  value,
-  options,
-  onChange,
-}: {
-  value: string;
-  options: Array<string | { value: string; label: string }>;
-  onChange: (value: string) => void;
-}) {
-  return (
-    <label className="select-control">
-      <select
-        aria-label={value}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-      >
-        {options.map((option) => {
-          const item = typeof option === "string" ? { value: option, label: option } : option;
-          return <option key={item.value} value={item.value}>{item.label}</option>;
-        })}
-      </select>
-      <ChevronDown size={16} />
-    </label>
-  );
-}
-
-function LearningPanel({
-  watches,
-  onManage,
-}: {
-  watches: Watch[];
-  onManage: () => void;
-}) {
-  return (
-    <div className="info-panel">
-      <div className="panel-title">
-        <h3>Learning progress</h3>
-        <Info size={16} />
-      </div>
-      {watches.length ? (
-        <>
-          <div className="learning-head">
-            <span>Watch</span>
-            <span>Samples</span>
-            <span>Status</span>
-            <span>Readiness</span>
-          </div>
-          {watches.slice(0, 4).map((watch) => (
-            <div className="learning-row" key={watch.id}>
-              <span>{watch.name}</span>
-              <span>
-                {watch.samples} / {watch.targetSamples}
-              </span>
-              <span
-                className={`learning-status learning-status--${watch.status.toLowerCase()}`}
-              >
-                <i />
-                {watch.status}
-              </span>
-              <span className="readiness">
-                <em>{Number.isFinite(watch.readiness) ? Math.min(100, Math.max(0, watch.readiness)) : 0}%</em>
-                <b>
-                  <i style={{ width: `${Number.isFinite(watch.readiness) ? Math.min(100, Math.max(0, watch.readiness)) : 0}%` }} />
-                </b>
-              </span>
-            </div>
-          ))}
-        </>
-      ) : (
-        <div className="panel-empty">No watches are learning yet.</div>
-      )}
-      <button className="panel-link" onClick={onManage}>
-        Manage watches <ArrowRight size={16} />
-      </button>
-    </div>
-  );
-}
-function ConnectorPanel({
-  connectors,
-  onManage,
-}: {
-  connectors: Connector[];
-  onManage: () => void;
-}) {
-  return (
-    <div className="info-panel">
-      <div className="panel-title connector-title">
-        <h3>Connector health</h3>
-        <span>Last successful check</span>
-      </div>
-      <div className="connector-list">
-        {connectors.map((connector) => (
-          <div className="connector-row" key={connector.name}>
-            <span className="connector-name">
-              <i style={{ background: connector.color }} />
-              {connector.name}
-            </span>
-            <span
-              className={`connector-status connector-status--${connector.status.toLowerCase()}`}
-            >
-              <i />
-              {connector.status}
-            </span>
-            <span>{connector.lastSuccess}</span>
-          </div>
-        ))}
-      </div>
-      <button className="panel-link" onClick={onManage}>
-        View connector details <ArrowRight size={16} />
-      </button>
-    </div>
   );
 }
 

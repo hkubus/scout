@@ -46,16 +46,9 @@ struct WatchEditorView: View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("Name, e.g. Steam Deck OLED 512GB", text: $draft.name)
-                    TextField("Search query", text: $draft.query)
+                    TextField("Search for, e.g. steam deck oled 512gb", text: $draft.query)
                         .textInputAutocapitalization(.never)
-                } header: {
-                    Text("Watch")
-                } footer: {
-                    Text("Scout searches every selected marketplace for the query, learns the typical asking price, and alerts on listings well below it.")
-                }
-
-                Section("Matching") {
+                    TextField("Name (optional)", text: $draft.name)
                     TextField("Must include, e.g. oled, 512gb", text: $draft.terms)
                         .textInputAutocapitalization(.never)
                     TextField("Exclude, e.g. broken, parts", text: $draft.excluded)
@@ -73,12 +66,9 @@ struct WatchEditorView: View {
                 }
 
                 Section {
-                    Picker("Condition", selection: $draft.condition) {
-                        ForEach(conditionOptions, id: \.self) { Text($0).tag($0) }
-                    }
-                    TextField("Minimum price (zł)", text: $minPrice)
+                    TextField("Minimum (zł)", text: $minPrice)
                         .keyboardType(.numberPad)
-                    TextField("Maximum price (zł)", text: $maxPrice)
+                    TextField("Maximum (zł)", text: $maxPrice)
                         .keyboardType(.numberPad)
                     Toggle("Require shipping", isOn: $draft.shippingOnly)
                     if draft.sources.contains(.olx) {
@@ -105,25 +95,25 @@ struct WatchEditorView: View {
                     Text("OLX filters seller type itself. On Vinted a listing is skipped only when it's known to be the other type. Promoted listings are paid placements, mostly dealers. Skipped listings don't count toward the typical price or alerts.")
                 }
 
+                // Set-once tuning stays folded away.
                 Section {
-                    Picker("Scan every", selection: $draft.interval) {
-                        ForEach(intervalOptions, id: \.self) { minutes in
-                            Text(Format.minutes(Double(minutes))).tag(minutes)
+                    DisclosureGroup("More options") {
+                        Picker("Condition", selection: $draft.condition) {
+                            ForEach(conditionOptions, id: \.self) { Text($0).tag($0) }
                         }
-                    }
-                    Picker("Sensitivity", selection: $draft.sensitivity) {
-                        ForEach(sensitivityOptions, id: \.self) { option in
-                            Text(option.label).tag(option.value)
+                        Picker("Scan every", selection: $draft.interval) {
+                            ForEach(intervalOptions, id: \.self) { minutes in
+                                Text(Format.minutes(Double(minutes))).tag(minutes)
+                            }
                         }
+                        Picker("Alert sensitivity", selection: $draft.sensitivity) {
+                            ForEach(sensitivityOptions, id: \.self) { option in
+                                Text(option.label).tag(option.value)
+                            }
+                        }
+                        Toggle("AI relevance filter", isOn: $draft.aiRelevance)
+                        Toggle("Also search typo variants", isOn: $draft.typoVariants)
                     }
-                    Toggle("Scan typo variants", isOn: $draft.typoVariants)
-                    Toggle("AI relevance filtering", isOn: $draft.aiRelevance)
-                } header: {
-                    Text("Scanning")
-                } footer: {
-                    Text(verbatim: isNew
-                        ? "Typo variants add up to 2 extra searches per scan. AI filtering drops accessories, parts, and unrelated listings."
-                        : "Model variants, exact search URLs, per-marketplace intervals, and research baselines are edited in the web app and are kept as they are.")
                 }
 
                 if let error {

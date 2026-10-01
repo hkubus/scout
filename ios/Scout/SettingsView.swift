@@ -28,14 +28,9 @@ struct SettingsView: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
-                    if let readiness {
-                        LabeledContent("Status", value: readiness.isReady ? "Ready" : readiness.status.capitalized)
-                        if let degraded = readiness.connectors?.degraded, !degraded.isEmpty {
-                            LabeledContent("Degraded", value: degraded.joined(separator: ", "))
-                        }
-                    }
-                    if let version = health?.version {
-                        LabeledContent("Server version", value: version)
+                    // Connector trouble shows in the Connectors list below.
+                    if let readiness, !readiness.isReady {
+                        LabeledContent("Status", value: readiness.status.capitalized)
                     }
                     if let error {
                         Text(error)
@@ -54,7 +49,7 @@ struct SettingsView: View {
                     }
                 }
 
-                apiTokenSection
+                notificationsSection
 
                 if !connectors.isEmpty {
                     Section("Connectors") {
@@ -64,42 +59,41 @@ struct SettingsView: View {
                                     Circle()
                                         .fill(color(for: connector.status))
                                         .frame(width: 8, height: 8)
-                                    Text(connector.name).font(.body.weight(.medium))
+                                    Text(connector.name)
                                     Spacer()
-                                    Text(connector.status)
+                                    Text(connector.status == "OK" ? connector.lastSuccess : connector.status)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
-                                Text(connector.detail)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                                Text("Last success \(connector.lastSuccess) · \(connector.latency)")
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
+                                // Only a problem needs its explanation.
+                                if connector.status != "OK" && connector.status != "Idle" {
+                                    Text(connector.detail)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                }
                             }
                         }
                     }
                 }
 
-                notificationsSection
+                apiTokenSection
 
                 Section {
-                    Button {
-                        model.showWidgetGallery = true
-                    } label: {
-                        Label("Preview widgets", systemImage: "square.grid.2x2")
+                    // The gallery is a screenshot surface; the system widget picker previews widgets for everyone else.
+                    if model.isDemo {
+                        Button {
+                            model.showWidgetGallery = true
+                        } label: {
+                            Label("Preview widgets", systemImage: "square.grid.2x2")
+                        }
                     }
-                } header: {
-                    Text("Widgets")
+                    LabeledContent("App version", value: Self.appVersion)
+                    if let version = health?.version {
+                        LabeledContent("Server version", value: version)
+                    }
                 } footer: {
                     Text(widgetFooter)
-                }
-
-                Section {
-                    LabeledContent("App version", value: Self.appVersion)
-                } footer: {
-                    Text("Marketplace prices shown in Scout are public asking prices, not completed sales.")
                 }
             }
             .navigationTitle("Settings")
@@ -138,33 +132,32 @@ struct SettingsView: View {
     private var apiTokenSection: some View {
         if !model.isDemo, let client = model.client {
             Section {
-                LabeledContent("Current token", value: Self.masked(client.apiToken))
-                SecureField(client.apiToken == nil ? "Paste an API token" : "Paste a new API token", text: $newAPIToken)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .submitLabel(.done)
-                    .onSubmit { saveAPIToken(newAPIToken) }
-                Button {
-                    saveAPIToken(newAPIToken)
-                } label: {
-                    HStack {
-                        Text("Save token")
-                        Spacer()
-                        if savingAPIToken { ProgressView() }
+                DisclosureGroup {
+                    SecureField(client.apiToken == nil ? "Paste an API token" : "Paste a new API token", text: $newAPIToken)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .submitLabel(.done)
+                        .onSubmit { saveAPIToken(newAPIToken) }
+                    Button {
+                        saveAPIToken(newAPIToken)
+                    } label: {
+                        HStack {
+                            Text("Save token")
+                            Spacer()
+                            if savingAPIToken { ProgressView() }
+                        }
                     }
+                    .disabled(savingAPIToken || newAPIToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    if client.apiToken != nil {
+                        Button("Remove token", role: .destructive) { saveAPIToken("") }
+                            .disabled(savingAPIToken)
+                    }
+                } label: {
+                    LabeledContent("API token", value: Self.masked(client.apiToken))
                 }
-                .disabled(savingAPIToken || newAPIToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                if client.apiToken != nil {
-                    Button("Remove token", role: .destructive) { saveAPIToken("") }
-                        .disabled(savingAPIToken)
-                }
-            } header: {
-                Text("API token")
             } footer: {
                 if let apiTokenError {
                     Text(apiTokenError).foregroundStyle(.red)
-                } else {
-                    Text("One of the server's SCOUT_API_TOKENS, sent with every request and kept in the Keychain. Scout checks a new token with the server before saving it.")
                 }
             }
         }
@@ -212,7 +205,7 @@ struct SettingsView: View {
                 Text("Notifications")
             } footer: {
                 if ntfy.configured && ntfy.openInApp != nil {
-                    Text("Tapping an ntfy alert opens the listing here, and the alert's Open listing button still goes to the marketplace. This applies to every device subscribed to the topic, so leave it off if you also read alerts on a computer or Android.")
+                    Text("Applies to every device on the topic; leave it off if you also read alerts on a computer or Android.")
                 }
             }
         }
@@ -232,7 +225,7 @@ struct SettingsView: View {
     }
 
     private var widgetFooter: String {
-        let add = "Long-press the Home Screen, tap Edit → Add Widget, and search for Scout. Lock Screen widgets are available too."
+        let add = "Widgets: long-press the Home Screen, tap Edit → Add Widget, and search for Scout."
         if model.isDemo || SharedStore.isAvailable { return add }
         return add + " This install can't share the server address with widgets, so long-press a widget, choose Edit Widget, and enter your server address there."
     }

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, ArrowLeft, ArrowRight, Check, Download, ImagePlus, LoaderCircle, Megaphone, Pencil, Plus, RotateCcw, Trash2, Wallet, X } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ArrowRight, Check, Download, ImagePlus, LoaderCircle, Megaphone, MoreHorizontal, Pencil, Plus, RotateCcw, Trash2, Wallet, X } from "lucide-react";
 import { api, forgetInFlightGets } from "./api";
 import { subscribe, subscribeStatus } from "./events";
 import {
@@ -21,7 +21,9 @@ import {
   type FlipListing,
   type ListingCondition,
 } from "./profit";
+import { dayMonth, dayMonthYear, formatDate } from "./format";
 import type { Flip, FlipPhoto } from "./types";
+import { PageHeader } from "./ui";
 
 type ToastType = "success" | "error" | "info";
 
@@ -43,12 +45,28 @@ const toAmount = (raw: string) => {
   return Number.isFinite(value) && value >= 0 ? value : NaN;
 };
 
-function Stat({ label, value, detail, title }: { label: string; value: string; detail: string; title?: string }) {
+/** "14 wrz" this year, "14 wrz 2025" otherwise; ledger dates are calendar days. */
+const formatDay = (day: string) => {
+  const date = new Date(`${day}T12:00:00`);
+  return formatDate(date.getFullYear() === new Date().getFullYear() ? dayMonth : dayMonthYear, date);
+};
+
+function RowMenu({ label, items }: { label: string; items: Array<{ label: string; icon: React.ReactNode; danger?: boolean; onSelect: () => void }> }) {
+  const [open, setOpen] = useState(false);
   return (
-    <div className="stat" title={title}>
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <small>{detail}</small>
+    <div className="menu-anchor">
+      <button className="icon-button" aria-label={label} title="More actions" aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+        <MoreHorizontal size={17} />
+      </button>
+      {open ? (
+        <div className="action-menu" role="menu">
+          {items.map((item) => (
+            <button key={item.label} role="menuitem" className={item.danger ? "danger-action" : undefined} onClick={() => { setOpen(false); item.onSelect(); }}>
+              {item.icon}{item.label}
+            </button>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -72,7 +90,7 @@ function ChannelToggles({ value, onChange, exclude = [] }: { value: FlipChannel[
   );
 }
 
-function Modal({ title, kicker, onClose, busy, children, footer }: { title: string; kicker: string; onClose: () => void; busy: boolean; children: React.ReactNode; footer: React.ReactNode }) {
+function Modal({ title, kicker, onClose, busy, children, footer }: { title: string; kicker?: string; onClose: () => void; busy: boolean; children: React.ReactNode; footer: React.ReactNode }) {
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => { if (event.key === "Escape" && !busy) onClose(); };
     window.addEventListener("keydown", onKey);
@@ -82,7 +100,7 @@ function Modal({ title, kicker, onClose, busy, children, footer }: { title: stri
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && !busy && onClose()}>
       <section className="modal" role="dialog" aria-modal="true" aria-labelledby="flip-dialog-title">
         <div className="modal-header">
-          <div><span className="modal-kicker">{kicker}</span><h2 id="flip-dialog-title">{title}</h2></div>
+          <div>{kicker ? <span className="modal-kicker">{kicker}</span> : null}<h2 id="flip-dialog-title">{title}</h2></div>
           <button className="icon-button" disabled={busy} onClick={onClose} aria-label="Close"><X size={20} /></button>
         </div>
         <div className="modal-body">{children}</div>
@@ -120,7 +138,6 @@ function FlipDialog({ flip, onClose, onSaved }: { flip: Flip | null; onClose: ()
   };
   return (
     <Modal
-      kicker="Flip ledger"
       title={flip ? "Edit flip" : "Add a flip"}
       onClose={onClose}
       busy={busy}
@@ -132,11 +149,11 @@ function FlipDialog({ flip, onClose, onSaved }: { flip: Flip | null; onClose: ()
         <label className="field-label">Bought from<select value={buyChannel} onChange={(event) => setBuyChannel(event.target.value as FlipChannel)}>{FLIP_CHANNELS.map((channel) => <option key={channel}>{channel}</option>)}</select></label>
       </div>
       <div className="field-row">
-        <label className="field-label">Price paid <span>PLN</span><input inputMode="decimal" value={buyPrice} onChange={(event) => setBuyPrice(event.target.value)} placeholder="0" /></label>
-        <label className="field-label">Extra costs <span>shipping in, buyer fees, repairs</span><input inputMode="decimal" value={buyCosts} onChange={(event) => setBuyCosts(event.target.value)} placeholder="0" /></label>
+        <label className="field-label">Price paid (zł)<input inputMode="decimal" value={buyPrice} onChange={(event) => setBuyPrice(event.target.value)} placeholder="0" /></label>
+        <label className="field-label" title="Shipping in, buyer fees, repairs">Extra costs (zł)<input inputMode="decimal" value={buyCosts} onChange={(event) => setBuyCosts(event.target.value)} placeholder="0" /></label>
       </div>
-      <div className="field-label"><span>Listed for sale on <span>used for the delist checklist</span></span><ChannelToggles value={listedOn} onChange={setListedOn} /></div>
-      <label className="field-label">Note <span>optional</span><textarea value={note} onChange={(event) => setNote(event.target.value)} /></label>
+      <div className="field-label"><span title="Used for the delist checklist when it sells">Listed for sale on</span><ChannelToggles value={listedOn} onChange={setListedOn} /></div>
+      <label className="field-label">Note <span className="field-hint-inline">optional</span><textarea value={note} onChange={(event) => setNote(event.target.value)} /></label>
       {error ? <div className="form-error" role="alert"><AlertTriangle size={15} />{error}</div> : null}
     </Modal>
   );
@@ -183,10 +200,10 @@ function SellDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; feePre
         <label className="field-label">Sold on platform<select value={channel} onChange={(event) => { setChannel(event.target.value as FlipChannel); setFeeOverride(""); }}>{FLIP_CHANNELS.map((option) => <option key={option}>{option}</option>)}</select></label>
       </div>
       <div className="field-row">
-        <label className="field-label">Sale price <span>what the buyer paid for the item</span><input autoFocus inputMode="decimal" value={salePrice} onChange={(event) => setSalePrice(event.target.value)} placeholder="0" /></label>
-        <label className="field-label">Platform fee <span>{feePresets[channel].percent}%{feePresets[channel].fixed ? ` + ${formatZl(feePresets[channel].fixed)}` : ""} preset</span><input inputMode="decimal" value={feeOverride} onChange={(event) => setFeeOverride(event.target.value)} placeholder={formatZl(presetFee)} /></label>
+        <label className="field-label">Sale price <span className="field-hint-inline">what the buyer paid for the item</span><input autoFocus inputMode="decimal" value={salePrice} onChange={(event) => setSalePrice(event.target.value)} placeholder="0" /></label>
+        <label className="field-label">Platform fee <span className="field-hint-inline">{feePresets[channel].percent}%{feePresets[channel].fixed ? ` + ${formatZl(feePresets[channel].fixed)}` : ""} preset</span><input inputMode="decimal" value={feeOverride} onChange={(event) => setFeeOverride(event.target.value)} placeholder={formatZl(presetFee)} /></label>
       </div>
-      <label className="field-label">Your selling costs <span>shipping you paid, packaging</span><input inputMode="decimal" value={saleCosts} onChange={(event) => setSaleCosts(event.target.value)} placeholder="0" /></label>
+      <label className="field-label">Your selling costs <span className="field-hint-inline">shipping you paid, packaging</span><input inputMode="decimal" value={saleCosts} onChange={(event) => setSaleCosts(event.target.value)} placeholder="0" /></label>
       {otherListings.length ? (
         <div className="field-label">
           <span>Delist everywhere else <span>so it cannot sell twice</span></span>
@@ -371,9 +388,9 @@ function FeePresetsPanel({ presets, onSaved, onToast }: { presets: FeePresets; o
     }
   };
   return (
-    <section className="flips-panel">
-      <div className="panel-title"><h3>Seller fee presets</h3></div>
-      <p className="field-hint">Used to prefill the platform fee when you record a sale and for estimates in the listing drawer. They are private-seller rates as of September 2026; check them against your own account.</p>
+    <details className="flips-panel flips-section">
+      <summary>Seller fee presets</summary>
+      <p className="field-hint">Prefill the platform fee when you record a sale, and the listing drawer's estimate. Private-seller rates as of September 2026; check them against your own account.</p>
       <div className="fee-preset-grid">
         {FLIP_CHANNELS.map((channel) => (
           <div className="fee-preset-row" key={channel}>
@@ -385,7 +402,7 @@ function FeePresetsPanel({ presets, onSaved, onToast }: { presets: FeePresets; o
         ))}
       </div>
       <button className="outline-button" disabled={!valid || busy} onClick={() => void save()}>{busy ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />}Save presets</button>
-    </section>
+    </details>
   );
 }
 
@@ -399,6 +416,7 @@ export default function FlipsPage({ onToast }: { onToast: (message: string, type
   const today = todayDate();
   const current = quarterOf(today);
   const [recordQuarter, setRecordQuarter] = useState(`${current.year}-Q${current.quarter}`);
+  const [ledgerView, setLedgerView] = useState<"unsold" | "sold" | null>(null);
 
   const load = async () => {
     try {
@@ -447,6 +465,7 @@ export default function FlipsPage({ onToast }: { onToast: (message: string, type
       openCount: open.length,
       openCost: sum(open, flipCost),
       byPlatform,
+      soldCount: sold.length,
       stillListed: sold.filter((flip) => flip.listedOn.some((channel) => channel !== flip.saleChannel && !flip.delisted.includes(channel))),
     };
   }, [flips, current.year, current.quarter]);
@@ -481,32 +500,33 @@ export default function FlipsPage({ onToast }: { onToast: (message: string, type
     try { await api.deleteFlip(flip.id); setFlips((items) => items.filter((item) => item.id !== flip.id)); } catch (error) { onToast(errorMessage(error), "error"); }
   };
 
+  // Unsold stock is what needs attention, so it opens first while there is any.
+  const view = ledgerView ?? (summary.openCount ? "unsold" : "sold");
+  const shown = flips.filter((flip) => (view === "unsold") === !flip.soldOn);
+  const dac7Warning = summary.byPlatform.some((platform) => platform.count >= DAC7_THRESHOLD.sales * 0.8);
+
   return (
     <>
-      <header className="page-header page-header--inner">
-        <div>
-          <h1>Flips</h1>
-          <p>What you bought, where it is listed, and what each sale actually netted. Your own prices stay here and never feed Scout's market statistics.</p>
-        </div>
-        <button className="primary-button" onClick={() => setEditing("new")}><Plus size={19} />Add flip</button>
-      </header>
+      <PageHeader title="Flips">
+        <button className="primary-button" onClick={() => setEditing("new")}><Plus size={18} />Add flip</button>
+      </PageHeader>
 
-      <section className="research-stats" aria-label="Flip summary">
-        <Stat
-          label={`Revenue Q${current.quarter} ${current.year}`}
-          value={formatZl(summary.quarterRevenue)}
-          detail={limit ? `of ${formatZl(limit)} · ${Math.round((limitShare ?? 0) * 100)}%` : "no limit on record for this year"}
-          title="Działalność nierejestrowana: revenue (full sale prices) in a quarter may not exceed 225% of the minimum wage. Above it you have 7 days to register a business."
-        />
-        <Stat label="Net this quarter" value={formatZl(summary.quarterNet)} detail={`${formatZl(summary.yearNet)} this year`} />
-        <Stat label="Unsold" value={String(summary.openCount)} detail={`${formatZl(summary.openCost)} tied up`} />
-        <Stat label={`Sales ${current.year}`} value={String(summary.yearSales)} detail="across all platforms" />
-      </section>
+      <div className="overview-summary" aria-label="Flip summary">
+        <span><strong>{formatZl(summary.quarterNet)}</strong> net in Q{current.quarter}</span>
+        <span><strong>{formatZl(summary.yearNet)}</strong> net in {current.year}</span>
+        <span><strong>{summary.openCount}</strong> unsold ({formatZl(summary.openCost)} tied up)</span>
+      </div>
 
       {limit ? (
-        <div className={`flips-limit ${limitShare !== null && limitShare >= 0.8 ? "flips-limit--warn" : ""}`}>
+        <div
+          className={`flips-limit ${limitShare !== null && limitShare >= 0.8 ? "flips-limit--warn" : ""}`}
+          title="Działalność nierejestrowana: revenue (full sale prices) in a quarter may not exceed 225% of the minimum wage. Above it you have 7 days to register a business."
+        >
+          <small>
+            Q{current.quarter} revenue {formatZl(summary.quarterRevenue)} of {formatZl(limit)}
+            {limitShare !== null && limitShare >= 1 ? " · over the limit: register a business within 7 days" : ` · ${formatZl(limit - summary.quarterRevenue)} left`}
+          </small>
           <div className="flips-limit-bar"><i style={{ width: `${Math.min(100, (limitShare ?? 0) * 100)}%` }} /></div>
-          <small>{limitShare !== null && limitShare >= 1 ? "Over the quarterly limit for działalność nierejestrowana: register a business within 7 days." : limitShare !== null && limitShare >= 0.8 ? `${formatZl(limit - summary.quarterRevenue)} left before the quarterly limit.` : `${formatZl(limit - summary.quarterRevenue)} left in this quarter's limit.`}</small>
         </div>
       ) : null}
 
@@ -515,39 +535,55 @@ export default function FlipsPage({ onToast }: { onToast: (message: string, type
       ) : null}
 
       <section className="flips-panel">
-        <div className="panel-title"><Wallet size={16} /><h3>Ledger</h3></div>
+        <div className="panel-title">
+          <h3>Ledger</h3>
+          <div className="segmented" role="group" aria-label="Ledger">
+            <button type="button" aria-pressed={view === "unsold"} className={view === "unsold" ? "segmented-option segmented-option--active" : "segmented-option"} onClick={() => setLedgerView("unsold")}>Unsold ({summary.openCount})</button>
+            <button type="button" aria-pressed={view === "sold"} className={view === "sold" ? "segmented-option segmented-option--active" : "segmented-option"} onClick={() => setLedgerView("sold")}>Sold ({summary.soldCount})</button>
+          </div>
+        </div>
         {loading ? (
           <div className="table-loading"><LoaderCircle size={18} className="spin" />Loading flips…</div>
-        ) : flips.length ? (
+        ) : shown.length ? (
           <div className="flips-table" role="table">
             <div className="flips-row flips-row--head" role="row"><span>Item</span><span>Bought</span><span>Cost</span><span>Sold</span><span>Net</span><span /></div>
-            {flips.map((flip) => {
+            {shown.map((flip) => {
               const net = flipNet(flip);
               return (
                 <div className="flips-row" role="row" key={flip.id}>
                   <span><strong>{flip.title}</strong>{flip.note ? <small>{flip.note}</small> : null}{!flip.soldOn && flip.listedOn.length ? <small>Listed on {flip.listedOn.join(", ")}</small> : null}{!flip.soldOn && (flip.listing || flip.photos.length) ? <small>Listing ready{flip.photos.length ? ` · ${flip.photos.length} photo${flip.photos.length === 1 ? "" : "s"}` : ""}</small> : null}</span>
-                  <span>{flip.boughtOn}<small>{flip.buyChannel}</small></span>
-                  <span>{formatZl(flipCost(flip))}</span>
-                  <span>{flip.soldOn ? <>{formatZl(flip.salePrice!)}<small>{flip.soldOn} · {flip.saleChannel}{flip.saleFee ? ` · fee ${formatZl(flip.saleFee)}` : ""}</small></> : <em className="decision-chip decision-chip--watch">Unsold</em>}</span>
-                  <strong className={net === null ? "" : net >= 0 ? "result-positive" : "result-negative"}>{net === null ? "—" : formatZl(net)}</strong>
+                  <span data-label="Bought">{formatDay(flip.boughtOn)}<small>{flip.buyChannel}</small></span>
+                  <span data-label="Cost">{formatZl(flipCost(flip))}</span>
+                  {flip.soldOn ? <span data-label="Sold">{formatZl(flip.salePrice!)}<small>{formatDay(flip.soldOn)} · {flip.saleChannel}{flip.saleFee ? ` · fee ${formatZl(flip.saleFee)}` : ""}</small></span> : <span className="flips-row-empty" />}
+                  {flip.soldOn ? <strong data-label="Net" className={net === null ? "" : net >= 0 ? "result-positive" : "result-negative"}>{net === null ? "—" : formatZl(net)}</strong> : <span className="flips-row-empty" />}
                   <span className="flips-actions">
-                    <button className="outline-button" onClick={() => setSelling(flip)} disabled={!feePresets}>{flip.soldOn ? "Edit sale" : "Mark sold"}</button>
-                    {!flip.soldOn ? <button className="icon-button" aria-label={`Listing for ${flip.title}`} title="Listing text, prices and photos" disabled={!feePresets} onClick={() => setListing(flip)}><Megaphone size={15} /></button> : null}
-                    {flip.soldOn ? <button className="icon-button" aria-label={`Remove the sale of ${flip.title}`} title="Remove sale" onClick={() => void unsell(flip)}><RotateCcw size={15} /></button> : null}
-                    <button className="icon-button" aria-label={`Edit ${flip.title}`} onClick={() => setEditing(flip)}><Pencil size={15} /></button>
-                    <button className="icon-button" aria-label={`Delete ${flip.title}`} onClick={() => void remove(flip)}><Trash2 size={15} /></button>
+                    {flip.soldOn ? null : <button className="outline-button" onClick={() => setSelling(flip)} disabled={!feePresets}>Mark sold</button>}
+                    <RowMenu
+                      label={`More actions for ${flip.title}`}
+                      items={[
+                        ...(flip.soldOn ? [{ label: "Edit sale", icon: <Pencil size={15} />, onSelect: () => setSelling(flip) }] : []),
+                        ...(!flip.soldOn && feePresets ? [{ label: "Listing text and photos", icon: <Megaphone size={15} />, onSelect: () => setListing(flip) }] : []),
+                        { label: flip.soldOn ? "Edit purchase" : "Edit", icon: <Pencil size={15} />, onSelect: () => setEditing(flip) },
+                        ...(flip.soldOn ? [{ label: "Remove sale", icon: <RotateCcw size={15} />, onSelect: () => void unsell(flip) }] : []),
+                        { label: "Delete", icon: <Trash2 size={15} />, danger: true, onSelect: () => void remove(flip) },
+                      ]}
+                    />
                   </span>
                 </div>
               );
             })}
           </div>
         ) : (
-          <div className="page-empty"><Wallet size={22} /><strong>No flips yet</strong><span>Add one here, or use “I bought this” in a listing's details.</span></div>
+          <div className="page-empty">
+            <Wallet size={22} />
+            <strong>{flips.length ? (view === "unsold" ? "Everything has sold" : "No sales recorded yet") : "No flips yet"}</strong>
+            <span>{flips.length ? "" : "Add one here, or use “I bought this” in a listing's details. Your own prices never feed Scout's market statistics."}</span>
+          </div>
         )}
       </section>
 
-      <section className="flips-panel">
-        <div className="panel-title"><h3>DAC7 · sales per platform in {current.year}</h3></div>
+      <details className="flips-panel flips-section" open={dac7Warning}>
+        <summary>DAC7: sales per platform in {current.year}</summary>
         <p className="field-hint">A platform reports you to the tax office once you reach {DAC7_THRESHOLD.sales} sales or {DAC7_THRESHOLD.euro.toLocaleString("pl-PL")} € of sales on it in a year. It is only a report and creates no tax by itself.</p>
         <div className="flips-dac7">
           {summary.byPlatform.map((platform) => (
@@ -558,26 +594,25 @@ export default function FlipsPage({ onToast }: { onToast: (message: string, type
             </div>
           ))}
         </div>
-      </section>
+      </details>
 
-      <section className="flips-panel">
-        <div className="panel-title">
-          <h3>Sales record (uproszczona ewidencja sprzedaży)</h3>
+      <details className="flips-panel flips-section">
+        <summary>Sales record (uproszczona ewidencja sprzedaży)</summary>
+        <div className="flips-record-controls">
           <select aria-label="Quarter" value={recordQuarter} onChange={(event) => setRecordQuarter(event.target.value)}>
             {quarterOptions.map((key) => <option key={key} value={key}>{key.replace("-", " ")}</option>)}
           </select>
-          <button className="icon-button" aria-label="Download the sales record as CSV" title="Download CSV" disabled={!record.length} onClick={downloadRecord}><Download size={16} /></button>
+          <button className="outline-button" disabled={!record.length} onClick={downloadRecord}><Download size={15} />Download CSV</button>
         </div>
-        <p className="field-hint">One row per day with sales, with the running total for the quarter. Keep it for działalność nierejestrowana; purchase costs are recorded separately above.</p>
         {record.length ? (
           <div className="flips-table flips-table--record" role="table">
             <div className="flips-row flips-row--head" role="row"><span>Lp.</span><span>Date</span><span>Sales that day</span><span>Quarter to date</span></div>
             {record.map((row) => (
-              <div className="flips-row" role="row" key={row.date}><span>{row.index}</span><span>{row.date}</span><span>{formatZl(row.daySales)}</span><strong>{formatZl(row.quarterToDate)}</strong></div>
+              <div className="flips-row" role="row" key={row.date}><span>{row.index}</span><span>{formatDay(row.date)}</span><span>{formatZl(row.daySales)}</span><strong>{formatZl(row.quarterToDate)}</strong></div>
             ))}
           </div>
         ) : <div className="panel-empty">No sales in {recordQuarter.replace("-", " ")}.</div>}
-      </section>
+      </details>
 
       {feePresets ? <FeePresetsPanel key={JSON.stringify(feePresets)} presets={feePresets} onSaved={setFeePresets} onToast={onToast} /> : null}
 

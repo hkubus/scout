@@ -97,6 +97,38 @@ test('serves the widget dashboard form with the widget ordering and unchanged st
   } finally { context.close(); }
 });
 
+test('filters listing pages by minimum strength, untriaged decisions and AI-filtered rows', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const fresh = new Date().toISOString();
+    context.db.prepare(`UPDATE watch_listings SET last_seen_at = ?, deal_strength = (id % 6), deal_label = 'Deal'`).run(fresh);
+    const actions = context.db.prepare('INSERT INTO listing_actions (marketplace, listing_id, decision, note, hidden, updated_at) VALUES (?, ?, ?, ?, ?, ?)');
+    const picks = context.db.prepare('SELECT marketplace, listing_id FROM listings ORDER BY id').all() as Array<{ marketplace: string; listing_id: string }>;
+    picks.forEach((listing, index) => {
+      if (index % 4 === 0) actions.run(listing.marketplace, listing.listing_id, 'pass', '', 0, fresh);
+      else if (index % 5 === 0) actions.run(listing.marketplace, listing.listing_id, 'buy', '', 0, fresh);
+    });
+    const all = context.service.listingsPage({ pageSize: 500, aiFiltered: 'include', visibility: 'all' }).listings;
+    assert.ok(all.some((listing) => listing.aiFiltered) && all.some((listing) => !listing.aiFiltered));
+    const keys = (rows: typeof all) => rows.map((listing) => listing.associationId).sort();
+    const page = (options: Parameters<typeof context.service.listingsPage>[0]) => keys(context.service.listingsPage({ pageSize: 500, visibility: 'all', ...options }).listings);
+
+    // The default still excludes AI-filtered rows, as before.
+    assert.deepEqual(page({}), keys(all.filter((listing) => !listing.aiFiltered)));
+    assert.deepEqual(page({ aiFiltered: 'only' }), keys(all.filter((listing) => listing.aiFiltered)));
+    for (const minStrength of [3, 4, 5]) {
+      const expected = keys(all.filter((listing) => !listing.aiFiltered && listing.dealStrength >= minStrength));
+      assert.ok(expected.length > 0);
+      assert.deepEqual(page({ minStrength }), expected);
+    }
+    const untriaged = keys(all.filter((listing) => !listing.aiFiltered && !listing.decision));
+    assert.ok(untriaged.length > 0 && untriaged.length < keys(all.filter((listing) => !listing.aiFiltered)).length);
+    assert.deepEqual(page({ decision: 'none' }), untriaged);
+    assert.deepEqual(page({ decision: 'none', minStrength: 3 }), keys(all.filter((listing) => !listing.aiFiltered && !listing.decision && listing.dealStrength >= 3)));
+  } finally { context.close(); }
+});
+
 test('keeps dashboard database work bounded as watch count grows', () => {
   const context = fixture();
   try {

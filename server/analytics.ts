@@ -28,7 +28,8 @@ export interface AnalyticsObservation {
   firstSeenAt: string;
 }
 
-export const STRONG_DEAL_DISCOUNT_PERCENT = 18;
+/** The Strong tier's lower bound (see dealStrengthFromDiscount), so every "strong" count means the same thing. */
+export const STRONG_DEAL_DISCOUNT_PERCENT = 12;
 
 export function discountPercentFor(row: Pick<AnalyticsObservation, 'price' | 'typical'>): number | null {
   return row.typical !== null && Number.isFinite(row.typical) && row.typical > 0

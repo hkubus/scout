@@ -19,25 +19,32 @@ struct ListingDetailView: View {
     @State private var feePresets = FeePresets.defaults
     @State private var addingFlip = false
     @State private var flipAdded = false
+    @State private var descriptionExpanded = false
 
     var body: some View {
         List {
             if let detail {
                 header(detail.listing)
-                if detail.history.count > 1 {
-                    Section("Price history") {
-                        PriceHistoryChart(points: detail.history, typical: detail.listing.typical)
-                            .frame(height: 170)
-                            .padding(.vertical, 6)
-                    }
-                }
                 triage(detail)
                 verification(detail)
+                // A flat line says nothing a sentence can't.
+                if Set(detail.history.map(\.price)).count > 1 {
+                    Section("Price history") {
+                        PriceHistoryChart(points: detail.history, typical: detail.listing.typical)
+                            .frame(height: 120)
+                            .padding(.vertical, 4)
+                    }
+                }
                 if let text = detail.descriptionSnapshot?.description, !text.isEmpty {
                     Section("Description") {
                         Text(text)
                             .font(.callout)
+                            .lineLimit(descriptionExpanded ? nil : 6)
                             .textSelection(.enabled)
+                        if !descriptionExpanded && text.count > 280 {
+                            Button("Show full description") { descriptionExpanded = true }
+                                .font(.callout)
+                        }
                     }
                 }
                 facts(detail.listing, detail: detail)
@@ -105,29 +112,35 @@ struct ListingDetailView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                HStack(spacing: 8) {
-                    DealBadge(label: listing.dealLabel)
-                    if let below = listing.belowTypical {
-                        Text(Format.versusTypical(below))
-                            .font(.subheadline.weight(.medium))
-                            .foregroundStyle(below < 0 ? listing.dealLabel.color : .secondary)
-                    }
-                }
                 if let typical = listing.typical {
-                    Text(verbatim: "Typical asking price \(Format.pln(typical))" + (listing.typicalSource == "reference-band" ? " (research band)" : ""))
-                        .font(.footnote)
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        if let below = listing.belowTypical, below < 0 {
+                            Text(Format.versusTypical(below))
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(listing.dealStrength >= 3 ? listing.dealLabel.color : .primary)
+                        } else if let below = listing.belowTypical, below > 0 {
+                            Text(Format.versusTypical(below))
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(verbatim: "typical \(Format.pln(typical))" + (listing.typicalSource == "reference-band" ? " (research)" : ""))
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("Typical price is still learning")
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
-                if let variant = listing.variantLabel {
-                    Label("Model: \(variant)", systemImage: "square.stack.3d.up")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
+                Text(verbatim: factsLine(listing))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
             .padding(.vertical, 4)
         }
     }
 
+    /// The decision and Hide save as soon as they change; only a note needs Save.
     private func triage(_ detail: ListingDetail) -> some View {
         Section {
             Picker("Decision", selection: $decision) {
@@ -137,25 +150,27 @@ struct ListingDetailView: View {
                 }
             }
             .pickerStyle(.segmented)
+            .onChange(of: decision) { _, value in
+                if value != detail.action.decision { save() }
+            }
             TextField("Note", text: $note, axis: .vertical)
-                .lineLimit(2...6)
-            Toggle("Hide from feeds and alerts", isOn: $hidden)
-            Button {
-                save()
-            } label: {
-                HStack {
-                    Text("Save")
-                    Spacer()
-                    if saving { ProgressView() }
+                .lineLimit(1...6)
+            if note != detail.action.note {
+                Button {
+                    save()
+                } label: {
+                    HStack {
+                        Text("Save note")
+                        Spacer()
+                        if saving { ProgressView() }
+                    }
                 }
+                .disabled(saving)
             }
-            .disabled(saving || !hasChanges(detail.action))
-        } header: {
-            Text("Triage")
-        } footer: {
-            if let updated = detail.action.updatedAt {
-                Text("Updated \(Format.relative(iso: updated))")
-            }
+            Toggle("Hide from feeds and alerts", isOn: $hidden)
+                .onChange(of: hidden) { _, value in
+                    if value != detail.action.hidden { save() }
+                }
         }
     }
 
@@ -164,24 +179,18 @@ struct ListingDetailView: View {
         let listing = detail.listing
         if let result = listing.aiDescriptionVerification {
             let verdict = VerificationVerdict(decision: result.decision)
-            Section {
-                Label(verdict.title, systemImage: verdict.symbol)
-                    .foregroundStyle(verdict.color)
-                Text(result.summary)
-                    .font(.callout)
+            Section("AI check") {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(verdict.title, systemImage: verdict.symbol)
+                        .foregroundStyle(verdict.color)
+                    Text(result.summary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
                 ForEach(result.issues, id: \.self) { issue in
                     Label(issue, systemImage: "exclamationmark.triangle")
                         .font(.footnote)
                 }
-                ForEach(result.evidence, id: \.self) { evidence in
-                    Text(evidence)
-                        .font(.footnote.italic())
-                        .foregroundStyle(.secondary)
-                }
-            } header: {
-                Text("AI check")
-            } footer: {
-                Text(verbatim: ["Confidence \(Int((result.confidence * 100).rounded()))%", detail.verificationModel].compactMap { $0 }.joined(separator: " · "))
             }
         } else if let status = listing.aiDescriptionVerificationStatus, status == "pending" {
             Section("AI check") {
@@ -198,8 +207,6 @@ struct ListingDetailView: View {
             } label: {
                 Label("Create a watch from this listing", systemImage: "bell.badge")
             }
-        } footer: {
-            Text("Starts from the cleaned-up title, this marketplace, and a price range of ±25% around this price.")
         }
     }
 
@@ -267,13 +274,19 @@ struct ListingDetailView: View {
         detail?.listing ?? (previewOnly ? link.preview : nil)
     }
 
+    /// Marketplace, shipping, condition and place on one line under the price.
+    private func factsLine(_ listing: Listing) -> String {
+        var parts = [listing.marketplace.rawValue]
+        if let shipping = listing.shippingAvailable { parts.append(shipping ? "shipping" : "pickup only") }
+        if let condition = listing.condition { parts.append(condition) }
+        if let location = listing.location { parts.append(location) }
+        if let variant = listing.variantLabel { parts.append("model \(variant)") }
+        return parts.joined(separator: " · ")
+    }
+
     private func facts(_ listing: Listing, detail: ListingDetail?) -> some View {
         Section("Details") {
-            LabeledContent("Marketplace") { MarketplaceTag(marketplace: listing.marketplace) }
             LabeledContent("Watch", value: listing.watch)
-            if let condition = listing.condition { LabeledContent("Condition", value: condition) }
-            if let location = listing.location { LabeledContent("Location", value: location) }
-            LabeledContent("Shipping", value: listing.shippingAvailable.map { $0 ? "Available" : "Pickup only" } ?? "Unknown")
             if let posted = listing.postedDate {
                 LabeledContent("Posted", value: Format.relative(posted))
                 if let bumped = listing.bumpedDate {
@@ -286,17 +299,12 @@ struct ListingDetailView: View {
                 LabeledContent("Promoted", value: "Yes")
             }
             if let detail {
-                LabeledContent("First seen", value: Format.relative(iso: detail.firstSeenAt))
-                LabeledContent("Last seen", value: Format.relative(iso: detail.lastSeenAt))
+                LabeledContent("Seen", value: "\(Format.relative(iso: detail.firstSeenAt)) – \(Format.relative(iso: detail.lastSeenAt))")
             }
         }
     }
 
     // MARK: Actions
-
-    private func hasChanges(_ action: ListingAction) -> Bool {
-        decision != action.decision || note != action.note || hidden != action.hidden
-    }
 
     private func load() async {
         guard let client = model.client else { return }

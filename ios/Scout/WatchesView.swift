@@ -8,6 +8,8 @@ struct WatchesView: View {
     @State private var error: String?
     @State private var path = NavigationPath()
     @State private var editor: WatchEditorRequest?
+    /// Bumped by a queued scan, for haptic confirmation.
+    @State private var scansQueued = 0
 
     private struct LoadKey: Hashable {
         var includeArchived: Bool
@@ -19,7 +21,7 @@ struct WatchesView: View {
             List {
                 if let watches {
                     if watches.isEmpty {
-                        ContentUnavailableView("No watches", systemImage: "binoculars", description: Text("Create watches in the Scout web app."))
+                        ContentUnavailableView("No watches", systemImage: "binoculars", description: Text("Tap + to create a watch."))
                     }
                     ForEach(watches) { watch in
                         NavigationLink(value: watch) {
@@ -44,8 +46,12 @@ struct WatchesView: View {
                             }
                         }
                     }
+                    Section {
+                        Toggle("Show archived watches", isOn: $includeArchived)
+                    }
                 }
             }
+            .sensoryFeedback(.success, trigger: scansQueued)
             .overlay { LoadingOverlay(isLoaded: watches != nil, error: error, retry: { await load() }) }
             .navigationTitle("Watches")
             .toolbar {
@@ -54,13 +60,6 @@ struct WatchesView: View {
                         editor = .create()
                     } label: {
                         Label("New watch", systemImage: "plus")
-                    }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Toggle("Show archived", isOn: $includeArchived)
-                    } label: {
-                        Label("Options", systemImage: "ellipsis.circle")
                     }
                 }
             }
@@ -119,6 +118,7 @@ struct WatchesView: View {
         Task { @MainActor in
             do {
                 _ = try await client.queueScan(watchId: watch.id)
+                scansQueued += 1
             } catch {
                 model.report(error)
             }
@@ -130,11 +130,11 @@ struct WatchStatusBadge: View {
     var status: String
 
     private var color: Color {
+        if status.hasPrefix("Learning") { return .scoutBlue }
         switch status {
-        case "Ready": .scoutGreen
-        case "Learning": .scoutBlue
-        case "Paused": .orange
-        default: .secondary
+        case "Ready": return .scoutGreen
+        case "Paused": return .orange
+        default: return .secondary
         }
     }
 
@@ -148,39 +148,35 @@ struct WatchStatusBadge: View {
     }
 }
 
+/// Two lines: the name and its state, then its deals and schedule.
 private struct WatchRow: View {
     var watch: Watch
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .firstTextBaseline) {
                 Text(watch.name)
                     .font(.headline)
                     .lineLimit(1)
                 Spacer()
-                WatchStatusBadge(status: watch.status)
-            }
-            if watch.status == "Learning" {
-                ProgressView(value: min(watch.readiness, 100), total: 100) {
-                    EmptyView()
-                } currentValueLabel: {
-                    Text("Learning prices · \(watch.samples)/\(watch.targetSamples) samples")
-                }
-                .font(.caption)
+                WatchStatusBadge(status: watch.status == "Learning" ? "Learning \(Int(min(watch.readiness, 100)))%" : watch.status)
             }
             HStack(spacing: 10) {
                 DealCountChips(counts: watch.dealCounts)
                 Spacer(minLength: 0)
-                Text(verbatim: watch.enabled ? "Every \(Format.minutes(watch.interval)) · \(watch.nextScan)" : "Paused")
+                Text(verbatim: schedule)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            }
-            HStack(spacing: 10) {
-                ForEach(watch.sources, id: \.self) { MarketplaceTag(marketplace: $0) }
+                    .lineLimit(1)
             }
         }
         .padding(.vertical, 2)
         .opacity(watch.enabled ? 1 : 0.6)
+    }
+
+    private var schedule: String {
+        let sources = watch.sources.map { $0 == .allegroLokalnie ? "Allegro" : $0.rawValue }.joined(separator: ", ")
+        return watch.enabled ? "\(sources) · every \(Format.minutes(watch.interval))" : "\(sources) · paused"
     }
 }
 
@@ -189,7 +185,7 @@ struct DealCountChips: View {
 
     var body: some View {
         if counts.total == 0 {
-            Text("No deals right now")
+            Text("No strong deals")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         } else {

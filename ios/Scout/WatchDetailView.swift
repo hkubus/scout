@@ -8,7 +8,7 @@ struct WatchDetailView: View {
     @State private var analytics: WatchAnalytics?
     @State private var days = 30
     @State private var error: String?
-    @State private var scanMessage: String?
+    @State private var scanQueued = false
     @State private var editor: WatchEditorRequest?
     /// The watch changes the shown watch was fetched for; a range change
     /// alone only needs new analytics.
@@ -39,7 +39,7 @@ struct WatchDetailView: View {
         List {
             Section {
                 HStack {
-                    WatchStatusBadge(status: watch.status)
+                    WatchStatusBadge(status: scanQueued ? "Scan queued" : watch.status)
                     Spacer()
                     DealCountChips(counts: watch.dealCounts)
                 }
@@ -50,23 +50,7 @@ struct WatchDetailView: View {
                         Text("\(watch.samples) of \(watch.targetSamples) samples over \(Int(watch.observationHours)) h")
                     }
                 }
-                NavigationLink(value: WatchListingsRoute(watchId: watch.id, name: watch.name)) {
-                    Label("Listings", systemImage: "list.bullet.rectangle")
-                }
-            }
-
-            Section {
-                Picker("Range", selection: $days) {
-                    Text("7d").tag(7)
-                    Text("30d").tag(30)
-                    Text("90d").tag(90)
-                    Text("180d").tag(180)
-                }
-                .pickerStyle(.segmented)
                 if let analytics {
-                    PriceBandChart(points: analytics.points.compactMap { PriceBandPoint($0) })
-                        .frame(height: 190)
-                        .padding(.vertical, 6)
                     if let median = analytics.current.medianPrice {
                         LabeledContent("Median asking price") {
                             HStack(spacing: 6) {
@@ -79,33 +63,11 @@ struct WatchDetailView: View {
                         }
                     }
                     if let low = analytics.current.lowerPrice, let high = analytics.current.upperPrice {
-                        LabeledContent("Typical range", value: "\(Format.pln(low)) – \(Format.pln(high))")
+                        LabeledContent("Middle half", value: "\(Format.pln(low)) – \(Format.pln(high))")
                     }
-                    LabeledContent("Listings seen", value: "\(analytics.current.listingCount)")
-                    if let rate = analytics.current.strongDealRate {
-                        LabeledContent("Strong deal rate", value: Format.percent(rate))
-                    }
-                } else if let error {
-                    Text(error).foregroundStyle(.secondary)
-                } else {
-                    ProgressView().frame(maxWidth: .infinity)
                 }
-            } header: {
-                Text("Asking prices")
-            } footer: {
-                Text("Public asking prices, not completed sales.")
-            }
-
-            if let sources = analytics?.sources, !sources.isEmpty {
-                Section("By marketplace") {
-                    ForEach(sources, id: \.source) { source in
-                        LabeledContent {
-                            Text(source.medianPrice.map(Format.pln) ?? "—").monospacedDigit()
-                        } label: {
-                            MarketplaceTag(marketplace: source.source)
-                            Text("\(source.listingCount) listings · \(source.strongDealCount) strong")
-                        }
-                    }
+                NavigationLink(value: WatchListingsRoute(watchId: watch.id, name: watch.name)) {
+                    Label("Listings", systemImage: "list.bullet.rectangle")
                 }
             }
 
@@ -122,29 +84,68 @@ struct WatchDetailView: View {
                 }
             }
 
-            Section("Search") {
-                LabeledContent("Query", value: watch.query)
-                if !watch.terms.isEmpty { LabeledContent("Must include", value: watch.terms) }
-                if !watch.excluded.isEmpty { LabeledContent("Excludes", value: watch.excluded) }
-                LabeledContent("Marketplaces", value: watch.sources.map(\.rawValue).joined(separator: ", "))
-                LabeledContent("Condition", value: watch.condition)
-                if let category = watch.olxCategory, watch.sources.contains(.olx) {
-                    LabeledContent("OLX category", value: category.label)
+            Section("Asking prices") {
+                Picker("Range", selection: $days) {
+                    Text("7d").tag(7)
+                    Text("30d").tag(30)
+                    Text("90d").tag(90)
+                    Text("180d").tag(180)
                 }
-                if let seller = watch.sellerType {
-                    LabeledContent("Sellers", value: seller == SellerType.business.rawValue ? "Business only" : "Private only")
+                .pickerStyle(.segmented)
+                if let analytics {
+                    PriceBandChart(points: analytics.points.compactMap { PriceBandPoint($0) })
+                        .frame(height: 170)
+                        .padding(.vertical, 6)
+                    LabeledContent("Listings seen", value: "\(analytics.current.listingCount)")
+                    if let rate = analytics.current.strongDealRate {
+                        LabeledContent("Strong (≥12%) share", value: Format.percent(rate))
+                    }
+                } else if let error {
+                    Text(error).foregroundStyle(.secondary)
+                } else {
+                    ProgressView().frame(maxWidth: .infinity)
                 }
-                if watch.ignorePromoted == true {
-                    LabeledContent("Promoted listings", value: "Skipped")
+            }
+
+            if let sources = analytics?.sources, !sources.isEmpty {
+                Section("By marketplace") {
+                    ForEach(sources, id: \.source) { source in
+                        LabeledContent {
+                            Text(source.medianPrice.map(Format.pln) ?? "—").monospacedDigit()
+                        } label: {
+                            MarketplaceTag(marketplace: source.source)
+                            Text("\(source.listingCount) listings · \(source.strongDealCount) strong")
+                        }
+                    }
                 }
-                if watch.minPrice != nil || watch.maxPrice != nil {
-                    LabeledContent("Price", value: "\(watch.minPrice.map(Format.pln) ?? "any") – \(watch.maxPrice.map(Format.pln) ?? "any")")
+            }
+
+            Section {
+                DisclosureGroup("Search settings") {
+                    LabeledContent("Query", value: watch.query)
+                    if !watch.terms.isEmpty { LabeledContent("Must include", value: watch.terms) }
+                    if !watch.excluded.isEmpty { LabeledContent("Excludes", value: watch.excluded) }
+                    LabeledContent("Marketplaces", value: watch.sources.map(\.rawValue).joined(separator: ", "))
+                    if watch.condition != "Any" { LabeledContent("Condition", value: watch.condition) }
+                    if let category = watch.olxCategory, watch.sources.contains(.olx) {
+                        LabeledContent("OLX category", value: category.label)
+                    }
+                    if let seller = watch.sellerType {
+                        LabeledContent("Sellers", value: seller == SellerType.business.rawValue ? "Business only" : "Private only")
+                    }
+                    if watch.ignorePromoted == true {
+                        LabeledContent("Promoted listings", value: "Skipped")
+                    }
+                    if watch.minPrice != nil || watch.maxPrice != nil {
+                        LabeledContent("Price", value: "\(watch.minPrice.map(Format.pln) ?? "any") – \(watch.maxPrice.map(Format.pln) ?? "any")")
+                    }
+                    LabeledContent("Scan interval", value: Format.minutes(watch.interval))
+                    LabeledContent("Next scan", value: watch.nextScan)
                 }
-                LabeledContent("Scan interval", value: Format.minutes(watch.interval))
-                LabeledContent("Next scan", value: watch.nextScan)
             }
         }
         .navigationTitle(watch.name)
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
@@ -168,11 +169,6 @@ struct WatchDetailView: View {
                     Label("Actions", systemImage: "ellipsis.circle")
                 }
             }
-        }
-        .alert("Scan", isPresented: Binding(get: { scanMessage != nil }, set: { if !$0 { scanMessage = nil } })) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(scanMessage ?? "")
         }
         .sheet(item: $editor) { request in
             WatchEditorView(request: request) { _ in }
@@ -211,7 +207,11 @@ struct WatchDetailView: View {
         guard let client = model.client else { return }
         Task { @MainActor in
             do {
-                scanMessage = try await client.queueScan(watchId: watch.id).message
+                // Confirmed in the status badge, like a swipe in the list, not a blocking alert.
+                _ = try await client.queueScan(watchId: watch.id)
+                scanQueued = true
+                try? await Task.sleep(for: .seconds(6))
+                scanQueued = false
             } catch {
                 model.report(error)
             }

@@ -2887,8 +2887,13 @@ export class ScoutService {
     q?: string;
     watchId?: string;
     includeAiFiltered?: boolean;
+    /** `only` lists just the rows AI relevance filtering hid; it wins over includeAiFiltered. */
+    aiFiltered?: 'exclude' | 'include' | 'only';
+    /** Lowest deal strength (1-5) to include. */
+    minStrength?: number;
     sort?: 'newest' | 'strongest' | 'price';
-    decision?: ListingDecision;
+    /** `none` keeps only untriaged rows. */
+    decision?: ListingDecision | 'none';
     /** Defaults to `all` so internal callers (dashboard feed) keep today's rows. */
     visibility?: 'visible' | 'hidden' | 'all';
   } = {}, knownWatches?: Watch[]) {
@@ -2897,11 +2902,12 @@ export class ScoutService {
     // The feed shows matches seen in the last 12 h, but listings you marked
     // (Buy/Watch/Pass) or hid stay reviewable after newer posts push them off
     // the scanned page, until retention prunes them.
-    const keepStale = Boolean(options.decision) || options.visibility === 'hidden';
+    const keepStale = (Boolean(options.decision) && options.decision !== 'none') || options.visibility === 'hidden';
+    const aiFiltered = options.aiFiltered ?? (options.includeAiFiltered ? 'include' : 'exclude');
     const predicates = [
       'w.archived_at IS NULL',
       ...(keepStale ? [] : ['wl.last_seen_at > ?']),
-      ...(options.includeAiFiltered ? [] : [`NOT (${aiFilteredPredicate})`]),
+      ...(aiFiltered === 'exclude' ? [`NOT (${aiFilteredPredicate})`] : aiFiltered === 'only' ? [aiFilteredPredicate] : []),
       "(w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))",
       '(w.min_price_pln IS NULL OR l.price_pln >= w.min_price_pln)',
       '(w.max_price_pln IS NULL OR l.price_pln <= w.max_price_pln)',
@@ -2909,7 +2915,9 @@ export class ScoutService {
     const params: unknown[] = keepStale ? [] : [freshnessCutoff];
     if (options.marketplace) { predicates.push('l.marketplace = ?'); params.push(options.marketplace); }
     if (options.watchId) { predicates.push('w.id = ?'); params.push(options.watchId); }
-    if (options.decision) { predicates.push('a.decision = ?'); params.push(options.decision); }
+    if (options.decision === 'none') predicates.push('a.decision IS NULL');
+    else if (options.decision) { predicates.push('a.decision = ?'); params.push(options.decision); }
+    if (options.minStrength && options.minStrength > 1) { predicates.push('COALESCE(wl.deal_strength, 1) >= ?'); params.push(Math.min(5, Math.floor(options.minStrength))); }
     if (options.visibility === 'hidden') predicates.push('COALESCE(a.hidden, 0) = 1');
     else if (options.visibility === 'visible') predicates.push('COALESCE(a.hidden, 0) = 0');
     const query = options.q?.trim().toLowerCase() ?? '';
@@ -3855,7 +3863,8 @@ export class ScoutService {
       // fall back to when Scout first saw the listing.
       const arrivedAt = listing.postedAt ?? listing.firstSeenAt ?? listing.observedAt;
       if (Date.parse(arrivedAt) >= todayTime) newToday += 1;
-      if (listing.dealStrength >= 4) strongDeals += 1;
+      // Strong and above (>=12% below typical), the same tier as the Strong+ filters.
+      if (listing.dealStrength >= 3) strongDeals += 1;
     }
     const lastScan = parseJson<{ at?: string }>(this.getSetting('last_scan'), {});
     return {

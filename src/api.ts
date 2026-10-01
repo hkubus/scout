@@ -86,7 +86,7 @@ export const api = {
   logoutAll: () => request<{ ok: true }>('/api/auth/logout-all', { method: 'POST' }),
   dashboard: (signal?: AbortSignal) => request<DashboardData>('/api/dashboard', { signal }),
   connectors: (signal?: AbortSignal) => request<{ connectors: Connector[] }>('/api/connectors', { signal }),
-  listings: (options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string; sort?: 'newest' | 'strongest' | 'price'; decision?: ListingDecision; visibility?: 'visible' | 'hidden' | 'all' } = {}, signal?: AbortSignal) => {
+  listings: (options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string; sort?: 'newest' | 'strongest' | 'price'; decision?: ListingDecision | 'none'; visibility?: 'visible' | 'hidden' | 'all'; minStrength?: number; aiFiltered?: 'exclude' | 'include' | 'only' } = {}, signal?: AbortSignal) => {
     const params = new URLSearchParams();
     if (options.page !== undefined) params.set('page', String(options.page));
     if (options.pageSize !== undefined) params.set('pageSize', String(options.pageSize));
@@ -96,6 +96,8 @@ export const api = {
     if (options.sort) params.set('sort', options.sort);
     if (options.decision) params.set('decision', options.decision);
     if (options.visibility) params.set('visibility', options.visibility);
+    if (options.minStrength && options.minStrength > 1) params.set('minStrength', String(options.minStrength));
+    if (options.aiFiltered) params.set('aiFiltered', options.aiFiltered);
     return request<{ listings: DashboardData['listings']; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/listings${params.toString() ? `?${params}` : ''}`, { signal });
   },
   watches: (includeArchived = false, signal?: AbortSignal) => request<{ watches: Watch[] }>(`/api/watches?includeArchived=${includeArchived ? 'true' : 'false'}`, { signal }),

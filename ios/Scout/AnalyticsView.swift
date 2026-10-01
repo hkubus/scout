@@ -97,37 +97,26 @@ struct AnalyticsView: View {
     private func content(_ data: AnalyticsData) -> some View {
         Section("Overview") {
             StatGrid(items: [
-                StatGrid.Item(title: "Tracked listings", value: "\(data.overview.trackedListings)", detail: "observed in range"),
-                StatGrid.Item(title: "New listings", value: "\(data.overview.newListings)", detail: "first seen in range"),
-                StatGrid.Item(title: "Strong deals", value: "\(data.overview.strongDeals)", detail: "≥18% below typical"),
-                StatGrid.Item(title: "Median discount", value: Format.percent(data.overview.medianDiscountPercent), detail: "vs typical asking price"),
-                StatGrid.Item(title: "Scan runs", value: "\(data.overview.scanRuns)", detail: "\(Format.percent(data.overview.scanSuccessRate, digits: 0)) completed"),
-                StatGrid.Item(title: "Median move", value: Format.percent(medianMove(data.trend)), detail: "first to last day"),
+                StatGrid.Item(title: "Tracked listings", value: "\(data.overview.trackedListings)", detail: "\(data.overview.newListings) new in range"),
+                StatGrid.Item(title: "Strong deals", value: "\(data.overview.strongDeals)", detail: "≥12% below typical"),
+                StatGrid.Item(title: "Median discount", value: Format.percent(data.overview.medianDiscountPercent), detail: "below typical"),
+                StatGrid.Item(title: "Median move", value: store.watchId == nil ? "—" : Format.percent(medianMove(data.trend)), detail: store.watchId == nil ? "pick a watch" : "first to last day"),
             ])
         }
 
-        Section {
-            PriceBandChart(points: data.trend.compactMap { PriceBandPoint($0) })
-                .frame(height: 190)
-                .padding(.vertical, 6)
-        } header: {
-            Text("Median asking price")
-        } footer: {
-            Text("Middle 50% of asking prices shaded.")
-        }
-
-        if data.trend.contains(where: { $0.strongDealCount > 0 }) {
-            Section("Strong deals per day") {
-                Chart {
-                    ForEach(data.trend, id: \.date) { point in
-                        if let day = point.day {
-                            BarMark(x: .value("Day", day, unit: .day), y: .value("Strong deals", point.strongDealCount))
-                                .foregroundStyle(Color.dealOrange)
-                        }
+        // A median across unrelated products means nothing, so the chart needs one watch.
+        Section("Median asking price") {
+            if store.watchId != nil {
+                PriceBandChart(points: data.trend.compactMap { PriceBandPoint($0) })
+                    .frame(height: 170)
+                    .padding(.vertical, 6)
+            } else {
+                Picker("Watch", selection: $store.watchId) {
+                    Text("Pick a watch").tag(String?.none)
+                    ForEach(store.watches) { watch in
+                        Text(watch.name).tag(String?.some(watch.id))
                     }
                 }
-                .frame(height: 120)
-                .padding(.vertical, 6)
             }
         }
 
@@ -143,15 +132,8 @@ struct AnalyticsView: View {
                         }
                 }
             }
-            .frame(height: 150)
+            .frame(height: 140)
             .padding(.vertical, 6)
-        }
-
-        Section("Triage") {
-            LabeledContent("Buy", value: "\(data.triage.buy)")
-            LabeledContent("Watch", value: "\(data.triage.watch)")
-            LabeledContent("Pass", value: "\(data.triage.pass)")
-            LabeledContent("Undecided", value: "\(data.triage.none)")
         }
 
         if !data.watchLeaderboard.isEmpty {
@@ -171,33 +153,26 @@ struct AnalyticsView: View {
         if !data.marketplaceComparison.isEmpty {
             Section("Marketplaces") {
                 ForEach(data.marketplaceComparison, id: \.marketplace) { row in
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack {
-                            MarketplaceTag(marketplace: row.marketplace)
-                                .font(.body)
-                                .foregroundStyle(.primary)
-                            Spacer()
-                            Text("median \(Format.percent(row.medianDiscountPercent))")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Text(verbatim: "\(row.listings) listings · \(row.strongDeals) strong · \(Format.percent(row.scanSuccessRate, digits: 0)) scans OK" + (row.averageLatencyMs.map { " · \(Int($0)) ms" } ?? ""))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    LabeledContent {
+                        Text("median \(Format.percent(row.medianDiscountPercent))")
+                            .monospacedDigit()
+                    } label: {
+                        MarketplaceTag(marketplace: row.marketplace)
+                            .font(.body)
+                            .foregroundStyle(.primary)
+                        Text("\(row.listings) listings · \(row.strongDeals) strong")
                     }
                 }
             }
         }
 
         Section {
-            LabeledContent("Relevance judged", value: "\(data.aiQuality.relevanceJudged)")
-            LabeledContent("Pass rate", value: Format.percent(data.aiQuality.relevancePassRate, digits: 0))
-            LabeledContent("Shadow judged", value: "\(data.aiQuality.shadowJudged)")
-            LabeledContent("Shadow agreement", value: Format.percent(data.aiQuality.shadowAgreementRate, digits: 0))
-        } header: {
-            Text("AI quality")
-        } footer: {
-            Text("Discounts compare public asking prices with each watch's learned typical asking price. They are not completed sales.")
+            DisclosureGroup("Diagnostics") {
+                LabeledContent("Scan runs", value: "\(data.overview.scanRuns) · \(Format.percent(data.overview.scanSuccessRate, digits: 0)) OK")
+                LabeledContent("Triaged", value: "\(data.triage.buy) buy · \(data.triage.watch) maybe · \(data.triage.pass) pass")
+                LabeledContent("AI relevance kept", value: "\(Format.percent(data.aiQuality.relevancePassRate, digits: 0)) of \(data.aiQuality.relevanceJudged)")
+                LabeledContent("Jev shadow agreement", value: Format.percent(data.aiQuality.shadowAgreementRate, digits: 0))
+            }
         }
     }
 

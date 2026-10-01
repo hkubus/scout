@@ -1,36 +1,23 @@
-import { memo, useState } from "react";
-import { ExternalLink, Eye, EyeOff, RefreshCw, Search, Tag } from "lucide-react";
+import { memo, type ReactNode } from "react";
+import { ExternalLink, Eye, EyeOff, RefreshCw, Search } from "lucide-react";
 import { marketplaceColors } from "./data";
 import { listingRowKey, sameListingFields } from "./listingRows";
 import type { Listing } from "./types";
-import { listingAge } from "./listingSignals";
-
-const formatPln = (value: number | null) =>
-  value === null ? "Learning" : `${value.toLocaleString("pl-PL")} zł`;
-
-function safeImageUrl(value: string | null | undefined) {
-  if (!value) return null;
-  if (value.startsWith("data:image/")) return value;
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" ? url.toString() : null;
-  } catch {
-    return null;
-  }
-}
+import { dealTierLabel, decisionLabels, discountDisplay, formatPln, listingAgeLabel, ListingThumbnail } from "./ui";
 
 // Memoized: App re-renders (toasts, connection, busy watches) and refetches
-// that change only some rows should not reconcile all ~500 rows.
+// that change only some rows should not reconcile every row.
 export default memo(function ListingTable({
   listings,
-  compact = false,
   isLoading = false,
+  empty,
   onSelect,
   onToggleHidden,
 }: {
   listings: Listing[];
-  compact?: boolean;
   isLoading?: boolean;
+  /** Replaces the default "No listings yet" state. */
+  empty?: ReactNode;
   onSelect?: (listing: Listing) => void;
   onToggleHidden?: (listing: Listing) => void;
 }) {
@@ -43,7 +30,7 @@ export default memo(function ListingTable({
     );
   }
   if (!listings.length) {
-    return (
+    return empty ?? (
       <div className="empty-state">
         <Search size={25} />
         <strong>No listings yet</strong>
@@ -52,19 +39,14 @@ export default memo(function ListingTable({
     );
   }
   return (
-    <div
-      className={`listing-table-wrap ${compact ? "listing-table-wrap--compact" : ""}`}
-      role="table"
-      aria-label="Saved marketplace listings"
-    >
+    <div className="listing-table-wrap" role="table" aria-label="Saved marketplace listings">
       <div className="listing-table listing-table--head" role="row">
         <span role="columnheader">Item</span>
         <span role="columnheader">Marketplace</span>
-        <span role="columnheader">Price (PLN)</span>
-        <span role="columnheader">Typical (PLN)</span>
-        <span role="columnheader">Below typical</span>
-        <span role="columnheader">Observed</span>
-        <span role="columnheader">Deal strength</span>
+        <span role="columnheader">Price</span>
+        <span role="columnheader">Typical</span>
+        <span role="columnheader">vs typical</span>
+        <span role="columnheader">Age</span>
         <span role="columnheader" aria-label="Actions" />
       </div>
       {listings.map((listing) => (
@@ -74,18 +56,6 @@ export default memo(function ListingTable({
   );
 });
 
-function ListingThumbnail({ listing }: { listing: Listing }) {
-  const [failed, setFailed] = useState(false);
-  const image = safeImageUrl(listing.image);
-  return image && !failed ? (
-    <img src={image} alt="" loading="lazy" onError={() => setFailed(true)} />
-  ) : (
-    <div className="listing-thumb-placeholder">
-      <Tag size={20} />
-    </div>
-  );
-}
-
 type ListingRowProps = { listing: Listing; onSelect?: (listing: Listing) => void; onToggleHidden?: (listing: Listing) => void };
 
 // A refetch replaces every row object; rows whose fields are unchanged skip
@@ -93,8 +63,11 @@ type ListingRowProps = { listing: Listing; onSelect?: (listing: Listing) => void
 const ListingRow = memo(function ListingRow({ listing, onSelect, onToggleHidden }: ListingRowProps) {
   const aiFiltered = Boolean(listing.aiFiltered);
   const hidden = Boolean(listing.hidden);
+  const discount = discountDisplay(listing);
+  const age = listingAgeLabel(listing);
+  const decisionClass = listing.decision ? ` listing-row--decision-${listing.decision}` : "";
   return (
-    <div className={`listing-table listing-row${aiFiltered ? " listing-row--ai-filtered" : ""}${hidden ? " listing-row--hidden" : ""}`} role="row">
+    <div className={`listing-table listing-row${aiFiltered ? " listing-row--ai-filtered" : ""}${hidden ? " listing-row--hidden" : ""}${decisionClass}`} role="row">
       <button
         type="button"
         className="listing-item listing-item--button"
@@ -105,33 +78,10 @@ const ListingRow = memo(function ListingRow({ listing, onSelect, onToggleHidden 
         <ListingThumbnail listing={listing} />
         <div>
           <strong>{listing.title}</strong>
-          <span>{listing.subtitle || listing.watch}</span>
-          <ListingSignalChips listing={listing} />
-          {listing.decision ? (
-            <em className={`decision-chip decision-chip--${listing.decision}`}>
-              {listing.decision === "buy" ? "Buy" : listing.decision === "watch" ? "Watch" : "Pass"}
-            </em>
-          ) : null}
-          {listing.variantLabel ? (
-            <em className="decision-chip decision-chip--variant" title={`Scored against the “${listing.variantLabel}” model baseline, not the watch-wide blend${listing.variantSource === "jev" ? " · placed by AI" : listing.variantSource === "manual" ? " · set manually" : ""}`}>
-              {listing.variantLabel}
-            </em>
-          ) : null}
-          {listing.typicalSource === "reference-band" ? (
-            <em className="decision-chip decision-chip--reference" title="Typical shown from the watch's reference research series while its own baseline is learning">
-              series baseline
-            </em>
-          ) : null}
-          {aiFiltered ? (
-            <em className="decision-chip decision-chip--ai-filtered" title="Hidden by AI relevance filtering">
-              Filtered by AI
-            </em>
-          ) : null}
-          {hidden ? (
-            <em className="decision-chip decision-chip--hidden" title="Manually hidden from the overview and alerts">
-              <EyeOff size={11} />Hidden
-            </em>
-          ) : null}
+          <span className="listing-item-meta">
+            <span>{listing.subtitle || listing.watch}</span>
+            <ListingChips listing={listing} />
+          </span>
         </div>
       </button>
       <div className="marketplace-cell" role="cell">
@@ -139,20 +89,19 @@ const ListingRow = memo(function ListingRow({ listing, onSelect, onToggleHidden 
         {listing.marketplace}
       </div>
       <strong className="price-cell" role="cell">{formatPln(listing.price)}</strong>
-      <span role="cell">{formatPln(listing.typical)}</span>
-      <strong className="discount-cell" role="cell">
-        {listing.belowTypical === null ? "—" : `${listing.belowTypical.toFixed(1)}%`}
+      <span className="typical-cell" role="cell">
+        {listing.typical === null ? "Learning" : formatPln(listing.typical)}
+        {listing.typicalSource === "reference-band" ? <sup title="From the watch's research series while its own typical is learning">*</sup> : null}
+      </span>
+      <strong className={`discount-cell discount-cell--${discount.tone}`} role="cell" title={dealTierLabel(listing)}>
+        {discount.text}
       </strong>
-      <span className="observed-cell" role="cell">{listing.observed}</span>
-      <div className="strength-cell" role="cell">
-        <DealBars strength={listing.dealStrength} />
-        <span>{listing.typical === null ? "Learning" : listing.dealLabel}</span>
-      </div>
+      <span className={`age-cell${age.old ? " age-cell--old" : ""}`} role="cell" title={age.detail}>{age.label}</span>
       <div className="row-actions" role="cell">
         {onToggleHidden ? (
           <button
             type="button"
-            className="icon-button row-action"
+            className="icon-button row-action row-action--hide"
             onClick={() => onToggleHidden(listing)}
             aria-label={hidden ? `Unhide ${listing.title}` : `Hide ${listing.title}`}
             title={hidden ? "Unhide listing" : "Hide listing from the overview and alerts"}
@@ -177,23 +126,19 @@ const ListingRow = memo(function ListingRow({ listing, onSelect, onToggleHidden 
   && previous.onToggleHidden === next.onToggleHidden
   && sameListingFields(previous.listing, next.listing));
 
-export function ListingSignalChips({ listing }: { listing: Listing }) {
-  const age = listingAge(listing);
-  return (
-    <>
-      {age ? <em className={`decision-chip decision-chip--age decision-chip--age-${age.freshness}`} title={age.detail}>{age.label}</em> : null}
-      {listing.promoted ? <em className="decision-chip decision-chip--promoted" title="Paid placement or highlight">Promoted</em> : null}
-      {listing.sellerType === "business" ? <em className="decision-chip decision-chip--business" title="The marketplace marks this seller as a business account">Business</em> : null}
-    </>
-  );
-}
-
-function DealBars({ strength }: { strength: number }) {
-  return (
-    <span className={`deal-bars deal-bars--${strength}`} role="img" aria-label={`${strength} of 5 deal strength`}>
-      {[1, 2, 3, 4, 5].map((bar) => (
-        <i key={bar} className={bar <= strength ? "is-filled" : ""} />
-      ))}
-    </span>
-  );
+/**
+ * At most two short chips after the subtitle: the triage decision first, then
+ * the state or signal that matters most. Age has its own column.
+ */
+function ListingChips({ listing }: { listing: Listing }) {
+  const chips: ReactNode[] = [];
+  if (listing.decision) chips.push(<em key="decision" className={`decision-chip decision-chip--${listing.decision}`}>{decisionLabels[listing.decision]}</em>);
+  if (listing.hidden) chips.push(<em key="hidden" className="decision-chip decision-chip--hidden" title="Manually hidden from the overview and alerts"><EyeOff size={11} />Hidden</em>);
+  if (listing.aiFiltered) chips.push(<em key="ai" className="decision-chip decision-chip--ai-filtered" title="Hidden by AI relevance filtering">Filtered by AI</em>);
+  if (listing.variantLabel) chips.push(<em key="variant" className="decision-chip decision-chip--variant" title={`Scored against the “${listing.variantLabel}” model typical, not the watch-wide blend${listing.variantSource === "jev" ? " · placed by AI" : listing.variantSource === "manual" ? " · set manually" : ""}`}>{listing.variantLabel}</em>);
+  if (listing.sellerType === "business") chips.push(<em key="business" className="decision-chip decision-chip--business" title="The marketplace marks this seller as a business account">Business</em>);
+  if (listing.promoted) chips.push(<em key="promoted" className="decision-chip decision-chip--promoted" title="Paid placement or highlight">Promoted</em>);
+  if (!chips.length) return null;
+  const extra = chips.length - 2;
+  return <>{chips.slice(0, 2)}{extra > 0 ? <em className="decision-chip decision-chip--more">+{extra}</em> : null}</>;
 }

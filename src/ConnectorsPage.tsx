@@ -1,39 +1,14 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { Activity, ArrowRight, LoaderCircle, RefreshCw, Send } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { ArrowRight, LoaderCircle, RefreshCw, Send } from "lucide-react";
 import { api } from "./api";
 import { formatDate, monthDayTime } from "./format";
 import type { Connector, ConnectorRun } from "./types";
+import { PageHeader } from "./ui";
 
 type Toast = { type: "success" | "error" | "info" };
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
-
-function PageHeader({
-  title,
-  description,
-  action,
-  actionIcon,
-  actionDisabled,
-  onAction,
-}: {
-  title: string;
-  description?: string;
-  action?: string;
-  actionIcon?: ReactNode;
-  actionDisabled?: boolean;
-  onAction?: () => void;
-}) {
-  return (
-    <header className="page-header page-header--inner">
-      <div>
-        <h1>{title}</h1>
-        {description ? <p>{description}</p> : null}
-      </div>
-      {action ? <button className="primary-button" disabled={actionDisabled} onClick={onAction}>{actionIcon}{action}</button> : null}
-    </header>
-  );
-}
 
 function runHealth(status: string): "OK" | "Warning" | "Degraded" | string {
   if (status === "ok") return "OK";
@@ -47,12 +22,14 @@ export default function ConnectorsPage({
   scanning,
   onScan,
   onHistory,
+  onOpenSettings,
   onToast,
 }: {
   connectors: Connector[];
   scanning: boolean;
   onScan: () => void;
   onHistory: () => void;
+  onOpenSettings: () => void;
   onToast: (message: string, type?: Toast["type"]) => void;
 }) {
   const [runs, setRuns] = useState<ConnectorRun[]>([]);
@@ -61,6 +38,8 @@ export default function ConnectorsPage({
   const [loadingOlderRuns, setLoadingOlderRuns] = useState(false);
   const [testingDiscord, setTestingDiscord] = useState(false);
   const [testingNtfy, setTestingNtfy] = useState(false);
+  // Most runs are routine; failures (with their message) are what this list is for.
+  const [problemsOnly, setProblemsOnly] = useState(true);
   const loadRuns = useCallback(async () => {
     try {
       const result = await api.connectorRuns();
@@ -102,76 +81,63 @@ export default function ConnectorsPage({
   const connectorColor = (source: string) =>
     connectors.find((connector) => connector.name === source)?.color ??
     "#8a94a6";
+  const shownRuns = problemsOnly ? runs.filter((run) => run.status === "error" || run.status === "degraded" || run.status === "warning") : runs;
   return (
     <>
-      <PageHeader
-        title="Connectors"
-        description="Public-page health, pacing, and notification delivery."
-        action={scanning ? "Queueing…" : "Scan now"}
-        actionIcon={
-          scanning ? (
-            <LoaderCircle size={18} className="spin" />
-          ) : (
-            <RefreshCw size={18} />
-          )
-        }
-        actionDisabled={scanning}
-        onAction={onScan}
-      />
-      <div className="connector-banner">
-        <div className="banner-icon">
-          <Activity size={22} />
-        </div>
-        <div>
-          <strong>Monitoring is best-effort by design.</strong>
-          <span>
-            Failures are recorded per source; one blocked marketplace never
-            stops the others.
-          </span>
-        </div>
-        <button onClick={onHistory}>
-          Notification history <ArrowRight size={16} />
+      <PageHeader title="Connectors">
+        <button className="outline-button" onClick={onHistory}>Notification history</button>
+        <button className="primary-button" disabled={scanning} onClick={onScan}>
+          {scanning ? <LoaderCircle size={17} className="spin" /> : <RefreshCw size={17} />}
+          {scanning ? "Queueing…" : "Scan now"}
         </button>
-      </div>
-      <div className="connector-cards">
+      </PageHeader>
+      <div className="connector-list" role="table" aria-label="Connector health">
         {connectors.map((connector) => (
-          <ConnectorCard
+          <ConnectorRow
             connector={connector}
             key={connector.name}
             testing={connector.name === "ntfy" ? testingNtfy : testingDiscord}
             onTest={connector.name === "Discord" ? testWebhook : connector.name === "ntfy" ? testNtfy : undefined}
+            onOpenSettings={onOpenSettings}
           />
         ))}
       </div>
       <div className="connector-runs">
         <div className="section-heading-row">
-          <h2>Recent connector runs</h2>
-          <button
-            className="icon-button"
-            aria-label="Refresh connector runs"
-            onClick={() => {
-              setLoadingRuns(true);
-              void loadRuns();
-            }}
-          >
-            <RefreshCw size={16} className={loadingRuns ? "spin" : ""} />
-          </button>
+          <h2>Recent runs</h2>
+          <div className="search-results-actions">
+            <div className="segmented" role="group" aria-label="Runs shown">
+              <button type="button" aria-pressed={problemsOnly} className={problemsOnly ? "segmented-option segmented-option--active" : "segmented-option"} onClick={() => setProblemsOnly(true)}>Problems</button>
+              <button type="button" aria-pressed={!problemsOnly} className={!problemsOnly ? "segmented-option segmented-option--active" : "segmented-option"} onClick={() => setProblemsOnly(false)}>All runs</button>
+            </div>
+            <button
+              className="icon-button"
+              aria-label="Refresh connector runs"
+              title="Refresh runs"
+              onClick={() => {
+                setLoadingRuns(true);
+                void loadRuns();
+              }}
+            >
+              <RefreshCw size={16} className={loadingRuns ? "spin" : ""} />
+            </button>
+          </div>
         </div>
         <div className="run-table">
           <div className="run-head">
             <span>Source</span>
             <span>Result</span>
-            <span>Duration</span>
             <span>Started</span>
+            <span>Details</span>
           </div>
           {loadingRuns ? (
             <div className="table-loading">
               <LoaderCircle size={18} className="spin" />
               Loading runs…
             </div>
-          ) : runs.length ? (
+          ) : shownRuns.length ? (
             <>
-            {runs.map((run) => (
+            {shownRuns.map((run) => (
               <div className="run-row" key={run.id}>
                 <span className="connector-name">
                   <i style={{ background: connectorColor(run.source) }} />
@@ -181,17 +147,17 @@ export default function ConnectorsPage({
                   <i />
                   {runHealth(run.status)}
                 </span>
-                <span>{run.duration}</span>
-                <span title={run.startedAt}>
+                <span title={`${run.startedAt} · took ${run.duration}`}>
                   {formatDate(monthDayTime, run.startedAt)}
                 </span>
+                <span className="run-message">{run.message || "—"}</span>
               </div>
             ))}
             {runsPagination?.hasNext ? <button className="link-button messages-load-more" disabled={loadingOlderRuns} onClick={async () => { setLoadingOlderRuns(true); try { const result = await api.connectorRuns({ page: (runsPagination.page ?? 1) + 1 }); setRuns((current) => [...current, ...result.runs]); setRunsPagination(result.pagination); } catch (error) { onToast(errorMessage(error), "error"); } finally { setLoadingOlderRuns(false); } }}>{loadingOlderRuns ? <LoaderCircle size={15} className="spin" /> : <ArrowRight size={15} />}{loadingOlderRuns ? "Loading…" : "Load older runs"}</button> : null}
             </>
           ) : (
-            <div className="panel-empty panel-empty--large">
-              No connector runs yet. Start a scan to test the selected sources.
+            <div className="panel-empty">
+              {runs.length ? "No failed or slow runs in the loaded history." : "No connector runs yet. Start a scan to test the sources."}
             </div>
           )}
         </div>
@@ -199,73 +165,46 @@ export default function ConnectorsPage({
     </>
   );
 }
-function ConnectorCard({
+
+/** One compact health row per source or notification channel. */
+function ConnectorRow({
   connector,
   testing,
   onTest,
+  onOpenSettings,
 }: {
   connector: Connector;
   testing: boolean;
   onTest?: () => void;
+  onOpenSettings: () => void;
 }) {
   const configured =
     (connector.name !== "Discord" && connector.name !== "ntfy") ||
     !connector.detail.toLowerCase().includes("not configured");
   return (
-    <article className="connector-card">
-      <div className="connector-card-top">
-        <span className="connector-logo" style={{ color: connector.color }}>
-          {connector.kind === "discord"
-            ? "D"
-            : connector.kind === "ntfy"
-              ? "N"
-              : connector.name === "Allegro Lokalnie"
-                ? "A"
-                : connector.name[0]}
-        </span>
-        <span
-          className={`status-pill status-pill--${connector.status.toLowerCase()}`}
-        >
-          <i />
-          {connector.status}
-        </span>
-      </div>
-      <h3>{connector.name}</h3>
-      <p>{connector.detail}</p>
-      <div className="connector-metrics">
-        <div>
-          <span>Runs</span>
-          <strong>{connector.requests}</strong>
-        </div>
-        <div>
-          <span>Last duration</span>
-          <strong>{connector.latency}</strong>
-        </div>
-        <div>
-          <span>Last good</span>
-          <strong>{connector.lastSuccess}</strong>
-        </div>
-      </div>
-      {onTest ? (
-        <button
-          className="outline-button connector-test"
-          disabled={testing || !configured}
-          onClick={onTest}
-        >
-          {testing ? (
-            <LoaderCircle size={15} className="spin" />
+    <div className="connector-row" role="row">
+      <span className="connector-name" role="cell">
+        <i style={{ background: connector.color }} />
+        <strong>{connector.name}</strong>
+      </span>
+      <span className={`status-pill status-pill--${connector.status.toLowerCase()}`} role="cell">
+        <i />
+        {connector.status}
+      </span>
+      <span className="connector-detail" role="cell" title={`${connector.requests} runs · last took ${connector.latency}`}>{connector.detail}</span>
+      <span className="connector-last" role="cell">{connector.lastSuccess}</span>
+      <span className="connector-action" role="cell">
+        {onTest ? (
+          configured ? (
+            <button className="outline-button" disabled={testing} onClick={onTest}>
+              {testing ? <LoaderCircle size={14} className="spin" /> : <Send size={14} />}
+              {testing ? "Sending…" : "Send test"}
+            </button>
           ) : (
-            <Send size={15} />
-          )}
-          {configured
-            ? testing
-              ? "Sending…"
-              : connector.kind === "ntfy" ? "Test ntfy notification" : "Test webhook"
-            : "Configure in Settings"}
-        </button>
-      ) : null}
-    </article>
+            <button className="link-button" onClick={onOpenSettings}>Set up</button>
+          )
+        ) : null}
+      </span>
+    </div>
   );
 }
-
-
