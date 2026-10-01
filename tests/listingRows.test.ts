@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { reuseUnchangedListings, sameListingFields } from '../src/listingRows';
+import { pageForFilters, reuseUnchangedListings, sameListingFields } from '../src/listingRows';
 import type { Listing } from '../src/types';
 
 const row = (id: string, extra: Partial<Listing> = {}) => ({ id, title: `Item ${id}`, price: 100, typical: null, observed: '1 min ago', hidden: false, ...extra }) as unknown as Listing;
@@ -42,4 +42,14 @@ test('keys rows by association so the same listing under two watches stays disti
   assert.equal(merged[0], previous[1]);
   assert.equal(merged[1], previous[0]);
   assert.equal(reuseUnchangedListings([], next), next);
+});
+
+test('a filter change restarts paging, and earlier filters do not bring their page back', () => {
+  let state = { key: 'all', page: 1 };
+  state = { key: state.key, page: 3 }; // Next, Next
+  assert.equal(pageForFilters(state, 'all'), state, 'unchanged filters keep the stored state');
+  state = pageForFilters(state, 'olx');
+  assert.deepEqual(state, { key: 'olx', page: 1 });
+  state = pageForFilters(state, 'all');
+  assert.deepEqual(state, { key: 'all', page: 1 });
 });

@@ -3,7 +3,7 @@ import { ChevronDown, Database, Search, X } from "lucide-react";
 import { api } from "./api";
 import { subscribe } from "./events";
 import { applyListingActionToPage, isListingActionEvent, listingActionKey, type ListingActionEvent } from "./listingActions";
-import { reuseUnchangedListings } from "./listingRows";
+import { pageForFilters, reuseUnchangedListings } from "./listingRows";
 import ListingTable from "./ListingTable";
 import type { Listing, ListingAction, ListingDecision, Marketplace } from "./types";
 
@@ -69,8 +69,10 @@ export default function ListingsPage({
   // restarts from page 1 instead of filtering only the loaded page. The page
   // is derived in the same render, so no request goes out with the old page.
   const filtersKey = [selectedWatchId, debouncedSearch, marketplace, sortKey, decision, visibilityKey].join("|");
-  const [pageState, setPageState] = useState({ key: filtersKey, page: 1 });
-  const page = pageState.key === filtersKey ? pageState.page : 1;
+  const [storedPage, setPageState] = useState({ key: filtersKey, page: 1 });
+  const pageState = pageForFilters(storedPage, filtersKey);
+  if (pageState !== storedPage) setPageState(pageState);
+  const page = pageState.page;
 
   useEffect(() => {
     const controller = new AbortController();

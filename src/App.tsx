@@ -25,12 +25,12 @@ import {
   TrendingUp,
   WifiOff,
 } from "lucide-react";
-import { api, ApiError, UNAUTHORIZED_EVENT, type AuthSession } from "./api";
+import { api, ApiError, forgetInFlightGets, UNAUTHORIZED_EVENT, type AuthSession } from "./api";
 import { emptyDashboard } from "./data";
-import { subscribe, subscribeStatus } from "./events";
+import { reconnectPending, subscribe, subscribeStatus, type StreamStatus } from "./events";
 import { isListingActionEvent, patchListingRows } from "./listingActions";
 import { reuseUnchangedListings } from "./listingRows";
-import { allLiveResources, dashboardResources, eventResources, planFlush, type LiveResource } from "./liveRefresh";
+import { allLiveResources, dashboardResources, eventResources, planFlush, streamDecidesConnection, type LiveResource } from "./liveRefresh";
 import ListingTable from "./ListingTable";
 import type { WatchPreset } from "./presets";
 import type {
@@ -150,9 +150,11 @@ preloadView(initialView);
 // when the first view shows it, the dashboard. ScoutApp's first refresh takes
 // the dashboard promise exactly once (in flight or already settled). A 401 on
 // a signed-out load is ignored while the session check decides (see App).
+// A tab opened in the background skips the dashboard: it could be shown hours
+// later, and a hidden tab fetches when it is shown.
 const bootSession = api.authSession();
 bootSession.catch(() => {});
-let bootDashboard: Promise<DashboardData> | null = initialViewNeedsDashboard ? api.dashboard() : null;
+let bootDashboard: Promise<DashboardData> | null = initialViewNeedsDashboard && !document.hidden ? api.dashboard() : null;
 bootDashboard?.catch(() => {});
 function takeBootDashboard() {
   const pending = bootDashboard;
@@ -318,6 +320,8 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
   const dirty = useRef(new Set<LiveResource>(allLiveResources));
   const dashboardLoaded = useRef(false);
   const dashboardFetches = useRef(0);
+  const connectorsSequence = useRef(0);
+  const streamStatus = useRef<StreamStatus | null>(null);
   const flushTimer = useRef<number | null>(null);
   const flushRef = useRef<() => Promise<void>>(async () => {});
   const scheduleFlush = useCallback(() => {
@@ -366,14 +370,23 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     if (document.hidden) return;
     const plan = planFlush(viewRef.current, dirty.current, dashboardLoaded.current, dashboardFetches.current > 0);
     for (const resource of plan.clear) dirty.current.delete(resource);
+    // A failed dashboard fetch shows the offline banner; on views that do not
+    // refetch the dashboard, the live stream decides it again.
+    if (streamDecidesConnection(viewRef.current, plan) && dashboardFetches.current === 0 && streamStatus.current === "online") {
+      setConnection((current) => (current === "offline" ? "online" : current));
+    }
     if (plan.page === "listings") setListingsRefreshKey((value) => value + 1);
     if (plan.page === "analytics") setAnalyticsRefreshKey((value) => value + 1);
     if (plan.page === "market") setMarketRefreshKey((value) => value + 1);
     const pending: Array<Promise<unknown>> = [];
     if (plan.dashboard) pending.push(refreshData(!dashboardLoaded.current));
     if (plan.connectors) {
+      // Only the newest request applies, so an older one landing late cannot overwrite it.
+      const sequence = ++connectorsSequence.current;
       pending.push(api.connectors().then(
-        (result) => setData((previous) => ({ ...previous, connectors: result.connectors })),
+        (result) => {
+          if (sequence === connectorsSequence.current) setData((previous) => ({ ...previous, connectors: result.connectors }));
+        },
         () => { dirty.current.add("connectors"); },
       ));
     }
@@ -392,7 +405,9 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
   }, [isLoading]);
   useEffect(() => {
     const onVisibility = () => {
-      if (!document.hidden) void flush();
+      // A stream released while hidden reopens now; its "ready" reconciles
+      // everything once, so flushing here too would fetch the dashboard twice.
+      if (!document.hidden && !reconnectPending()) void flush();
     };
     document.addEventListener("visibilitychange", onVisibility);
     return () => document.removeEventListener("visibilitychange", onVisibility);
@@ -400,6 +415,8 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
   useEffect(() => {
     const markDirty = (resources: readonly LiveResource[]) => {
       for (const resource of resources) dirty.current.add(resource);
+      // Refetches must not share a GET that started before this event.
+      forgetInFlightGets();
       scheduleFlush();
     };
     // Triage clicks (in any tab) patch the loaded rows at once and reconcile
@@ -412,6 +429,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         return listings === previous.listings ? previous : { ...previous, listings };
       });
       for (const resource of eventResources["listing-action"]) dirty.current.add(resource);
+      forgetInFlightGets();
       if (triageTimer !== null) window.clearTimeout(triageTimer);
       triageTimer = window.setTimeout(() => {
         triageTimer = null;
@@ -421,6 +439,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     const unsubscribers = [
       // A stream that comes back after a gap (server restart, hidden tab) may have missed events.
       subscribeStatus((status, reconnected) => {
+        streamStatus.current = status;
         setConnection(status);
         if (reconnected) markDirty(allLiveResources);
       }),

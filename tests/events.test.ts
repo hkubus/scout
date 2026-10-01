@@ -36,8 +36,26 @@ class FakeDocument extends EventTarget {
 
 mock.timers.enable({ apis: ['setTimeout'] });
 const fakeDocument = new FakeDocument();
-Object.assign(globalThis, { window: globalThis, document: fakeDocument, EventSource: FakeEventSource });
-const { subscribe, subscribeStatus } = await import('../src/events');
+// window events (the unauthorized signal) and the session check a CLOSED stream makes.
+const windowEvents = new EventTarget();
+let session = { authEnabled: true, authenticated: true, passwordLogin: true };
+let sessionChecks = 0;
+Object.assign(globalThis, {
+  window: globalThis,
+  document: fakeDocument,
+  EventSource: FakeEventSource,
+  addEventListener: windowEvents.addEventListener.bind(windowEvents),
+  removeEventListener: windowEvents.removeEventListener.bind(windowEvents),
+  dispatchEvent: windowEvents.dispatchEvent.bind(windowEvents),
+  fetch: async (path: string) => {
+    assert.equal(path, '/api/auth/session');
+    sessionChecks += 1;
+    return new Response(JSON.stringify(session), { status: 200 });
+  },
+});
+const { reconnectPending, subscribe, subscribeStatus } = await import('../src/events');
+const { UNAUTHORIZED_EVENT } = await import('../src/api');
+const settle = () => new Promise((resolve) => setImmediate(resolve));
 
 const open = () => FakeEventSource.instances.filter((source) => source.readyState !== FakeEventSource.CLOSED);
 const latest = () => FakeEventSource.instances.at(-1)!;
@@ -88,14 +106,17 @@ test('status: online on ready, offline on error, reconnected only after a gap', 
   off();
 });
 
-test('replaces a CLOSED source after a retry delay', () => {
+test('replaces a CLOSED source after a retry delay and a session check', async () => {
   const statuses: Array<[string, boolean]> = [];
   const off = subscribeStatus((status, reconnected) => statuses.push([status, reconnected]));
   const first = latest();
   first.dispatch('ready');
   first.fail(true);
   assert.equal(open().length, 0);
+  const checks = sessionChecks;
   mock.timers.tick(5_000);
+  await settle();
+  assert.equal(sessionChecks, checks + 1);
   assert.notEqual(latest(), first);
   latest().dispatch('ready');
   assert.deepEqual(statuses, [['online', false], ['offline', false], ['online', true]]);
@@ -121,5 +142,55 @@ test('closes after the hidden grace period and reopens as a reconnect when shown
   latest().dispatch('ready');
   assert.deepEqual(statuses, [['online', false], ['online', true]]);
   offScan();
+  off();
+});
+
+test('a CLOSED source with a lapsed session sends the app to sign-in instead of retrying', async () => {
+  let unauthorized = 0;
+  const onUnauthorized = () => { unauthorized += 1; };
+  window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+  session = { ...session, authenticated: false };
+  const off = subscribeStatus(() => {});
+  const first = latest();
+  first.dispatch('ready');
+  first.fail(true);
+  mock.timers.tick(5_000);
+  await settle();
+  assert.equal(unauthorized, 1);
+  assert.equal(latest(), first, 'no new stream');
+  mock.timers.tick(30_000);
+  await settle();
+  assert.equal(unauthorized, 1, 'no further retries');
+  off();
+  window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+  session = { ...session, authenticated: true };
+});
+
+test('a first stream after failed attempts reports a reconnect', () => {
+  const statuses: Array<[string, boolean]> = [];
+  const off = subscribeStatus((status, reconnected) => statuses.push([status, reconnected]));
+  assert.equal(reconnectPending(), false, 'a fresh stream is not a reconnect');
+  latest().fail();
+  assert.equal(reconnectPending(), true);
+  latest().dispatch('ready');
+  assert.equal(reconnectPending(), false);
+  assert.deepEqual(statuses, [['offline', false], ['online', true]]);
+  off();
+});
+
+test('a tab opened in the background releases the stream and reconciles once when shown', () => {
+  fakeDocument.hidden = true;
+  const statuses: Array<[string, boolean]> = [];
+  const off = subscribeStatus((status, reconnected) => statuses.push([status, reconnected]));
+  latest().dispatch('ready');
+  mock.timers.tick(45_000);
+  assert.equal(open().length, 0, 'released without any visibilitychange');
+  const before = FakeEventSource.instances.length;
+  fakeDocument.setHidden(false);
+  assert.equal(FakeEventSource.instances.length, before + 1);
+  assert.equal(reconnectPending(), true, 'App leaves the refetch to the coming ready');
+  latest().dispatch('ready');
+  assert.equal(reconnectPending(), false);
+  assert.deepEqual(statuses, [['online', false], ['online', true]]);
   off();
 });

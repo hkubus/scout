@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { allLiveResources, eventResources, planFlush, type LiveResource } from '../src/liveRefresh';
+import { allLiveResources, eventResources, planFlush, streamDecidesConnection, type LiveResource } from '../src/liveRefresh';
 import type { View } from '../src/types';
 
 const views: View[] = ['overview', 'search', 'watches', 'market-research', 'analytics', 'listings', 'connectors', 'logs', 'settings'];
@@ -56,4 +56,15 @@ test('verification events and research scans never touch the dashboard', () => {
   assert.equal(eventResources['ai-description-verification'], undefined);
   assert.deepEqual(eventResources['market-watch'], ['market']);
   assert.equal(planFlush('overview', dirtyAfter('market-watch'), true, false).dashboard, false);
+});
+
+test('outside Overview, a failed dashboard fetch does not keep the offline banner', () => {
+  // After a failure the dashboard resources are dirty again.
+  const dirty = new Set<LiveResource>(['dashboard', 'connectors', 'watchList']);
+  const decides = (view: View) => streamDecidesConnection(view, planFlush(view, dirty, true, false));
+  assert.equal(decides('overview'), false);
+  assert.equal(decides('analytics'), false, 'Analytics refetches the dashboard, and its result decides');
+  for (const view of ['listings', 'watches', 'logs', 'settings', 'search', 'market-research', 'connectors'] as View[]) {
+    assert.equal(decides(view), true, view);
+  }
 });

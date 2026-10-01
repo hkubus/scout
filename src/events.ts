@@ -9,6 +9,8 @@
  * tab is shown again. There is no replay: status listeners get `reconnected`
  * whenever a stream comes back after a gap, and callers reconcile from HTTP.
  */
+import { api, UNAUTHORIZED_EVENT } from "./api";
+
 type Handler = (payload: unknown) => void;
 export type StreamStatus = "online" | "offline";
 type StatusHandler = (status: StreamStatus, reconnected: boolean) => void;
@@ -23,8 +25,10 @@ const statusListeners = new Set<StatusHandler>();
 const bound = new Set<string>();
 let source: EventSource | null = null;
 let status: StreamStatus | null = null;
-/** True once any stream was open, so the next "ready" is a reconnect. */
+/** True once any stream was open or failed, so the next "ready" is a reconnect. */
 let wasOpen = false;
+/** True from opening a source (or an error) until its "ready" arrives. */
+let awaitingReady = false;
 let hiddenTimer: number | null = null;
 let retryTimer: number | null = null;
 let closedWhileHidden = false;
@@ -57,6 +61,31 @@ function closeSource() {
   bound.clear();
 }
 
+function startHiddenTimer() {
+  if (hiddenTimer !== null || !source) return;
+  hiddenTimer = window.setTimeout(() => {
+    hiddenTimer = null;
+    if (!document.hidden || !source) return;
+    closeSource();
+    closedWhileHidden = true;
+  }, HIDDEN_GRACE_MS);
+}
+
+/**
+ * EventSource cannot see status codes, so a CLOSED stream checks the session
+ * before reopening: a lapsed or revoked one sends the app to the sign-in
+ * screen instead of retrying every few seconds.
+ */
+function retryClosedSource() {
+  api.authSession().then(
+    (session) => {
+      if (session.authEnabled && !session.authenticated) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+      else ensureSource();
+    },
+    () => ensureSource(),
+  );
+}
+
 function ensureSource() {
   if (!hasListeners() || (typeof document !== "undefined" && document.hidden && closedWhileHidden)) return;
   // A CLOSED source never reconnects by itself (for example after a 401 before
@@ -66,23 +95,31 @@ function ensureSource() {
   closedWhileHidden = false;
   const current = new EventSource("/events");
   source = current;
+  awaitingReady = true;
   current.addEventListener("ready", () => {
     if (source !== current) return;
-    // Native auto-reconnects and reopened streams both land here after a gap.
+    awaitingReady = false;
+    // Native auto-reconnects, reopened streams and a first stream after
+    // failed attempts all land here after a gap.
     setStatus("online", wasOpen);
     wasOpen = true;
   });
   current.onerror = () => {
     if (source !== current) return;
+    // A page loaded while the server was down reconciles on its first "ready".
+    wasOpen = true;
+    awaitingReady = true;
     setStatus("offline");
     if (current.readyState === EventSource.CLOSED && retryTimer === null) {
       retryTimer = window.setTimeout(() => {
         retryTimer = null;
-        ensureSource();
+        retryClosedSource();
       }, CLOSED_RETRY_MS);
     }
   };
   for (const event of listeners.keys()) attach(event);
+  // A tab opened in the background releases its stream like one hidden later.
+  if (typeof document !== "undefined" && document.hidden) startHiddenTimer();
 }
 
 function releaseIfUnused() {
@@ -93,18 +130,13 @@ function releaseIfUnused() {
   // Nobody saw the gap, so the next stream starts fresh rather than as a reconnect.
   status = null;
   wasOpen = false;
+  awaitingReady = false;
 }
 
 if (typeof document !== "undefined") {
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
-      if (hiddenTimer !== null || !source) return;
-      hiddenTimer = window.setTimeout(() => {
-        hiddenTimer = null;
-        if (!document.hidden || !source) return;
-        closeSource();
-        closedWhileHidden = true;
-      }, HIDDEN_GRACE_MS);
+      startHiddenTimer();
       return;
     }
     if (hiddenTimer !== null) window.clearTimeout(hiddenTimer);
@@ -114,6 +146,15 @@ if (typeof document !== "undefined") {
       ensureSource();
     }
   });
+}
+
+/**
+ * Whether a stream is coming back after a gap, so its "ready" will report
+ * `reconnected` and callers can leave reconciling to that (one refetch
+ * instead of one now and another on "ready").
+ */
+export function reconnectPending() {
+  return source !== null && wasOpen && awaitingReady;
 }
 
 /** Subscribe to one named event; returns an unsubscribe function. */

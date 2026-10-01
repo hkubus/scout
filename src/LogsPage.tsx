@@ -1,8 +1,9 @@
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Download, LoaderCircle, RefreshCw, ScrollText } from "lucide-react";
 import { api } from "./api";
 import { subscribe, subscribeStatus } from "./events";
 import { formatDate, timeWithSeconds } from "./format";
+import { mergeLogs, prependLog } from "./logEntries";
 import type { LogEntry } from "./types";
 
 const errorMessage = (error: unknown) =>
@@ -24,9 +25,6 @@ function PageHeader({ title, description }: { title: string; description?: strin
 
 const timeOnly = (value: string) => formatDate(timeWithSeconds, value);
 
-/** Matches the server's in-memory LOG_BUFFER_LIMIT. */
-const LOG_LIMIT = 500;
-
 const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
   return (
     <div className={`log-row ${log.level === "error" ? "log-row--error" : ""}`}>
@@ -46,17 +44,22 @@ export default function LogsPage({ onToast }: { onToast: (message: string, type?
   const [loading, setLoading] = useState(true);
   const [level, setLevel] = useState<LevelFilter>("all");
   const [scope, setScope] = useState<ScopeFilter>("all");
+  /** Live entries received while each GET /api/logs is in flight (newest first). */
+  const liveDuringLoad = useRef(new Set<LogEntry[]>());
 
   // The spinner replaces the list only on the first load and on Refresh;
   // reconnect refetches keep the rows (and the scroll position) in place.
   const loadLogs = useCallback(async (showLoader: boolean) => {
     if (showLoader) setLoading(true);
+    const live: LogEntry[] = [];
+    liveDuringLoad.current.add(live);
     try {
       const result = await api.logs();
-      setLogs(result.logs);
+      setLogs(mergeLogs(live, result.logs));
     } catch (error) {
       onToast(errorMessage(error), "error");
     } finally {
+      liveDuringLoad.current.delete(live);
       if (showLoader) setLoading(false);
     }
   }, [onToast]);
@@ -73,7 +76,8 @@ export default function LogsPage({ onToast }: { onToast: (message: string, type?
     const unsubscribeLog = subscribe("log", (payload) => {
       const entry = payload as LogEntry;
       if (!entry || typeof entry.id !== "number") return;
-      setLogs((current) => current.some((log) => log.id === entry.id) ? current : [entry, ...current].slice(0, LOG_LIMIT));
+      for (const live of liveDuringLoad.current) live.unshift(entry);
+      setLogs((current) => prependLog(current, entry));
     });
     const unsubscribeStatus = subscribeStatus((_status, reconnected) => {
       if (reconnected) void loadLogs(false);

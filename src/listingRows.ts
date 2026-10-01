@@ -36,3 +36,14 @@ export function reuseUnchangedListings(previous: Listing[], next: Listing[]): Li
   });
   return identical ? previous : merged;
 }
+
+export type PageState = { key: string; page: number };
+
+/**
+ * The page to show for the current filters. Any filter change restarts from
+ * page 1, and the returned state replaces the stored one, so going back to
+ * earlier filters does not bring back the page they were on.
+ */
+export function pageForFilters(state: PageState, filtersKey: string): PageState {
+  return state.key === filtersKey ? state : { key: filtersKey, page: 1 };
+}

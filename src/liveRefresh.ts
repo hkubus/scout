@@ -75,3 +75,13 @@ export function planFlush(view: View, dirty: ReadonlySet<LiveResource>, dashboar
   }
   return { dashboard, connectors, page, clear };
 }
+
+/**
+ * Whether the connection indicator should follow the live stream after this
+ * flush. A failed dashboard fetch marks the app offline; Overview keeps that
+ * until a refetch succeeds (or Retry), but a view that does not refetch the
+ * dashboard would otherwise keep the banner until the next stream error.
+ */
+export function streamDecidesConnection(view: View, plan: FlushPlan) {
+  return view !== "overview" && !plan.dashboard;
+}

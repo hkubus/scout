@@ -16,6 +16,15 @@ export type AuthSession = { authEnabled: boolean; authenticated: boolean; passwo
 
 const inFlightGets = new Map<string, Promise<unknown>>();
 
+/**
+ * Stop sharing the GETs in flight now: a server event can make their responses
+ * stale, so a request made after it must not get one of them. Callers that
+ * already hold one keep it.
+ */
+export function forgetInFlightGets() {
+  inFlightGets.clear();
+}
+
 function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) return Promise.reject(signal.reason ?? new DOMException('The operation was aborted', 'AbortError'));
   return new Promise<T>((resolve, reject) => {
