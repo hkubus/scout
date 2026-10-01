@@ -11,6 +11,8 @@ final class AnalyticsStore {
     var watchId: String?
     var marketplace: Marketplace?
     var watches: [Watch] = []
+    /// `AppModel.watchesToken` when `watches` was fetched.
+    var watchesLoadedFor: Int?
     var data: AnalyticsData?
     var error: String?
     let memory = LoadMemory()
@@ -209,10 +211,14 @@ struct AnalyticsView: View {
     private func load() async -> Bool {
         guard let client = model.client else { return false }
         let (days, watchId, marketplace) = (store.days, store.watchId, store.marketplace)
+        let watchesToken = model.watchesToken
         do {
             async let loaded = client.analytics(days: days, watchId: watchId, marketplace: marketplace)
-            if store.watches.isEmpty {
-                store.watches = (try? await client.watches()) ?? []
+            // Refetch the picker's watches after any watch change; on failure
+            // keep the previous list and try again next load.
+            if store.watchesLoadedFor != watchesToken, let watches = try? await client.watches() {
+                store.watches = watches
+                store.watchesLoadedFor = watchesToken
             }
             store.data = try await loaded
             store.error = nil

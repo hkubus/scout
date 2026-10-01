@@ -135,6 +135,61 @@ public struct ListingActionEvent: Decodable, Hashable, Sendable {
         }
         return matched ? rows : nil
     }
+
+    /// What a list without stats (Listings) does with this action: patch
+    /// decision and hidden into its rows and drop those that leave `filter`,
+    /// reload when the listing isn't loaded but may now belong in the list,
+    /// and otherwise nothing.
+    public func triage(_ rows: [Listing], filter: ListingFilter) -> ListingTriage {
+        guard rows.contains(where: { $0.key == key }) else {
+            return filter.admits(decision: decision, hidden: hidden) ? .reload : .unchanged
+        }
+        var removed = 0
+        let patched = rows.compactMap { row -> Listing? in
+            guard row.key == key else { return row }
+            var row = row
+            row.decision = decision
+            row.hidden = hidden
+            guard filter.admits(row) else {
+                removed += 1
+                return nil
+            }
+            return row
+        }
+        return .patched(patched, removed: removed)
+    }
+}
+
+/// The triage filters of a listing list.
+public struct ListingFilter: Hashable, Sendable {
+    public var decision: ListingDecision?
+    public var visibility: ListingVisibility
+
+    public init(decision: ListingDecision? = nil, visibility: ListingVisibility = .visible) {
+        self.decision = decision
+        self.visibility = visibility
+    }
+
+    public func admits(decision: ListingDecision?, hidden: Bool) -> Bool {
+        switch visibility {
+        case .visible where hidden, .hidden where !hidden: return false
+        default: return self.decision == nil || decision == self.decision
+        }
+    }
+
+    public func admits(_ listing: Listing) -> Bool {
+        admits(decision: listing.decision, hidden: listing.hidden ?? false)
+    }
+}
+
+/// See `ListingActionEvent.triage(_:filter:)`.
+public enum ListingTriage: Equatable, Sendable {
+    /// The loaded rows after the action; `removed` of them left the filters.
+    case patched([Listing], removed: Int)
+    /// The listing isn't loaded and may now enter the list.
+    case reload
+    /// The listing isn't loaded and still can't be in the list.
+    case unchanged
 }
 
 /// Whether a screen that keys its load on `key` should load when it appears

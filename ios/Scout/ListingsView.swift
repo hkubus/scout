@@ -165,28 +165,39 @@ struct ListingsView: View {
 
     private func replace(_ listing: Listing) {
         guard let index = listings.firstIndex(where: { $0.rowID == listing.rowID }) else { return }
-        if leavesFilter(listing) {
-            listings.remove(at: index)
-        } else {
+        if triageFilter.admits(listing) {
             listings[index] = listing
+        } else {
+            listings.remove(at: index)
+            dropFromTotal(1)
         }
     }
 
-    private func leavesFilter(_ listing: Listing) -> Bool {
-        (filters.visibility == .visible && listing.hidden == true)
-            || (filters.visibility == .hidden && listing.hidden != true)
-            || (filters.decision != nil && listing.decision != filters.decision)
+    private var triageFilter: ListingFilter {
+        ListingFilter(decision: filters.decision, visibility: filters.visibility)
     }
 
-    /// Triage from any client: a decision is patched into the rows (dropping
-    /// them if they leave the decision filter); hiding, or a listing that
-    /// isn't loaded, reloads the loaded pages.
+    /// Rows that left the filters are no longer counted by the server either.
+    private func dropFromTotal(_ removed: Int) {
+        guard removed > 0, var pagination else { return }
+        pagination.total = max(0, pagination.total - removed)
+        self.pagination = pagination
+    }
+
+    /// Triage from any client. This list shows no stats, so decision and
+    /// hidden are patched into loaded rows (dropping those that leave the
+    /// filters); it reloads only when a listing that isn't loaded may now
+    /// belong in it.
     private func apply(_ action: ListingActionEvent) {
         guard pagination != nil else { return }
-        guard let patched = action.patched(listings) else {
+        switch action.triage(listings, filter: triageFilter) {
+        case let .patched(rows, removed):
+            listings = rows
+            dropFromTotal(removed)
+        case .reload:
             triageReloads += 1
-            return
+        case .unchanged:
+            break
         }
-        listings = patched.filter { $0.key != action.key || !leavesFilter($0) }
     }
 }

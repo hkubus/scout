@@ -124,7 +124,10 @@ struct SettingsView: View {
             self.connectors = connectors
             serverSettings = try? await client.settings()
             error = nil
-            return true
+            // A cancelled or failed settings fetch leaves the server settings
+            // section missing, so don't mark the load done: the next
+            // appearance loads again.
+            return !Task.isCancelled && serverSettings != nil
         } catch {
             if !error.isCancellation { self.error = error.localizedDescription }
             return false

@@ -203,6 +203,10 @@ final class AppModel {
         openedListing = nil
         selectedTab = .deals
         widgetSnapshot = nil
+        // Photos were fetched with this server's token and are keyed only by
+        // URL, so a later server at the same address must not see them.
+        URLCache.shared.removeAllCachedResponses()
+        ImagePipeline.shared.removeAll()
         do {
             try SharedStore.saveAPIToken(nil)
         } catch {

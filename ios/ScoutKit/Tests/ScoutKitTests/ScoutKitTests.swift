@@ -855,6 +855,49 @@ final class LiveUpdatesTests: XCTestCase {
         XCTAssertNil(buy.patched([]))
     }
 
+    func testListingsTriagePatchesDropsOrReloadsOnlyWhenARowMayEnter() throws {
+        var rows = DemoTransport.dashboard().listings
+        var twin = rows[1]
+        twin.associationId = "twin"
+        rows.append(twin)
+        let key = rows[1].key
+        let visible = ListingFilter()
+
+        // Loaded and still admitted: patched in place, nothing removed.
+        let buy = ListingActionEvent(key: key, decision: .buy, hidden: false)
+        guard case let .patched(bought, removed) = buy.triage(rows, filter: visible) else { return XCTFail() }
+        XCTAssertEqual(removed, 0)
+        XCTAssertEqual(bought.map(\.rowID), rows.map(\.rowID))
+        XCTAssertEqual(bought.filter { $0.key == key }.map(\.decision), [.buy, .buy])
+
+        // Hiding under the visible filter drops both rows locally, no reload.
+        let hide = ListingActionEvent(key: key, decision: nil, hidden: true)
+        guard case let .patched(left, hiddenCount) = hide.triage(rows, filter: visible) else { return XCTFail() }
+        XCTAssertEqual(hiddenCount, 2)
+        XCTAssertFalse(left.contains { $0.key == key })
+        XCTAssertEqual(left.count, rows.count - 2)
+
+        // Under "all", hiding patches the flag and keeps the rows.
+        guard case let .patched(all, kept) = hide.triage(rows, filter: ListingFilter(visibility: .all)) else { return XCTFail() }
+        XCTAssertEqual(kept, 0)
+        XCTAssertEqual(all.filter { $0.key == key }.map(\.hidden), [true, true])
+
+        // A decision filter drops rows whose decision changed away from it.
+        let buys = ListingFilter(decision: .buy, visibility: .all)
+        guard case let .patched(_, passed) = ListingActionEvent(key: key, decision: .pass, hidden: false).triage(bought, filter: buys) else { return XCTFail() }
+        XCTAssertEqual(passed, 2)
+
+        // Not loaded: reload only when the new state passes the filters.
+        let other = "OLX:unknown"
+        XCTAssertEqual(ListingActionEvent(key: other, decision: nil, hidden: false).triage(rows, filter: visible), .reload)
+        XCTAssertEqual(ListingActionEvent(key: other, decision: nil, hidden: true).triage(rows, filter: visible), .unchanged)
+        XCTAssertEqual(ListingActionEvent(key: other, decision: nil, hidden: false).triage(rows, filter: ListingFilter(visibility: .hidden)), .unchanged)
+        XCTAssertEqual(ListingActionEvent(key: other, decision: nil, hidden: true).triage(rows, filter: ListingFilter(visibility: .hidden)), .reload)
+        XCTAssertEqual(ListingActionEvent(key: other, decision: .pass, hidden: false).triage(rows, filter: buys), .unchanged)
+        XCTAssertEqual(ListingActionEvent(key: other, decision: .buy, hidden: true).triage(rows, filter: buys), .reload)
+        XCTAssertEqual(ListingActionEvent(key: other, decision: .buy, hidden: false).triage([], filter: visible), .reload)
+    }
+
     func testReloadsOnlyWhenTheKeyChangedOrLiveDataMayBeStale() {
         let loadedAt = Date(timeIntervalSince1970: 1_000)
         func should(_ key: Int, visible: Bool = true, live: Bool = true, loaded: Int? = 1, at: Date? = loadedAt, now: TimeInterval = 1_060) -> Bool {
