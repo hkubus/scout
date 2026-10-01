@@ -147,6 +147,24 @@ Each research watch card offers a price-trend dialog (`GET /api/market-watches/:
 
 A deal watch can point at a research watch (`referenceMarketWatchId`). While the watch's own baseline is below 30 comparable samples and the reference series has at least 4 eligible probable sales, new listings display a **series baseline**: the reference band's median stands in for the learned typical price, clearly chipped as "series baseline" in the table and drawer. This improves ranking and display only — the alert readiness gate (30 samples and 6 hours) is unchanged, so no alerts fire earlier than they would without a reference series. Once the watch's own history reaches the sample floor, own history always wins and new rows are marked `own-history`.
 
+## Flips ledger
+
+The **Flips** page records what you bought, where it is listed for sale, and what it sold for. It then shows the net profit of each flip after the platform fee and your costs. **I bought this** in a listing's details adds a flip prefilled from the listing, and that panel's resale estimate subtracts the fee of the platform you plan to sell on.
+
+- **Fee presets** are editable. The defaults are private-seller rates as of September 2026:
+  - OLX: 0% for a standard listing with OLX Przesyłka. Enter a rate if you use the optional "Zapłać, jeśli sprzedasz" model.
+  - Allegro Lokalnie: 4,9% for Kup teraz or auctions in Elektronika (7,9% in other categories).
+  - Vinted: 0%.
+
+  The fee is stored with each sale, so editing a preset never rewrites past sales.
+- **Delist checklist:** marking an item sold lists the other platforms it is still listed on, and the page warns about any sold item that is still up somewhere else.
+- **Działalność nierejestrowana:**
+  - Revenue this quarter is tracked against the quarterly limit (10 813,50 zł in 2026).
+  - Sales per platform are counted against the DAC7 reporting threshold (30 sales or 2 000 € a year per platform).
+  - The page produces the simplified sales record (*uproszczona ewidencja sprzedaży*): one row per day with that day's sales and the running total for the quarter, downloadable as CSV. These figures are estimates for your own records, not tax advice.
+
+The ledger is private bookkeeping. Nothing in scanning, scoring, bands or alerts reads it, so your own buy and sale prices never mix with marketplace asking prices. Retention never prunes it. It is included in `/api/export` and database backups, but hidden from the Debug API: it is left out of the table list, refused in read-only SQL, and emptied in debug snapshots.
+
 ## Preserved listing copies
 
 Research listings are preserved for market research: when a listing first appears in a research watch, Scout fetches its detail page once (bounded per scan, with a small retry budget on later scans), stores the description, and downloads the gallery images into the Scout database so the listing stays viewable after it is sold or removed. Captures are deduplicated by listing state, capped at 12 images of up to 4 MB each, and served only from Scout's own image endpoint. Use the eye action on a Saved listings row to view the preserved copy, or the save action to capture or refresh a copy on demand — including for listings that already ended. Copies live and die with their research listing row, so the daily 180-day retention cleanup also prunes them; deleting a research watch deletes its copies.

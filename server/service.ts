@@ -355,6 +355,9 @@ const nowIso = () => new Date().toISOString();
 // /api/export: [response key, table] in response order, then redacted settings.
 const EXPORT_TABLES = [
   ['watches', 'watches'],
+  // The operator's own flip ledger: their data, so it is exported, but
+  // never exposed through the debug API.
+  ['flips', 'flips'],
   ['listings', 'listings'],
   ['observations', 'observations'],
   ['listingRelevance', 'listing_relevance'],

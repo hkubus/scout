@@ -1,5 +1,5 @@
 export type Theme = 'light' | 'dark' | 'system';
-export type View = 'overview' | 'search' | 'watches' | 'market-research' | 'analytics' | 'listings' | 'connectors' | 'logs' | 'settings';
+export type View = 'overview' | 'search' | 'watches' | 'market-research' | 'analytics' | 'listings' | 'flips' | 'connectors' | 'logs' | 'settings';
 export type Marketplace = 'OLX' | 'Allegro Lokalnie' | 'Vinted';
 export type DealLabel = 'Exceptional' | 'Very strong' | 'Strong' | 'Watch';
 export type NotificationPriority = 'strong' | 'very-strong' | 'exceptional';
@@ -613,4 +613,36 @@ export interface DashboardData {
   stats: DashboardStats;
   lastScan: string;
   lastScanTime: string;
+}
+
+export type { FeePreset, FeePresets, FlipChannel } from './profit';
+
+export interface Flip {
+  id: number;
+  title: string;
+  /** `Marketplace:listingId` of the listing it was bought from, when known. */
+  listingKey: string | null;
+  watchId: string | null;
+  buyChannel: import('./profit').FlipChannel;
+  /** YYYY-MM-DD */
+  boughtOn: string;
+  buyPrice: number;
+  buyCosts: number;
+  /** Where it is currently listed for sale; drives the delist checklist. */
+  listedOn: import('./profit').FlipChannel[];
+  soldOn: string | null;
+  saleChannel: import('./profit').FlipChannel | null;
+  salePrice: number | null;
+  saleFee: number | null;
+  saleCosts: number | null;
+  /** Channels already delisted after the sale. */
+  delisted: import('./profit').FlipChannel[];
+  note: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface FlipsData {
+  flips: Flip[];
+  feePresets: import('./profit').FeePresets;
 }

@@ -23,6 +23,7 @@ import {
   SlidersHorizontal,
   Tag,
   TrendingUp,
+  Wallet,
   WifiOff,
 } from "lucide-react";
 import { api, ApiError, forgetInFlightGets, UNAUTHORIZED_EVENT, type AuthSession } from "./api";
@@ -50,6 +51,7 @@ const navItems: Array<{ id: View; label: string; icon: typeof Grid2X2 }> = [
   { id: "market-research", label: "Market research", icon: BarChart3 },
   { id: "analytics", label: "Analytics", icon: TrendingUp },
   { id: "listings", label: "Listings", icon: Tag },
+  { id: "flips", label: "Flips", icon: Wallet },
   { id: "connectors", label: "Connectors", icon: PlugZap },
   { id: "logs", label: "Logs", icon: ScrollText },
   { id: "settings", label: "Settings", icon: Settings2 },
@@ -90,6 +92,7 @@ const LazyConnectorsPage = lazyWithPreload(() => import("./ConnectorsPage"));
 const LazyLogsPage = lazyWithPreload(() => import("./LogsPage"));
 const LazySearchPage = lazyWithPreload(() => import("./SearchPage"));
 const LazyListingsPage = lazyWithPreload(() => import("./ListingsPage"));
+const LazyFlipsPage = lazyWithPreload(() => import("./FlipsPage"));
 const LazyListingDetailDrawer = lazyWithPreload(() => import("./ListingDetailDrawer"));
 const loadWatchesPage = () => import("./WatchesPage");
 const LazyWatchesPage = lazyWithPreload(loadWatchesPage);
@@ -105,6 +108,7 @@ const routePages: Partial<Record<View, { preload: () => Promise<unknown> }>> = {
   "market-research": LazyMarketResearchPage,
   analytics: LazyAnalyticsPage,
   listings: LazyListingsPage,
+  flips: LazyFlipsPage,
   connectors: LazyConnectorsPage,
   logs: LazyLogsPage,
   settings: LazySettingsPage,
@@ -803,6 +807,11 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
             />
           </Suspense>
         ) : null}
+        {view === "flips" ? (
+          <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading flips…</div>}>
+            <LazyFlipsPage onToast={notify} />
+          </Suspense>
+        ) : null}
         {view === "connectors" ? (
           <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading connectors…</div>}>
             <LazyConnectorsPage
@@ -869,6 +878,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
             listing={selectedListing}
             onClose={() => setSelectedListing(null)}
             onUpdated={updateListingAction}
+            onFlipAdded={(flip) => notify(`${flip.title} added to Flips.`)}
             onCreateWatch={(preset) => {
               setSelectedListing(null);
               setWatchPreset(preset);

@@ -865,7 +865,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .listing-description-snapshot p { margin: 9px 0 0; color: var(--text); font-size: 11px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 .ai-normalize-button { min-height: 34px; margin-top: 12px; font-size: 11px; }
 .calculator-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
-.calculator-fields .field-label:last-child { grid-column: 1 / -1; }
+.drawer-flip-button { display: inline-flex; align-items: center; gap: 7px; margin-top: 12px; }
 .calculator-results { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 15px; }
 .calculator-results div { display: grid; gap: 5px; padding: 11px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-muted); }
 .calculator-results span { color: var(--muted); font-size: 10px; }
@@ -917,3 +917,43 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .login-card { width: min(380px, 100%); display: grid; gap: 4px; padding: 28px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
 .login-card .primary-button { margin-top: 20px; }
 .login-error { margin: 12px 0 0; color: var(--orange); font-size: 13px; }
+
+/* Flips ledger */
+.flips-panel { margin-top: 16px; padding: 16px 20px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow); }
+.flips-panel .panel-title { margin-bottom: 10px; }
+.flips-panel .panel-title h3 { flex: 1; }
+.flips-panel .panel-title select { min-height: 32px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); color: var(--text); font-size: 12px; }
+.flips-panel > .field-hint { display: block; margin: 0 0 12px; }
+.flips-table { display: grid; }
+.flips-row { display: grid; grid-template-columns: minmax(0, 2.4fr) minmax(0, 1fr) minmax(0, 0.9fr) minmax(0, 1.4fr) minmax(0, 0.9fr) 200px; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); font-size: 13px; }
+.flips-row > span { display: grid; gap: 3px; min-width: 0; }
+.flips-row small { color: var(--muted); font-size: 11px; }
+.flips-row--head { border-top: 0; padding-top: 0; color: var(--muted); font-size: 11px; font-weight: 600; }
+.flips-table--record .flips-row { grid-template-columns: 60px 1fr 1fr 1fr; }
+.flips-actions { display: flex !important; align-items: center; gap: 6px; justify-content: flex-end; }
+.flips-actions .outline-button { padding: 6px 10px; font-size: 12px; }
+.flips-limit { margin-top: 10px; display: grid; gap: 6px; }
+.flips-limit small { color: var(--muted); font-size: 12px; }
+.flips-limit-bar { height: 6px; border-radius: 999px; background: var(--surface-muted); overflow: hidden; }
+.flips-limit-bar i { display: block; height: 100%; border-radius: inherit; background: var(--green); }
+.flips-limit--warn .flips-limit-bar i { background: var(--orange); }
+.flips-limit--warn small { color: var(--orange); }
+.flips-alert { margin-top: 12px; }
+.flips-dac7 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.flips-dac7 > div { display: grid; gap: 4px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-muted); }
+.flips-dac7 span, .flips-dac7 small { color: var(--muted); font-size: 11px; }
+.flips-dac7 strong { color: var(--text-strong); font-size: 16px; }
+.flips-dac7--warn { border-color: rgba(241, 90, 53, .45) !important; }
+.fee-preset-grid { display: grid; gap: 8px; margin-bottom: 12px; }
+.fee-preset-row { display: grid; grid-template-columns: 130px 110px 110px minmax(0, 1fr); align-items: center; gap: 10px; font-size: 13px; }
+.fee-preset-row label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
+.fee-preset-row input { width: 70px; min-height: 32px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); color: var(--text); }
+.fee-preset-row small { color: var(--muted); font-size: 11px; }
+@media (max-width: 760px) {
+  .flips-row { grid-template-columns: 1fr 1fr; }
+  .flips-row--head { display: none; }
+  .flips-actions { grid-column: 1 / -1; justify-content: flex-start; }
+  .flips-dac7 { grid-template-columns: 1fr; }
+  .fee-preset-row { grid-template-columns: 1fr 1fr; }
+  .fee-preset-row strong, .fee-preset-row small { grid-column: 1 / -1; }
+}
