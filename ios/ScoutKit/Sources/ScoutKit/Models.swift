@@ -89,12 +89,31 @@ public struct Listing: Codable, Hashable, Sendable {
     public var aiDescriptionVerificationAt: String?
     public var aiDescriptionVerificationStatus: String?
     public var aiDescriptionVerificationError: String?
+    /// When Scout first saw the listing (for this watch).
+    public var firstSeenAt: String?
+    /// When the seller posted it, where the marketplace says (OLX). OLX's
+    /// "newest" order is really "most recently refreshed", so this can be
+    /// months before the listing reached the top of a scan.
+    public var postedAt: String?
+    /// The seller's latest refresh or paid bump (OLX).
+    public var refreshedAt: String?
+    /// Paid placement or highlight; nil when the marketplace doesn't say.
+    public var promoted: Bool?
+    /// `private` or `business` from the marketplace's own flag; nil when unknown.
+    public var sellerType: String?
 
     /// Unique per row in watch-scoped lists, where `id` can repeat.
     public var rowID: String { associationId ?? id }
     /// Key accepted by `/api/listing-detail` and `/api/listing-actions`.
     public var key: String { marketplaceListingKey ?? id }
     public var observedDate: Date? { ScoutDate.parse(observedAt) }
+    public var postedDate: Date? { ScoutDate.parse(postedAt) }
+    public var isBusinessSeller: Bool { sellerType == SellerType.business.rawValue }
+    /// Bumped well after posting (more than an hour later).
+    public var bumpedDate: Date? {
+        guard let posted = postedDate, let refreshed = ScoutDate.parse(refreshedAt), refreshed.timeIntervalSince(posted) > 3600 else { return nil }
+        return refreshed
+    }
     public var imageURL: URL? { image.isEmpty ? nil : URL(string: image) }
     public var webURL: URL? { URL(string: url) }
 }
@@ -198,8 +217,45 @@ public struct Watch: Codable, Hashable, Sendable, Identifiable {
     public var minPrice: Double?
     public var maxPrice: Double?
     public var archivedAt: String?
+    /// OLX scans only search this category; nil searches all of OLX.
+    public var olxCategory: OlxCategory?
+    /// `private` or `business`; nil is any seller. Missing on older servers.
+    public var sellerType: String?
+    /// Skip paid placements and highlights. Missing on older servers.
+    public var ignorePromoted: Bool?
 
     public var isArchived: Bool { archivedAt != nil || status == "Archived" }
+}
+
+/// An OLX category picked from OLX's own hit counts for a query. `path` is
+/// OLX's slug path; only `id` is sent to OLX.
+public struct OlxCategory: Codable, Hashable, Sendable {
+    public var id: Int
+    public var label: String
+    public var path: String
+
+    public init(id: Int, label: String, path: String) {
+        self.id = id
+        self.label = label
+        self.path = path
+    }
+
+    /// `elektronika/komputery/podzespoly-i-czesci` → `elektronika › komputery › podzespoly i czesci`
+    public var readablePath: String {
+        path.split(separator: "/").map { $0.replacingOccurrences(of: "-", with: " ") }.joined(separator: " › ")
+    }
+}
+
+/// One row of `GET /api/marketplaces/olx/categories`.
+public struct OlxCategoryOption: Codable, Hashable, Sendable, Identifiable {
+    public var id: Int
+    public var label: String
+    public var path: String
+    /// OLX hits for the query in this category, including subcategories.
+    public var count: Int
+
+    public var category: OlxCategory { OlxCategory(id: id, label: label, path: path) }
+    public var depth: Int { path.split(separator: "/").count }
 }
 
 public struct WatchAnalyticsPoint: Codable, Hashable, Sendable {
@@ -391,8 +447,11 @@ public struct SearchFilters: Codable, Hashable, Sendable {
     public var shippingOnly: Bool
     public var condition: SearchCondition
     public var location: String
-    /// OLX only.
+    /// Seller type. OLX filters it natively; Vinted listings are dropped only
+    /// when their flag is known to be the other type.
     public var ownerType: SellerType?
+    /// OLX only: search a single category.
+    public var olxCategory: OlxCategory?
     /// 1-based marketplace result page; the server caps it at 10.
     public var page: Int
     /// Correlates the streamed `search` progress events with this request.
@@ -412,7 +471,8 @@ public struct SearchFilters: Codable, Hashable, Sendable {
         ownerType: SellerType? = nil,
         page: Int = 1,
         searchId: String? = nil,
-        aiRelevance: Bool = true
+        aiRelevance: Bool = true,
+        olxCategory: OlxCategory? = nil
     ) {
         self.query = query
         self.terms = terms
@@ -427,6 +487,7 @@ public struct SearchFilters: Codable, Hashable, Sendable {
         self.page = page
         self.searchId = searchId
         self.aiRelevance = aiRelevance
+        self.olxCategory = olxCategory
     }
 
     /// The price range the server accepts: both bounds optional, minimum ≥ 0,
@@ -450,6 +511,8 @@ public struct SearchFilters: Codable, Hashable, Sendable {
         copy.excluded = excluded.trimmingCharacters(in: .whitespacesAndNewlines)
         let place = location.trimmingCharacters(in: .whitespacesAndNewlines)
         copy.location = place.isEmpty ? "Polska" : place
+        // The category only means something while OLX is searched.
+        if !sources.contains(.olx) { copy.olxCategory = nil }
         return copy
     }
 }

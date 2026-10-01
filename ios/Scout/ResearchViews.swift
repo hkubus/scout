@@ -255,6 +255,9 @@ struct ResearchWatchDetailView: View {
                     if !watch.excluded.isEmpty { LabeledContent("Excludes", value: watch.excluded) }
                     LabeledContent("Marketplaces", value: watch.sources.map(\.rawValue).joined(separator: ", "))
                     if watch.condition != "Any" { LabeledContent("Condition", value: watch.condition) }
+                    if let category = watch.olxCategory, watch.sources.contains(.olx) {
+                        LabeledContent("OLX category", value: category.label)
+                    }
                     if watch.minPrice != nil || watch.maxPrice != nil {
                         LabeledContent("Price", value: "\(watch.minPrice.map(Format.pln) ?? "any") – \(watch.maxPrice.map(Format.pln) ?? "any")")
                     }

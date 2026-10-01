@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Scout listing helper</title>
+<link rel="stylesheet" href="ui.css">
+</head>
+<body class="options">
+  <h1>Scout listing helper</h1>
+  <p class="muted">Fills the OLX, Allegro Lokalnie and Vinted listing forms from your Scout flips. You always check the form and publish it yourself.</p>
+  <form id="form">
+    <label>Scout address
+      <input id="serverUrl" type="url" required placeholder="https://scout.example.com">
+    </label>
+    <label>API token <span class="muted">one of the server's SCOUT_API_TOKENS</span>
+      <input id="apiToken" type="password" autocomplete="off" required>
+    </label>
+    <button type="submit">Save and test</button>
+  </form>
+  <p id="result" class="muted"></p>
+  <p class="muted">The token is kept in this Firefox profile and only sent to the Scout address above. The marketplace pages never see it.</p>
+  <script src="options.js"></script>
+</body>
+</html>

@@ -14,6 +14,8 @@ public struct LiveInvalidation: Equatable, Sendable {
     public var server = false
     /// Research watches and their saved listings.
     public var research = false
+    /// The flip ledger.
+    public var flips = false
     /// Every watch detail, for events that don't say which watch changed.
     public var allWatches = false
     public var watchIDs: Set<String> = []
@@ -32,6 +34,7 @@ public struct LiveInvalidation: Equatable, Sendable {
         all.triage = true
         all.server = true
         all.research = true
+        all.flips = true
         all.allWatches = true
         all.allMarketWatches = true
         return all
@@ -45,6 +48,7 @@ public struct LiveInvalidation: Equatable, Sendable {
         triage = triage || other.triage
         server = server || other.server
         research = research || other.research
+        flips = flips || other.flips
         allWatches = allWatches || other.allWatches
         watchIDs.formUnion(other.watchIDs)
         allMarketWatches = allMarketWatches || other.allMarketWatches
@@ -63,6 +67,7 @@ public struct LiveInvalidation: Equatable, Sendable {
     ///   rows from the payload (`ListingActionEvent`) or reload themselves.
     /// - `notification`: connector runs only.
     /// - `market-watch` ({id} or none): research.
+    /// - `flips`: the flip ledger.
     /// - `ai-description-verification` always precedes a `scan` for the same
     ///   run and no list shows it, so it invalidates nothing; neither do
     ///   unknown events.
@@ -89,6 +94,8 @@ public struct LiveInvalidation: Equatable, Sendable {
         case "market-watch":
             research = true
             if let id = payload?.id { marketWatchIDs = [id] } else { allMarketWatches = true }
+        case "flips":
+            flips = true
         default:
             break
         }

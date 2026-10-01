@@ -252,6 +252,7 @@ private struct SearchResultRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                ListingSignals(listing: listing)
             }
         }
         .padding(.vertical, 2)
@@ -317,18 +318,25 @@ private struct SearchFiltersSheet: View {
                     }
                 }
 
-                Section("Listing") {
+                Section {
                     Picker("Condition", selection: $filters.condition) {
                         ForEach(SearchCondition.allCases, id: \.self) { condition in
                             Text(condition.rawValue).tag(condition)
                         }
                     }
-                    Picker("Seller (OLX only)", selection: $filters.ownerType) {
+                    Picker("Seller", selection: $filters.ownerType) {
                         Text("Any").tag(SellerType?.none)
                         Text("Private").tag(SellerType?.some(SellerType.private))
                         Text("Business").tag(SellerType?.some(SellerType.business))
                     }
                     Toggle("Shipping only", isOn: $filters.shippingOnly)
+                    if filters.sources.contains(.olx) {
+                        OlxCategoryField(query: filters.query, category: $filters.olxCategory)
+                    }
+                } header: {
+                    Text("Listing")
+                } footer: {
+                    Text("Seller type applies to OLX and Vinted; the OLX category only to OLX.")
                 }
 
                 Section("Terms") {

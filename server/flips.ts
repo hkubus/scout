@@ -1,8 +1,42 @@
-import { DEFAULT_FEE_PRESETS, isFlipChannel, normalizeFeePresets, saleFee, type FeePresets, type FlipChannel } from '../src/profit';
-import type { Flip, FlipsData } from '../src/types';
+import { DEFAULT_FEE_PRESETS, FLIP_CHANNELS, LISTING_CONDITIONS, isFlipChannel, normalizeFeePresets, saleFee, type FeePresets, type FlipChannel, type FlipListing, type ListingCondition } from '../src/profit';
+import type { Flip, FlipPhoto, FlipsData } from '../src/types';
 import { ServiceError } from './service';
 
 const FEE_PRESETS_KEY = 'flip_fee_presets';
+/** More than any of the three marketplaces takes per listing. */
+export const MAX_FLIP_PHOTOS = 20;
+export const MAX_FLIP_PHOTO_BYTES = 10 * 1024 * 1024;
+
+/** Recognise the image by its bytes, never by the declared type. */
+export function sniffImageMime(data: Uint8Array): 'image/jpeg' | 'image/png' | 'image/webp' | null {
+  if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return 'image/jpeg';
+  if (data.length >= 8 && [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a].every((byte, index) => data[index] === byte)) return 'image/png';
+  if (data.length >= 12 && String.fromCharCode(...data.subarray(0, 4)) === 'RIFF' && String.fromCharCode(...data.subarray(8, 12)) === 'WEBP') return 'image/webp';
+  return null;
+}
+
+function listingFromJson(value: unknown): FlipListing | null {
+  if (typeof value !== 'string' || !value) return null;
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { return null; }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const raw = parsed as Record<string, unknown>;
+  const prices: Partial<Record<FlipChannel, number>> = {};
+  if (raw.prices && typeof raw.prices === 'object') {
+    for (const channel of FLIP_CHANNELS) {
+      const price = (raw.prices as Record<string, unknown>)[channel];
+      if (typeof price === 'number' && Number.isFinite(price) && price > 0) prices[channel] = price;
+    }
+  }
+  const condition = LISTING_CONDITIONS.includes(raw.condition as ListingCondition) ? raw.condition as ListingCondition : null;
+  return {
+    title: typeof raw.title === 'string' ? raw.title : '',
+    description: typeof raw.description === 'string' ? raw.description : '',
+    condition,
+    prices,
+    basePrice: typeof raw.basePrice === 'number' && Number.isFinite(raw.basePrice) && raw.basePrice > 0 ? raw.basePrice : null,
+  };
+}
 
 export interface FlipInput {
   title: string;
@@ -34,7 +68,7 @@ const channels = (value: unknown): FlipChannel[] => {
 };
 const num = (value: unknown) => (value === null || value === undefined ? null : Number(value));
 
-function flipFromRow(row: Record<string, any>): Flip {
+function flipFromRow(row: Record<string, any>, photos: FlipPhoto[] = []): Flip {
   return {
     id: Number(row.id),
     title: String(row.title),
@@ -54,6 +88,8 @@ function flipFromRow(row: Record<string, any>): Flip {
     note: String(row.note ?? ''),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
+    listing: listingFromJson(row.listing_json),
+    photos,
   };
 }
 
@@ -79,15 +115,74 @@ export class FlipStore {
     return normalized;
   }
 
+  /** Photo metadata only, grouped by flip, in posting order. */
+  private photosByFlip(flipId?: number) {
+    const rows = (flipId === undefined
+      ? this.db.prepare('SELECT id, flip_id, mime, byte_size FROM flip_photos ORDER BY flip_id, position, id').all()
+      : this.db.prepare('SELECT id, flip_id, mime, byte_size FROM flip_photos WHERE flip_id = ? ORDER BY position, id').all(flipId)) as Array<Record<string, any>>;
+    const byFlip = new Map<number, FlipPhoto[]>();
+    for (const row of rows) {
+      const list = byFlip.get(Number(row.flip_id)) ?? [];
+      list.push({ id: Number(row.id), mime: String(row.mime), byteSize: Number(row.byte_size) });
+      byFlip.set(Number(row.flip_id), list);
+    }
+    return byFlip;
+  }
+
   list(): FlipsData {
     const rows = this.db.prepare('SELECT * FROM flips ORDER BY COALESCE(sold_on, bought_on) DESC, id DESC').all() as Array<Record<string, any>>;
-    return { flips: rows.map(flipFromRow), feePresets: this.feePresets() };
+    const photos = this.photosByFlip();
+    return { flips: rows.map((row) => flipFromRow(row, photos.get(Number(row.id)) ?? [])), feePresets: this.feePresets() };
   }
 
   get(id: number): Flip {
     const row = this.db.prepare('SELECT * FROM flips WHERE id = ?').get(id) as Record<string, any> | undefined;
     if (!row) throw new ServiceError('Flip not found', 404);
-    return flipFromRow(row);
+    return flipFromRow(row, this.photosByFlip(id).get(id) ?? []);
+  }
+
+  setListing(id: number, listing: FlipListing | null): Flip {
+    this.get(id);
+    this.db.prepare('UPDATE flips SET listing_json = ?, updated_at = ? WHERE id = ?').run(listing ? JSON.stringify(listing) : null, new Date().toISOString(), id);
+    this.onChange({ id });
+    return this.get(id);
+  }
+
+  addPhoto(flipId: number, data: Uint8Array): FlipPhoto {
+    this.get(flipId);
+    if (data.byteLength > MAX_FLIP_PHOTO_BYTES) throw new ServiceError('Photos can be at most 10 MB', 413);
+    const mime = sniffImageMime(data);
+    if (!mime) throw new ServiceError('Photos must be JPEG, PNG or WebP', 415);
+    const count = Number((this.db.prepare('SELECT COUNT(*) AS count FROM flip_photos WHERE flip_id = ?').get(flipId) as { count: number }).count);
+    if (count >= MAX_FLIP_PHOTOS) throw new ServiceError(`A flip can have at most ${MAX_FLIP_PHOTOS} photos`, 400);
+    const position = Number((this.db.prepare('SELECT COALESCE(MAX(position), -1) + 1 AS next FROM flip_photos WHERE flip_id = ?').get(flipId) as { next: number }).next);
+    const result = this.db.prepare('INSERT INTO flip_photos (flip_id, position, mime, data, byte_size, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(flipId, position, mime, data, data.byteLength, new Date().toISOString());
+    this.onChange({ id: flipId });
+    return { id: Number(result.lastInsertRowid), mime, byteSize: data.byteLength };
+  }
+
+  photo(photoId: number): { mime: string; data: Uint8Array } | null {
+    const row = this.db.prepare('SELECT mime, data FROM flip_photos WHERE id = ?').get(photoId) as { mime: string; data: Uint8Array } | undefined;
+    return row ? { mime: row.mime, data: row.data } : null;
+  }
+
+  deletePhoto(photoId: number) {
+    const row = this.db.prepare('SELECT flip_id FROM flip_photos WHERE id = ?').get(photoId) as { flip_id: number } | undefined;
+    if (!row) throw new ServiceError('Photo not found', 404);
+    this.db.prepare('DELETE FROM flip_photos WHERE id = ?').run(photoId);
+    this.onChange({ id: Number(row.flip_id) });
+  }
+
+  /** Reorders a flip's photos; `ids` must be exactly its photos. */
+  orderPhotos(flipId: number, ids: number[]): Flip {
+    const current = (this.photosByFlip(flipId).get(flipId) ?? []).map((photo) => photo.id);
+    if (ids.length !== current.length || new Set(ids).size !== ids.length || !ids.every((id) => current.includes(id))) {
+      throw new ServiceError('Send every photo of this flip exactly once', 400);
+    }
+    const update = this.db.prepare('UPDATE flip_photos SET position = ? WHERE id = ?');
+    ids.forEach((id, position) => update.run(position, id));
+    this.onChange({ id: flipId });
+    return this.get(flipId);
   }
 
   create(input: FlipInput): Flip {
@@ -143,6 +238,7 @@ export class FlipStore {
   }
 
   delete(id: number) {
+    this.db.prepare('DELETE FROM flip_photos WHERE flip_id = ?').run(id);
     const result = this.db.prepare('DELETE FROM flips WHERE id = ?').run(id);
     if (!result.changes) throw new ServiceError('Flip not found', 404);
     this.onChange({ id, deleted: true });

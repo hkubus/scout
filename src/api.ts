@@ -1,4 +1,4 @@
-import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, FeePresets, Flip, FlipsData, NotificationPriority, NotificationRecord, OlxCategoryOption, PriceHistoryPoint, SearchFilters, SettingsData, VariantSuggestions, VerificationComparison, Watch, WatchAnalytics, Connector } from './types';
+import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, FeePresets, Flip, FlipListing, FlipPhoto, FlipsData, NotificationPriority, NotificationRecord, OlxCategoryOption, PriceHistoryPoint, SearchFilters, SettingsData, VariantSuggestions, VerificationComparison, Watch, WatchAnalytics, Connector } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -116,6 +116,11 @@ export const api = {
   createFlip: (flip: Pick<Flip, 'title' | 'buyChannel' | 'boughtOn' | 'buyPrice'> & Partial<Pick<Flip, 'listingKey' | 'watchId' | 'buyCosts' | 'listedOn' | 'note'>>) => request<{ flip: Flip }>('/api/flips', json('POST', flip)),
   updateFlip: (id: number, patch: Partial<Omit<Flip, 'id' | 'createdAt' | 'updatedAt'>>) => request<{ flip: Flip }>(`/api/flips/${id}`, json('PATCH', patch)),
   deleteFlip: (id: number) => request<{ ok: true }>(`/api/flips/${id}`, json('DELETE')),
+  saveFlipListing: (id: number, listing: FlipListing | null) => request<{ flip: Flip }>(`/api/flips/${id}/listing`, json('PUT', listing)),
+  uploadFlipPhoto: (id: number, photo: Blob) => request<{ photo: FlipPhoto }>(`/api/flips/${id}/photos`, { method: 'POST', headers: { 'content-type': photo.type }, body: photo }, 60_000),
+  orderFlipPhotos: (id: number, ids: number[]) => request<{ flip: Flip }>(`/api/flips/${id}/photos/order`, json('PUT', { ids })),
+  deleteFlipPhoto: (photoId: number) => request<{ ok: true }>(`/api/flip-photos/${photoId}`, json('DELETE')),
+  flipPhotoUrl: (photoId: number) => `/api/flip-photos/${photoId}`,
   saveFeePresets: (presets: FeePresets) => request<{ feePresets: FeePresets }>('/api/flips/fee-presets', json('PUT', presets)),
   olxCategories: (query: string, signal?: AbortSignal) => request<{ categories: OlxCategoryOption[] }>(`/api/marketplaces/olx/categories?${new URLSearchParams({ query })}`, { signal }),
   search: (filters: SearchFilters, signal?: AbortSignal) => request<ManualSearchResponse>('/api/search', { ...json('POST', filters), signal }, 90_000),

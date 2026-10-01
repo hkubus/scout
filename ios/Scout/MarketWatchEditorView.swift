@@ -80,6 +80,9 @@ struct MarketWatchEditorView: View {
                         .keyboardType(.numberPad)
                     Toggle("Shipping only", isOn: $draft.shippingOnly)
                     Toggle("Scan typo variants", isOn: $draft.typoVariants)
+                    if draft.sources.contains(.olx) {
+                        OlxCategoryField(query: draft.query, category: $draft.olxCategory)
+                    }
                 }
 
                 Section("Snapshots") {

@@ -1,0 +1,18 @@
+body { font: 13px/1.4 system-ui, sans-serif; color: #1c2433; margin: 0; }
+.muted { color: #5c6678; font-size: 12px; }
+button { font: inherit; font-size: 12px; font-weight: 600; padding: 6px 10px; border-radius: 7px; border: 1px solid #c3cad6; background: #fff; color: #1c2433; cursor: pointer; }
+button:hover { border-color: #1d61e8; }
+.popup { width: 340px; }
+.popup header { display: flex; gap: 8px; align-items: baseline; padding: 12px 14px 8px; border-bottom: 1px solid #e3e7ee; }
+.popup header span { color: #5c6678; }
+.popup main { max-height: 460px; overflow: auto; padding: 4px 14px; }
+.popup footer { padding: 8px 14px 12px; border-top: 1px solid #e3e7ee; }
+.flip { padding: 10px 0; border-bottom: 1px solid #eef1f5; }
+.flip-title { font-weight: 700; }
+.platforms { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.platforms .listed { color: #3aab61; }
+.options { max-width: 520px; margin: 32px auto; padding: 0 16px; }
+.options form { display: grid; gap: 12px; margin: 16px 0; }
+.options label { display: grid; gap: 4px; font-weight: 600; }
+.options input { font: inherit; padding: 8px 10px; border: 1px solid #c3cad6; border-radius: 7px; }
+.options button[type=submit] { justify-self: start; background: #1d61e8; border-color: #1d61e8; color: #fff; }

@@ -24,6 +24,12 @@ public struct WatchDraft: Hashable, Sendable {
     public var aiRelevance: Bool
     /// 0.6–1.6; higher flags smaller discounts.
     public var sensitivity: Double
+    /// OLX scans only search this category; nil searches all of OLX.
+    public var olxCategory: OlxCategory?
+    /// Only learn from and alert on this seller type; nil is any seller.
+    public var sellerType: SellerType?
+    /// Skip paid placements and highlights.
+    public var ignorePromoted: Bool
 
     public init(
         name: String = "",
@@ -39,7 +45,10 @@ public struct WatchDraft: Hashable, Sendable {
         shippingOnly: Bool = false,
         typoVariants: Bool = false,
         aiRelevance: Bool = true,
-        sensitivity: Double = 1
+        sensitivity: Double = 1,
+        olxCategory: OlxCategory? = nil,
+        sellerType: SellerType? = nil,
+        ignorePromoted: Bool = false
     ) {
         self.name = name
         self.query = query
@@ -55,6 +64,9 @@ public struct WatchDraft: Hashable, Sendable {
         self.typoVariants = typoVariants
         self.aiRelevance = aiRelevance
         self.sensitivity = sensitivity
+        self.olxCategory = olxCategory
+        self.sellerType = sellerType
+        self.ignorePromoted = ignorePromoted
     }
 
     public init(watch: Watch) {
@@ -72,7 +84,10 @@ public struct WatchDraft: Hashable, Sendable {
             shippingOnly: watch.shippingOnly,
             typoVariants: watch.typoVariants,
             aiRelevance: watch.aiRelevance,
-            sensitivity: watch.sensitivity
+            sensitivity: watch.sensitivity,
+            olxCategory: watch.olxCategory,
+            sellerType: watch.sellerType.flatMap(SellerType.init(rawValue:)),
+            ignorePromoted: watch.ignorePromoted ?? false
         )
     }
 
@@ -91,7 +106,9 @@ public struct WatchDraft: Hashable, Sendable {
             minPrice: search.minPrice,
             maxPrice: search.maxPrice,
             shippingOnly: search.shippingOnly,
-            aiRelevance: search.aiRelevance
+            aiRelevance: search.aiRelevance,
+            olxCategory: search.sources.contains(.olx) ? search.olxCategory : nil,
+            sellerType: search.ownerType
         )
     }
 
@@ -134,6 +151,8 @@ public struct WatchDraft: Hashable, Sendable {
         let place = location.trimmingCharacters(in: .whitespacesAndNewlines)
         copy.location = place.isEmpty ? "Polska" : place
         copy.sensitivity = min(1.6, max(0.6, sensitivity))
+        // Kept only while OLX is a source, like the web editor.
+        if !sources.contains(.olx) { copy.olxCategory = nil }
         return copy
     }
 
@@ -177,6 +196,7 @@ extension WatchDraft: Encodable {
     private enum CodingKeys: String, CodingKey {
         case name, query, terms, excluded, sources, location, condition, interval
         case minPrice, maxPrice, shippingOnly, typoVariants, aiRelevance, sensitivity
+        case olxCategory, sellerType, ignorePromoted
     }
 
     // Prices are always sent, as null when empty, so an edit can clear them.
@@ -196,6 +216,10 @@ extension WatchDraft: Encodable {
         try container.encode(typoVariants, forKey: .typoVariants)
         try container.encode(aiRelevance, forKey: .aiRelevance)
         try container.encode(sensitivity, forKey: .sensitivity)
+        // Sent as null when unset, so an edit can clear them.
+        try container.encode(olxCategory, forKey: .olxCategory)
+        try container.encode(sellerType, forKey: .sellerType)
+        try container.encode(ignorePromoted, forKey: .ignorePromoted)
     }
 }
 
@@ -218,5 +242,8 @@ extension WatchDraft: Decodable {
         typoVariants = try container.decodeIfPresent(Bool.self, forKey: .typoVariants) ?? typoVariants
         aiRelevance = try container.decodeIfPresent(Bool.self, forKey: .aiRelevance) ?? aiRelevance
         sensitivity = try container.decodeIfPresent(Double.self, forKey: .sensitivity) ?? sensitivity
+        olxCategory = try container.decodeIfPresent(OlxCategory.self, forKey: .olxCategory)
+        sellerType = try container.decodeIfPresent(SellerType.self, forKey: .sellerType)
+        ignorePromoted = try container.decodeIfPresent(Bool.self, forKey: .ignorePromoted) ?? ignorePromoted
     }
 }

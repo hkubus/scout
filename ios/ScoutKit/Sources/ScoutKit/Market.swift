@@ -40,6 +40,8 @@ public struct MarketWatch: Codable, Hashable, Sendable, Identifiable {
     public var estimatedMedianPrice: Double?
     public var saleBand: SaleBand?
     public var activeVersionId: String?
+    /// Part of the research criteria: changing it starts a new series.
+    public var olxCategory: OlxCategory?
 }
 
 public struct MarketTrackedListing: Codable, Hashable, Sendable, Identifiable {
@@ -146,6 +148,8 @@ public struct MarketWatchDraft: Hashable, Sendable {
     public var maxPrice: Double?
     public var shippingOnly: Bool
     public var typoVariants: Bool
+    /// OLX scans only search this category; nil searches all of OLX.
+    public var olxCategory: OlxCategory?
 
     public init(
         name: String = "",
@@ -159,7 +163,8 @@ public struct MarketWatchDraft: Hashable, Sendable {
         minPrice: Double? = nil,
         maxPrice: Double? = nil,
         shippingOnly: Bool = false,
-        typoVariants: Bool = false
+        typoVariants: Bool = false,
+        olxCategory: OlxCategory? = nil
     ) {
         self.name = name
         self.query = query
@@ -173,6 +178,7 @@ public struct MarketWatchDraft: Hashable, Sendable {
         self.maxPrice = maxPrice
         self.shippingOnly = shippingOnly
         self.typoVariants = typoVariants
+        self.olxCategory = olxCategory
     }
 
     public init(watch: MarketWatch) {
@@ -180,7 +186,8 @@ public struct MarketWatchDraft: Hashable, Sendable {
             name: watch.name, query: watch.query, terms: watch.terms, excluded: watch.excluded,
             location: watch.location, condition: watch.condition, sources: watch.sources,
             intervalHours: watch.intervalHours, minPrice: watch.minPrice, maxPrice: watch.maxPrice,
-            shippingOnly: watch.shippingOnly, typoVariants: watch.typoVariants
+            shippingOnly: watch.shippingOnly, typoVariants: watch.typoVariants,
+            olxCategory: watch.olxCategory
         )
     }
 
@@ -203,6 +210,7 @@ public struct MarketWatchDraft: Hashable, Sendable {
         copy.excluded = excluded.trimmingCharacters(in: .whitespacesAndNewlines)
         let place = location.trimmingCharacters(in: .whitespacesAndNewlines)
         copy.location = place.isEmpty ? "Polska" : place
+        if !sources.contains(.olx) { copy.olxCategory = nil }
         return copy
     }
 }
@@ -210,7 +218,7 @@ public struct MarketWatchDraft: Hashable, Sendable {
 extension MarketWatchDraft: Codable {
     private enum CodingKeys: String, CodingKey {
         case name, query, terms, excluded, location, condition, sources, intervalHours
-        case minPrice, maxPrice, shippingOnly, typoVariants
+        case minPrice, maxPrice, shippingOnly, typoVariants, olxCategory
     }
 
     // Prices are always sent, as null when empty, so an edit can clear them.
@@ -228,6 +236,8 @@ extension MarketWatchDraft: Codable {
         try container.encode(maxPrice, forKey: .maxPrice)
         try container.encode(shippingOnly, forKey: .shippingOnly)
         try container.encode(typoVariants, forKey: .typoVariants)
+        // Only sent when set, so creating a watch works against older servers.
+        try container.encodeIfPresent(olxCategory, forKey: .olxCategory)
     }
 
     public init(from decoder: Decoder) throws {
@@ -245,6 +255,7 @@ extension MarketWatchDraft: Codable {
         maxPrice = try container.decodeIfPresent(Double.self, forKey: .maxPrice)
         shippingOnly = try container.decodeIfPresent(Bool.self, forKey: .shippingOnly) ?? shippingOnly
         typoVariants = try container.decodeIfPresent(Bool.self, forKey: .typoVariants) ?? typoVariants
+        olxCategory = try container.decodeIfPresent(OlxCategory.self, forKey: .olxCategory)
     }
 }
 
@@ -265,6 +276,8 @@ public struct MarketWatchPatch: Hashable, Sendable {
     public var maxPrice: Double??
     public var shippingOnly: Bool?
     public var typoVariants: Bool?
+    /// `.some(nil)` removes the category.
+    public var olxCategory: OlxCategory??
 
     public init() {}
 
@@ -298,6 +311,8 @@ extension MarketWatchDraft {
         if new.maxPrice != old.maxPrice { patch.maxPrice = .some(new.maxPrice) }
         if new.shippingOnly != old.shippingOnly { patch.shippingOnly = new.shippingOnly }
         if new.typoVariants != old.typoVariants { patch.typoVariants = new.typoVariants }
+        // Compared by id like the server, so a relabelled category is no change.
+        if new.olxCategory?.id != old.olxCategory?.id { patch.olxCategory = .some(new.olxCategory) }
         return patch
     }
 }
@@ -305,10 +320,10 @@ extension MarketWatchDraft {
 extension MarketWatchPatch: Codable {
     private enum CodingKeys: String, CodingKey {
         case name, query, terms, excluded, location, condition, sources, intervalHours
-        case minPrice, maxPrice, shippingOnly, typoVariants
+        case minPrice, maxPrice, shippingOnly, typoVariants, olxCategory
     }
 
-    // Absent fields are left out; a cleared price is sent as null.
+    // Absent fields are left out; a cleared price or category is sent as null.
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encodeIfPresent(name, forKey: .name)
@@ -323,6 +338,7 @@ extension MarketWatchPatch: Codable {
         if let maxPrice { try container.encode(maxPrice, forKey: .maxPrice) }
         try container.encodeIfPresent(shippingOnly, forKey: .shippingOnly)
         try container.encodeIfPresent(typoVariants, forKey: .typoVariants)
+        if let olxCategory { try container.encode(olxCategory, forKey: .olxCategory) }
     }
 
     public init(from decoder: Decoder) throws {
@@ -340,6 +356,7 @@ extension MarketWatchPatch: Codable {
         if container.contains(.maxPrice) { maxPrice = .some(try container.decodeIfPresent(Double.self, forKey: .maxPrice)) }
         shippingOnly = try container.decodeIfPresent(Bool.self, forKey: .shippingOnly)
         typoVariants = try container.decodeIfPresent(Bool.self, forKey: .typoVariants)
+        if container.contains(.olxCategory) { olxCategory = .some(try container.decodeIfPresent(OlxCategory.self, forKey: .olxCategory)) }
     }
 }
 

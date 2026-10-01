@@ -14,6 +14,11 @@ struct ListingDetailView: View {
     @State private var saving = false
     @State private var previewOnly = false
     @State private var editor: WatchEditorRequest?
+    @State private var resalePrice = ""
+    @State private var sellOn: FlipChannel = .olx
+    @State private var feePresets = FeePresets.defaults
+    @State private var addingFlip = false
+    @State private var flipAdded = false
     @State private var descriptionExpanded = false
 
     var body: some View {
@@ -43,6 +48,7 @@ struct ListingDetailView: View {
                     }
                 }
                 facts(detail.listing, detail: detail)
+                flip(detail.listing)
                 createWatch(detail.listing)
             } else if previewOnly, let listing = link.preview {
                 header(listing)
@@ -51,6 +57,7 @@ struct ListingDetailView: View {
                         .foregroundStyle(.secondary)
                 }
                 facts(listing, detail: nil)
+                flip(listing)
                 createWatch(listing)
             }
         }
@@ -73,6 +80,7 @@ struct ListingDetailView: View {
             }
         }
         .task(id: link) { await load() }
+        .task { await loadFeePresets() }
     }
 
     // MARK: Sections
@@ -202,6 +210,66 @@ struct ListingDetailView: View {
         }
     }
 
+    /// Display-only estimate: resale minus the chosen platform's seller fee
+    /// and this price. "I bought this" starts a flip in the ledger.
+    private func flip(_ listing: Listing) -> some View {
+        Section {
+            TextField("Expected resale (zł)", text: $resalePrice)
+                .keyboardType(.numberPad)
+            Picker("Sell on", selection: $sellOn) {
+                ForEach(FlipChannel.all) { channel in
+                    Text(verbatim: channel.rawValue).tag(channel)
+                }
+            }
+            if let estimate = flipEstimate(for: listing) {
+                LabeledContent("Platform fee", value: Format.zl(estimate.fee))
+                LabeledContent("Net if resold") {
+                    Text(verbatim: Format.zl(estimate.net))
+                        .monospacedDigit()
+                        .foregroundStyle(estimate.net >= 0 ? Color.scoutGreen : Color.red)
+                }
+            }
+            Button {
+                addFlip(listing)
+            } label: {
+                HStack {
+                    Label(flipAdded ? "Added to Flips" : "I bought this", systemImage: flipAdded ? "checkmark.circle" : "shippingbox")
+                    Spacer()
+                    if addingFlip { ProgressView() }
+                }
+            }
+            .disabled(addingFlip || flipAdded)
+        } header: {
+            Text("Flip")
+        } footer: {
+            Text("An estimate from the fee presets in Market → Flips. “I bought this” adds the item to your ledger at this price, dated today.")
+        }
+    }
+
+    private func flipEstimate(for listing: Listing) -> (fee: Double, net: Double)? {
+        guard let resale = Double(resalePrice.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")), resale > 0 else { return nil }
+        return Profit.estimate(buyPrice: listing.price, buyCosts: 0, resalePrice: resale, preset: feePresets[sellOn])
+    }
+
+    private func addFlip(_ listing: Listing) {
+        guard let client = model.client else { return }
+        addingFlip = true
+        Task { @MainActor in
+            defer { addingFlip = false }
+            do {
+                _ = try await client.createFlip(FlipDraft(listing: listing))
+                flipAdded = true
+            } catch {
+                model.report(error)
+            }
+        }
+    }
+
+    private func loadFeePresets() async {
+        guard let client = model.client, let data = try? await client.flips() else { return }
+        feePresets = data.feePresets
+    }
+
     private var shownListing: Listing? {
         detail?.listing ?? (previewOnly ? link.preview : nil)
     }
@@ -219,6 +287,17 @@ struct ListingDetailView: View {
     private func facts(_ listing: Listing, detail: ListingDetail?) -> some View {
         Section("Details") {
             LabeledContent("Watch", value: listing.watch)
+            if let posted = listing.postedDate {
+                LabeledContent("Posted", value: Format.relative(posted))
+                if let bumped = listing.bumpedDate {
+                    LabeledContent("Last bumped", value: Format.relative(bumped))
+                }
+            }
+            if let seller = listing.sellerType {
+                LabeledContent("Seller", value: (seller == SellerType.business.rawValue ? "Business" : "Private") + (listing.promoted == true ? " · promoted" : ""))
+            } else if listing.promoted == true {
+                LabeledContent("Promoted", value: "Yes")
+            }
             if let detail {
                 LabeledContent("Seen", value: "\(Format.relative(iso: detail.firstSeenAt)) – \(Format.relative(iso: detail.lastSeenAt))")
             }
@@ -231,6 +310,11 @@ struct ListingDetailView: View {
         guard let client = model.client else { return }
         do {
             let detail = try await client.listingDetail(key: link.key, watchId: link.watchId)
+            if self.detail == nil {
+                // Resell on the same platform at the typical price by default.
+                sellOn = FlipChannel(detail.listing.marketplace)
+                if resalePrice.isEmpty, let typical = detail.listing.typical { resalePrice = String(Int(typical.rounded())) }
+            }
             self.detail = detail
             decision = detail.action.decision
             note = detail.action.note

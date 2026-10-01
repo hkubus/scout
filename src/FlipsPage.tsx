@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Check, Download, LoaderCircle, MoreHorizontal, Pencil, Plus, RotateCcw, Trash2, Wallet, X } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ArrowRight, Check, Download, ImagePlus, LoaderCircle, Megaphone, MoreHorizontal, Pencil, Plus, RotateCcw, Trash2, Wallet, X } from "lucide-react";
 import { api, forgetInFlightGets } from "./api";
 import { subscribe, subscribeStatus } from "./events";
 import {
   DAC7_THRESHOLD,
   FEE_PRESET_NOTES,
   FLIP_CHANNELS,
+  LISTING_CONDITIONS,
+  LISTING_CONDITION_LABELS,
   UNREGISTERED_QUARTERLY_LIMITS,
+  suggestedListingPrice,
   flipCost,
   flipNet,
   quarterOf,
@@ -15,9 +18,11 @@ import {
   salesRecordCsv,
   type FeePresets,
   type FlipChannel,
+  type FlipListing,
+  type ListingCondition,
 } from "./profit";
 import { dayMonth, dayMonthYear, formatDate } from "./format";
-import type { Flip } from "./types";
+import type { Flip, FlipPhoto } from "./types";
 import { PageHeader } from "./ui";
 
 type ToastType = "success" | "error" | "info";
@@ -215,6 +220,156 @@ function SellDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; feePre
   );
 }
 
+/** The marketplaces the browser extension fills. */
+const LISTING_PLATFORMS = FLIP_CHANNELS.filter((channel) => channel !== "Other");
+const MAX_PHOTO_EDGE = 2000;
+
+/**
+ * Phone photos are several megabytes; the marketplaces resize them anyway.
+ * Shrink to 2000 px on the long edge as JPEG, keeping small JPEGs as they are.
+ */
+async function prepareForUpload(file: File): Promise<Blob> {
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+  } catch {
+    throw new Error(`${file.name}: this browser can't read the image. Export it as JPEG (HEIC is not supported).`);
+  }
+  const scale = Math.min(1, MAX_PHOTO_EDGE / Math.max(bitmap.width, bitmap.height));
+  if (scale === 1 && file.type === "image/jpeg" && file.size <= 4 * 1024 * 1024) {
+    bitmap.close();
+    return file;
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(bitmap.width * scale);
+  canvas.height = Math.round(bitmap.height * scale);
+  canvas.getContext("2d")!.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  return new Promise((resolve, reject) => canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error(`${file.name}: could not convert the image`))), "image/jpeg", 0.88));
+}
+
+function ListingDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; feePresets: FeePresets; onClose: () => void; onSaved: (flip: Flip) => void }) {
+  const draft = flip.listing;
+  const [title, setTitle] = useState(draft?.title ?? flip.title);
+  const [description, setDescription] = useState(draft?.description ?? "");
+  const [condition, setCondition] = useState<ListingCondition | "">(draft?.condition ?? "");
+  const [basePrice, setBasePrice] = useState(draft?.basePrice ? String(draft.basePrice) : "");
+  const [prices, setPrices] = useState<Record<string, string>>(() => Object.fromEntries(LISTING_PLATFORMS.map((channel) => [channel, draft?.prices[channel] ? String(draft.prices[channel]) : ""])));
+  const [photos, setPhotos] = useState<FlipPhoto[]>(flip.photos);
+  const [uploading, setUploading] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const base = toAmount(basePrice);
+  const suggestion = (channel: FlipChannel) => (Number.isFinite(base) && base > 0 ? suggestedListingPrice(base, feePresets[channel]) : null);
+  const priceFor = (channel: FlipChannel) => {
+    const entered = prices[channel]?.trim() ? toAmount(prices[channel]) : null;
+    return entered !== null && Number.isFinite(entered) && entered > 0 ? entered : suggestion(channel);
+  };
+  const valid = Boolean(title.trim()) && (basePrice.trim() === "" || (Number.isFinite(base) && base > 0)) && LISTING_PLATFORMS.every((channel) => !prices[channel]?.trim() || (Number.isFinite(toAmount(prices[channel])) && toAmount(prices[channel]) > 0));
+
+  const addPhotos = async (files: FileList | null) => {
+    if (!files?.length) return;
+    setError(null);
+    try {
+      for (const [index, file] of [...files].entries()) {
+        setUploading(`Uploading ${index + 1} of ${files.length}…`);
+        const result = await api.uploadFlipPhoto(flip.id, await prepareForUpload(file));
+        setPhotos((current) => [...current, result.photo]);
+      }
+    } catch (uploadError) {
+      setError(errorMessage(uploadError));
+    } finally {
+      setUploading(null);
+    }
+  };
+  const move = async (index: number, offset: number) => {
+    const next = [...photos];
+    const [photo] = next.splice(index, 1);
+    next.splice(index + offset, 0, photo);
+    setPhotos(next);
+    try { await api.orderFlipPhotos(flip.id, next.map((item) => item.id)); } catch (orderError) { setError(errorMessage(orderError)); setPhotos(photos); }
+  };
+  const removePhoto = async (photo: FlipPhoto) => {
+    try { await api.deleteFlipPhoto(photo.id); setPhotos((current) => current.filter((item) => item.id !== photo.id)); } catch (deleteError) { setError(errorMessage(deleteError)); }
+  };
+  const save = async () => {
+    if (!valid) return;
+    setBusy(true);
+    setError(null);
+    const listing: FlipListing = {
+      title: title.trim(),
+      description,
+      condition: condition || null,
+      basePrice: Number.isFinite(base) && base > 0 ? base : null,
+      prices: Object.fromEntries(LISTING_PLATFORMS.flatMap((channel) => { const price = priceFor(channel); return price ? [[channel, price]] : []; })),
+    };
+    try {
+      const result = await api.saveFlipListing(flip.id, listing);
+      onSaved({ ...result.flip, photos });
+    } catch (saveError) {
+      setError(errorMessage(saveError));
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal
+      kicker={flip.title}
+      title="Listing"
+      onClose={onClose}
+      busy={busy || Boolean(uploading)}
+      footer={<><button className="outline-button" disabled={busy} onClick={onClose}>Close</button><button className="primary-button" disabled={!valid || busy || Boolean(uploading)} onClick={() => void save()}>{busy ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}Save listing</button></>}
+    >
+      <p className="field-hint">What the Scout browser extension fills into the OLX, Allegro Lokalnie and Vinted forms. You check each form and publish it yourself.</p>
+      <label className="field-label">Title <span>{title.trim().length} characters</span><input value={title} onChange={(event) => setTitle(event.target.value)} maxLength={200} /></label>
+      <label className="field-label">Description <span>{description.length} characters</span><textarea rows={7} value={description} onChange={(event) => setDescription(event.target.value)} maxLength={9000} placeholder="Model, condition, what's included, tested how, why you're selling" /></label>
+      <div className="field-row">
+        <label className="field-label">Condition<select value={condition} onChange={(event) => setCondition(event.target.value as ListingCondition | "")}><option value="">Set on each site</option>{LISTING_CONDITIONS.map((option) => <option key={option} value={option}>{LISTING_CONDITION_LABELS[option].label}</option>)}</select></label>
+        <label className="field-label">You want to receive <span>before fees, PLN</span><input inputMode="decimal" value={basePrice} onChange={(event) => setBasePrice(event.target.value)} placeholder="e.g. 1450" /></label>
+      </div>
+      <div className="field-label">
+        <span>Asking price per platform <span>empty = suggested from your fee presets</span></span>
+        <div className="listing-prices">
+          {LISTING_PLATFORMS.map((channel) => {
+            const price = priceFor(channel);
+            const fee = price ? saleFee(price, feePresets[channel]) : 0;
+            return (
+              <label key={channel}>
+                <strong>{channel}</strong>
+                <input inputMode="decimal" aria-label={`${channel} asking price`} value={prices[channel]} placeholder={suggestion(channel) ? String(suggestion(channel)) : "—"} onChange={(event) => setPrices((current) => ({ ...current, [channel]: event.target.value }))} />
+                <small>{price ? `${formatZl(price - fee)} after ${fee ? formatZl(fee) + " fee" : "no fee"}` : "set a price"}</small>
+              </label>
+            );
+          })}
+        </div>
+      </div>
+      <div className="field-label">
+        <span>Photos <span>{photos.length} of 20 · first one is the cover</span></span>
+        <div className="listing-photos">
+          {photos.map((photo, index) => (
+            <figure key={photo.id}>
+              <img src={api.flipPhotoUrl(photo.id)} alt={`Photo ${index + 1}`} loading="lazy" />
+              <figcaption>
+                <button type="button" className="icon-button" aria-label="Move earlier" disabled={index === 0} onClick={() => void move(index, -1)}><ArrowLeft size={14} /></button>
+                <button type="button" className="icon-button" aria-label="Delete photo" onClick={() => void removePhoto(photo)}><Trash2 size={14} /></button>
+                <button type="button" className="icon-button" aria-label="Move later" disabled={index === photos.length - 1} onClick={() => void move(index, 1)}><ArrowRight size={14} /></button>
+              </figcaption>
+            </figure>
+          ))}
+          {photos.length < 20 ? (
+            <label className="listing-photo-add">
+              {uploading ? <LoaderCircle size={18} className="spin" /> : <ImagePlus size={18} />}
+              <span>{uploading ?? "Add photos"}</span>
+              <input type="file" accept="image/jpeg,image/png,image/webp" multiple disabled={Boolean(uploading)} onChange={(event) => { void addPhotos(event.target.files); event.target.value = ""; }} />
+            </label>
+          ) : null}
+        </div>
+        <small className="field-hint">Photos are resized to at most 2000 px and stored on your Scout server. The iOS app can add them straight from your phone.</small>
+      </div>
+      {error ? <div className="form-error" role="alert"><AlertTriangle size={15} />{error}</div> : null}
+    </Modal>
+  );
+}
+
 function FeePresetsPanel({ presets, onSaved, onToast }: { presets: FeePresets; onSaved: (presets: FeePresets) => void; onToast: (message: string, type?: ToastType) => void }) {
   const [draft, setDraft] = useState(() => Object.fromEntries(FLIP_CHANNELS.map((channel) => [channel, { percent: String(presets[channel].percent), fixed: String(presets[channel].fixed) }])) as Record<FlipChannel, { percent: string; fixed: string }>);
   const [busy, setBusy] = useState(false);
@@ -257,6 +412,7 @@ export default function FlipsPage({ onToast }: { onToast: (message: string, type
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState<Flip | "new" | null>(null);
   const [selling, setSelling] = useState<Flip | null>(null);
+  const [listing, setListing] = useState<Flip | null>(null);
   const today = todayDate();
   const current = quarterOf(today);
   const [recordQuarter, setRecordQuarter] = useState(`${current.year}-Q${current.quarter}`);
@@ -395,7 +551,7 @@ export default function FlipsPage({ onToast }: { onToast: (message: string, type
               const net = flipNet(flip);
               return (
                 <div className="flips-row" role="row" key={flip.id}>
-                  <span><strong>{flip.title}</strong>{flip.note ? <small>{flip.note}</small> : null}{!flip.soldOn && flip.listedOn.length ? <small>Listed on {flip.listedOn.join(", ")}</small> : null}</span>
+                  <span><strong>{flip.title}</strong>{flip.note ? <small>{flip.note}</small> : null}{!flip.soldOn && flip.listedOn.length ? <small>Listed on {flip.listedOn.join(", ")}</small> : null}{!flip.soldOn && (flip.listing || flip.photos.length) ? <small>Listing ready{flip.photos.length ? ` · ${flip.photos.length} photo${flip.photos.length === 1 ? "" : "s"}` : ""}</small> : null}</span>
                   <span data-label="Bought">{formatDay(flip.boughtOn)}<small>{flip.buyChannel}</small></span>
                   <span data-label="Cost">{formatZl(flipCost(flip))}</span>
                   {flip.soldOn ? <span data-label="Sold">{formatZl(flip.salePrice!)}<small>{formatDay(flip.soldOn)} · {flip.saleChannel}{flip.saleFee ? ` · fee ${formatZl(flip.saleFee)}` : ""}</small></span> : <span className="flips-row-empty" />}
@@ -406,6 +562,7 @@ export default function FlipsPage({ onToast }: { onToast: (message: string, type
                       label={`More actions for ${flip.title}`}
                       items={[
                         ...(flip.soldOn ? [{ label: "Edit sale", icon: <Pencil size={15} />, onSelect: () => setSelling(flip) }] : []),
+                        ...(!flip.soldOn && feePresets ? [{ label: "Listing text and photos", icon: <Megaphone size={15} />, onSelect: () => setListing(flip) }] : []),
                         { label: flip.soldOn ? "Edit purchase" : "Edit", icon: <Pencil size={15} />, onSelect: () => setEditing(flip) },
                         ...(flip.soldOn ? [{ label: "Remove sale", icon: <RotateCcw size={15} />, onSelect: () => void unsell(flip) }] : []),
                         { label: "Delete", icon: <Trash2 size={15} />, danger: true, onSelect: () => void remove(flip) },
@@ -460,6 +617,7 @@ export default function FlipsPage({ onToast }: { onToast: (message: string, type
       {feePresets ? <FeePresetsPanel key={JSON.stringify(feePresets)} presets={feePresets} onSaved={setFeePresets} onToast={onToast} /> : null}
 
       {editing ? <FlipDialog flip={editing === "new" ? null : editing} onClose={() => setEditing(null)} onSaved={(flip) => { replaceFlip(flip); setEditing(null); onToast(`${flip.title} saved.`); }} /> : null}
+      {listing && feePresets ? <ListingDialog flip={listing} feePresets={feePresets} onClose={() => { setListing(null); void load(); }} onSaved={(flip) => { replaceFlip(flip); setListing(null); onToast(`Listing for ${flip.title} saved.`); }} /> : null}
       {selling && feePresets ? <SellDialog flip={selling} feePresets={feePresets} onClose={() => setSelling(null)} onSaved={(flip) => { replaceFlip(flip); setSelling(null); onToast(`Sale of ${flip.title} recorded.`); }} /> : null}
     </>
   );
