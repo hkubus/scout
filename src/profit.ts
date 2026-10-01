@@ -156,3 +156,36 @@ export function salesRecordCsv(rows: SalesRecordRow[]) {
     ...rows.map((row) => `${row.index};${row.date};${pln(row.daySales)};${pln(row.quarterToDate)}`),
   ].join("\r\n");
 }
+
+export const LISTING_CONDITIONS = ["new", "like-new", "good", "damaged"] as const;
+export type ListingCondition = (typeof LISTING_CONDITIONS)[number];
+
+/** How each marketplace words Scout's listing conditions, for form filling. */
+export const LISTING_CONDITION_LABELS: Record<ListingCondition, { label: string; OLX: string; "Allegro Lokalnie": string; Vinted: string }> = {
+  new: { label: "New", OLX: "Nowe", "Allegro Lokalnie": "Nowy", Vinted: "Nowy bez metki" },
+  "like-new": { label: "Used, like new", OLX: "Używane", "Allegro Lokalnie": "Używany", Vinted: "Bardzo dobry" },
+  good: { label: "Used, good", OLX: "Używane", "Allegro Lokalnie": "Używany", Vinted: "Dobry" },
+  damaged: { label: "Damaged / for parts", OLX: "Uszkodzone", "Allegro Lokalnie": "Uszkodzony", Vinted: "Zadowalający" },
+};
+
+/** What the operator wants to post for a flip. */
+export interface FlipListing {
+  title: string;
+  description: string;
+  condition: ListingCondition | null;
+  /** Asking price per platform; missing platforms fall back to `basePrice`. */
+  prices: Partial<Record<FlipChannel, number>>;
+  /** What the operator wants to receive before fees; drives the suggestions. */
+  basePrice: number | null;
+}
+
+/**
+ * Asking price on a platform that leaves the same amount as `receive` on a
+ * fee-free one, rounded up to whole złoty. Display-only suggestion.
+ */
+export function suggestedListingPrice(receive: number, preset: FeePreset) {
+  if (!Number.isFinite(receive) || receive <= 0) return null;
+  const share = 1 - preset.percent / 100;
+  if (share <= 0) return null;
+  return Math.ceil((receive + preset.fixed) / share);
+}

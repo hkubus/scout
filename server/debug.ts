@@ -74,7 +74,7 @@ function stripLeadingComments(sql: string) {
  * it is left out of the table list, refused in read-only SQL, and emptied in
  * snapshots. Export it through the authenticated /api/export instead.
  */
-const PRIVATE_TABLES = ['flips'];
+const PRIVATE_TABLES = ['flips', 'flip_photos'];
 const PRIVATE_TABLE_PATTERN = new RegExp(`\\b(?:${PRIVATE_TABLES.join('|')})\\b`, 'i');
 
 const quoteIdent = (name: string) => `"${name.replace(/"/g, '""')}"`;
@@ -95,7 +95,7 @@ process.stdin.on('end', () => {
     db = new DatabaseSync(path, { readOnly: true });
     db.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 2000;');
     if (typeof db.setAuthorizer === 'function' && constants) {
-      db.setAuthorizer((action, table, column) => (action === constants.SQLITE_READ && table === 'flips' ? constants.SQLITE_DENY
+      db.setAuthorizer((action, table, column) => (action === constants.SQLITE_READ && (table === 'flips' || table === 'flip_photos') ? constants.SQLITE_DENY
         : action === constants.SQLITE_READ && table === 'marketplace_sessions' && column === 'storage_state_encrypted' ? constants.SQLITE_IGNORE : constants.SQLITE_OK));
     }
   } catch (error) { out({ error: 'open', message: String(error && error.message || error) }); return; }

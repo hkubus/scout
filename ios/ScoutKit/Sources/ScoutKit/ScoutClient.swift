@@ -235,6 +235,27 @@ public struct ScoutClient: Sendable {
         let _: OkResponse = try await send("DELETE", "/api/flips/\(id)", body: EmptyBody())
     }
 
+    /// Adds a listing photo (JPEG) to a flip; the server checks the bytes.
+    public func uploadFlipPhoto(flipId: Int, jpeg: Data) async throws -> FlipPhoto {
+        var request = request("/api/flips/\(flipId)/photos", timeout: 60)
+        request.httpMethod = "POST"
+        request.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
+        request.httpBody = jpeg
+        let (data, response) = try await transport.send(request)
+        guard (200..<300).contains(response.statusCode) else { throw error(from: data, response) }
+        let decoded: FlipPhotoResponse = try Self.decode(data)
+        return decoded.photo
+    }
+
+    public func deleteFlipPhoto(id: Int) async throws {
+        let _: OkResponse = try await send("DELETE", "/api/flip-photos/\(id)", body: EmptyBody())
+    }
+
+    /// Served by Scout itself; load it with `serverData` so the token is sent.
+    public func flipPhotoURL(id: Int) -> URL {
+        url("/api/flip-photos/\(id)", query: [])
+    }
+
     public func saveFeePresets(_ presets: FeePresets) async throws -> FeePresets {
         let response: FeePresetsResponse = try await send("PUT", "/api/flips/fee-presets", body: presets)
         return response.feePresets
@@ -421,6 +442,7 @@ private struct ListingActionResponse: Decodable { var action: ListingAction }
 private struct ScanBody: Encodable { var watchId: String? }
 private struct OlxCategoriesResponse: Decodable { var categories: [OlxCategoryOption] }
 private struct FlipResponse: Decodable { var flip: Flip }
+private struct FlipPhotoResponse: Decodable { var photo: FlipPhoto }
 private struct FeePresetsResponse: Decodable { var feePresets: FeePresets }
 
 private struct ListingActionBody: Encodable {

@@ -144,7 +144,8 @@ test('the private flip ledger is hidden from tables, read-only SQL and snapshots
     context.db.prepare("INSERT INTO flips (title, buy_channel, bought_on, buy_price_pln, created_at, updated_at) VALUES ('RTX 3070', 'OLX', '2026-09-01', 1200, 'now', 'now')").run();
     assert.equal(context.debug.schema().tables.some((table: { name: string }) => table.name === 'flips'), false);
     assert.throws(() => context.debug.tableRows('flips'), (error: unknown) => error instanceof ServiceError && error.status === 404);
-    for (const sql of ['SELECT * FROM flips', 'select title from "FLIPS"', 'WITH x AS (SELECT buy_price_pln FROM flips) SELECT * FROM x']) {
+    assert.equal(context.debug.schema().tables.some((table: { name: string }) => table.name === 'flip_photos'), false);
+    for (const sql of ['SELECT * FROM flips', 'select title from "FLIPS"', 'WITH x AS (SELECT buy_price_pln FROM flips) SELECT * FROM x', 'SELECT data FROM flip_photos']) {
       await assert.rejects(context.debug.query(sql), (error: unknown) => error instanceof ServiceError && error.status === 403, sql);
     }
     const snapshot = context.debug.snapshot();

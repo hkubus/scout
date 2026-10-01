@@ -849,6 +849,11 @@ final class FlipTests: XCTestCase {
         let json = #"{"flips":[{"id":7,"title":"RTX 3070","listingKey":"OLX:1","watchId":null,"buyChannel":"Vinted","boughtOn":"2026-09-20","buyPrice":1000,"buyCosts":22,"listedOn":["OLX","Allegro Lokalnie"],"soldOn":"2026-09-29","saleChannel":"Allegro Lokalnie","salePrice":1300,"saleFee":63.7,"saleCosts":0,"delisted":["OLX"],"note":"","createdAt":"now","updatedAt":"now"}],"feePresets":{"OLX":{"percent":8,"fixed":0}}}"#
         let data: FlipsData = try ScoutClient.decode(Data(json.utf8))
         XCTAssertEqual(data.flips.first?.net, 214.3)
+        XCTAssertNil(data.flips.first?.photos, "older servers send no photos")
+        let listed = json.replacingOccurrences(of: #""updatedAt":"now"}"#, with: #""updatedAt":"now","listing":{"title":"RTX","description":"ok","condition":"good","prices":{"OLX":1450},"basePrice":1450},"photos":[{"id":3,"mime":"image/jpeg","byteSize":120}]}"#)
+        let withListing: FlipsData = try ScoutClient.decode(Data(listed.utf8))
+        XCTAssertEqual(withListing.flips.first?.listing?.prices["OLX"], 1450)
+        XCTAssertEqual(withListing.flips.first?.photos?.first?.id, 3)
         XCTAssertEqual(data.feePresets[.olx].percent, 8)
         XCTAssertEqual(data.feePresets[.allegroLokalnie].percent, 4.9)
     }
@@ -869,6 +874,13 @@ final class FlipTests: XCTestCase {
         presets[.olx] = FeePreset(percent: 8, fixed: 0)
         let saved = try await client.saveFeePresets(presets)
         XCTAssertEqual(saved[.olx].percent, 8)
+        let photo = try await client.uploadFlipPhoto(flipId: created.id, jpeg: Data([0xFF, 0xD8, 0xFF, 0xE0, 1, 2]))
+        let withPhoto = try await client.flips().flips.first { $0.id == created.id }
+        XCTAssertEqual(withPhoto?.photos?.map(\.id), [photo.id])
+        XCTAssertEqual(client.flipPhotoURL(id: photo.id).absoluteString, "https://demo.scout.invalid/api/flip-photos/\(photo.id)")
+        try await client.deleteFlipPhoto(id: photo.id)
+        let withoutPhoto = try await client.flips().flips.first { $0.id == created.id }
+        XCTAssertEqual(withoutPhoto?.photos ?? [], [])
         try await client.deleteFlip(id: created.id)
         let after = try await client.flips()
         XCTAssertEqual(after.flips.count, 4)

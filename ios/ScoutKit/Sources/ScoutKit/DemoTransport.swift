@@ -17,6 +17,7 @@ public actor DemoTransport: HTTPTransport {
     private var ntfyOpenInApp = false
     private var flips: [Flip]
     private var feePresets = FeePresets.defaults
+    private var nextPhotoID = 100
     private let encoder = JSONEncoder()
 
     public init(now: Date = Date()) {
@@ -95,7 +96,7 @@ public actor DemoTransport: HTTPTransport {
         let segments = components.path.split(separator: "/").map(String.init)
         let method = request.httpMethod ?? "GET"
         // `/api/<collection>/<id>/...` routes are matched with the id replaced by `:id`.
-        let collections: Set<String> = ["watches", "market-watches", "market-listings", "flips"]
+        let collections: Set<String> = ["watches", "market-watches", "market-listings", "flips", "flip-photos"]
         let watchID = segments.count >= 3 && segments[0] == "api" && collections.contains(segments[1]) ? segments[2] : nil
         let route = method + " /" + segments.enumerated().map { $0.offset == 2 && watchID != nil ? ":id" : $0.element }.joined(separator: "/")
         try await Task.sleep(nanoseconds: 150_000_000)
@@ -270,6 +271,19 @@ public actor DemoTransport: HTTPTransport {
         case "DELETE /api/flips/:id":
             flips.removeAll { String($0.id) == watchID }
             return try respond(["ok": true])
+        case "DELETE /api/flip-photos/:id":
+            for index in flips.indices { flips[index].photos?.removeAll { String($0.id) == watchID } }
+            return try respond(["ok": true])
+        case "POST /api/flips/:id/photos":
+            guard let index = flips.firstIndex(where: { String($0.id) == watchID }) else {
+                return try respond(["error": "Flip not found"], status: 404)
+            }
+            let body = request.httpBody ?? Data()
+            guard body.starts(with: [0xFF, 0xD8, 0xFF]) else { return try respond(["error": "Photos must be JPEG, PNG or WebP"], status: 415) }
+            nextPhotoID += 1
+            let photo = FlipPhoto(id: nextPhotoID, mime: "image/jpeg", byteSize: body.count)
+            flips[index].photos = (flips[index].photos ?? []) + [photo]
+            return try respond(["photo": photo], status: 201)
         default:
             return try respond(["error": "Not available in demo mode"], status: 404)
         }
