@@ -2,6 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import { brotliDecompressSync, gunzipSync } from 'node:zlib';
+import Fastify from 'fastify';
+import { compressApiResponse } from '../server/compression';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase } from '../server/db';
@@ -118,4 +122,46 @@ test('falls back to exportData() when the database has no file to reopen', async
     assert.equal(count, 1);
     assert.equal(text, JSON.stringify({ ...service.exportData(), exportedAt: JSON.parse(text).exportedAt }));
   } finally { context.close(); }
+});
+
+test('an export whose snapshot cannot open fails in the route as a plain 500, with or without compression', async () => {
+  const context = fixture();
+  const directory = mkdtempSync(join(tmpdir(), 'scout-export-broken-'));
+  // One target cannot be opened at all; the other opens but has no settings
+  // table, so BEGIN succeeds and the settings SELECT throws.
+  const empty = join(directory, 'empty.sqlite');
+  new DatabaseSync(empty).close();
+  const serviceFor = (file: string) => new ScoutService(new Proxy(context.db, {
+    get(target, property, receiver) {
+      if (property !== 'prepare') return Reflect.get(target, property, receiver);
+      return (sql: string) => sql === 'PRAGMA database_list' ? { all: () => [{ seq: 0, name: 'main', file }] } : target.prepare(sql);
+    },
+  }), () => {}, { suggestVariantGroups: async () => [] });
+  const app = Fastify({ logger: false });
+  app.addHook('onSend', compressApiResponse);
+  // Same shape as the /api/export route in server/index.ts.
+  app.get('/api/export/:target', async (request, reply) => {
+    const { target } = request.params as { target: string };
+    const stream = serviceFor(target === 'missing' ? join(directory, 'missing.sqlite') : empty).exportStream();
+    return reply.header('Content-Disposition', 'attachment; filename="scout-export.json"').type('application/json').send(stream);
+  });
+  try {
+    assert.throws(() => serviceFor(join(directory, 'missing.sqlite')).exportStream());
+    assert.throws(() => serviceFor(empty).exportStream(), /no such table: settings/);
+    for (const target of ['missing', 'no-settings']) {
+      for (const acceptEncoding of [undefined, 'br', 'gzip, deflate, br']) {
+        const response = await app.inject({ method: 'GET', url: `/api/export/${target}`, headers: acceptEncoding ? { 'accept-encoding': acceptEncoding } : {} });
+        const label = `${target} ${acceptEncoding}`;
+        assert.equal(response.statusCode, 500, label);
+        const encoding = response.headers['content-encoding'];
+        const raw = encoding === 'br' ? brotliDecompressSync(response.rawPayload) : encoding === 'gzip' ? gunzipSync(response.rawPayload) : response.rawPayload;
+        assert.equal(JSON.parse(raw.toString()).statusCode, 500, label);
+        assert.equal(response.headers['content-disposition'], undefined, label);
+      }
+    }
+  } finally {
+    await app.close();
+    context.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

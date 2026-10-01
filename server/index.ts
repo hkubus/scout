@@ -403,7 +403,11 @@ app.get('/api/logs', async () => ({ logs: service.logs() }));
 app.get('/api/settings', async () => service.settings());
 app.get('/api/marketplace-sessions', async () => ({ sessions: service.marketplaceSessions() }));
 // Streamed from a read-only snapshot so the export never buffers the database.
-app.get('/api/export', async (_request, reply) => reply.header('Content-Disposition', `attachment; filename="scout-export-${new Date().toISOString().slice(0, 10)}.json"`).type('application/json').send(service.exportStream()));
+// The snapshot opens before any header is set, so an open failure is a plain 500.
+app.get('/api/export', async (_request, reply) => {
+  const stream = service.exportStream();
+  return reply.header('Content-Disposition', `attachment; filename="scout-export-${new Date().toISOString().slice(0, 10)}.json"`).type('application/json').send(stream);
+});
 app.post('/api/backup', async (_request, reply) => reply.code(201).send({ backup: basename(backupDatabase(db)), message: 'SQLite backup created beside the configured database file.' }));
 
 app.put('/api/marketplace-sessions/:marketplace', async (request, reply) => {
@@ -974,7 +978,10 @@ const diagnosticsInterval = setInterval(() => {
   service.logDiagnostic(formatMemoryLine());
 }, 30 * 60_000);
 
-app.addHook('onClose', async () => { await service.closeBrowser(); debug?.close(); clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); clearInterval(sessionPurge); for (const client of clients) client.end(); await checkpointer?.stop(); try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ } db.close(); });
+// Stop the timers first so no scheduler tick starts a scan (or a Chromium) while
+// shutting down; the final closeBrowser refuses relaunches and is time-bounded,
+// so the checkpoint and db.close() always run.
+app.addHook('onClose', async () => { clearInterval(scheduler); clearInterval(sseHeartbeat); clearInterval(diagnosticsInterval); clearInterval(sessionPurge); debug?.close(); for (const client of clients) client.end(); await service.closeBrowser({ final: true }); await checkpointer?.stop(); try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ } db.close(); });
 let shuttingDown = false;
 const shutdown = async (signal: string) => {
   if (shuttingDown) return;

@@ -83,3 +83,23 @@ test('leaves small, binary, pre-encoded, bodiless and non-API responses alone', 
     await app.close();
   }
 });
+
+test('a stream that fails before its first byte becomes a normal, decodable 500', async () => {
+  const app = Fastify({ logger: false });
+  app.addHook('onSend', compressApiResponse);
+  app.get('/api/failing-stream', async (_request, reply) => reply.type('application/json').send(Readable.from((async function* () {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    throw new Error('snapshot open failed');
+  })(), { objectMode: false })));
+  try {
+    for (const acceptEncoding of [undefined, 'br', 'gzip', 'gzip, deflate, br']) {
+      const response = await app.inject({ method: 'GET', url: '/api/failing-stream', headers: acceptEncoding ? { 'accept-encoding': acceptEncoding } : {} });
+      assert.equal(response.statusCode, 500, String(acceptEncoding));
+      const body = JSON.parse(decode(response.headers['content-encoding'] as string | undefined, response.rawPayload).toString());
+      assert.equal(body.statusCode, 500, String(acceptEncoding));
+      assert.equal(response.headers['content-encoding'], undefined, 'the small error body goes out uncompressed');
+    }
+  } finally {
+    await app.close();
+  }
+});

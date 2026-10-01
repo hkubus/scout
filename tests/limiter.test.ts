@@ -69,3 +69,20 @@ test('mapPool runs each synchronous prefix in index order before the next item s
   assert.deepEqual(order.slice(0, 3), ['start a', 'start b', 'start c']);
   assert.equal(order.indexOf('start d') > order.indexOf('end a'), true);
 });
+
+test('mapPool starts no new items after a call rejects', async () => {
+  const started: number[] = [];
+  const finished: number[] = [];
+  const items = Array.from({ length: 10 }, (_, index) => index);
+  await assert.rejects(mapPool(items, 3, async (index) => {
+    started.push(index);
+    if (index === 1) throw new Error('cache read failed');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    finished.push(index);
+    return index;
+  }), /cache read failed/);
+  // Let the calls already in flight settle; none of them may pull another item.
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.deepEqual(started, [0, 1, 2]);
+  assert.deepEqual(finished.sort(), [0, 2]);
+});

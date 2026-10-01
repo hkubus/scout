@@ -19,6 +19,12 @@ const brotliCompress = promisify(zlib.brotliCompress);
 const gzip = promisify(zlib.gzip);
 const compressibleType = /^(?:application\/json|text\/(?!event-stream))/i;
 
+// Replies whose stream this hook is compressing. If that stream fails before
+// its first byte, Fastify sends the error through onSend again while the
+// content-encoding header is still set (also on the raw response), so the
+// hook drops the header and treats the error body like any other payload.
+const streamingEncoded = new WeakSet<FastifyReply>();
+
 export type ResponseEncoding = 'br' | 'gzip';
 
 /** Pick br, else gzip, from an Accept-Encoding header; `q=0` refuses a coding. */
@@ -54,6 +60,12 @@ export async function compressApiResponse(request: FastifyRequest, reply: Fastif
   if (!request.routeOptions.url?.startsWith('/api/')) return payload;
   if (payload === null || payload === undefined) return payload;
   if (reply.statusCode === 204 || reply.statusCode === 206 || reply.statusCode === 304) return payload;
+  if (streamingEncoded.has(reply)) {
+    streamingEncoded.delete(reply);
+    if (reply.raw.headersSent) return payload;
+    reply.removeHeader('content-encoding');
+    reply.raw.removeHeader('content-encoding');
+  }
   if (reply.hasHeader('content-encoding')) return payload;
   const type = reply.getHeader('content-type');
   if (typeof type !== 'string' || !compressibleType.test(type)) return payload;
@@ -72,6 +84,7 @@ export async function compressApiResponse(request: FastifyRequest, reply: Fastif
     // pipeline tears the source down (ending an async generator) when the
     // client aborts and Fastify destroys the compressor, or on an error.
     body = pipeline(payload as Readable, compressor, () => {});
+    streamingEncoded.add(reply);
   } else {
     const input = payload as string | Buffer;
     body = encoding === 'br' ? await brotliCompress(input, brotliOptions(size)) : await gzip(input, gzipOptions);

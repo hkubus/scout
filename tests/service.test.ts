@@ -3672,6 +3672,54 @@ test('a stored town no longer filters watch scans and the API reports no locatio
   } finally { context.close(); }
 });
 
+test('the final closeBrowser refuses relaunches and does not wait on a wedged Chromium', async (t) => {
+  const previousPath = process.env.SCOUT_CHROMIUM_PATH;
+  const previousWs = process.env.SCOUT_BROWSER_WS;
+  process.env.SCOUT_CHROMIUM_PATH = '/nonexistent/chromium';
+  delete process.env.SCOUT_BROWSER_WS;
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const context = fixture();
+  const service = context.service as any;
+  let launches = 0;
+  service.launchLocalBrowser = async () => {
+    launches += 1;
+    return {
+      on: () => {},
+      // A wedged Chromium: close() never settles.
+      close: () => new Promise<void>(() => {}),
+      newContext: async () => {
+        let target = '';
+        return {
+          route: async () => {},
+          routeWebSocket: async () => {},
+          close: async () => {},
+          newPage: async () => ({ goto: async (url: string) => { target = url; return { status: () => 200, ok: () => true }; }, waitForTimeout: async () => {}, url: () => target, content: async () => '<html></html>', close: async () => {} }),
+        };
+      },
+    };
+  };
+  try {
+    await service.renderInBrowser('https://www.olx.pl/d/oferta/a', 'OLX');
+    assert.equal(launches, 1);
+    let closed = false;
+    const closing = service.closeBrowser({ final: true }).then(() => { closed = true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(closed, false);
+    t.mock.timers.tick(5_000);
+    await closing;
+    assert.equal(closed, true);
+    // A scan still in flight after shutdown cannot start a new Chromium.
+    await assert.rejects(service.renderInBrowser('https://www.olx.pl/d/oferta/b', 'OLX'), /shutting down/);
+    assert.equal(launches, 1);
+    assert.equal(service.activeBrowserRenders, 0);
+    assert.equal(service.sharedBrowser, null);
+  } finally {
+    if (previousPath === undefined) delete process.env.SCOUT_CHROMIUM_PATH; else process.env.SCOUT_CHROMIUM_PATH = previousPath;
+    if (previousWs !== undefined) process.env.SCOUT_BROWSER_WS = previousWs;
+    context.close();
+  }
+});
+
 test('shares one locally launched Chromium across renders with a context each, and closes it when idle', async (t) => {
   const previousPath = process.env.SCOUT_CHROMIUM_PATH;
   const previousWs = process.env.SCOUT_BROWSER_WS;

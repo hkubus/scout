@@ -170,6 +170,8 @@ function loadPlaywright() {
 const BROWSER_RENDER_CONCURRENCY = 2;
 /** A locally launched Chromium is shared across renders and closed this long after the last one. */
 const BROWSER_IDLE_CLOSE_MS = 20_000;
+// A wedged Chromium must not hold up shutdown (and the database close after it).
+const BROWSER_CLOSE_TIMEOUT_MS = 5_000;
 /**
  * Served for marketplace CDN images during renders: only page.content() is
  * read, and a real (tiny) image keeps onerror handlers from rewriting src.
@@ -3869,56 +3871,90 @@ export class ScoutService {
    * connection inside one read transaction (the same snapshot for every
    * table) in ~64 KB chunks with an event-loop turn between them, so the
    * export never materializes the database or blocks SSE and the scheduler.
+   * The reader, BEGIN and the settings read happen synchronously in this
+   * call, so a failure to open the snapshot throws here (and becomes a normal
+   * error response) rather than from the stream after the route has replied.
    * An in-memory database, or a Node without StatementSync.iterate(), falls
    * back to exportData().
    */
-  async *exportChunks(): AsyncGenerator<string> {
+  exportChunks(): AsyncGenerator<string> {
+    return this.openExportSnapshot().chunks;
+  }
+
+  private openExportSnapshot(): { chunks: AsyncGenerator<string>; release: () => void } {
     const main = (this.db.prepare('PRAGMA database_list').all() as Array<{ name: string; file: string }>).find((row) => row.name === 'main');
     const reader = main?.file ? new DatabaseSync(main.file, { readOnly: true }) : null;
-    if (!reader || typeof reader.prepare('SELECT 1').iterate !== 'function') {
+    let iterable = false;
+    try {
+      iterable = typeof reader?.prepare('SELECT 1').iterate === 'function';
+    } catch (error) {
       reader?.close();
-      yield JSON.stringify(this.exportData());
-      return;
+      throw error;
+    }
+    if (!reader || !iterable) {
+      reader?.close();
+      const text = JSON.stringify(this.exportData());
+      return { chunks: (async function* () { yield text; })(), release: () => {} };
     }
     let open = false;
+    let released = false;
+    // Idempotent: the generator's finally and the stream's close both call it,
+    // since a generator that never started skips its finally on return().
+    const release = () => {
+      if (released) return;
+      released = true;
+      if (open) { try { reader.exec('ROLLBACK'); } catch { /* the snapshot is released on close */ } }
+      try { reader.close(); } catch { /* best-effort */ }
+    };
+    let settings: Array<Record<string, unknown>>;
     try {
       reader.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;');
       reader.exec('BEGIN');
       open = true;
-      const settings = (reader.prepare('SELECT * FROM settings').all() as Array<Record<string, unknown>>).map(redactExportSetting);
-      let chunk = `{"exportedAt":${JSON.stringify(nowIso())},"note":${JSON.stringify(EXPORT_NOTE)}`;
-      for (const [key, table] of EXPORT_TABLES) {
-        chunk += `,${JSON.stringify(key)}:[`;
-        let first = true;
-        for (const row of reader.prepare(`SELECT * FROM ${table}`).iterate()) {
-          chunk += first ? JSON.stringify(row) : `,${JSON.stringify(row)}`;
-          first = false;
-          if (chunk.length >= EXPORT_CHUNK_CHARS) {
-            yield chunk;
-            chunk = '';
-            await new Promise<void>((resolve) => setImmediate(resolve));
-          }
-        }
-        chunk += ']';
-      }
-      yield `${chunk},"settings":${JSON.stringify(settings)}}`;
-    } finally {
-      // Also runs when the consumer stops early (client abort or timeout).
-      if (open) { try { reader.exec('ROLLBACK'); } catch { /* the snapshot is released on close */ } }
-      try { reader.close(); } catch { /* best-effort */ }
+      // The first SELECT takes the snapshot every table is read from.
+      settings = (reader.prepare('SELECT * FROM settings').all() as Array<Record<string, unknown>>).map(redactExportSetting);
+    } catch (error) {
+      release();
+      throw error;
     }
+    const chunks = async function* (): AsyncGenerator<string> {
+      try {
+        let chunk = `{"exportedAt":${JSON.stringify(nowIso())},"note":${JSON.stringify(EXPORT_NOTE)}`;
+        for (const [key, table] of EXPORT_TABLES) {
+          chunk += `,${JSON.stringify(key)}:[`;
+          let first = true;
+          for (const row of reader.prepare(`SELECT * FROM ${table}`).iterate()) {
+            chunk += first ? JSON.stringify(row) : `,${JSON.stringify(row)}`;
+            first = false;
+            if (chunk.length >= EXPORT_CHUNK_CHARS) {
+              yield chunk;
+              chunk = '';
+              await new Promise<void>((resolve) => setImmediate(resolve));
+            }
+          }
+          chunk += ']';
+        }
+        yield `${chunk},"settings":${JSON.stringify(settings)}}`;
+      } finally {
+        // Also runs when the consumer stops early (client abort or timeout).
+        release();
+      }
+    };
+    return { chunks: chunks(), release };
   }
 
   /**
-   * exportChunks() as a byte stream for the /api/export route. The stream is
+   * exportChunks() as a byte stream for the /api/export route. Opening the
+   * snapshot can throw synchronously (see exportChunks). The stream is
    * destroyed after maxOpenMs, so a stalled client cannot pin the read
    * snapshot (and block WAL checkpoints from resetting) indefinitely.
    */
   exportStream(maxOpenMs = EXPORT_MAX_OPEN_MS) {
-    const stream = Readable.from(this.exportChunks(), { objectMode: false });
+    const { chunks, release } = this.openExportSnapshot();
+    const stream = Readable.from(chunks, { objectMode: false });
     const timer = setTimeout(() => stream.destroy(new Error(`Export exceeded ${maxOpenMs} ms and was stopped`)), maxOpenMs);
     timer.unref?.();
-    stream.once('close', () => clearTimeout(timer));
+    stream.once('close', () => { clearTimeout(timer); release(); });
     return stream;
   }
 
@@ -4568,6 +4604,7 @@ export class ScoutService {
   private sharedBrowser: Promise<Browser> | null = null;
   private activeBrowserRenders = 0;
   private browserIdleTimer: NodeJS.Timeout | null = null;
+  private browserShutDown = false;
 
   private async launchLocalBrowser(executablePath: string): Promise<Browser> {
     const { chromium } = await loadPlaywright();
@@ -4584,6 +4621,8 @@ export class ScoutService {
       clearTimeout(this.browserIdleTimer);
       this.browserIdleTimer = null;
     }
+    // After the final close (server shutdown) nothing may launch a new Chromium.
+    if (this.browserShutDown) return Promise.reject(new Error('Scout is shutting down; Chromium is closed'));
     if (!this.sharedBrowser) {
       const pending = this.launchLocalBrowser(executablePath).then((browser) => {
         // A crash or external kill drops the cache; the next render relaunches.
@@ -4610,15 +4649,30 @@ export class ScoutService {
     this.browserIdleTimer.unref?.();
   }
 
-  /** Close the shared local Chromium, if any (idle timeout and server shutdown). */
-  async closeBrowser() {
+  /**
+   * Close the shared local Chromium, if any (idle timeout and server shutdown).
+   * `final` (shutdown) also refuses later launches. Waits at most
+   * BROWSER_CLOSE_TIMEOUT_MS for the launch and close to finish.
+   */
+  async closeBrowser({ final = false }: { final?: boolean } = {}) {
+    if (final) this.browserShutDown = true;
     if (this.browserIdleTimer) {
       clearTimeout(this.browserIdleTimer);
       this.browserIdleTimer = null;
     }
     const pending = this.sharedBrowser;
     this.sharedBrowser = null;
-    if (pending) await pending.then((browser) => browser.close()).catch(() => undefined);
+    if (!pending) return;
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, BROWSER_CLOSE_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    try {
+      await Promise.race([pending.then((browser) => browser.close()).catch(() => undefined), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async renderInBrowser(url: string, marketplace: Marketplace, storageState?: MarketplaceStorageState): Promise<string> {
