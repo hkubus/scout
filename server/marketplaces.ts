@@ -555,6 +555,16 @@ function isDescriptionBoilerplate(text: string, marketplace: Marketplace) {
   return marketplace === 'Allegro Lokalnie' && ALLEGRO_DESCRIPTION_BOILERPLATE.test(text);
 }
 
+/**
+ * Normalize one description value exactly as parseListingDescription treats a
+ * page candidate: text content, 8,000-character cap, marketplace boilerplate
+ * dropped. Null when nothing usable remains.
+ */
+export function listingDescriptionText(value: unknown, marketplace: Marketplace): string | null {
+  const normalized = normalizeDescriptionCandidate(value);
+  return normalized && !isDescriptionBoilerplate(normalized, marketplace) ? normalized : null;
+}
+
 /** Extract only listing-description fields from a marketplace detail page. */
 export function parseListingDescription(html: string, marketplace: Marketplace): string | null {
   if (!html) return null;
@@ -645,19 +655,22 @@ export function imageIdentityKey(raw: string) {
  * JSON-LD and Open Graph markup are the stable surfaces; CDN-hosted <img> and
  * srcset entries are a secondary source. Icon/logo-like assets are ignored.
  */
+/** Add one gallery candidate to `found` unless it is off-CDN, icon-like or a duplicate photo. */
+function pushGalleryImageUrl(found: string[], value: unknown) {
+  if (typeof value !== 'string') return;
+  const candidate = concreteImageUrl(value.trim());
+  if (!isMarketplaceImageUrl(candidate)) return;
+  if (candidate.length > 1_000) return;
+  if (/favicon|sprite|logo|icon|avatar|placeholder|banner|emoji|flag/i.test(candidate)) return;
+  const identity = imageIdentityKey(candidate);
+  if (!identity || found.some((existing) => imageIdentityKey(existing) === identity)) return;
+  found.push(candidate);
+}
+
 export function parseListingImageUrls(html: string, marketplace: Marketplace, limit = 40): string[] {
   if (!html) return [];
   const found: string[] = [];
-  const push = (value: unknown) => {
-    if (typeof value !== 'string') return;
-    const candidate = concreteImageUrl(value.trim());
-    if (!isMarketplaceImageUrl(candidate)) return;
-    if (candidate.length > 1_000) return;
-    if (/favicon|sprite|logo|icon|avatar|placeholder|banner|emoji|flag/i.test(candidate)) return;
-    const identity = imageIdentityKey(candidate);
-    if (!identity || found.some((existing) => imageIdentityKey(existing) === identity)) return;
-    found.push(candidate);
-  };
+  const push = (value: unknown) => pushGalleryImageUrl(found, value);
 
   const scripts = html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
   for (const match of scripts) {
@@ -1021,6 +1034,24 @@ function olxSearchApiUrlFromSearchPage(url: string, pathParams: OlxSearchPathPar
   return api.toString();
 }
 
+/** Description and gallery the OLX offers API already returned for a listing. */
+export type OlxDetailHint = { description: string | null; imageUrls: string[] };
+
+const OLX_DETAIL_HINT_IMAGES = 12;
+
+/**
+ * Side channel from parseOlxOffer to description verification, keyed by the
+ * listing object. Scans pass listings through by identity, so verification
+ * can skip the HTML offer page; keeping the text off NormalizedListing keeps
+ * it out of notification payloads and API JSON. A cloned listing has no hint
+ * and falls back to the page fetch.
+ */
+const olxDetailHints = new WeakMap<NormalizedListing, OlxDetailHint>();
+
+export function olxDetailHint(listing: NormalizedListing): OlxDetailHint | undefined {
+  return olxDetailHints.get(listing);
+}
+
 function parseOlxOffer(offer: unknown): NormalizedListing | null {
   if (!isRecord(offer)) return null;
   const listingId = offer.id === undefined || offer.id === null ? '' : String(offer.id).trim();
@@ -1050,13 +1081,22 @@ function parseOlxOffer(offer: unknown): NormalizedListing | null {
   const promotionFlags = promotion ? [promotion.top_ad, promotion.highlighted, promotion.urgent].filter((flag): flag is boolean => typeof flag === 'boolean') : [];
   const promoted = promotionFlags.length ? promotionFlags.some(Boolean) : null;
   const sellerType = typeof offer.business === 'boolean' ? (offer.business ? 'business' : 'private') : null;
-  return normalizeListing({
+  const listing = normalizeListing({
     marketplace: 'OLX', listingId, title, price, url, imageUrl, condition, location, shippingAvailable, priceNegotiable,
     postedAt: typeof offer.created_time === 'string' ? offer.created_time : null,
     refreshedAt: typeof offer.last_refresh_time === 'string' ? offer.last_refresh_time : null,
     promoted,
     sellerType,
   });
+  const imageUrls: string[] = [];
+  for (const photo of photos) {
+    if (imageUrls.length >= OLX_DETAIL_HINT_IMAGES) break;
+    if (typeof photo.link !== 'string') continue;
+    // URL parsing drops the API's explicit :443, as normalizeListing does for imageUrl.
+    try { pushGalleryImageUrl(imageUrls, new URL(concreteImageUrl(photo.link)).toString()); } catch { /* not a usable URL */ }
+  }
+  olxDetailHints.set(listing, { description: listingDescriptionText(offer.description, 'OLX'), imageUrls });
+  return listing;
 }
 
 /**

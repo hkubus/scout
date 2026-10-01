@@ -1,3 +1,4 @@
+import { dayMonth, formatDate } from "./format";
 import type { WatchAnalytics } from "./types";
 
 const formatPln = (value: number | null) =>
@@ -18,10 +19,7 @@ export function formatAnalyticsDate(value: string | null) {
       ? new Date(parts[0], parts[1] - 1, parts[2])
       : new Date(value);
   }
-  return date.toLocaleDateString("pl-PL", {
-    day: "2-digit",
-    month: "short",
-  });
+  return formatDate(dayMonth, date);
 }
 
 /**

@@ -82,12 +82,8 @@ struct ListingDetailView: View {
     private func header(_ listing: Listing) -> some View {
         Section {
             if let url = listing.imageURL {
-                AsyncImage(url: url) { phase in
-                    if let image = phase.image {
-                        image.resizable().scaledToFit()
-                    } else {
-                        Color.secondary.opacity(0.1)
-                    }
+                PipelineImage(url: url, contentMode: .fit, pointSize: ImagePipeline.headerPoints) {
+                    Color.secondary.opacity(0.1)
                 }
                 .frame(maxWidth: .infinity, minHeight: 200, maxHeight: 320)
                 .listRowInsets(EdgeInsets())

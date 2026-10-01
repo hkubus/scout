@@ -1,8 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ChevronDown, Database, Search, X } from "lucide-react";
 import { api } from "./api";
+import { subscribe } from "./events";
+import { applyListingActionToPage, isListingActionEvent, listingActionKey, type ListingActionEvent } from "./listingActions";
+import { pageForFilters, reuseUnchangedListings } from "./listingRows";
 import ListingTable from "./ListingTable";
-import type { Listing, ListingDecision, Marketplace } from "./types";
+import type { Listing, ListingAction, ListingDecision, Marketplace } from "./types";
 
 function SelectControl({
   value,
@@ -35,12 +38,12 @@ export default function ListingsPage({
   onToggleHidden,
 }: {
   listings: Listing[];
-  /** Bumped on server events (scans, listing actions) so the fetched page stays current. */
+  /** Bumped when server events (scans, listing actions) leave the fetched page stale. */
   refreshKey: number;
   selectedWatchId: string | null;
   onClearWatch: () => void;
   onSelectListing: (listing: Listing) => void;
-  onToggleHidden: (listing: Listing) => void;
+  onToggleHidden: (listing: Listing) => Promise<ListingAction | null>;
 }) {
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
@@ -48,9 +51,9 @@ export default function ListingsPage({
   const [sort, setSort] = useState<"Newest" | "Strongest" | "Price">("Newest");
   const [decision, setDecision] = useState<"All" | ListingDecision>("All");
   const [visibility, setVisibility] = useState<"Visible" | "Hidden" | "All">("Visible");
-  const [page, setPage] = useState(1);
-  const [remoteListings, setRemoteListings] = useState<Listing[] | null>(null);
-  const [pagination, setPagination] = useState<{ page: number; pageSize: number; total: number; hasNext: boolean } | null>(null);
+  const [remote, setRemote] = useState<{ listings: Listing[]; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } } | null>(null);
+  const remoteListings = remote?.listings ?? null;
+  const pagination = remote?.pagination ?? null;
   const [loadingPage, setLoadingPage] = useState(false);
 
   // Debounce typing so one search fires after the user pauses, not per keystroke.
@@ -63,10 +66,13 @@ export default function ListingsPage({
   const visibilityKey = visibility === "Visible" ? "visible" : visibility === "Hidden" ? "hidden" : "all";
 
   // Every filter is applied by the API across all pages, so a filter change
-  // restarts from page 1 instead of filtering only the loaded page.
-  useEffect(() => {
-    setPage(1);
-  }, [selectedWatchId, debouncedSearch, marketplace, sort, decision, visibility]);
+  // restarts from page 1 instead of filtering only the loaded page. The page
+  // is derived in the same render, so no request goes out with the old page.
+  const filtersKey = [selectedWatchId, debouncedSearch, marketplace, sortKey, decision, visibilityKey].join("|");
+  const [storedPage, setPageState] = useState({ key: filtersKey, page: 1 });
+  const pageState = pageForFilters(storedPage, filtersKey);
+  if (pageState !== storedPage) setPageState(pageState);
+  const page = pageState.page;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -81,20 +87,35 @@ export default function ListingsPage({
       decision: decision === "All" ? undefined : decision,
       visibility: visibilityKey,
     }, controller.signal)
-      .then((result) => {
-        setRemoteListings(result.listings);
-        setPagination(result.pagination);
-      })
+      // Unchanged rows keep their identity, so their memoized rows skip.
+      .then((result) => setRemote((current) => ({ listings: current ? reuseUnchangedListings(current.listings, result.listings) : result.listings, pagination: result.pagination })))
       .catch(() => {
         if (controller.signal.aborted) return;
-        setRemoteListings(null);
-        setPagination(null);
+        setRemote(null);
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoadingPage(false);
       });
     return () => controller.abort();
   }, [page, selectedWatchId, debouncedSearch, marketplace, sortKey, decision, visibilityKey, refreshKey]);
+
+  // Triage saves (this tab or another) patch the loaded page at once and drop
+  // rows that left the decision/visibility filter; App schedules the refetch.
+  const applyListingAction = useCallback((event: ListingActionEvent) => {
+    setRemote((current) => {
+      if (!current) return current;
+      const { rows, removed } = applyListingActionToPage(current.listings, event, decision, visibilityKey);
+      if (rows === current.listings) return current;
+      return { listings: rows, pagination: { ...current.pagination, total: Math.max(0, current.pagination.total - removed) } };
+    });
+  }, [decision, visibilityKey]);
+  useEffect(() => subscribe("listing-action", (payload) => {
+    if (isListingActionEvent(payload)) applyListingAction(payload);
+  }), [applyListingAction]);
+  const toggleHidden = useCallback(async (listing: Listing) => {
+    const action = await onToggleHidden(listing);
+    if (action) applyListingAction({ key: listingActionKey(listing), decision: action.decision, hidden: action.hidden });
+  }, [applyListingAction, onToggleHidden]);
 
   // Offline fallback only: an unreachable API filters the dashboard feed in
   // memory. Server-backed results already cover every page and are pre-sorted.
@@ -170,12 +191,12 @@ export default function ListingsPage({
           </button>
         </div>
       ) : null}
-      <ListingTable listings={filtered} onSelect={onSelectListing} onToggleHidden={onToggleHidden} />
+      <ListingTable listings={filtered} onSelect={onSelectListing} onToggleHidden={toggleHidden} />
       {pagination && (pagination.page > 1 || pagination.hasNext) ? (
         <div className="research-pagination listings-pagination">
-          <button className="outline-button" disabled={page <= 1 || loadingPage} onClick={() => setPage((current) => Math.max(1, current - 1))}>Previous</button>
+          <button className="outline-button" disabled={page <= 1 || loadingPage} onClick={() => setPageState({ key: filtersKey, page: Math.max(1, page - 1) })}>Previous</button>
           <span>Page {pagination.page} · {pagination.total.toLocaleString("pl-PL")} matching listings</span>
-          <button className="outline-button" disabled={!pagination.hasNext || loadingPage} onClick={() => setPage((current) => current + 1)}>Next</button>
+          <button className="outline-button" disabled={!pagination.hasNext || loadingPage} onClick={() => setPageState({ key: filtersKey, page: page + 1 })}>Next</button>
         </div>
       ) : null}
       <div className="retention-note">

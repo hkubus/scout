@@ -2,28 +2,42 @@ import Charts
 import SwiftUI
 import ScoutKit
 
+/// The Analytics screen's filters and data. MarketView owns it, so switching
+/// to Research and back keeps them instead of reloading from 30d/All.
+@MainActor
+@Observable
+final class AnalyticsStore {
+    var days = 30
+    var watchId: String?
+    var marketplace: Marketplace?
+    var watches: [Watch] = []
+    /// `AppModel.watchesToken` when `watches` was fetched.
+    var watchesLoadedFor: Int?
+    var data: AnalyticsData?
+    var error: String?
+    let memory = LoadMemory()
+}
+
 /// Deal analytics across watches, like the web Analytics page. Discounts
 /// compare asking prices with each watch's learned typical asking price.
 struct AnalyticsView: View {
     @Environment(AppModel.self) private var model
-    @State private var days = 30
-    @State private var watchId: String?
-    @State private var marketplace: Marketplace?
-    @State private var watches: [Watch] = []
-    @State private var data: AnalyticsData?
-    @State private var error: String?
+    @Bindable var store: AnalyticsStore
 
     private struct LoadKey: Hashable {
         var days: Int
         var watchId: String?
         var marketplace: Marketplace?
-        var refreshToken: Int
+        var watchesToken: Int
     }
 
     var body: some View {
+        let days = store.days
+        let watchId = store.watchId
+        let marketplace = store.marketplace
         List {
             Section {
-                Picker("Range", selection: $days) {
+                Picker("Range", selection: $store.days) {
                     Text("7d").tag(7)
                     Text("30d").tag(30)
                     Text("90d").tag(90)
@@ -37,29 +51,29 @@ struct AnalyticsView: View {
                             .foregroundStyle(.secondary)
                         Spacer()
                         Button("Clear") {
-                            watchId = nil
-                            marketplace = nil
+                            store.watchId = nil
+                            store.marketplace = nil
                         }
                         .font(.footnote)
                     }
                 }
             }
 
-            if let data {
+            if let data = store.data {
                 content(data)
             }
         }
-        .overlay { LoadingOverlay(isLoaded: data != nil, error: error, retry: load) }
+        .overlay { LoadingOverlay(isLoaded: store.data != nil, error: store.error, retry: { await load() }) }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
-                    Picker("Watch", selection: $watchId) {
+                    Picker("Watch", selection: $store.watchId) {
                         Text("All watches").tag(String?.none)
-                        ForEach(watches) { watch in
+                        ForEach(store.watches) { watch in
                             Text(watch.name).tag(String?.some(watch.id))
                         }
                     }
-                    Picker("Marketplace", selection: $marketplace) {
+                    Picker("Marketplace", selection: $store.marketplace) {
                         Text("All marketplaces").tag(Marketplace?.none)
                         ForEach(Marketplace.all, id: \.self) { marketplace in
                             Text(marketplace.rawValue).tag(Marketplace?.some(marketplace))
@@ -71,12 +85,12 @@ struct AnalyticsView: View {
             }
         }
         .refreshable { await load() }
-        .task(id: LoadKey(days: days, watchId: watchId, marketplace: marketplace, refreshToken: model.refreshToken)) { await load() }
+        .reloadOnChange(of: LoadKey(days: days, watchId: watchId, marketplace: marketplace, watchesToken: model.watchesToken), memory: store.memory) { await load() }
     }
 
     private var filterSummary: String {
-        let watchName = watches.first { $0.id == watchId }?.name
-        return [watchName, marketplace?.rawValue].compactMap { $0 }.joined(separator: " · ")
+        let watchName = store.watches.first { $0.id == store.watchId }?.name
+        return [watchName, store.marketplace?.rawValue].compactMap { $0 }.joined(separator: " · ")
     }
 
     @ViewBuilder
@@ -193,16 +207,25 @@ struct AnalyticsView: View {
         return (last - first) / first * 100
     }
 
-    private func load() async {
-        guard let client = model.client else { return }
+    @discardableResult
+    private func load() async -> Bool {
+        guard let client = model.client else { return false }
+        let (days, watchId, marketplace) = (store.days, store.watchId, store.marketplace)
+        let watchesToken = model.watchesToken
         do {
-            data = try await client.analytics(days: days, watchId: watchId, marketplace: marketplace)
-            error = nil
-            if watches.isEmpty {
-                watches = (try? await client.watches()) ?? []
+            async let loaded = client.analytics(days: days, watchId: watchId, marketplace: marketplace)
+            // Refetch the picker's watches after any watch change; on failure
+            // keep the previous list and try again next load.
+            if store.watchesLoadedFor != watchesToken, let watches = try? await client.watches() {
+                store.watches = watches
+                store.watchesLoadedFor = watchesToken
             }
+            store.data = try await loaded
+            store.error = nil
+            return true
         } catch {
-            if !error.isCancellation { self.error = error.localizedDescription }
+            if !error.isCancellation { store.error = error.localizedDescription }
+            return false
         }
     }
 }

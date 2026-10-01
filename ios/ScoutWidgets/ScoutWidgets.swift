@@ -24,7 +24,7 @@ struct ScoutWidgetIntent: WidgetConfigurationIntent {
 
 struct DealsWidget: Widget {
     var body: some WidgetConfiguration {
-        AppIntentConfiguration(kind: "ScoutDeals", intent: ScoutWidgetIntent.self, provider: ScoutTimelineProvider()) { entry in
+        AppIntentConfiguration(kind: "ScoutDeals", intent: ScoutWidgetIntent.self, provider: ScoutTimelineProvider(drawsThumbnails: true)) { entry in
             DealsWidgetView(entry: entry)
         }
         .configurationDisplayName("Top deals")
@@ -35,7 +35,7 @@ struct DealsWidget: Widget {
 
 struct SummaryWidget: Widget {
     var body: some WidgetConfiguration {
-        AppIntentConfiguration(kind: "ScoutSummary", intent: ScoutWidgetIntent.self, provider: ScoutTimelineProvider()) { entry in
+        AppIntentConfiguration(kind: "ScoutSummary", intent: ScoutWidgetIntent.self, provider: ScoutTimelineProvider(drawsThumbnails: false)) { entry in
             SummaryWidgetView(entry: entry)
         }
         .configurationDisplayName("Scout summary")

@@ -12,6 +12,10 @@ struct ListingsView: View {
     @State private var pagination: Pagination?
     @State private var loadingMore = false
     @State private var error: String?
+    /// The filters and search the rows were loaded for.
+    @State private var loadedQuery: LoadedQuery?
+    /// Bumped when triage needs a reload rather than a row patch.
+    @State private var triageReloads = 0
 
     init(watch: WatchListingsRoute? = nil) {
         self.watch = watch
@@ -24,10 +28,15 @@ struct ListingsView: View {
         var visibility: ListingVisibility = .visible
     }
 
-    private struct LoadKey: Hashable {
+    private struct LoadedQuery: Hashable {
         var filters: Filters
         var search: String
+    }
+
+    private struct LoadKey: Hashable {
+        var query: LoadedQuery
         var refreshToken: Int
+        var triageReloads: Int
     }
 
     var body: some View {
@@ -51,19 +60,22 @@ struct ListingsView: View {
             }
         }
         .listStyle(.plain)
-        .overlay { LoadingOverlay(isLoaded: pagination != nil, error: error, retry: reload) }
+        .overlay { LoadingOverlay(isLoaded: pagination != nil, error: error, retry: { await reload() }) }
         .navigationTitle(watch?.name ?? "Listings")
         .searchable(text: $search, prompt: "Search titles")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) { filterMenu }
         }
         .refreshable { await reload() }
-        .task(id: LoadKey(filters: filters, search: search, refreshToken: model.refreshToken)) {
-            if !search.isEmpty {
+        .reloadOnChange(of: LoadKey(query: LoadedQuery(filters: filters, search: search), refreshToken: model.refreshToken, triageReloads: triageReloads)) {
+            if !search.isEmpty, LoadedQuery(filters: filters, search: search) != loadedQuery {
                 try? await Task.sleep(nanoseconds: 350_000_000)
-                if Task.isCancelled { return }
+                if Task.isCancelled { return false }
             }
-            await reload()
+            return await reload()
+        }
+        .onChange(of: model.listingAction) { _, action in
+            if let action { apply(action) }
         }
     }
 
@@ -108,15 +120,32 @@ struct ListingsView: View {
         )
     }
 
-    private func reload() async {
-        guard let client = model.client else { return }
+    /// Loads page 1 for new filters or search. For the same ones it refetches
+    /// every page already loaded in one request, so a refresh keeps the rows
+    /// and scroll position instead of dropping back to the first page.
+    @discardableResult
+    private func reload() async -> Bool {
+        guard let client = model.client else { return false }
+        let current = LoadedQuery(filters: filters, search: search)
+        let pages = current == loadedQuery ? ReloadPolicy.pagesToKeep(loadedRows: listings.count, maxRows: 500) : 1
+        var request = query(page: 1)
+        request.pageSize = pages * 50
         do {
-            let page = try await client.listings(query(page: 1))
+            let action = model.listingAction
+            var page = try await client.listings(request)
+            // Triage patches rows in place, so a response the server may have
+            // built before a triage event arrived would undo it.
+            if model.listingAction != action {
+                page = try await client.listings(request)
+            }
             listings = page.listings
-            pagination = page.pagination
+            pagination = Pagination(page: pages, pageSize: 50, total: page.pagination.total, hasNext: page.pagination.total > pages * 50)
+            loadedQuery = current
             error = nil
+            return true
         } catch {
             if !error.isCancellation { self.error = error.localizedDescription }
+            return false
         }
     }
 
@@ -136,13 +165,39 @@ struct ListingsView: View {
 
     private func replace(_ listing: Listing) {
         guard let index = listings.firstIndex(where: { $0.rowID == listing.rowID }) else { return }
-        let leavesFilter = (filters.visibility == .visible && listing.hidden == true)
-            || (filters.visibility == .hidden && listing.hidden != true)
-            || (filters.decision != nil && listing.decision != filters.decision)
-        if leavesFilter {
-            listings.remove(at: index)
-        } else {
+        if triageFilter.admits(listing) {
             listings[index] = listing
+        } else {
+            listings.remove(at: index)
+            dropFromTotal(1)
+        }
+    }
+
+    private var triageFilter: ListingFilter {
+        ListingFilter(decision: filters.decision, visibility: filters.visibility)
+    }
+
+    /// Rows that left the filters are no longer counted by the server either.
+    private func dropFromTotal(_ removed: Int) {
+        guard removed > 0, var pagination else { return }
+        pagination.total = max(0, pagination.total - removed)
+        self.pagination = pagination
+    }
+
+    /// Triage from any client. This list shows no stats, so decision and
+    /// hidden are patched into loaded rows (dropping those that leave the
+    /// filters); it reloads only when a listing that isn't loaded may now
+    /// belong in it.
+    private func apply(_ action: ListingActionEvent) {
+        guard pagination != nil else { return }
+        switch action.triage(listings, filter: triageFilter) {
+        case let .patched(rows, removed):
+            listings = rows
+            dropFromTotal(removed)
+        case .reload:
+            triageReloads += 1
+        case .unchanged:
+            break
         }
     }
 }

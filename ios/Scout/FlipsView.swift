@@ -89,7 +89,7 @@ struct FlipsView: View {
             SellFlipView(flip: flip, feePresets: data?.feePresets ?? .defaults) { saved in replace(saved) }
         }
         .refreshable { await load() }
-        .task(id: model.refreshToken) { await load() }
+        .task(id: model.flipsToken) { await load() }
     }
 
     private var summary: FlipsSummary? {
