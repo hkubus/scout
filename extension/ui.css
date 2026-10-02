@@ -1,18 +1,62 @@
-body { font: 13px/1.4 system-ui, sans-serif; color: #1c2433; margin: 0; }
-.muted { color: #5c6678; font-size: 12px; }
-button { font: inherit; font-size: 12px; font-weight: 600; padding: 6px 10px; border-radius: 7px; border: 1px solid #c3cad6; background: #fff; color: #1c2433; cursor: pointer; }
-button:hover { border-color: #1d61e8; }
-.popup { width: 340px; }
-.popup header { display: flex; gap: 8px; align-items: baseline; padding: 12px 14px 8px; border-bottom: 1px solid #e3e7ee; }
-.popup header span { color: #5c6678; }
-.popup main { max-height: 460px; overflow: auto; padding: 4px 14px; }
-.popup footer { padding: 8px 14px 12px; border-top: 1px solid #e3e7ee; }
-.flip { padding: 10px 0; border-bottom: 1px solid #eef1f5; }
-.flip-title { font-weight: 700; }
-.platforms { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
-.platforms .listed { color: #3aab61; }
-.options { max-width: 520px; margin: 32px auto; padding: 0 16px; }
-.options form { display: grid; gap: 12px; margin: 16px 0; }
-.options label { display: grid; gap: 4px; font-weight: 600; }
-.options input { font: inherit; padding: 8px 10px; border: 1px solid #c3cad6; border-radius: 7px; }
-.options button[type=submit] { justify-self: start; background: #1d61e8; border-color: #1d61e8; color: #fff; }
+/* Scout's tokens and controls (src/styles.css), light and dark. */
+:root {
+  --bg: #f8fafc; --surface: #fff; --surface-muted: #f8faff; --text: #182133; --text-strong: #101827; --muted: #667085;
+  --line: #e1e6ee; --line-strong: #d6dce6; --blue: #1d61e8; --blue-deep: #1556d2; --blue-soft: #eaf1ff; --green: #3aab61; --orange: #f15a35;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #101214; --surface: #15181c; --surface-muted: #171b20; --text: #dce2ed; --text-strong: #f7f9fc; --muted: #a2adbd; --line: #2a3039; --line-strong: #353c48; --blue: #2b70ff; --blue-deep: #1b5be5; --blue-soft: #182642; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 13px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--text); background: var(--bg); }
+button, input { font: inherit; }
+.muted { color: var(--muted); font-size: 12px; }
+
+.brand-row { display: flex; align-items: center; gap: 10px; }
+.brand-row img { width: 26px; height: 26px; }
+.brand-name { color: var(--text-strong); font-size: 18px; font-weight: 750; letter-spacing: -.6px; }
+.brand-sub { color: var(--muted); font-size: 12px; }
+
+.primary-button { min-height: 40px; padding: 0 17px; border: 0; border-radius: 8px; background: var(--blue); color: #fff; box-shadow: 0 6px 12px rgba(29, 97, 232, .16); font-size: 14px; font-weight: 600; cursor: pointer; }
+.primary-button:hover { background: var(--blue-deep); }
+.link-button { border: 0; padding: 0; background: transparent; color: var(--blue); font-size: 12px; font-weight: 600; cursor: pointer; }
+.link-button:hover { text-decoration: underline; }
+
+/* Popup */
+.popup { width: 400px; background: var(--surface); }
+.popup header { padding: 14px 16px 12px; border-bottom: 1px solid var(--line); }
+.popup main { max-height: 480px; overflow: auto; padding: 10px 12px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; background: var(--bg); }
+.popup main > .muted { padding: 18px 6px; text-align: center; }
+.popup footer { display: flex; justify-content: space-between; align-items: center; padding: 10px 16px 12px; border-top: 1px solid var(--line); }
+.flip { padding: 11px 12px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.flip-title { color: var(--text-strong); font-size: 13px; font-weight: 650; letter-spacing: -.15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flip-meta { margin-top: 2px; color: var(--muted); font-size: 11px; }
+.flip-meta.warn { color: var(--orange); }
+.platforms { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.3fr) minmax(0, .9fr); gap: 6px; margin-top: 10px; }
+.platform { display: grid; gap: 1px; min-height: 44px; padding: 6px 8px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); color: var(--text); text-align: left; cursor: pointer; transition: border-color .18s ease, color .18s ease; }
+.platform:hover { border-color: var(--blue); color: var(--blue); }
+.platform strong { font-size: 11.5px; letter-spacing: -.1px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.platform span { color: var(--muted); font-size: 11px; }
+.platform.listed { border-color: rgba(58, 171, 97, .45); }
+.platform.listed span { color: var(--green); }
+.record { display: grid; gap: 8px; padding: 11px 16px 12px; border-top: 1px solid var(--line); }
+.record-text { display: grid; gap: 1px; }
+.record-text strong { color: var(--text-strong); font-size: 12px; font-weight: 650; }
+.record-buttons { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.3fr) minmax(0, .9fr); gap: 6px; }
+.record-button { min-height: 30px; padding: 0 8px; border: 1px dashed var(--line-strong); border-radius: 7px; background: var(--surface); color: var(--text); font-size: 11.5px; font-weight: 600; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.record-button:hover { border-color: var(--blue); color: var(--blue); }
+
+/* Options */
+.options { padding: 40px 16px; }
+.options .card { max-width: 540px; margin: 0 auto; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: 0 10px 24px rgba(31, 50, 83, .06); }
+.options .card > header { padding: 20px 24px 16px; border-bottom: 1px solid var(--line); }
+.options .card > header p { margin: 10px 0 0; }
+.options form { display: grid; gap: 16px; padding: 18px 24px 22px; }
+.options label { display: grid; gap: 7px; font-size: 12px; font-weight: 600; }
+.options label .muted { font-size: 11px; font-weight: 400; }
+.options input, .options select { width: 100%; min-height: 40px; padding: 0 11px; border: 1px solid var(--line-strong); border-radius: 7px; outline: 0; background: var(--surface); color: var(--text); font-size: 13px; font-weight: 400; }
+.options input:focus, .options select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-soft); }
+.options .primary-button { justify-self: start; }
+.options #result:empty { display: none; }
+.options #result { margin: 0; padding: 10px 12px; border-radius: 7px; background: var(--blue-soft); color: var(--text); font-size: 12px; }
+.options .card > footer { padding: 14px 24px 18px; border-top: 1px solid var(--line); }

@@ -114,7 +114,7 @@ app.addHook('onRequest', async (request, reply) => {
   const route = request.routeOptions.url;
   if (!isProtectedRoute(route)) return;
 
-  const expensive = route === '/mcp' || /\/search$|\/categories$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route);
+  const expensive = route === '/mcp' || /\/search$|\/categories$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/listing-draft$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route);
   const limit = expensive ? 30 : 240;
   // Snapshot images use the general limit so a screen of saved photos loads.
   // Key on the route template, not the raw URL, so ids cannot mint new buckets.
@@ -673,6 +673,20 @@ app.put('/api/flips/:id/listing', async (request, reply) => {
   }).strict().nullable().safeParse(request.body);
   if (!listing.success) return reply.code(400).send({ error: 'Invalid listing draft', details: listing.error.flatten() });
   return { flip: flips.setListing(params.data.id, listing.data) };
+});
+app.post('/api/flips/:id/listing-draft', async (request, reply) => {
+  const params = flipIdParams.safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid flip id is required' });
+  const flip = flips.get(params.data.id);
+  if (!flip.listingKey) return reply.code(409).send({ error: 'This flip was not added from a Scout listing, so there is nothing to draft from' });
+  // Photos come along only while the flip has none, so a redraft never
+  // duplicates them or undoes the operator's own selection.
+  const { draft, images } = await service.draftResaleListing(flip.listingKey, { photos: flip.photos.length === 0 });
+  let added = 0;
+  for (const image of images.slice(0, MAX_FLIP_PHOTOS)) {
+    try { flips.addPhoto(flip.id, image.data); added += 1; } catch { /* unreadable or oversized image: skip it */ }
+  }
+  return { draft, photosAdded: added, flip: flips.get(flip.id) };
 });
 // Raw image bodies (the photo is the whole request), checked by their bytes.
 app.addContentTypeParser(['image/jpeg', 'image/png', 'image/webp'], { parseAs: 'buffer', bodyLimit: MAX_FLIP_PHOTO_BYTES }, (_request, body, done) => done(null, body));

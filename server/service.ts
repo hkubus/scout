@@ -9,7 +9,7 @@ import type { Browser, BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, type SellerType, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult, olxDetailHint } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
-import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext } from './ai';
+import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, writeResaleListingWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext } from './ai';
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchVariantWithJev, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
 import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, verifyListingDescriptionWithVision, visionToVerification } from './vision';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
@@ -21,7 +21,7 @@ import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assi
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
-import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat } from '../src/types';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft } from '../src/types';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -223,6 +223,7 @@ export interface ScoutServiceDependencies {
   classifyConditionMatchWithJev?: typeof classifyConditionMatchWithJev;
   classifyWatchVariantWithJev?: typeof classifyWatchVariantWithJev;
   suggestVariantGroups?: typeof suggestVariantGroupsWithDeepSeek;
+  writeResaleListing?: typeof writeResaleListingWithDeepSeek;
   classifyListingRelevanceWithVision?: typeof classifyListingRelevanceWithVision;
   verifyListingDescriptionWithVision?: typeof verifyListingDescriptionWithVision;
   fetchListingDetailHtml?: (url: string, marketplace: Marketplace) => Promise<string>;
@@ -653,6 +654,7 @@ export class ScoutService {
   private readonly jevConditionMatch: typeof classifyConditionMatchWithJev;
   private readonly jevVariant: typeof classifyWatchVariantWithJev;
   private readonly aiVariantSuggestions: typeof suggestVariantGroupsWithDeepSeek;
+  private readonly aiResaleListing: typeof writeResaleListingWithDeepSeek;
   private readonly visionRelevance: typeof classifyListingRelevanceWithVision;
   private readonly visionVerification: typeof verifyListingDescriptionWithVision;
   private readonly detailHtml: (url: string, marketplace: Marketplace) => Promise<string>;
@@ -675,6 +677,7 @@ export class ScoutService {
     this.jevConditionMatch = dependencies.classifyConditionMatchWithJev ?? classifyConditionMatchWithJev;
     this.jevVariant = dependencies.classifyWatchVariantWithJev ?? classifyWatchVariantWithJev;
     this.aiVariantSuggestions = dependencies.suggestVariantGroups ?? suggestVariantGroupsWithDeepSeek;
+    this.aiResaleListing = dependencies.writeResaleListing ?? writeResaleListingWithDeepSeek;
     this.visionRelevance = dependencies.classifyListingRelevanceWithVision ?? classifyListingRelevanceWithVision;
     this.visionVerification = dependencies.verifyListingDescriptionWithVision ?? verifyListingDescriptionWithVision;
     this.detailHtml = dependencies.fetchListingDetailHtml ?? ((url, marketplace) => this.fetchPublicPage(url, marketplace));
@@ -2508,6 +2511,72 @@ export class ScoutService {
       }
     }
     return { groups: finalizeVariantSuggestions(suggestVariantGroupsFromTitles(samples, context), samples, existing), listings: samples.length, method: 'titles' };
+  }
+
+  /**
+   * Draft the operator's resale listing from the listing a flip was bought
+   * through: its saved description, or the live page when Scout never saved
+   * one. The AI rewrites it as the operator's own listing; without an API key
+   * (or when the call fails) the original text is returned to edit by hand.
+   * With `photos`, the original gallery comes back too: a preserved research
+   * copy's images, else the live page's gallery, else the search thumbnail.
+   */
+  async draftResaleListing(listingKey: string, options: { photos?: boolean } = {}): Promise<{ draft: ResaleListingDraft; images: Array<{ mime: string; data: Buffer }> }> {
+    const { marketplace, listingId } = parseListingKey(listingKey);
+    const ordinary = this.stmt('SELECT id, title, condition, url, image_url FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as Record<string, any> | undefined;
+    const research = ordinary ? undefined : this.stmt('SELECT id, title, NULL AS condition, url, image_url FROM market_listings WHERE marketplace = ? AND listing_id = ? ORDER BY last_seen_at DESC, id DESC LIMIT 1').get(marketplace, listingId) as Record<string, any> | undefined;
+    const row = ordinary ?? research;
+    if (!row) throw new ServiceError('Scout no longer has the listing this flip was bought from', 404);
+    const url = String(row.url);
+    // The detail page is fetched at most once, and only when something needs it.
+    let page: Promise<string | null> | undefined;
+    const html = () => page ??= this.detailHtml(url, marketplace).catch((error) => {
+      this.log('info', 'diagnostics', `Resale draft: could not fetch the original ${marketplace} listing ${listingId} — ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    });
+
+    const saved = (ordinary
+      ? this.stmt('SELECT description FROM listing_detail_snapshots WHERE listing_id = ? AND description IS NOT NULL ORDER BY captured_at DESC, id DESC LIMIT 1').get(row.id)
+      : this.stmt('SELECT description FROM market_listing_snapshots WHERE market_listing_id = ? AND description IS NOT NULL ORDER BY captured_at DESC, id DESC LIMIT 1').get(row.id)) as { description?: string | null } | undefined;
+    let description = saved?.description?.trim() || null;
+    if (!description) {
+      const fetched = await html();
+      description = fetched ? parseListingDescription(fetched, marketplace)?.trim() || null : null;
+    }
+
+    const images: Array<{ mime: string; data: Buffer }> = [];
+    if (options.photos) {
+      // Flip photos must be JPEG, PNG or WebP; other formats are skipped.
+      const usable = (mime: string) => mime === 'image/jpeg' || mime === 'image/png' || mime === 'image/webp';
+      if (research) {
+        const stored = this.stmt(`SELECT i.mime_type, i.data FROM market_listing_snapshot_images i
+          WHERE i.snapshot_id = (SELECT id FROM market_listing_snapshots WHERE market_listing_id = ? AND image_count > 0 ORDER BY captured_at DESC, id DESC LIMIT 1)
+          ORDER BY i.position, i.id`).all(row.id) as Array<{ mime_type: string; data: Uint8Array }>;
+        for (const image of stored) if (usable(image.mime_type)) images.push({ mime: image.mime_type, data: Buffer.from(image.data) });
+      }
+      if (!images.length) {
+        const fetched = await html();
+        let urls: string[] = [];
+        try { urls = fetched ? parseListingImageUrls(fetched, marketplace, SNAPSHOT_MAX_IMAGES * 4).slice(0, SNAPSHOT_MAX_IMAGES) : []; } catch { urls = []; }
+        if (!urls.length && row.image_url) urls = [String(row.image_url)];
+        for (let offset = 0; offset < urls.length; offset += 3) {
+          const batch = await Promise.all(urls.slice(offset, offset + 3).map((imageUrl) => this.fetchSnapshotImage(imageUrl, url).catch(() => null)));
+          for (const image of batch) if (image && usable(image.mime)) images.push(image);
+        }
+      }
+    }
+
+    const source = { marketplace, title: String(row.title), url, description };
+    const { apiKey, model } = this.deepSeekConfig();
+    if (apiKey) {
+      try {
+        const written = await this.aiResaleListing({ marketplace, title: source.title, condition: row.condition ? String(row.condition) : null, description }, { apiKey, model });
+        return { draft: { ...written, method: 'ai', source }, images };
+      } catch (error) {
+        this.log('error', 'diagnostics', `Resale draft for ${marketplace} ${listingId}: AI failed, returning the original text — ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return { draft: { title: source.title.slice(0, 70), description: description ?? '', condition: null, method: 'copy', source }, images };
   }
 
   /**

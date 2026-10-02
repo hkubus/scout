@@ -8,7 +8,7 @@ const api = globalThis.browser;
 /** The "add a listing" page of each marketplace. */
 const FORM_URLS = {
   OLX: "https://www.olx.pl/adding/",
-  "Allegro Lokalnie": "https://allegrolokalnie.pl/wystaw",
+  "Allegro Lokalnie": "https://allegrolokalnie.pl/o/oferty/wystaw",
   Vinted: "https://www.vinted.pl/items/new",
 };
 
@@ -88,14 +88,24 @@ const handlers = {
   async open({ flipId, channel }) {
     if (!FORM_URLS[channel]) throw new Error(`No form address for ${channel}`);
     const tab = await api.tabs.create({ url: FORM_URLS[channel], active: true });
-    await setJob(tab.id, { flipId, channel, openedAt: Date.now() });
+    // `filled` lists the fields already done, so a form that spreads over
+    // several pages fills each field once, on whichever page shows it.
+    await setJob(tab.id, { flipId, channel, openedAt: Date.now(), following: false, filled: [] });
     return { tabId: tab.id };
   },
   async job(_message, sender) {
     const job = sender.tab ? await getJob(sender.tab.id) : null;
     if (!job) return null;
+    if (job.mode === "record") return { mode: job.mode, channel: job.channel, steps: job.steps.length };
     const { flip, feePresets } = await flipById(job.flipId);
-    return { ...job, flip, feePresets };
+    const { parcelSize = "" } = await api.storage.local.get("parcelSize");
+    return { ...job, flip, feePresets, parcelSize };
+  },
+  async progress({ following, filled }, sender) {
+    const job = sender.tab ? await getJob(sender.tab.id) : null;
+    if (!job) throw new Error("This tab has no Scout listing to fill.");
+    await setJob(sender.tab.id, { ...job, following: Boolean(following), filled: Array.isArray(filled) ? filled : [] });
+    return { ok: true };
   },
   async photos(_message, sender) {
     const job = sender.tab ? await getJob(sender.tab.id) : null;
@@ -128,11 +138,64 @@ const handlers = {
     await clearJob(sender.tab.id);
     return { listedOn };
   },
+  // Recording: the operator walks a listing form by hand and Scout keeps the
+  // shape of every step (labels, options, buttons, clicks; never typed
+  // values), so the filling can be taught each marketplace's real flow.
+  async record({ channel }) {
+    if (!FORM_URLS[channel]) throw new Error(`No form address for ${channel}`);
+    const tab = await api.tabs.create({ url: FORM_URLS[channel], active: true });
+    await setJob(tab.id, { mode: "record", channel, startedAt: new Date().toISOString(), steps: [], clicks: [] });
+    return { tabId: tab.id };
+  },
+  recordStep({ step }, sender) {
+    return serially(async () => {
+      const job = sender.tab ? await getJob(sender.tab.id) : null;
+      if (job?.mode !== "record") throw new Error("This tab is not recording.");
+      if (job.steps.length < 80) job.steps.push(step);
+      await setJob(sender.tab.id, job);
+      return { steps: job.steps.length };
+    });
+  },
+  recordClick({ click }, sender) {
+    return serially(async () => {
+      const job = sender.tab ? await getJob(sender.tab.id) : null;
+      if (job?.mode !== "record") return { ok: false };
+      if (job.clicks.length < 600) job.clicks.push(click);
+      await setJob(sender.tab.id, job);
+      return { ok: true };
+    });
+  },
+  finishRecording: (message, sender) => serially(() => finishRecording(message, sender)),
   async dismiss(_message, sender) {
     if (sender.tab) await clearJob(sender.tab.id);
     return { ok: true };
   },
 };
+
+// Recording updates read, change and write the whole job; one at a time.
+let queue = Promise.resolve();
+function serially(task) {
+  const run = queue.then(task);
+  queue = run.catch(() => {});
+  return run;
+}
+
+async function finishRecording(_message, sender) {
+  const job = sender.tab ? await getJob(sender.tab.id) : null;
+  if (job?.mode !== "record") throw new Error("This tab is not recording.");
+  const { version } = api.runtime.getManifest();
+  const recording = { kind: "scout-form-recording", extension: version, channel: job.channel, startedAt: job.startedAt, finishedAt: new Date().toISOString(), steps: job.steps, clicks: job.clicks };
+  const url = URL.createObjectURL(new Blob([JSON.stringify(recording, null, 1)], { type: "application/json" }));
+  const stamp = recording.finishedAt.slice(0, 16).replace(/[:T]/g, "-");
+  const filename = `Scout/form-recordings/${job.channel.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${stamp}.json`;
+  try {
+    await api.downloads.download({ url, filename, conflictAction: "uniquify" });
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  }
+  await clearJob(sender.tab.id);
+  return { filename, steps: job.steps.length };
+}
 
 api.runtime.onMessage.addListener((message, sender) => {
   const handler = message && handlers[message.type];

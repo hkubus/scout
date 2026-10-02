@@ -4,8 +4,7 @@ const api = globalThis.browser;
 const PLATFORMS = ["OLX", "Allegro Lokalnie", "Vinted"];
 const content = document.getElementById("content");
 
-document.getElementById("options").addEventListener("click", (event) => {
-  event.preventDefault();
+document.getElementById("options").addEventListener("click", () => {
   api.runtime.openOptionsPage();
   window.close();
 });
@@ -35,27 +34,33 @@ async function load() {
     message("No unsold flips. Add one in Scout → Flips or with “I bought this”.");
     return;
   }
+  document.getElementById("server").textContent = status.serverUrl.replace(/^https?:\/\//, "");
   content.replaceChildren(...unsold.map((flip) => {
     const card = document.createElement("section");
     card.className = "flip";
     const title = document.createElement("div");
     title.className = "flip-title";
     title.textContent = flip.listing?.title || flip.title;
+    title.title = title.textContent;
     const detail = document.createElement("div");
-    detail.className = "muted";
     const photos = flip.photos.length;
-    detail.textContent = flip.listing
-      ? `${photos} photo${photos === 1 ? "" : "s"}${flip.listing.description ? "" : " · no description yet"}`
-      : "No listing text yet. Add it in Scout → Flips (megaphone button).";
+    const missing = !flip.listing ? "No listing yet. Open it in Scout → Flips (megaphone) to draft one." : !flip.listing.description ? "No description yet" : "";
+    detail.className = missing ? "flip-meta warn" : "flip-meta";
+    detail.textContent = [`${photos} photo${photos === 1 ? "" : "s"}`, missing].filter(Boolean).join(" · ");
     const buttons = document.createElement("div");
     buttons.className = "platforms";
     for (const channel of PLATFORMS) {
       const button = document.createElement("button");
       const listed = flip.listedOn.includes(channel);
       const price = flip.listing?.prices?.[channel];
-      button.textContent = `${listed ? "✓ " : ""}${channel}${price ? ` · ${Math.round(price)} zł` : ""}`;
+      button.type = "button";
+      button.className = listed ? "platform listed" : "platform";
+      const name = document.createElement("strong");
+      name.textContent = channel;
+      const sub = document.createElement("span");
+      sub.textContent = listed ? "✓ Listed" : price ? `${Math.round(price)} zł` : "No price";
+      button.append(name, sub);
       button.title = listed ? `Already listed on ${channel}; opens the form again` : `Open the ${channel} listing form and fill it`;
-      if (listed) button.className = "listed";
       button.addEventListener("click", async () => {
         try {
           await send("open", { flipId: flip.id, channel });
@@ -69,6 +74,23 @@ async function load() {
     card.append(title, detail, buttons);
     return card;
   }));
+}
+
+for (const channel of PLATFORMS) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "record-button";
+  button.textContent = channel;
+  button.title = `Open the ${channel} listing form and record its steps`;
+  button.addEventListener("click", async () => {
+    try {
+      await send("record", { channel });
+      window.close();
+    } catch (error) {
+      message(error.message);
+    }
+  });
+  document.getElementById("record").append(button);
 }
 
 load().catch((error) => message(error.message));

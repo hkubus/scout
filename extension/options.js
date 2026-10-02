@@ -2,12 +2,15 @@ const api = globalThis.browser;
 const form = document.getElementById("form");
 const serverUrl = document.getElementById("serverUrl");
 const apiToken = document.getElementById("apiToken");
+const parcelSize = document.getElementById("parcelSize");
 const result = document.getElementById("result");
 
-api.storage.local.get(["serverUrl", "apiToken"]).then((stored) => {
+api.storage.local.get(["serverUrl", "apiToken", "parcelSize"]).then((stored) => {
   serverUrl.value = stored.serverUrl || "";
   apiToken.value = stored.apiToken || "";
+  parcelSize.value = stored.parcelSize || "";
 });
+parcelSize.addEventListener("change", () => { void api.storage.local.set({ parcelSize: parcelSize.value }); });
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -27,7 +30,7 @@ form.addEventListener("submit", async (event) => {
     result.textContent = "Firefox needs permission to reach your Scout server.";
     return;
   }
-  await api.storage.local.set({ serverUrl: origin, apiToken: apiToken.value.trim() });
+  await api.storage.local.set({ serverUrl: origin, apiToken: apiToken.value.trim(), parcelSize: parcelSize.value });
   result.textContent = "Testing…";
   const reply = await api.runtime.sendMessage({ type: "flips" });
   result.textContent = reply?.ok

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, ArrowLeft, ArrowRight, Check, Download, ImagePlus, LoaderCircle, Megaphone, MoreHorizontal, Pencil, Plus, RotateCcw, Trash2, Wallet, X } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ArrowRight, Check, Download, ImagePlus, LoaderCircle, Megaphone, MoreHorizontal, Pencil, Plus, RotateCcw, Sparkles, Trash2, Wallet, X } from "lucide-react";
 import { api, forgetInFlightGets } from "./api";
 import { subscribe, subscribeStatus } from "./events";
 import {
@@ -22,7 +22,7 @@ import {
   type ListingCondition,
 } from "./profit";
 import { dayMonth, dayMonthYear, formatDate } from "./format";
-import type { Flip, FlipPhoto } from "./types";
+import type { Flip, FlipPhoto, ResaleListingDraft } from "./types";
 import { PageHeader } from "./ui";
 
 type ToastType = "success" | "error" | "info";
@@ -259,6 +259,8 @@ function ListingDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; fee
   const [uploading, setUploading] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [drafting, setDrafting] = useState(false);
+  const [draftNote, setDraftNote] = useState<string | null>(null);
   const base = toAmount(basePrice);
   const suggestion = (channel: FlipChannel) => (Number.isFinite(base) && base > 0 ? suggestedListingPrice(base, feePresets[channel]) : null);
   const priceFor = (channel: FlipChannel) => {
@@ -266,6 +268,46 @@ function ListingDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; fee
     return entered !== null && Number.isFinite(entered) && entered > 0 ? entered : suggestion(channel);
   };
   const valid = Boolean(title.trim()) && (basePrice.trim() === "" || (Number.isFinite(base) && base > 0)) && LISTING_PLATFORMS.every((channel) => !prices[channel]?.trim() || (Number.isFinite(toAmount(prices[channel])) && toAmount(prices[channel]) > 0));
+
+  const applyDraft = ({ draft: written, photosAdded, flip: updated }: { draft: ResaleListingDraft; photosAdded: number; flip: Flip }, replace: { title: boolean; text: boolean }) => {
+    if (photosAdded) setPhotos(updated.photos);
+    const photoNote = photosAdded ? ` Added ${photosAdded} photo${photosAdded === 1 ? "" : "s"} from it.` : "";
+    if (!replace.text) {
+      if (photosAdded) setDraftNote(`Added ${photosAdded} photo${photosAdded === 1 ? "" : "s"} from the original ${written.source.marketplace} listing.`);
+      return;
+    }
+    if (replace.title && written.title) setTitle(written.title);
+    if (written.description) setDescription(written.description);
+    if (written.condition) setCondition((current) => current || written.condition!);
+    setDraftNote((!written.description
+      ? `The original ${written.source.marketplace} listing has no description Scout could read.`
+      : written.method === "ai"
+        ? `Written from the original ${written.source.marketplace} listing. Check it before saving.`
+        : `Copied from the original ${written.source.marketplace} listing because AI is not configured. Remove anything about the previous seller.`) + photoNote);
+  };
+  const redraft = async () => {
+    setDrafting(true);
+    setError(null);
+    try {
+      applyDraft(await api.draftFlipListing(flip.id), { title: true, text: true });
+    } catch (draftError) {
+      setError(errorMessage(draftError));
+    } finally {
+      setDrafting(false);
+    }
+  };
+  // A new listing starts from the one the flip was bought through: its text
+  // when there is none yet, and its photos while the flip has none.
+  useEffect(() => {
+    if ((draft?.description && flip.photos.length) || !flip.listingKey) return;
+    let active = true;
+    setDrafting(true);
+    api.draftFlipListing(flip.id)
+      .then((result) => { if (active) applyDraft(result, { title: !draft?.description && title === flip.title, text: !draft?.description }); })
+      .catch((draftError) => { if (active) setDraftNote(`Could not draft from the original listing: ${errorMessage(draftError)}`); })
+      .finally(() => { if (active) setDrafting(false); });
+    return () => { active = false; };
+  }, []);
 
   const addPhotos = async (files: FileList | null) => {
     if (!files?.length) return;
@@ -317,11 +359,17 @@ function ListingDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; fee
       title="Listing"
       onClose={onClose}
       busy={busy || Boolean(uploading)}
-      footer={<><button className="outline-button" disabled={busy} onClick={onClose}>Close</button><button className="primary-button" disabled={!valid || busy || Boolean(uploading)} onClick={() => void save()}>{busy ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}Save listing</button></>}
+      footer={<><button className="outline-button" disabled={busy} onClick={onClose}>Close</button><button className="primary-button" disabled={!valid || busy || drafting || Boolean(uploading)} onClick={() => void save()}>{busy ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}Save listing</button></>}
     >
       <p className="field-hint">What the Scout browser extension fills into the OLX, Allegro Lokalnie and Vinted forms. You check each form and publish it yourself.</p>
       <label className="field-label">Title <span>{title.trim().length} characters</span><input value={title} onChange={(event) => setTitle(event.target.value)} maxLength={200} /></label>
-      <label className="field-label">Description <span>{description.length} characters</span><textarea rows={7} value={description} onChange={(event) => setDescription(event.target.value)} maxLength={9000} placeholder="Model, condition, what's included, tested how, why you're selling" /></label>
+      <label className="field-label">Description <span>{description.length} characters</span><textarea rows={9} value={description} disabled={drafting} onChange={(event) => setDescription(event.target.value)} maxLength={9000} placeholder={drafting ? "Writing a description from the original listing…" : "Model, condition, what's included, tested how"} /></label>
+      {flip.listingKey ? (
+        <div className="listing-draft-row">
+          <button type="button" className="panel-link" disabled={drafting} onClick={() => void redraft()}>{drafting ? <LoaderCircle size={14} className="spin" /> : <Sparkles size={14} />}{drafting ? "Writing…" : "Rewrite from the original listing"}</button>
+          {draftNote ? <small className="field-hint">{draftNote}</small> : null}
+        </div>
+      ) : null}
       <div className="field-row">
         <label className="field-label">Condition<select value={condition} onChange={(event) => setCondition(event.target.value as ListingCondition | "")}><option value="">Set on each site</option>{LISTING_CONDITIONS.map((option) => <option key={option} value={option}>{LISTING_CONDITION_LABELS[option].label}</option>)}</select></label>
         <label className="field-label">You want to receive <span>before fees, PLN</span><input inputMode="decimal" value={basePrice} onChange={(event) => setBasePrice(event.target.value)} placeholder="e.g. 1450" /></label>

@@ -8,8 +8,12 @@ submits a form, so the marketplaces see you listing from your own browser.
 ## Set up
 
 1. In Scout, open **Flips**, press the megaphone button on an unsold flip, and
-   add the listing text, a price, and photos. Photos can also be added from
-   the iOS app, in the flip's editor.
+   add a price and photos. For a flip added with "I bought this", Scout drafts
+   the title and description from the listing you bought it through (rewritten
+   by AI when OpenRouter is configured, otherwise copied for you to edit).
+   Its photos are copied in too while the flip has none.
+   **Rewrite from the original listing** drafts it again. Photos can also be
+   added from the iOS app, in the flip's editor.
 2. Install the extension (see below), open its **Options**, and enter your
    Scout address and one of the server's `SCOUT_API_TOKENS`. Firefox asks once
    for access to that address. Scout must have sign-in enabled, since the
@@ -19,9 +23,13 @@ submits a form, so the marketplaces see you listing from your own browser.
 
 1. Click the Scout toolbar button and choose a platform for an unsold flip.
    The listing form opens in a new tab, and a small Scout panel appears.
-2. Go to the step with the title and description (log in or pick a category
-   first if the site asks), then press **Fill this form**. The panel shows what
-   was filled and what is left, usually the category, shipping and parcel size.
+2. Log in or pick a category first if the site asks, then press **Fill this
+   form**. Scout fills what the page shows and keeps watching: on forms with
+   several steps, such as Allegro Lokalnie, where the price comes later, it
+   fills each remaining field when its step appears. The panel lists each
+   field as filled, waiting for its step, or left for you. Fields that already
+   hold text are not overwritten, and the panel's minimize button gets it out
+   of the way. Category, delivery and parcel size are always yours to pick.
 3. Check everything, publish, then press **I published it**. Scout ticks the
    platform in the flip's "Listed on", which feeds the delist checklist when it
    sells.
@@ -30,6 +38,32 @@ If a field isn't filled after a site redesign, press **Report form fields**. It
 copies a description of the form's fields (names and labels, not your data) so
 the matching can be updated. **Download photos** saves the photos to
 `Downloads/Scout/…` so you can drag them in by hand.
+
+What it does beyond the title, description, price, condition and photos:
+
+- **OLX:** presses **Dalej** (next) after the title, and with a **Default parcel
+  size** set in Options, switches on Przesyłka OLX with that size. OLX picks the
+  category from the title.
+- **Allegro Lokalnie:** takes the first suggested category, then leaves the
+  product match and features (Cechy) to you. After you press **Kolejny krok**
+  it fills the price, picks the parcel size, chooses "Nie chcę wyróżniać" (no
+  paid promotion), and stops on the summary page.
+- **Vinted:** searches categories with words from the title and takes the
+  first match, then picks the condition and the parcel weight.
+
+Check the category it chose; the panel names it. It never presses a publish
+button ("Dodaj ogłoszenie", "Wystaw…", Vinted's "Dodaj").
+
+## Record a form
+
+To teach Scout a marketplace's full flow (category pickers, item details,
+delivery), press that marketplace under **Teach Scout a form** in the popup.
+Go through the form as if listing a real item, without publishing, then press
+**Finish and save**. The extension saves a JSON file to
+`Downloads/Scout/form-recordings/` with each step's headings, form fields,
+dropdown options and buttons, plus what you clicked. It never stores what you
+type, only whether a field has a value. This runs in your own browser, so it
+avoids the bot checks an automated browser runs into.
 
 ## Install
 

@@ -6,19 +6,32 @@
 <link rel="stylesheet" href="ui.css">
 </head>
 <body class="options">
-  <h1>Scout listing helper</h1>
-  <p class="muted">Fills the OLX, Allegro Lokalnie and Vinted listing forms from your Scout flips. You always check the form and publish it yourself.</p>
-  <form id="form">
-    <label>Scout address
-      <input id="serverUrl" type="url" required placeholder="https://scout.example.com">
-    </label>
-    <label>API token <span class="muted">one of the server's SCOUT_API_TOKENS</span>
-      <input id="apiToken" type="password" autocomplete="off" required>
-    </label>
-    <button type="submit">Save and test</button>
-  </form>
-  <p id="result" class="muted"></p>
-  <p class="muted">The token is kept in this Firefox profile and only sent to the Scout address above. The marketplace pages never see it.</p>
+  <div class="card">
+    <header>
+      <div class="brand-row"><img src="icon.svg" alt=""><span class="brand-name">Scout</span><span class="brand-sub">Listing helper</span></div>
+      <p class="muted">Fills the OLX, Allegro Lokalnie and Vinted listing forms from your Scout flips. You always check the form and publish it yourself.</p>
+    </header>
+    <form id="form">
+      <label>Scout address
+        <input id="serverUrl" type="url" required placeholder="https://scout.example.com">
+      </label>
+      <label>API token <span class="muted">One of the server's SCOUT_API_TOKENS</span>
+        <input id="apiToken" type="password" autocomplete="off" required>
+      </label>
+      <label>Default parcel size <span class="muted">Turns on OLX shipping (Przesyłka OLX) with this size. You can change it before publishing.</span>
+        <select id="parcelSize">
+          <option value="">Leave shipping to me</option>
+          <option value="S">S · CD, pendrive, gloves</option>
+          <option value="M">M · phone, tablet, shoes</option>
+          <option value="L">L · laptop, printer, coat</option>
+          <option value="XL">XL · lamp, pram, microwave</option>
+        </select>
+      </label>
+      <p id="result" role="status"></p>
+      <button type="submit" class="primary-button">Save and test</button>
+    </form>
+    <footer><p class="muted">The token is kept in this Firefox profile and only sent to the Scout address above. The marketplace pages never see it.</p></footer>
+  </div>
   <script src="options.js"></script>
 </body>
 </html>

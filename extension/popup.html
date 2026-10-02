@@ -5,9 +5,13 @@
 <link rel="stylesheet" href="ui.css">
 </head>
 <body class="popup">
-  <header><strong>Scout</strong><span>list a flip</span></header>
+  <header class="brand-row"><img src="icon.svg" alt=""><span class="brand-name">Scout</span><span class="brand-sub">List a flip</span></header>
   <main id="content"><p class="muted">Loading your flips…</p></main>
-  <footer><a href="#" id="options">Options</a></footer>
+  <section class="record">
+    <div class="record-text"><strong>Teach Scout a form</strong><span class="muted">Go through a listing form once while Scout records its steps.</span></div>
+    <div class="record-buttons" id="record"></div>
+  </section>
+  <footer><span class="muted" id="server"></span><button type="button" class="link-button" id="options">Options</button></footer>
   <script src="popup.js"></script>
 </body>
 </html>

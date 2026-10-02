@@ -132,3 +132,75 @@ test('suggested listing prices leave the same amount on every platform', () => {
   assert.equal(suggestedListingPrice(0, DEFAULT_FEE_PRESETS.OLX), null);
   assert.equal(suggestedListingPrice(100, { percent: 100, fixed: 0 }), null);
 });
+
+test('a resale draft starts from the saved original listing and falls back to its text', async () => {
+  const { ScoutService } = await import('../server/service');
+  const directory = mkdtempSync(join(tmpdir(), 'scout-resale-draft-'));
+  const db = openDatabase(join(directory, 'scout.sqlite'));
+  const previousKey = process.env.SCOUT_OPENROUTER_API_KEY;
+  process.env.SCOUT_OPENROUTER_API_KEY = 'test-key';
+  const seen: Array<{ title: string; description: string | null }> = [];
+  let fail = false;
+  let fetched = 0;
+  const service = new ScoutService(db, () => {}, {
+    writeResaleListing: async (context) => {
+      seen.push({ title: context.title, description: context.description });
+      if (fail) throw new Error('provider down');
+      return { title: 'Sony WH-1000XM4 słuchawki', description: 'Sprzedam słuchawki.\n- etui w zestawie', condition: 'good' };
+    },
+    fetchListingDetailHtml: async () => { fetched += 1; throw new Error('offline'); },
+  });
+  try {
+    const now = new Date().toISOString();
+    const saved = db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run('OLX', 'a1', 'Sony WH-1000XM4 okazja', 500, 'https://www.olx.pl/d/oferta/a1', now, now);
+    db.prepare(`INSERT INTO listing_detail_snapshots (listing_id, marketplace, external_listing_id, title, price_pln, url, description, state_hash, captured_at)
+      VALUES (?, 'OLX', 'a1', 'Sony WH-1000XM4 okazja', 500, 'https://www.olx.pl/d/oferta/a1', ?, 'h1', ?)`).run(saved.lastInsertRowid, 'Etui w zestawie. Odbiór Kraków, tel 600100200.', now);
+
+    const { draft: written, images: none } = await service.draftResaleListing('OLX:a1');
+    assert.deepEqual(none, [], 'photos are only fetched when asked for');
+    assert.equal(written.method, 'ai');
+    assert.equal(written.condition, 'good');
+    assert.equal(written.source.description, 'Etui w zestawie. Odbiór Kraków, tel 600100200.');
+    assert.deepEqual(seen[0], { title: 'Sony WH-1000XM4 okazja', description: 'Etui w zestawie. Odbiór Kraków, tel 600100200.' });
+    assert.equal(fetched, 0, 'a saved description is used without fetching the page');
+
+    fail = true;
+    const { draft: copied } = await service.draftResaleListing('OLX:a1');
+    assert.equal(copied.method, 'copy');
+    assert.equal(copied.description, 'Etui w zestawie. Odbiór Kraków, tel 600100200.');
+
+    // Without a saved description the live page is tried; a failure still drafts.
+    db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run('Vinted', 'v1', 'Kurtka Patagonia M', 200, 'https://www.vinted.pl/items/v1', now, now);
+    const { draft: bare } = await service.draftResaleListing('Vinted:v1');
+    assert.equal(fetched, 1);
+    assert.equal(bare.description, '');
+    assert.equal(bare.title, 'Kurtka Patagonia M');
+
+    // When the original page is gone, the search thumbnail is the photo; the
+    // page is fetched once for both the description and the gallery.
+    const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+    db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run('OLX', 'p1', 'Lampa', 90, 'https://www.olx.pl/d/oferta/p1', 'https://ireland.apollo.olxcdn.com/v1/files/p1/image', now, now);
+    const realFetch = globalThis.fetch;
+    const requested: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      requested.push(String(input));
+      return new Response(png, { status: 200, headers: { 'content-type': 'image/png' } });
+    }) as typeof fetch;
+    try {
+      const { images } = await service.draftResaleListing('OLX:p1', { photos: true });
+      assert.equal(images.length, 1);
+      assert.equal(images[0].mime, 'image/png');
+      assert.deepEqual(requested, ['https://ireland.apollo.olxcdn.com/v1/files/p1/image']);
+      assert.equal(fetched, 2);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+
+    await assert.rejects(service.draftResaleListing('OLX:missing'), (error: unknown) => error instanceof ServiceError && error.status === 404);
+  } finally {
+    if (previousKey === undefined) delete process.env.SCOUT_OPENROUTER_API_KEY;
+    else process.env.SCOUT_OPENROUTER_API_KEY = previousKey;
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

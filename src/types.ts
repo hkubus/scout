@@ -652,6 +652,16 @@ export interface FlipPhoto {
   byteSize: number;
 }
 
+/** A resale listing drafted from the listing a flip was bought through. */
+export interface ResaleListingDraft {
+  title: string;
+  description: string;
+  condition: import('./profit').ListingCondition | null;
+  /** `ai` when OpenRouter rewrote it, `copy` when it is the original text. */
+  method: 'ai' | 'copy';
+  source: { marketplace: string; title: string; url: string; description: string | null };
+}
+
 export interface FlipsData {
   flips: Flip[];
   feePresets: import('./profit').FeePresets;
