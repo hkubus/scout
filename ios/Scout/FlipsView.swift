@@ -412,7 +412,7 @@ struct FlipEditorView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         ForEach(photos) { photo in
-                            ServerImage(client: client, url: client.flipPhotoURL(id: photo.id)) {
+                            ServerImage(client: client, url: client.flipPhotoURL(id: photo.id), pointSize: 72) {
                                 Color.secondary.opacity(0.12)
                             }
                             .frame(width: 72, height: 72)
