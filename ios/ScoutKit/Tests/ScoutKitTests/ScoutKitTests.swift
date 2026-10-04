@@ -82,9 +82,9 @@ final class ClientTests: XCTestCase {
     }
 
     func testListingsQueryItems() {
-        let query = ListingsQuery(page: 2, marketplace: .vinted, search: "  xm5 ", watchId: "w1", sort: .strongest, decision: .buy)
+        let query = ListingsQuery(page: 2, marketplace: .vinted, search: "  xm5 ", watchId: "w1", sort: .strongest, decision: .buy, minStrength: 3)
         let items = Dictionary(uniqueKeysWithValues: query.queryItems.map { ($0.name, $0.value ?? "") })
-        XCTAssertEqual(items, ["page": "2", "pageSize": "50", "sort": "strongest", "visibility": "visible", "marketplace": "Vinted", "q": "xm5", "watchId": "w1", "decision": "buy"])
+        XCTAssertEqual(items, ["page": "2", "pageSize": "50", "sort": "strongest", "visibility": "visible", "marketplace": "Vinted", "q": "xm5", "watchId": "w1", "decision": "buy", "minStrength": "3"])
     }
 
     func testMapsServerErrors() async {

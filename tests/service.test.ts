@@ -129,6 +129,26 @@ test('filters listing pages by minimum strength, untriaged decisions and AI-filt
   } finally { context.close(); }
 });
 
+test('sorts the strongest listing page by tier, then the deepest discount', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const fresh = new Date().toISOString();
+    // One coarse tier for most rows, so the order within it is what matters.
+    context.db.prepare(`UPDATE watch_listings SET last_seen_at = ?, typical_source = 'own-history', deal_strength = CASE WHEN id % 4 = 0 THEN 4 ELSE 5 END`).run(fresh);
+    context.db.prepare(`UPDATE watch_listings SET typical_pln = (SELECT l.price_pln FROM listings l WHERE l.id = watch_listings.listing_id) * (1.5 + (id % 7) * 0.25)`).run();
+    const rows = context.service.listingsPage({ pageSize: 500, sort: 'strongest', aiFiltered: 'include', visibility: 'all' }).listings;
+    assert.ok(rows.length > 10);
+    assert.ok(new Set(rows.map((listing) => Math.round(listing.belowTypical ?? 0))).size > 3);
+    for (let index = 1; index < rows.length; index += 1) {
+      const previous = rows[index - 1];
+      const current = rows[index];
+      assert.ok(previous.dealStrength >= current.dealStrength);
+      if (previous.dealStrength === current.dealStrength) assert.ok((previous.belowTypical ?? 0) <= (current.belowTypical ?? 0) + 1e-9);
+    }
+  } finally { context.close(); }
+});
+
 test('keeps dashboard database work bounded as watch count grows', () => {
   const context = fixture();
   try {

@@ -7,7 +7,11 @@ private let topDealCount = 25
 /// The web's Top deals: Strong+ listings still worth a look, one status line.
 struct DealsView: View {
     @Environment(AppModel.self) private var model
+    @AppStorage("dealsSort") private var sort: ListingSort = .strongest
     @State private var dashboard: DashboardData?
+    /// Strong+ rows in `sort` order, queried from the whole feed rather than
+    /// ranked within the dashboard's newest rows.
+    @State private var deals: [Listing] = []
     @State private var error: String?
     @State private var scanQueued = false
     /// Bumped when triage needs a reload rather than a row patch.
@@ -17,7 +21,6 @@ struct DealsView: View {
         NavigationStack {
             List {
                 if let dashboard {
-                    let deals = topDeals(dashboard.listings)
                     Section {
                         if deals.isEmpty {
                             ContentUnavailableView("No strong deals right now", systemImage: "tag", description: Text("Listings at least 12% below their typical price show up here."))
@@ -42,13 +45,14 @@ struct DealsView: View {
             .overlay { LoadingOverlay(isLoaded: dashboard != nil, error: error, retry: { await load() }) }
             .navigationTitle("Deals")
             .toolbar {
+                ToolbarItem(placement: .topBarTrailing) { sortMenu }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Scan now", action: scanAll)
                         .disabled(scanQueued)
                 }
             }
             .refreshable { await load() }
-            .reloadOnChange(of: [model.refreshToken, triageReloads]) { await load() }
+            .reloadOnChange(of: LoadKey(sort: sort, refreshToken: model.refreshToken, triageReloads: triageReloads)) { await load() }
             .onChange(of: model.listingAction) { _, action in
                 if let action { apply(action) }
             }
@@ -56,18 +60,33 @@ struct DealsView: View {
         }
     }
 
-    /// Not hidden, not filtered by AI, not passed (the widget's rule) and
-    /// Strong or better; untriaged rows lead within a tier.
+    private struct LoadKey: Hashable {
+        var sort: ListingSort
+        var refreshToken: Int
+        var triageReloads: Int
+    }
+
+    private var sortMenu: some View {
+        Menu {
+            Picker("Sort", selection: $sort) {
+                Text("Strongest deal").tag(ListingSort.strongest)
+                Text("Newest").tag(ListingSort.newest)
+                Text("Lowest price").tag(ListingSort.price)
+            }
+        } label: {
+            Label("Sort", systemImage: "arrow.up.arrow.down")
+        }
+    }
+
+    /// Strong or better, visible, not filtered by AI (the server's default)
+    /// and not passed (the widget's rule). Passed rows are dropped here, so
+    /// the query asks for a page's worth of spare rows.
+    private var dealsQuery: ListingsQuery {
+        ListingsQuery(pageSize: topDealCount * 2, sort: sort, visibility: .visible, minStrength: 3)
+    }
+
     private func topDeals(_ listings: [Listing]) -> [Listing] {
-        let candidates = listings.filter {
-            $0.hidden != true && $0.aiFiltered != true && $0.decision != .pass && $0.dealStrength >= 3
-        }
-        let sorted = candidates.sorted { left, right in
-            if left.dealStrength != right.dealStrength { return left.dealStrength > right.dealStrength }
-            if (left.decision == nil) != (right.decision == nil) { return left.decision == nil }
-            return left.observedAt > right.observedAt
-        }
-        return Array(sorted.prefix(topDealCount))
+        Array(listings.filter { $0.hidden != true && $0.decision != .pass }.prefix(topDealCount))
     }
 
     /// "12 strong · 3 new today · scanned 5 min ago", plus the connection when it is not live.
@@ -87,13 +106,19 @@ struct DealsView: View {
         guard let client = model.client else { return false }
         do {
             let action = model.listingAction
-            var dashboard = try await client.dashboard()
+            let query = dealsQuery
+            async let fetchedDashboard = client.dashboard()
+            async let fetchedDeals = client.listings(query)
+            var dashboard = try await fetchedDashboard
+            var page = try await fetchedDeals
             // Triage patches rows in place, so a response the server may have
             // built before a triage event arrived would undo it.
             if model.listingAction != action {
                 dashboard = try await client.dashboard()
+                page = try await client.listings(query)
             }
             self.dashboard = dashboard
+            deals = topDeals(page.listings)
             error = nil
             model.publishWidgets(from: dashboard)
             return true
@@ -113,10 +138,15 @@ struct DealsView: View {
         }
         dashboard.listings = listings
         self.dashboard = dashboard
+        if let patched = action.patched(deals) { deals = topDeals(patched) }
         model.publishWidgets(from: dashboard)
     }
 
     private func replace(_ listing: Listing) {
+        if let index = deals.firstIndex(where: { $0.rowID == listing.rowID }) {
+            deals[index] = listing
+            deals = topDeals(deals)
+        }
         guard var dashboard else { return }
         if listing.hidden == true {
             dashboard.listings.removeAll { $0.rowID == listing.rowID }

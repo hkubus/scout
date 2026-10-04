@@ -43,15 +43,19 @@ public struct WidgetSnapshot: Codable, Hashable, Sendable {
     /// The listings a widget may show, in the order it shows them. The server's
     /// `/api/dashboard?top=N` applies the same filter and stable sort.
     public static func ranked(_ listings: [Listing]) -> [Listing] {
-        listings
-            .filter { $0.hidden != true && $0.aiFiltered != true && $0.decision != .pass }
-            .sorted { lhs, rhs in
-                if lhs.dealStrength != rhs.dealStrength { return lhs.dealStrength > rhs.dealStrength }
-                let left = lhs.belowTypical ?? 0
-                let right = rhs.belowTypical ?? 0
-                if left != right { return left < right }
-                return lhs.observedAt > rhs.observedAt
-            }
+        strongestFirst(listings.filter { $0.hidden != true && $0.aiFiltered != true && $0.decision != .pass })
+    }
+
+    /// Deal strength, then the biggest discount, then the newest: the
+    /// server's `sort=strongest` order.
+    public static func strongestFirst(_ listings: [Listing]) -> [Listing] {
+        listings.sorted { lhs, rhs in
+            if lhs.dealStrength != rhs.dealStrength { return lhs.dealStrength > rhs.dealStrength }
+            let left = lhs.belowTypical ?? 0
+            let right = rhs.belowTypical ?? 0
+            if left != right { return left < right }
+            return lhs.observedAt > rhs.observedAt
+        }
     }
 
     /// Same content as the widgets draw it. Ignores when it was generated,

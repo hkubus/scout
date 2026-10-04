@@ -388,6 +388,8 @@ public struct ListingsQuery: Hashable, Sendable {
     public var sort: ListingSort
     public var decision: ListingDecision?
     public var visibility: ListingVisibility
+    /// Lowest deal strength (1-5) to include; nil includes every tier.
+    public var minStrength: Int?
 
     public init(
         page: Int = 1,
@@ -397,7 +399,8 @@ public struct ListingsQuery: Hashable, Sendable {
         watchId: String? = nil,
         sort: ListingSort = .newest,
         decision: ListingDecision? = nil,
-        visibility: ListingVisibility = .visible
+        visibility: ListingVisibility = .visible,
+        minStrength: Int? = nil
     ) {
         self.page = page
         self.pageSize = pageSize
@@ -407,6 +410,7 @@ public struct ListingsQuery: Hashable, Sendable {
         self.sort = sort
         self.decision = decision
         self.visibility = visibility
+        self.minStrength = minStrength
     }
 
     var queryItems: [URLQueryItem] {
@@ -421,6 +425,7 @@ public struct ListingsQuery: Hashable, Sendable {
         if !trimmed.isEmpty { items.append(URLQueryItem(name: "q", value: String(trimmed.prefix(240)))) }
         if let watchId { items.append(URLQueryItem(name: "watchId", value: watchId)) }
         if let decision { items.append(URLQueryItem(name: "decision", value: decision.rawValue)) }
+        if let minStrength { items.append(URLQueryItem(name: "minStrength", value: String(minStrength))) }
         return items
     }
 }

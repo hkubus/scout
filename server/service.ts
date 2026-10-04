@@ -2995,8 +2995,10 @@ export class ScoutService {
       params.push(`%${ScoutService.escapeLike(query)}%`);
     }
     const where = predicates.join(' AND ');
+    // Strongest: tier, then the deepest discount (lowest price-to-typical
+    // ratio, unscored rows last), then the newest.
     const orderBy = options.sort === 'strongest'
-      ? 'wl.deal_strength DESC, wl.last_seen_at DESC, wl.id DESC'
+      ? 'COALESCE(wl.deal_strength, 1) DESC, CASE WHEN COALESCE(wl.typical_pln, l.typical_pln) > 0 THEN l.price_pln / COALESCE(wl.typical_pln, l.typical_pln) END ASC NULLS LAST, wl.last_seen_at DESC, wl.id DESC'
       : options.sort === 'price'
         ? 'l.price_pln ASC, wl.last_seen_at DESC, wl.id DESC'
         : 'wl.last_seen_at DESC, wl.id DESC';
