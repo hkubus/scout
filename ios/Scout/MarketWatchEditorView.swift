@@ -162,6 +162,7 @@ struct MarketWatchEditorView: View {
                 } else {
                     _ = try await client.createMarketWatch(draft)
                 }
+                model.play(.success)
                 model.refreshUnlessLive()
                 dismiss()
             } catch {

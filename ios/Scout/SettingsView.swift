@@ -13,96 +13,103 @@ struct SettingsView: View {
     @State private var apiTokenError: String?
     @State private var error: String?
 
+    /// Pushed from the gear on Deals.
     var body: some View {
         @Bindable var model = model
-        NavigationStack {
-            Form {
-                Section("Server") {
-                    LabeledContent("Address", value: model.serverURL?.absoluteString ?? "Demo data")
-                    LabeledContent("Live updates") {
-                        ConnectionIndicator()
-                            .foregroundStyle(.secondary)
-                    }
-                    if case let .offline(reason) = model.connection {
-                        Text(reason)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-                    // Connector trouble shows in the Connectors list below.
-                    if let readiness, !readiness.isReady {
-                        LabeledContent("Status", value: readiness.status.capitalized)
-                    }
-                    if let error {
-                        Text(error)
-                            .font(.footnote)
-                            .foregroundStyle(.red)
-                    }
-                    if let url = model.serverURL {
-                        Link(destination: url) {
-                            Label("Open web app", systemImage: "safari")
-                        }
-                    }
-                    Button(role: .destructive) {
-                        model.disconnect()
-                    } label: {
-                        Text(verbatim: model.isDemo ? "Leave demo" : "Change server")
+        Form {
+            Section {
+                NavigationLink(value: WatchesRoute()) {
+                    Label("Watches", systemImage: "binoculars")
+                }
+            } footer: {
+                Text("What Scout scans for deals, and how often.")
+            }
+
+            Section("Server") {
+                LabeledContent("Address", value: model.serverURL?.absoluteString ?? "Demo data")
+                LabeledContent("Live updates") {
+                    ConnectionIndicator()
+                        .foregroundStyle(.secondary)
+                }
+                if case let .offline(reason) = model.connection {
+                    Text(reason)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                // Connector trouble shows in the Connectors list below.
+                if let readiness, !readiness.isReady {
+                    LabeledContent("Status", value: readiness.status.capitalized)
+                }
+                if let error {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
+                if let url = model.serverURL {
+                    Link(destination: url) {
+                        Label("Open web app", systemImage: "safari")
                     }
                 }
+                Button(role: .destructive) {
+                    model.disconnect()
+                } label: {
+                    Text(verbatim: model.isDemo ? "Leave demo" : "Change server")
+                }
+            }
 
-                notificationsSection
+            notificationsSection
 
-                if !connectors.isEmpty {
-                    Section("Connectors") {
-                        ForEach(connectors, id: \.name) { connector in
-                            VStack(alignment: .leading, spacing: 3) {
-                                HStack {
-                                    Circle()
-                                        .fill(color(for: connector.status))
-                                        .frame(width: 8, height: 8)
-                                    Text(connector.name)
-                                    Spacer()
-                                    Text(connector.status == "OK" ? connector.lastSuccess : connector.status)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                // Only a problem needs its explanation.
-                                if connector.status != "OK" && connector.status != "Idle" {
-                                    Text(connector.detail)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(2)
-                                }
+            if !connectors.isEmpty {
+                Section("Connectors") {
+                    ForEach(connectors, id: \.name) { connector in
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack {
+                                Circle()
+                                    .fill(color(for: connector.status))
+                                    .frame(width: 8, height: 8)
+                                Text(connector.name)
+                                Spacer()
+                                Text(connector.status == "OK" ? connector.lastSuccess : connector.status)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            // Only a problem needs its explanation.
+                            if connector.status != "OK" && connector.status != "Idle" {
+                                Text(connector.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
                             }
                         }
                     }
                 }
+            }
 
-                apiTokenSection
+            apiTokenSection
 
-                Section {
-                    // The gallery is a screenshot surface; the system widget picker previews widgets for everyone else.
-                    if model.isDemo {
-                        Button {
-                            model.showWidgetGallery = true
-                        } label: {
-                            Label("Preview widgets", systemImage: "square.grid.2x2")
-                        }
+            Section {
+                // The gallery is a screenshot surface; the system widget picker previews widgets for everyone else.
+                if model.isDemo {
+                    Button {
+                        model.showWidgetGallery = true
+                    } label: {
+                        Label("Preview widgets", systemImage: "square.grid.2x2")
                     }
-                    LabeledContent("App version", value: Self.appVersion)
-                    if let version = health?.version {
-                        LabeledContent("Server version", value: version)
-                    }
-                } footer: {
-                    Text(widgetFooter)
                 }
+                LabeledContent("App version", value: Self.appVersion)
+                if let version = health?.version {
+                    LabeledContent("Server version", value: version)
+                }
+            } footer: {
+                Text(widgetFooter)
             }
-            .navigationTitle("Settings")
-            .navigationDestination(isPresented: $model.showWidgetGallery) {
-                WidgetGalleryView()
-            }
-            .refreshable { await load() }
-            .reloadOnChange(of: model.serverToken) { await load() }
         }
+        .navigationTitle("Settings")
+        .navigationDestination(isPresented: $model.showWidgetGallery) {
+            WidgetGalleryView()
+        }
+        .refreshable { await load() }
+        .reloadOnChange(of: model.serverToken) { await load() }
     }
 
     @discardableResult

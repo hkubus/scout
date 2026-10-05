@@ -14,8 +14,14 @@ struct DealsView: View {
     @State private var triageReloads = 0
 
     var body: some View {
-        NavigationStack {
+        @Bindable var model = model
+        NavigationStack(path: $model.dealsPath) {
             List {
+                if dashboard == nil && error == nil {
+                    Section {
+                        PlaceholderRows()
+                    }
+                }
                 if let dashboard {
                     let deals = topDeals(dashboard.listings)
                     Section {
@@ -26,7 +32,7 @@ struct DealsView: View {
                             NavigationLink(value: ListingLink(listing)) {
                                 ListingRow(listing: listing)
                             }
-                            .triageSwipeActions(for: listing) { updated in
+                            .triageActions(for: listing) { updated in
                                 replace(updated)
                             }
                         }
@@ -39,12 +45,22 @@ struct DealsView: View {
                     }
                 }
             }
-            .overlay { LoadingOverlay(isLoaded: dashboard != nil, error: error, retry: { await load() }) }
+            .overlay { LoadingOverlay(isLoaded: dashboard != nil, error: error, spinner: false, retry: { await load() }) }
             .navigationTitle("Deals")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button(action: scanAll) {
+                        Label(scanQueued ? "Scan queued" : "Scan now", systemImage: scanQueued ? "checkmark.circle" : "arrow.triangle.2.circlepath")
+                            .contentTransition(.symbolEffect(.replace))
+                    }
+                    .disabled(scanQueued)
+                }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Scan now", action: scanAll)
-                        .disabled(scanQueued)
+                    Button {
+                        model.dealsPath.append(SettingsRoute())
+                    } label: {
+                        Label("Settings", systemImage: "gearshape")
+                    }
                 }
             }
             .refreshable { await load() }
@@ -53,6 +69,8 @@ struct DealsView: View {
                 if let action { apply(action) }
             }
             .scoutDestinations()
+            .navigationDestination(for: SettingsRoute.self) { _ in SettingsView() }
+            .navigationDestination(for: WatchesRoute.self) { _ in WatchesView() }
         }
     }
 
@@ -93,7 +111,7 @@ struct DealsView: View {
             if model.listingAction != action {
                 dashboard = try await client.dashboard()
             }
-            self.dashboard = dashboard
+            show(dashboard)
             error = nil
             model.publishWidgets(from: dashboard)
             return true
@@ -112,18 +130,22 @@ struct DealsView: View {
             return
         }
         dashboard.listings = listings
-        self.dashboard = dashboard
+        withAnimation { show(dashboard) }
         model.publishWidgets(from: dashboard)
     }
 
+    /// Patched in place even when hidden: `topDeals` leaves hidden rows out,
+    /// and Undo can bring the row back where it was.
     private func replace(_ listing: Listing) {
-        guard var dashboard else { return }
-        if listing.hidden == true {
-            dashboard.listings.removeAll { $0.rowID == listing.rowID }
-        } else if let index = dashboard.listings.firstIndex(where: { $0.rowID == listing.rowID }) {
-            dashboard.listings[index] = listing
-        }
+        guard var dashboard, let index = dashboard.listings.firstIndex(where: { $0.rowID == listing.rowID }) else { return }
+        dashboard.listings[index] = listing
+        show(dashboard)
+    }
+
+    /// Also the tab badge: strong deals nobody has triaged yet.
+    private func show(_ dashboard: DashboardData) {
         self.dashboard = dashboard
+        model.untriagedDeals = topDeals(dashboard.listings).filter { $0.decision == nil }.count
     }
 
     /// Confirms in the status line instead of a blocking alert.
@@ -132,9 +154,10 @@ struct DealsView: View {
         Task { @MainActor in
             do {
                 _ = try await client.queueScan()
-                scanQueued = true
+                model.play(.success)
+                withAnimation { scanQueued = true }
                 try? await Task.sleep(for: .seconds(6))
-                scanQueued = false
+                withAnimation { scanQueued = false }
             } catch {
                 model.report(error)
             }

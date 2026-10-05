@@ -1,15 +1,13 @@
 import SwiftUI
 import ScoutKit
 
+/// Settings → Watches, pushed on the Deals stack, so its pushes go there too.
 struct WatchesView: View {
     @Environment(AppModel.self) private var model
     @State private var watches: [Watch]?
     @State private var includeArchived = false
     @State private var error: String?
-    @State private var path = NavigationPath()
     @State private var editor: WatchEditorRequest?
-    /// Bumped by a queued scan, for haptic confirmation.
-    @State private var scansQueued = 0
 
     private struct LoadKey: Hashable {
         var includeArchived: Bool
@@ -17,69 +15,102 @@ struct WatchesView: View {
     }
 
     var body: some View {
-        NavigationStack(path: $path) {
-            List {
-                if let watches {
-                    if watches.isEmpty {
-                        ContentUnavailableView("No watches", systemImage: "binoculars", description: Text("Tap + to create a watch."))
+        List {
+            if watches == nil && error == nil {
+                PlaceholderRows(thumbnail: nil)
+            }
+            if let watches {
+                if watches.isEmpty {
+                    ContentUnavailableView("No watches", systemImage: "binoculars", description: Text("Tap + to create a watch."))
+                }
+                ForEach(watches) { watch in
+                    NavigationLink(value: watch) {
+                        WatchRow(watch: watch)
                     }
-                    ForEach(watches) { watch in
-                        NavigationLink(value: watch) {
-                            WatchRow(watch: watch)
+                    .swipeActions(edge: .leading) {
+                        Button {
+                            scan(watch)
+                        } label: {
+                            Label("Scan now", systemImage: "arrow.triangle.2.circlepath")
                         }
-                        .swipeActions(edge: .leading) {
+                        .tint(.scoutBlue)
+                    }
+                    .swipeActions(edge: .trailing) {
+                        if !watch.isArchived {
                             Button {
-                                scan(watch)
+                                setEnabled(!watch.enabled, for: watch)
                             } label: {
-                                Label("Scan now", systemImage: "arrow.triangle.2.circlepath")
+                                Label(watch.enabled ? "Pause" : "Resume", systemImage: watch.enabled ? "pause.fill" : "play.fill")
                             }
-                            .tint(.scoutBlue)
-                        }
-                        .swipeActions(edge: .trailing) {
-                            if !watch.isArchived {
-                                Button {
-                                    setEnabled(!watch.enabled, for: watch)
-                                } label: {
-                                    Label(watch.enabled ? "Pause" : "Resume", systemImage: watch.enabled ? "pause.fill" : "play.fill")
-                                }
-                                .tint(watch.enabled ? Color.orange : Color.scoutGreen)
-                            }
+                            .tint(watch.enabled ? Color.orange : Color.scoutGreen)
                         }
                     }
-                    Section {
-                        Toggle("Show archived watches", isOn: $includeArchived)
-                    }
+                    .contextMenu { actions(for: watch) }
+                }
+                Section {
+                    Toggle("Show archived watches", isOn: $includeArchived)
                 }
             }
-            .sensoryFeedback(.success, trigger: scansQueued)
-            .overlay { LoadingOverlay(isLoaded: watches != nil, error: error, retry: { await load() }) }
-            .navigationTitle("Watches")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        editor = .create()
-                    } label: {
-                        Label("New watch", systemImage: "plus")
-                    }
+        }
+        .animation(.default, value: watches)
+        .overlay { LoadingOverlay(isLoaded: watches != nil, error: error, spinner: false, retry: { await load() }) }
+        .navigationTitle("Watches")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    editor = .create()
+                } label: {
+                    Label("New watch", systemImage: "plus")
                 }
             }
-            .refreshable { await load() }
-            .reloadOnChange(of: LoadKey(includeArchived: includeArchived, watchesToken: model.watchesToken)) { await load() }
-            .onChange(of: model.pendingWatchID) { _, id in
-                if id != nil { Task { @MainActor in await load() } }
+        }
+        .refreshable { await load() }
+        .reloadOnChange(of: LoadKey(includeArchived: includeArchived, watchesToken: model.watchesToken)) { await load() }
+        .onChange(of: model.pendingWatchID) { _, id in
+            if id != nil { Task { @MainActor in await load() } }
+        }
+        .onChange(of: model.pendingNewWatch != nil, initial: true) {
+            if let draft = model.pendingNewWatch {
+                model.pendingNewWatch = nil
+                editor = .create(draft)
             }
-            .onAppear {
-                if model.pendingNewWatch {
-                    model.pendingNewWatch = false
-                    editor = .create(WatchDraft(name: "Nintendo Switch OLED", query: "nintendo switch oled", excluded: "joy-con, etui", maxPrice: 1100))
-                }
+        }
+        .sheet(item: $editor) { request in
+            WatchEditorView(request: request) { created in
+                if let created { model.dealsPath.append(created) }
             }
-            .sheet(item: $editor) { request in
-                WatchEditorView(request: request) { created in
-                    if let created { path.append(created) }
-                }
+        }
+    }
+
+    @ViewBuilder
+    private func actions(for watch: Watch) -> some View {
+        Button {
+            scan(watch)
+        } label: {
+            Label("Scan now", systemImage: "arrow.triangle.2.circlepath")
+        }
+        if !watch.isArchived {
+            Button {
+                setEnabled(!watch.enabled, for: watch)
+            } label: {
+                Label(watch.enabled ? "Pause" : "Resume", systemImage: watch.enabled ? "pause" : "play")
             }
-            .scoutDestinations()
+        }
+        Button {
+            editor = .edit(watch)
+        } label: {
+            Label("Edit watch", systemImage: "pencil")
+        }
+        Button {
+            model.dealsPath.append(WatchListingsRoute(watchId: watch.id, name: watch.name))
+        } label: {
+            Label("Listings", systemImage: "list.bullet.rectangle")
+        }
+        Divider()
+        Button(role: watch.isArchived ? nil : .destructive) {
+            setArchived(!watch.isArchived, for: watch)
+        } label: {
+            Label(watch.isArchived ? "Restore watch" : "Archive watch", systemImage: watch.isArchived ? "tray.and.arrow.up" : "archivebox")
         }
     }
 
@@ -92,7 +123,7 @@ struct WatchesView: View {
             error = nil
             if let id = model.pendingWatchID, let watch = loaded.first(where: { $0.id == id }) {
                 model.pendingWatchID = nil
-                path.append(watch)
+                model.dealsPath.append(watch)
             }
             return true
         } catch {
@@ -106,7 +137,22 @@ struct WatchesView: View {
         Task { @MainActor in
             do {
                 try await client.updateWatch(id: watch.id, patch: WatchPatch(enabled: enabled))
+                model.play(.selection)
                 await load()
+            } catch {
+                model.report(error)
+            }
+        }
+    }
+
+    private func setArchived(_ archived: Bool, for watch: Watch) {
+        guard let client = model.client else { return }
+        Task { @MainActor in
+            do {
+                try await client.updateWatch(id: watch.id, patch: WatchPatch(archived: archived))
+                model.play(.success)
+                await load()
+                model.refreshUnlessLive()
             } catch {
                 model.report(error)
             }
@@ -118,7 +164,7 @@ struct WatchesView: View {
         Task { @MainActor in
             do {
                 _ = try await client.queueScan(watchId: watch.id)
-                scansQueued += 1
+                model.play(.success)
             } catch {
                 model.report(error)
             }
@@ -139,12 +185,12 @@ struct WatchStatusBadge: View {
     }
 
     var body: some View {
-        Text(status)
-            .font(.caption.weight(.semibold))
-            .padding(.horizontal, 7)
-            .padding(.vertical, 2)
-            .foregroundStyle(color)
-            .background(color.opacity(0.14), in: Capsule())
+    Text(status)
+        .font(.caption.weight(.semibold))
+        .padding(.horizontal, 7)
+        .padding(.vertical, 2)
+        .foregroundStyle(color)
+        .background(color.opacity(0.14), in: Capsule())
     }
 }
 
@@ -153,25 +199,25 @@ private struct WatchRow: View {
     var watch: Watch
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(watch.name)
-                    .font(.headline)
-                    .lineLimit(1)
-                Spacer()
-                WatchStatusBadge(status: watch.status == "Learning" ? "Learning \(Int(min(watch.readiness, 100)))%" : watch.status)
-            }
-            HStack(spacing: 10) {
-                DealCountChips(counts: watch.dealCounts)
-                Spacer(minLength: 0)
-                Text(verbatim: schedule)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
+    VStack(alignment: .leading, spacing: 5) {
+        HStack(alignment: .firstTextBaseline) {
+            Text(watch.name)
+                .font(.headline)
+                .lineLimit(1)
+            Spacer()
+            WatchStatusBadge(status: watch.status == "Learning" ? "Learning \(Int(min(watch.readiness, 100)))%" : watch.status)
         }
-        .padding(.vertical, 2)
-        .opacity(watch.enabled ? 1 : 0.6)
+        HStack(spacing: 10) {
+            DealCountChips(counts: watch.dealCounts)
+            Spacer(minLength: 0)
+            Text(verbatim: schedule)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+    .padding(.vertical, 2)
+    .opacity(watch.enabled ? 1 : 0.6)
     }
 
     private var schedule: String {
@@ -184,17 +230,17 @@ struct DealCountChips: View {
     var counts: WatchDealCounts
 
     var body: some View {
-        if counts.total == 0 {
-            Text("No strong deals")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        } else {
-            HStack(spacing: 6) {
-                chip(counts.exceptional, label: .exceptional)
-                chip(counts.veryStrong, label: .veryStrong)
-                chip(counts.strong, label: .strong)
-            }
+    if counts.total == 0 {
+        Text("No strong deals")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    } else {
+        HStack(spacing: 6) {
+            chip(counts.exceptional, label: .exceptional)
+            chip(counts.veryStrong, label: .veryStrong)
+            chip(counts.strong, label: .strong)
         }
+    }
     }
 
     @ViewBuilder

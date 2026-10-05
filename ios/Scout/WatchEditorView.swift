@@ -198,6 +198,7 @@ struct WatchEditorView: View {
                     let watch = try await client.createWatch(draft)
                     onSaved(watch)
                 }
+                model.play(.success)
                 model.refreshUnlessLive()
                 dismiss()
             } catch {

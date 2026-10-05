@@ -173,6 +173,12 @@ struct ListingRow: View {
                         .lineLimit(2)
                         .strikethrough(listing.hidden == true)
                     Spacer(minLength: 4)
+                    if let verdict = VerificationVerdict(listing: listing) {
+                        Image(systemName: verdict.symbol)
+                            .font(.footnote)
+                            .foregroundStyle(verdict.color)
+                            .accessibilityLabel(verdict.title)
+                    }
                     if let decision = listing.decision {
                         Image(systemName: decision.symbol)
                             .foregroundStyle(decision.color)
@@ -380,8 +386,9 @@ struct OlxCategoryPickerView: View {
     }
 }
 
-/// Swipe right to triage, swipe left to hide; the server keeps the listing's note.
-struct TriageSwipeActions: ViewModifier {
+/// Swipe right to triage, swipe left to hide, or long-press for both plus
+/// "I bought this" and the listing's link; the server keeps the listing's note.
+struct TriageActions: ViewModifier {
     @Environment(AppModel.self) private var model
     var listing: Listing
     var onChange: (Listing) -> Void
@@ -391,8 +398,7 @@ struct TriageSwipeActions: ViewModifier {
             .swipeActions(edge: .leading, allowsFullSwipe: true) {
                 ForEach(ListingDecision.allCases, id: \.self) { decision in
                     Button {
-                        let next: ListingDecision? = listing.decision == decision ? nil : decision
-                        apply(decision: .some(next))
+                        toggle(decision)
                     } label: {
                         Label(decision.title, systemImage: decision.symbol)
                     }
@@ -400,26 +406,78 @@ struct TriageSwipeActions: ViewModifier {
                 }
             }
             .swipeActions(edge: .trailing) {
-                Button {
-                    apply(hidden: !(listing.hidden ?? false))
-                } label: {
+                Button(action: toggleHidden) {
                     Label(listing.hidden == true ? "Unhide" : "Hide", systemImage: listing.hidden == true ? "eye" : "eye.slash")
                 }
                 .tint(.indigo)
             }
+            .contextMenu {
+                ControlGroup {
+                    ForEach(ListingDecision.allCases, id: \.self) { decision in
+                        Toggle(isOn: Binding(get: { listing.decision == decision }, set: { _ in toggle(decision) })) {
+                            Label(decision.title, systemImage: decision.symbol)
+                        }
+                    }
+                }
+                Button(action: toggleHidden) {
+                    Label(listing.hidden == true ? "Unhide" : "Hide", systemImage: listing.hidden == true ? "eye" : "eye.slash")
+                }
+                Button(action: addFlip) {
+                    Label("I bought this", systemImage: "shippingbox")
+                }
+                Divider()
+                ListingLinkActions(url: listing.webURL, marketplace: listing.marketplace)
+            } preview: {
+                ListingPreview(listing: listing)
+            }
     }
 
-    /// Sends only the swiped field, so a stale copy of the note is never written back.
+    private func toggle(_ decision: ListingDecision) {
+        let next: ListingDecision? = listing.decision == decision ? nil : decision
+        apply(decision: .some(next))
+    }
+
+    private func toggleHidden() {
+        let hiding = listing.hidden != true
+        apply(hidden: hiding)
+        if hiding {
+            model.showUndo("Listing hidden") { [self] in apply(hidden: false) }
+        }
+    }
+
+    /// Shows the change at once and puts the row back if the server refuses
+    /// it. Sends only the changed field, so a stale copy of the note is never
+    /// written back.
     private func apply(decision: ListingDecision?? = .none, hidden: Bool? = nil) {
         guard let client = model.client else { return }
+        let original = listing
+        var optimistic = listing
+        if let decision { optimistic.decision = decision }
+        if let hidden { optimistic.hidden = hidden }
+        model.play(.selection)
+        withAnimation { onChange(optimistic) }
         Task { @MainActor in
             do {
-                let action = try await client.patchListingAction(key: listing.key, decision: decision, hidden: hidden)
-                var updated = listing
+                let action = try await client.patchListingAction(key: original.key, decision: decision, hidden: hidden)
+                var updated = original
                 updated.decision = action.decision
                 updated.note = action.note
                 updated.hidden = action.hidden
                 onChange(updated)
+            } catch {
+                withAnimation { onChange(original) }
+                model.report(error)
+            }
+        }
+    }
+
+    /// The same as "I bought this" in the listing's details.
+    private func addFlip() {
+        guard let client = model.client else { return }
+        Task { @MainActor in
+            do {
+                _ = try await client.createFlip(FlipDraft(listing: listing))
+                model.play(.success)
             } catch {
                 model.report(error)
             }
@@ -427,9 +485,88 @@ struct TriageSwipeActions: ViewModifier {
     }
 }
 
+/// Open, share, and copy a marketplace listing's address, for context menus.
+struct ListingLinkActions: View {
+    var url: URL?
+    var marketplace: Marketplace
+
+    var body: some View {
+        if let url {
+            Link(destination: url) {
+                Label("Open on \(marketplace.rawValue)", systemImage: "safari")
+            }
+            ShareLink(item: url) {
+                Label("Share link", systemImage: "square.and.arrow.up")
+            }
+            Button {
+                UIPasteboard.general.url = url
+            } label: {
+                Label("Copy link", systemImage: "doc.on.doc")
+            }
+        }
+    }
+}
+
+/// A long-press preview: the photo at the size the details header loads it
+/// (so opening the listing next draws it from cache), the title, and the price.
+struct ListingPreview: View {
+    var listing: Listing
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let url = listing.imageURL {
+                PipelineImage(url: url, contentMode: .fit, pointSize: ImagePipeline.headerPoints) {
+                    ProgressView()
+                }
+                .frame(width: 320, height: 240)
+                .background(Color.secondary.opacity(0.08))
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(listing.title)
+                    .font(.headline)
+                    .lineLimit(3)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(Format.pln(listing.price))
+                        .font(.title3.weight(.bold))
+                        .monospacedDigit()
+                    if let below = listing.belowTypical, below < 0 {
+                        Text(Format.versusTypical(below))
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(listing.dealStrength >= 3 ? listing.dealLabel.color : .primary)
+                    }
+                }
+                Text(verbatim: ([listing.marketplace.rawValue, listing.condition, listing.location] as [String?]).compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if let verdict = VerificationVerdict(listing: listing) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Label(verdict.title, systemImage: verdict.symbol)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(verdict.color)
+                        if let summary = listing.aiDescriptionVerification?.summary, !summary.isEmpty {
+                            Text(summary)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(3)
+                        }
+                    }
+                    .padding(.top, 4)
+                }
+            }
+            .padding(12)
+        }
+        .frame(width: 320, alignment: .leading)
+    }
+}
+
 extension View {
-    func triageSwipeActions(for listing: Listing, onChange: @escaping (Listing) -> Void) -> some View {
-        modifier(TriageSwipeActions(listing: listing, onChange: onChange))
+    func undoToastHost() -> some View {
+        modifier(UndoToastHost())
+    }
+
+    func triageActions(for listing: Listing, onChange: @escaping (Listing) -> Void) -> some View {
+        modifier(TriageActions(listing: listing, onChange: onChange))
     }
 
     /// Navigation targets shared by every tab's stack.
@@ -480,6 +617,8 @@ struct ConnectionIndicator: View {
 struct LoadingOverlay: View {
     var isLoaded: Bool
     var error: String?
+    /// Off where the list shows `PlaceholderRows` while it loads.
+    var spinner = true
     var retry: () async -> Void
 
     var body: some View {
@@ -493,9 +632,110 @@ struct LoadingOverlay: View {
                     Button("Try again") { Task { await retry() } }
                         .buttonStyle(.borderedProminent)
                 }
-            } else {
+            } else if spinner {
                 ProgressView()
             }
         }
+    }
+}
+
+/// Grey rows shaped like the content, pulsing while a list loads for the
+/// first time, so the screen doesn't jump from a spinner to rows.
+struct PlaceholderRows: View {
+    var count = 6
+    /// The thumbnail's side, or nil for text-only rows.
+    var thumbnail: CGFloat? = 64
+
+    var body: some View {
+        ForEach(0..<count, id: \.self) { _ in
+            HStack(alignment: .top, spacing: 12) {
+                if let thumbnail {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color.secondary.opacity(0.2))
+                        .frame(width: thumbnail, height: thumbnail)
+                }
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(verbatim: "A listing title that runs fairly long")
+                        .font(.subheadline.weight(.semibold))
+                    Text(verbatim: "1 234 zł")
+                        .font(.headline)
+                    Text(verbatim: "Marketplace · 5 min ago")
+                        .font(.caption)
+                }
+            }
+            .padding(.vertical, 2)
+            .redacted(reason: .placeholder)
+            .phaseAnimator([1.0, 0.45]) { content, opacity in
+                content.opacity(opacity)
+            } animation: { _ in
+                .easeInOut(duration: 0.9)
+            }
+            .accessibilityHidden(true)
+        }
+    }
+}
+
+/// What the AI description check concluded, for rows, previews and details.
+struct VerificationVerdict {
+    var title: String
+    var symbol: String
+    var color: Color
+
+    init(decision: String) {
+        switch decision {
+        case "pass":
+            title = "Description checks out"
+            symbol = "checkmark.seal.fill"
+            color = .scoutGreen
+        case "reject":
+            title = "Description raises concerns"
+            symbol = "exclamationmark.octagon.fill"
+            color = .red
+        default:
+            title = "Inconclusive"
+            symbol = "questionmark.circle"
+            color = .secondary
+        }
+    }
+
+    /// Nil until a check has finished; a pending or unconfigured check says nothing yet.
+    init?(listing: Listing) {
+        if let decision = listing.aiDescriptionVerification?.decision {
+            self.init(decision: decision)
+        } else if let status = listing.aiDescriptionVerificationStatus, ["pass", "reject", "unknown"].contains(status) {
+            self.init(decision: status)
+        } else {
+            return nil
+        }
+    }
+}
+
+/// The Undo toast, above the tab bar of the tab it is applied to.
+struct UndoToastHost: ViewModifier {
+    @Environment(AppModel.self) private var model
+
+    func body(content: Content) -> some View {
+        content
+            .overlay(alignment: .bottom) {
+                if let toast = model.toast {
+                    HStack(spacing: 16) {
+                        Text(verbatim: toast.message)
+                            .font(.subheadline)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                        Button("Undo") { model.undoToast() }
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 12)
+                    .background(.regularMaterial, in: Capsule())
+                    .shadow(color: .black.opacity(0.15), radius: 12, y: 4)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .id(toast.id)
+                }
+            }
+            .animation(.spring(duration: 0.35), value: model.toast?.id)
     }
 }

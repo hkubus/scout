@@ -258,7 +258,8 @@ struct ListingDetailView: View {
             defer { addingFlip = false }
             do {
                 _ = try await client.createFlip(FlipDraft(listing: listing))
-                flipAdded = true
+                model.play(.success)
+                withAnimation { flipAdded = true }
             } catch {
                 model.report(error)
             }
@@ -332,41 +333,20 @@ struct ListingDetailView: View {
     }
 
     private func save() {
-        guard let client = model.client, detail != nil else { return }
+        guard let client = model.client, let current = detail else { return }
+        let noteChanged = note != current.action.note
         saving = true
         Task { @MainActor in
             defer { saving = false }
             do {
                 let action = try await client.updateListingAction(key: link.key, action: ListingAction(decision: decision, note: note, hidden: hidden))
+                model.play(noteChanged ? .success : .selection)
                 detail?.action = action
                 detail?.listing.decision = action.decision
                 detail?.listing.hidden = action.hidden
             } catch {
                 model.report(error)
             }
-        }
-    }
-}
-
-private struct VerificationVerdict {
-    var title: String
-    var symbol: String
-    var color: Color
-
-    init(decision: String) {
-        switch decision {
-        case "pass":
-            title = "Description checks out"
-            symbol = "checkmark.seal.fill"
-            color = .scoutGreen
-        case "reject":
-            title = "Description raises concerns"
-            symbol = "exclamationmark.octagon.fill"
-            color = .red
-        default:
-            title = "Inconclusive"
-            symbol = "questionmark.circle"
-            color = .secondary
         }
     }
 }

@@ -2,6 +2,7 @@ import SwiftUI
 
 @main
 struct ScoutApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
 
@@ -24,6 +25,8 @@ struct ScoutApp: App {
                     case .active:
                         model.resumeLiveUpdates()
                     case .background:
+                        // A delete waiting on its Undo toast happens now.
+                        model.dismissToast()
                         model.stopLiveUpdates()
                     default:
                         break

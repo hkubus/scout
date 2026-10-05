@@ -7,6 +7,8 @@ import ScoutKit
 struct SearchView: View {
     @Environment(AppModel.self) private var model
     @AppStorage("searchAIRelevance") private var aiRelevance = true
+    /// Newest first, one per line.
+    @AppStorage("recentSearches") private var recentSearches = ""
     @State private var filters = SearchFilters()
     @State private var lastRequest: SearchFilters?
     @State private var results: [Listing] = []
@@ -23,44 +25,38 @@ struct SearchView: View {
     var body: some View {
         NavigationStack {
             List {
-                // Progress while searching; afterwards only a marketplace that failed.
-                let shownStatuses = searching ? statuses : statuses.filter { $0.status == "error" }
-                if !shownStatuses.isEmpty {
+                if showingRecents {
                     Section {
-                        ForEach(shownStatuses, id: \.source) { SourceStatusRow(status: $0) }
-                    }
-                }
-                if let error {
-                    Section {
-                        Label(error, systemImage: "exclamationmark.triangle")
-                            .foregroundStyle(.red)
-                    }
-                }
-                if !results.isEmpty {
-                    Section {
-                        ForEach(results, id: \.id) { listing in
-                            NavigationLink(value: ListingLink(listing)) {
-                                SearchResultRow(listing: listing)
+                        ForEach(recents, id: \.self) { query in
+                            Button {
+                                filters.query = query
+                                startSearch()
+                            } label: {
+                                Label(query, systemImage: "clock.arrow.circlepath")
+                                    .foregroundStyle(.primary)
                             }
                         }
-                        if canLoadMore {
-                            Button(action: loadMore) {
-                                HStack {
-                                    Text("Load more")
-                                    Spacer()
-                                    if loadingMore { ProgressView() }
-                                }
-                            }
-                            .disabled(loadingMore)
+                        .onDelete { offsets in
+                            var kept = recents
+                            kept.remove(atOffsets: offsets)
+                            recentSearches = kept.joined(separator: "\n")
                         }
                     } header: {
-                        Text(verbatim: "\(results.count) \(results.count == 1 ? "result" : "results")\(searching ? " so far…" : "") · lowest price first")
+                        HStack {
+                            Text("Recent")
+                            Spacer()
+                            Button("Clear") { withAnimation { recentSearches = "" } }
+                                .font(.subheadline)
+                                .textCase(nil)
+                        }
                     }
+                } else {
+                    resultSections
                 }
             }
             .overlay { emptyState }
             .navigationTitle("Search")
-            .searchable(text: $filters.query, placement: .navigationBarDrawer(displayMode: .always), prompt: "What are you looking for?")
+            .searchable(text: $filters.query, prompt: "What are you looking for?")
             .onSubmit(of: .search, startSearch)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -103,8 +99,57 @@ struct SearchView: View {
     }
 
     @ViewBuilder
+    private var resultSections: some View {
+        // Progress while searching; afterwards only a marketplace that failed.
+        let shownStatuses = searching ? statuses : statuses.filter { $0.status == "error" }
+        if !shownStatuses.isEmpty {
+            Section {
+                ForEach(shownStatuses, id: \.source) { SourceStatusRow(status: $0) }
+            }
+        }
+        if let error {
+            Section {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.red)
+            }
+        }
+        if !results.isEmpty {
+            Section {
+                ForEach(results, id: \.id) { listing in
+                    NavigationLink(value: ListingLink(listing)) {
+                        SearchResultRow(listing: listing)
+                    }
+                    .contextMenu {
+                        Button {
+                            editor = .create(WatchDraft(listing: listing))
+                        } label: {
+                            Label("Create a watch from this listing", systemImage: "bell.badge")
+                        }
+                        Divider()
+                        ListingLinkActions(url: listing.webURL, marketplace: listing.marketplace)
+                    } preview: {
+                        ListingPreview(listing: listing)
+                    }
+                }
+                if canLoadMore {
+                    Button(action: loadMore) {
+                        HStack {
+                            Text("Load more")
+                            Spacer()
+                            if loadingMore { ProgressView() }
+                        }
+                    }
+                    .disabled(loadingMore)
+                }
+            } header: {
+                Text(verbatim: "\(results.count) \(results.count == 1 ? "result" : "results")\(searching ? " so far…" : "") · lowest price first")
+            }
+        }
+    }
+
+    @ViewBuilder
     private var emptyState: some View {
-        if results.isEmpty && error == nil {
+        if results.isEmpty && error == nil && !showingRecents {
             if searching {
                 ProgressView("Searching public marketplace pages…")
             } else if lastRequest != nil {
@@ -113,6 +158,22 @@ struct SearchView: View {
                 ContentUnavailableView("Search marketplaces", systemImage: "magnifyingglass", description: Text("Search OLX, Allegro Lokalnie, and Vinted right now without creating a watch or touching its price history."))
             }
         }
+    }
+
+    private var recents: [String] {
+        recentSearches.split(separator: "\n").map(String.init)
+    }
+
+    /// Like other search screens: an empty field shows what was searched before.
+    private var showingRecents: Bool {
+        filters.query.isEmpty && !searching && !recents.isEmpty
+    }
+
+    private func remember(_ query: String) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let kept = [trimmed] + recents.filter { $0.caseInsensitiveCompare(trimmed) != .orderedSame }
+        recentSearches = kept.prefix(8).joined(separator: "\n")
     }
 
     private var hasCustomFilters: Bool {
@@ -134,6 +195,7 @@ struct SearchView: View {
             return
         }
         guard request.canSearch, let client = model.client else { return }
+        remember(request.query)
         let id = UUID().uuidString
         request.searchId = id
         searchID = id

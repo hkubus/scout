@@ -209,6 +209,7 @@ struct WatchDetailView: View {
             do {
                 // Confirmed in the status badge, like a swipe in the list, not a blocking alert.
                 _ = try await client.queueScan(watchId: watch.id)
+                model.play(.success)
                 scanQueued = true
                 try? await Task.sleep(for: .seconds(6))
                 scanQueued = false
@@ -224,6 +225,7 @@ struct WatchDetailView: View {
         Task { @MainActor in
             do {
                 try await client.updateWatch(id: watch.id, patch: WatchPatch(archived: archived))
+                model.play(.success)
                 loadedVersion = nil
                 await load()
                 model.refreshUnlessLive()
@@ -239,6 +241,7 @@ struct WatchDetailView: View {
         Task { @MainActor in
             do {
                 try await client.updateWatch(id: watch.id, patch: WatchPatch(enabled: enabled))
+                model.play(.selection)
                 loadedVersion = nil
                 await load()
             } catch {

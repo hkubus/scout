@@ -129,6 +129,31 @@ test('filters listing pages by minimum strength, untriaged decisions and AI-filt
   } finally { context.close(); }
 });
 
+test('carries the AI description check on feed rows only for checked listings', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const fresh = new Date().toISOString();
+    context.db.prepare('UPDATE watch_listings SET last_seen_at = ?').run(fresh);
+    const checked = context.db.prepare('SELECT id, listing_id FROM listings ORDER BY id LIMIT 1').get() as { id: number; listing_id: string };
+    const verification = { decision: 'reject', confidence: 0.9, summary: 'Mentions a cracked screen.', issues: ['cracked screen'], evidence: ['"pęknięty ekran"'] };
+    context.db.prepare(`UPDATE listings SET ai_description_verification_json = ?, ai_description_verification_status = 'reject', ai_description_verification_at = ? WHERE id = ?`)
+      .run(JSON.stringify(verification), fresh, checked.id);
+
+    const rows = context.service.dashboard().listings;
+    const verified = rows.filter((listing) => listing.listingId === checked.listing_id);
+    assert.ok(verified.length > 0);
+    for (const listing of verified) {
+      assert.equal(listing.aiDescriptionVerificationStatus, 'reject');
+      assert.equal(listing.aiDescriptionVerification?.summary, 'Mentions a cracked screen.');
+    }
+    const unchecked = rows.find((listing) => listing.listingId !== checked.listing_id);
+    assert.ok(unchecked);
+    assert.equal('aiDescriptionVerification' in unchecked, false);
+    assert.equal('aiDescriptionVerificationStatus' in unchecked, false);
+  } finally { context.close(); }
+});
+
 test('keeps dashboard database work bounded as watch count grows', () => {
   const context = fixture();
   try {

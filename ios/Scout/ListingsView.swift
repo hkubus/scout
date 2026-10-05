@@ -41,6 +41,9 @@ struct ListingsView: View {
 
     var body: some View {
         List {
+            if pagination == nil && error == nil {
+                PlaceholderRows()
+            }
             if pagination != nil && listings.isEmpty {
                 ContentUnavailableView.search(text: search)
             }
@@ -48,7 +51,7 @@ struct ListingsView: View {
                 NavigationLink(value: ListingLink(listing)) {
                     ListingRow(listing: listing)
                 }
-                .triageSwipeActions(for: listing) { updated in
+                .triageActions(for: listing) { updated in
                     replace(updated)
                 }
                 .onAppear {
@@ -60,7 +63,7 @@ struct ListingsView: View {
             }
         }
         .listStyle(.plain)
-        .overlay { LoadingOverlay(isLoaded: pagination != nil, error: error, retry: { await reload() }) }
+        .overlay { LoadingOverlay(isLoaded: pagination != nil, error: error, spinner: false, retry: { await reload() }) }
         .navigationTitle(watch?.name ?? "Listings")
         .searchable(text: $search, prompt: "Search titles")
         .toolbar {
@@ -163,8 +166,13 @@ struct ListingsView: View {
         }
     }
 
+    /// A row that isn't loaded but now belongs (Undo, or a refused change
+    /// put back) comes back with a reload, which keeps the scroll position.
     private func replace(_ listing: Listing) {
-        guard let index = listings.firstIndex(where: { $0.rowID == listing.rowID }) else { return }
+        guard let index = listings.firstIndex(where: { $0.rowID == listing.rowID }) else {
+            if triageFilter.admits(listing) { triageReloads += 1 }
+            return
+        }
         if triageFilter.admits(listing) {
             listings[index] = listing
         } else {
@@ -192,7 +200,7 @@ struct ListingsView: View {
         guard pagination != nil else { return }
         switch action.triage(listings, filter: triageFilter) {
         case let .patched(rows, removed):
-            listings = rows
+            withAnimation { listings = rows }
             dropFromTotal(removed)
         case .reload:
             triageReloads += 1

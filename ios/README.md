@@ -2,15 +2,15 @@
 
 A native SwiftUI client for a self-hosted Scout server. It covers:
 
-- the top deals (Strong or better, untriaged first);
-- live marketplace search, like the web Search page, with "Save as watch";
-- the paginated listing history with triage (buy / maybe / pass / hide);
+- the top deals (Strong or better, untriaged first), with the AI description check's verdict on each row and the untriaged count on the tab;
+- live marketplace search, like the web Search page, with recent searches and "Save as watch";
+- the paginated listing history with triage (buy / maybe / pass / hide): swipe a row, or long-press it for a photo preview, triage, **I bought this**, and the listing's link. Hiding (and deleting a flip) shows an Undo toast;
 - listing detail with price history, the AI description check, when the listing was really posted, seller type, and a resale estimate after the platform's fee with **I bought this**;
-- creating, editing, archiving, pausing, and scanning watches (including the OLX category, seller type, and skipping promoted listings), plus asking-price analytics;
+- creating, editing, archiving, pausing, and scanning watches (Settings → Watches; including the OLX category, seller type, and skipping promoted listings), plus asking-price analytics;
 - market research watches with probable-sale estimates, saved listings, and saved copies;
 - deal analytics (Market tab → Analytics);
-- the flip ledger (Market tab → Flips): buys and sales with net profit, the delist checklist, the quarterly limit for działalność nierejestrowana, DAC7 counts, the sales record as CSV, and seller fee presets;
-- connector health, and a switch that makes ntfy alerts open in the app;
+- the flip ledger (Flips tab): buys and sales with net profit, the delist checklist, the quarterly limit for działalność nierejestrowana, DAC7 counts, the sales record as CSV, and seller fee presets;
+- connector health, and a switch that makes ntfy alerts open in the app (Settings, the gear on Deals);
 - Home Screen and Lock Screen widgets.
 
 Live updates come from the server's `/events` stream. Notifications stay with ntfy.
@@ -69,6 +69,6 @@ In demo mode, **Settings → Preview widgets** shows every widget size; the CI s
 
 ## Deep links
 
-`scout://listing?key=<marketplace>:<listing id>&watchId=<watch id>` opens a listing, and `scout://deals` opens the Deals tab. The widgets use both.
+`scout://listing?key=<marketplace>:<listing id>&watchId=<watch id>` opens a listing, and `scout://deals` opens the Deals tab. The widgets use both. `scout://search`, `scout://new-flip`, and `scout://new-watch` open Search, the new-flip form, and the new-watch form; they are also the Home Screen quick actions (long-press the app icon).
 
 To make ntfy alerts open in the app, turn on **Open alerts in the Scout iOS app**: in the web app it's under Settings → ntfy notifications, and in the iOS app under Settings → Notifications. Tapping an alert then opens the listing in Scout, and the alert's **Open listing** action button still goes to the marketplace page. The setting applies to every device subscribed to the topic, so leave it off if you also read alerts on a computer or Android.
