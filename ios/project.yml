@@ -45,6 +45,17 @@ targets:
         CFBundleURLTypes:
           - CFBundleURLName: io.github.hkubus.scout
             CFBundleURLSchemes: [scout]
+        # Home Screen quick actions; each type is a scout:// link (QuickActions.swift).
+        UIApplicationShortcutItems:
+          - UIApplicationShortcutItemType: scout://search
+            UIApplicationShortcutItemTitle: Search
+            UIApplicationShortcutItemIconSymbolName: magnifyingglass
+          - UIApplicationShortcutItemType: scout://new-flip
+            UIApplicationShortcutItemTitle: Add Flip
+            UIApplicationShortcutItemIconSymbolName: shippingbox
+          - UIApplicationShortcutItemType: scout://new-watch
+            UIApplicationShortcutItemTitle: New Watch
+            UIApplicationShortcutItemIconSymbolName: binoculars
         # The server is user-hosted on a LAN or VPN, often over plain HTTP or
         # with a private CA, so App Transport Security cannot be scoped to a
         # fixed domain.

@@ -2,6 +2,17 @@ import PhotosUI
 import SwiftUI
 import ScoutKit
 
+/// The Flips tab.
+struct FlipsTab: View {
+    var body: some View {
+        NavigationStack {
+            FlipsView()
+                .navigationTitle("Flips")
+                .scoutDestinations()
+        }
+    }
+}
+
 /// The flip ledger: what was bought, where it is listed, and what each sale
 /// netted. Private bookkeeping, like the web Flips page; nothing here feeds
 /// Scout's market statistics.
@@ -11,19 +22,27 @@ struct FlipsView: View {
     @State private var error: String?
     @State private var editor: FlipEditorRequest?
     @State private var selling: Flip?
+    /// Deleted on screen, waiting for their Undo toast to go away.
+    @State private var pendingDeletes: Set<Int> = []
 
     var body: some View {
         List {
+            if data == nil && error == nil {
+                PlaceholderRows(thumbnail: 48)
+            }
             if let data, let summary {
+                if data.flips.isEmpty {
+                    ContentUnavailableView {
+                        Label("No flips yet", systemImage: "shippingbox")
+                    } description: {
+                        Text("Add what you bought with +, or long-press a deal and choose “I bought this”.")
+                    } actions: {
+                        Button("Add flip") { editor = .create() }
+                    }
+                }
                 summarySection(summary)
                 let unsold = data.flips.filter { !$0.isSold }
                 let sold = data.flips.filter(\.isSold)
-                if data.flips.isEmpty {
-                    Section {
-                        Text("No flips yet. Add one with +, or use “I bought this” in a listing's details.")
-                            .foregroundStyle(.secondary)
-                    }
-                }
                 if !unsold.isEmpty {
                     Section("Unsold") {
                         ForEach(unsold) { flip in
@@ -72,7 +91,7 @@ struct FlipsView: View {
                 }
             }
         }
-        .overlay { LoadingOverlay(isLoaded: data != nil, error: error, retry: load) }
+        .overlay { LoadingOverlay(isLoaded: data != nil, error: error, spinner: false, retry: load) }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -91,6 +110,12 @@ struct FlipsView: View {
         }
         .refreshable { await load() }
         .task(id: model.flipsToken) { await load() }
+        .onChange(of: model.pendingNewFlip, initial: true) { _, pending in
+            if pending {
+                model.pendingNewFlip = false
+                editor = .create()
+            }
+        }
     }
 
     private var summary: FlipsSummary? {
@@ -154,6 +179,7 @@ struct FlipsView: View {
             if flip.isSold { selling = flip } else { editor = .edit(flip) }
         } label: {
             HStack(alignment: .top, spacing: 10) {
+                FlipThumbnail(flip: flip)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(verbatim: flip.title)
                         .font(.subheadline.weight(.semibold))
@@ -213,6 +239,38 @@ struct FlipsView: View {
                 .tint(.orange)
             }
         }
+        .contextMenu {
+            Button {
+                selling = flip
+            } label: {
+                Label(flip.isSold ? "Edit sale" : "Mark as sold", systemImage: "banknote")
+            }
+            if flip.isSold {
+                Button {
+                    removeSale(flip)
+                } label: {
+                    Label("Unsell", systemImage: "arrow.uturn.backward")
+                }
+            }
+            Button {
+                editor = .edit(flip)
+            } label: {
+                Label("Edit", systemImage: "pencil")
+            }
+            if let key = flip.listingKey {
+                Button {
+                    model.openedListing = ListingLink(key: key, watchId: flip.watchId)
+                } label: {
+                    Label("Show bought listing", systemImage: "tag")
+                }
+            }
+            Divider()
+            Button(role: .destructive) {
+                delete(flip)
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+        }
     }
 
     private func replace(_ flip: Flip) {
@@ -222,13 +280,15 @@ struct FlipsView: View {
         } else {
             current.flips.insert(flip, at: 0)
         }
-        data = current
+        withAnimation { data = current }
     }
 
     private func load() async {
         guard let client = model.client else { return }
         do {
-            data = try await client.flips()
+            var loaded = try await client.flips()
+            loaded.flips.removeAll { pendingDeletes.contains($0.id) }
+            data = loaded
             error = nil
         } catch {
             if error.isCancellation { return }
@@ -236,16 +296,38 @@ struct FlipsView: View {
         }
     }
 
+    /// Leaves the list at once; the server deletes it (and its photos) only
+    /// once the Undo toast goes away.
     private func delete(_ flip: Flip) {
+        guard let index = data?.flips.firstIndex(where: { $0.id == flip.id }) else { return }
+        pendingDeletes.insert(flip.id)
+        withAnimation { _ = data?.flips.remove(at: index) }
+        model.play(.impact)
+        model.showUndo("Deleted “\(flip.title)”") {
+            pendingDeletes.remove(flip.id)
+            restore(flip, at: index)
+        } commit: {
+            commitDelete(flip, at: index)
+        }
+    }
+
+    private func commitDelete(_ flip: Flip, at index: Int) {
         guard let client = model.client else { return }
         Task { @MainActor in
             do {
                 try await client.deleteFlip(id: flip.id)
-                data?.flips.removeAll { $0.id == flip.id }
             } catch {
+                restore(flip, at: index)
                 model.report(error)
             }
+            pendingDeletes.remove(flip.id)
         }
+    }
+
+    private func restore(_ flip: Flip, at index: Int) {
+        guard var current = data, !current.flips.contains(where: { $0.id == flip.id }) else { return }
+        current.flips.insert(flip, at: min(index, current.flips.count))
+        withAnimation { data = current }
     }
 
     private func removeSale(_ flip: Flip) {
@@ -253,10 +335,38 @@ struct FlipsView: View {
         Task { @MainActor in
             do {
                 let unsold = try await client.removeSale(flipId: flip.id)
+                model.play(.success)
                 replace(unsold)
             } catch {
                 model.report(error)
             }
+        }
+    }
+}
+
+/// The cover photo, or a box for flips without photos.
+private struct FlipThumbnail: View {
+    @Environment(AppModel.self) private var model
+    var flip: Flip
+
+    var body: some View {
+        Group {
+            if let photo = flip.photos?.first, let client = model.client {
+                ServerImage(client: client, url: client.flipPhotoURL(id: photo.id), pointSize: 48) {
+                    placeholder
+                }
+            } else {
+                placeholder
+            }
+        }
+        .frame(width: 48, height: 48)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var placeholder: some View {
+        ZStack {
+            Color.secondary.opacity(0.12)
+            Image(systemName: "shippingbox").foregroundStyle(.tertiary)
         }
     }
 }
@@ -462,7 +572,8 @@ struct FlipEditorView: View {
                         continue
                     }
                     let photo = try await client.uploadFlipPhoto(flipId: flipID, jpeg: jpeg)
-                    photos.append(photo)
+                    withAnimation { photos.append(photo) }
+                    model.play(.success)
                 } catch {
                     self.error = error.localizedDescription
                 }
@@ -475,7 +586,8 @@ struct FlipEditorView: View {
         Task { @MainActor in
             do {
                 try await client.deleteFlipPhoto(id: photo.id)
-                photos.removeAll { $0.id == photo.id }
+                withAnimation { photos.removeAll { $0.id == photo.id } }
+                model.play(.impact)
                 model.refresh()
             } catch {
                 self.error = error.localizedDescription
@@ -531,6 +643,7 @@ struct FlipEditorView: View {
                 } else {
                     saved = try await client.createFlip(body)
                 }
+                model.play(.success)
                 onSaved(saved)
                 dismiss()
             } catch {
@@ -687,6 +800,7 @@ struct SellFlipView: View {
             defer { saving = false }
             do {
                 let saved = try await client.recordSale(flipId: flip.id, sale: sale)
+                model.play(.success)
                 onSaved(saved)
                 dismiss()
             } catch {
@@ -863,6 +977,7 @@ struct FeePresetsView: View {
             defer { saving = false }
             do {
                 let saved = try await client.saveFeePresets(presets)
+                model.play(.success)
                 onSaved(saved)
                 dismiss()
             } catch {

@@ -24,9 +24,13 @@ struct ResearchView: View {
     @Environment(AppModel.self) private var model
     var store: ResearchStore
     @State private var editor: MarketWatchEditorRequest?
+    @State private var deleting: MarketWatch?
 
     var body: some View {
         List {
+            if store.data == nil && store.error == nil {
+                PlaceholderRows(thumbnail: nil)
+            }
             if let data = store.data {
                 Section {
                     if data.watches.isEmpty {
@@ -58,6 +62,29 @@ struct ResearchView: View {
                             }
                             .tint(watch.enabled ? Color.orange : Color.scoutGreen)
                         }
+                        .contextMenu {
+                            Button {
+                                scan(watch)
+                            } label: {
+                                Label("Scan now", systemImage: "arrow.triangle.2.circlepath")
+                            }
+                            Button {
+                                setEnabled(!watch.enabled, for: watch)
+                            } label: {
+                                Label(watch.enabled ? "Pause" : "Resume", systemImage: watch.enabled ? "pause" : "play")
+                            }
+                            Button {
+                                editor = .edit(watch)
+                            } label: {
+                                Label("Edit research watch", systemImage: "pencil")
+                            }
+                            Divider()
+                            Button(role: .destructive) {
+                                deleting = watch
+                            } label: {
+                                Label("Delete research watch", systemImage: "trash")
+                            }
+                        }
                     }
                 } header: {
                     if !data.watches.isEmpty {
@@ -67,7 +94,18 @@ struct ResearchView: View {
                 }
             }
         }
-        .overlay { LoadingOverlay(isLoaded: store.data != nil, error: store.error, retry: { await load() }) }
+        .animation(.default, value: store.data?.watches)
+        .overlay { LoadingOverlay(isLoaded: store.data != nil, error: store.error, spinner: false, retry: { await load() }) }
+        .confirmationDialog(
+            Text(verbatim: "Delete \(deleting?.name ?? "")?"),
+            isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+            titleVisibility: .visible,
+            presenting: deleting
+        ) { watch in
+            Button("Delete research watch", role: .destructive) { delete(watch) }
+        } message: { _ in
+            Text("Its snapshots and saved listings are deleted too.")
+        }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -107,6 +145,20 @@ struct ResearchView: View {
         Task { @MainActor in
             do {
                 _ = try await client.scanMarketWatch(id: watch.id)
+                model.play(.success)
+            } catch {
+                model.report(error)
+            }
+        }
+    }
+
+    private func delete(_ watch: MarketWatch) {
+        guard let client = model.client else { return }
+        Task { @MainActor in
+            do {
+                try await client.deleteMarketWatch(id: watch.id)
+                model.play(.impact)
+                await load()
             } catch {
                 model.report(error)
             }
@@ -118,6 +170,7 @@ struct ResearchView: View {
         Task { @MainActor in
             do {
                 try await client.setMarketWatchEnabled(id: watch.id, enabled: enabled)
+                model.play(.selection)
                 await load()
             } catch {
                 model.report(error)
@@ -343,6 +396,7 @@ struct ResearchWatchDetailView: View {
         Task { @MainActor in
             do {
                 _ = try await client.scanMarketWatch(id: watch.id)
+                model.play(.success)
                 scanQueued = true
                 try? await Task.sleep(for: .seconds(6))
                 scanQueued = false
@@ -358,6 +412,7 @@ struct ResearchWatchDetailView: View {
         Task { @MainActor in
             do {
                 try await client.setMarketWatchEnabled(id: watch.id, enabled: enabled)
+                model.play(.selection)
                 loadedVersion = nil
                 await load()
             } catch {
@@ -371,6 +426,7 @@ struct ResearchWatchDetailView: View {
         Task { @MainActor in
             do {
                 try await client.deleteMarketWatch(id: watch.id)
+                model.play(.impact)
                 model.refreshUnlessLive()
                 dismiss()
             } catch {
@@ -401,12 +457,18 @@ struct ResearchListingsView: View {
 
     var body: some View {
         List {
+            if pagination == nil && error == nil {
+                PlaceholderRows(thumbnail: 60)
+            }
             if pagination != nil && listings.isEmpty {
                 ContentUnavailableView("No saved listings here", systemImage: "tray", description: Text("The first successful snapshot fills this history."))
             }
             ForEach(listings) { listing in
                 NavigationLink(value: listing) {
                     ResearchListingRow(listing: listing)
+                }
+                .contextMenu {
+                    ListingLinkActions(url: listing.webURL, marketplace: listing.marketplace)
                 }
                 .onAppear {
                     if listing.id == listings.last?.id { Task { @MainActor in await loadMore() } }
@@ -417,7 +479,7 @@ struct ResearchListingsView: View {
             }
         }
         .listStyle(.plain)
-        .overlay { LoadingOverlay(isLoaded: pagination != nil, error: error, retry: { await reload() }) }
+        .overlay { LoadingOverlay(isLoaded: pagination != nil, error: error, spinner: false, retry: { await reload() }) }
         .navigationTitle(route.name ?? "Saved listings")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -694,6 +756,7 @@ struct ResearchListingDetailView: View {
             defer { capturing = false }
             do {
                 snapshot = try await client.captureMarketListingSnapshot(id: listing.id)
+                model.play(.success)
             } catch {
                 model.report(error)
             }

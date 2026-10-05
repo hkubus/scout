@@ -1,10 +1,42 @@
 import Foundation
+import SwiftUI
 import Observation
 import ScoutKit
 import WidgetKit
 
 enum AppTab: String, Hashable {
-    case deals, search, watches, market, settings
+    case deals, flips, market, search
+}
+
+/// Settings, pushed from the gear on Deals.
+struct SettingsRoute: Hashable {}
+
+/// The watch list, inside Settings.
+struct WatchesRoute: Hashable {}
+
+/// A haptic for something the user did, played once by `RootView`.
+enum Haptic {
+    /// A server action finished: a scan queued, a save, a flip added.
+    case success
+    /// A choice changed: a triage decision, hide, pause.
+    case selection
+    /// Something was removed.
+    case impact
+    case error
+}
+
+struct HapticEvent: Equatable {
+    let id = UUID()
+    var kind: Haptic
+}
+
+/// "Hidden · Undo" at the bottom of the screen for a few seconds. `commit`
+/// runs when it goes away without Undo, for actions that wait for it.
+struct UndoToast: Identifiable {
+    let id = UUID()
+    var message: String
+    var undo: @MainActor () -> Void
+    var commit: (@MainActor () -> Void)?
 }
 
 enum ConnectionState: Equatable {
@@ -85,11 +117,19 @@ final class AppModel {
     private(set) var listingAction: ListingActionEvent?
     var selectedTab: AppTab = .deals
     var marketSection: MarketSection = .research
+    /// The Deals stack, which also holds Settings and Watches.
+    var dealsPath = NavigationPath()
     var openedListing: ListingLink?
-    /// Watch to push once the Watches tab has loaded (screenshots).
+    /// Watch to push once Watches has loaded (screenshots).
     var pendingWatchID: String?
-    /// Opens the new-watch form when the Watches tab appears (screenshots).
-    var pendingNewWatch = false
+    /// Opens the new-watch form with this draft when Watches appears.
+    var pendingNewWatch: WatchDraft?
+    /// Opens the new-flip form when Flips appears (Home Screen quick action).
+    var pendingNewFlip = false
+    /// Strong deals nobody has triaged yet, for the Deals tab badge.
+    var untriagedDeals = 0
+    private(set) var haptic: HapticEvent?
+    private(set) var toast: UndoToast?
     /// Query the Search tab runs when it appears (screenshots).
     var pendingSearchQuery: String?
     /// Bumped for every per-marketplace result streamed while a manual search
@@ -101,6 +141,7 @@ final class AppModel {
     var showWidgetGallery = false
     var alertMessage: String?
 
+    @ObservationIgnored private var toastTimer: Task<Void, Never>?
     @ObservationIgnored private var eventsTask: Task<Void, Never>?
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var pendingInvalidation = LiveInvalidation()
@@ -128,20 +169,18 @@ final class AppModel {
         case "analytics":
             selectedTab = .market
             marketSection = .analytics
-        case "flips":
-            selectedTab = .market
-            marketSection = .flips
-        case "watches": selectedTab = .watches
-        case "settings": selectedTab = .settings
+        case "flips": selectedTab = .flips
+        case "watches": showWatches()
+        case "settings": dealsPath.append(SettingsRoute())
         case "watch":
-            selectedTab = .watches
+            showWatches()
             pendingWatchID = "watch-deck"
         case "listing": openedListing = ListingLink(key: "OLX:890231", watchId: "watch-deck")
         case "new-watch":
-            selectedTab = .watches
-            pendingNewWatch = true
+            showWatches()
+            pendingNewWatch = WatchDraft(name: "Nintendo Switch OLED", query: "nintendo switch oled", excluded: "joy-con, etui", maxPrice: 1100)
         case "widgets":
-            selectedTab = .settings
+            dealsPath.append(SettingsRoute())
             showWidgetGallery = true
         default: break
         }
@@ -202,11 +241,13 @@ final class AppModel {
     }
 
     func disconnect() {
+        dismissToast()
         stopLiveUpdates()
         client = nil
         connection = .connecting
         openedListing = nil
         selectedTab = .deals
+        dealsPath = NavigationPath()
         widgetSnapshot = nil
         // Photos were fetched with this server's token and are keyed only by
         // URL, so a later server at the same address must not see them.
@@ -247,10 +288,27 @@ final class AppModel {
 
     func open(_ url: URL) {
         guard url.scheme == "scout" else { return }
-        if url.host == "deals" {
+        switch url.host {
+        case "deals":
             openedListing = nil
             selectedTab = .deals
             return
+        case "search":
+            openedListing = nil
+            selectedTab = .search
+            return
+        case "new-watch":
+            openedListing = nil
+            showWatches()
+            pendingNewWatch = WatchDraft()
+            return
+        case "new-flip":
+            openedListing = nil
+            selectedTab = .flips
+            pendingNewFlip = true
+            return
+        default:
+            break
         }
         guard url.host == "listing",
               let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
@@ -259,11 +317,58 @@ final class AppModel {
         openedListing = ListingLink(key: key, watchId: items.first(where: { $0.name == "watchId" })?.value)
     }
 
-    /// Switches to the Watches tab and opens the watch (after creating one).
+    /// Opens Settings → Watches on the Deals tab.
+    func showWatches() {
+        selectedTab = .deals
+        var path = NavigationPath()
+        path.append(SettingsRoute())
+        path.append(WatchesRoute())
+        dealsPath = path
+    }
+
+    /// Opens the watch inside Settings → Watches (after creating one).
     func showWatch(_ watch: Watch) {
         openedListing = nil
-        pendingWatchID = watch.id
-        selectedTab = .watches
+        showWatches()
+        dealsPath.append(watch)
+    }
+
+    // MARK: - Feedback
+
+    func play(_ kind: Haptic) {
+        haptic = HapticEvent(kind: kind)
+    }
+
+    /// Shows an Undo toast for four seconds, replacing (and committing) any
+    /// earlier one.
+    func showUndo(_ message: String, undo: @escaping @MainActor () -> Void, commit: (@MainActor () -> Void)? = nil) {
+        dismissToast()
+        let shown = UndoToast(message: message, undo: undo, commit: commit)
+        toast = shown
+        toastTimer = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled, let self, self.toast?.id == shown.id else { return }
+            self.dismissToast()
+        }
+    }
+
+    /// Hides the toast and commits its action.
+    func dismissToast() {
+        toastTimer?.cancel()
+        toastTimer = nil
+        guard let shown = toast else { return }
+        toast = nil
+        shown.commit?()
+    }
+
+    /// Hides the toast and reverts its action instead.
+    func undoToast() {
+        toastTimer?.cancel()
+        toastTimer = nil
+        guard let shown = toast else { return }
+        toast = nil
+        shown.undo()
+        play(.selection)
     }
 
     // MARK: - Widgets
@@ -288,6 +393,7 @@ final class AppModel {
 
     func report(_ error: Error) {
         guard !error.isCancellation else { return }
+        play(.error)
         alertMessage = error.localizedDescription
     }
 
