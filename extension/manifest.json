@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Scout listing helper",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Fills OLX, Allegro Lokalnie and Vinted listing forms from a flip in your Scout server. You check each form and publish it yourself.",
   "browser_specific_settings": {
     "gecko": {

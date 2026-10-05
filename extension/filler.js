@@ -22,6 +22,7 @@
 
   // How each marketplace words the condition Scout stores.
   const CONDITION_LABELS = {
+    "new-with-tags": { OLX: "Nowe", "Allegro Lokalnie": "Nowy", Vinted: "Nowy z metką" },
     new: { OLX: "Nowe", "Allegro Lokalnie": "Nowy", Vinted: "Nowy bez metki" },
     "like-new": { OLX: "Używane", "Allegro Lokalnie": "Używany", Vinted: "Bardzo dobry" },
     good: { OLX: "Używane", "Allegro Lokalnie": "Używany", Vinted: "Dobry" },
@@ -153,13 +154,66 @@
     return element.isContentEditable ? squash(element.textContent) === squash(value) : norm(element.value) === norm(value);
   }
 
+  /** "1450" or "1449,99", the way Polish forms show a price. */
+  const formatPrice = (price) => (Number.isInteger(price) ? String(price) : price.toFixed(2).replace(".", ","));
+
+  /** What a price field holds as a number: "1 449,99 zł" and "1449.99" are both 1449.99. */
+  function readPrice(field) {
+    const text = (field.value || "").replace(/[^\d,.]/g, "");
+    const value = Number(text.includes(",") ? text.replace(/\./g, "").replace(",", ".") : text);
+    return text && Number.isFinite(value) ? value : null;
+  }
+
+  /**
+   * Type the price with its grosze when it has any, in the comma form first,
+   * then with a dot, and check what the field kept. A site that takes whole
+   * złoty only gets the price rounded.
+   */
+  async function fillPrice(field, price) {
+    const whole = Math.round(price);
+    const tries = Number.isInteger(price) ? [String(price)] : [formatPrice(price), price.toFixed(2), String(whole)];
+    for (const text of tries) {
+      setValue(field, text);
+      await wait(150);
+      const kept = readPrice(field);
+      if (kept !== null && Math.abs(kept - price) < 0.005) return { ok: true, final: true, note: `${formatPrice(price)} zł` };
+      if (text === String(whole) && kept === whole) return { ok: true, final: true, note: `${whole} zł, the site takes whole złoty` };
+    }
+    return { ok: false, final: false, note: "check it, the site may have changed it" };
+  }
+
   // Editors drop the line breaks from textContent, so compare without spaces.
   const squash = (text) => norm(text).replace(/\s+/g, "");
 
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  /** Pick the condition in a <select>, a radio group, or an open dropdown. */
-  async function chooseCondition(label, { openDropdown = true } = {}) {
+  const CONDITION_WORD = /\b(stan|stan przedmiotu|condition)\b/;
+
+  /**
+   * The control that opens the condition list: a combobox or a condition
+   * input first, then short buttons. Containers that merely hold the word
+   * "Stan" somewhere in a long text are never taken.
+   */
+  function conditionOpener() {
+    return [...document.querySelectorAll("[role='combobox'], input[name*='condition' i], input[data-testid*='condition' i], button, [aria-haspopup], input[readonly], div[tabindex]")]
+      .filter((element) => isVisible(element))
+      .map((element) => ({ element, own: norm(describe(element)), text: norm(element.textContent) }))
+      .filter(({ own, text }) => CONDITION_WORD.test(own) || (text.length < 40 && CONDITION_WORD.test(text)))
+      // A field named just "Stan" beats "Stan baterii"; real dropdowns beat buttons.
+      .map((item) => ({ ...item, exact: item.own.split("|").some((part) => /^(stan|stan przedmiotu|condition)\*?$/.test(part.trim())) ? 0 : 1, rank: item.element.matches("[role='combobox'], input") ? 0 : 1 }))
+      .sort((a, b) => a.exact - b.exact || a.rank - b.rank || a.text.length - b.text.length)[0]?.element || null;
+  }
+
+  const pressEscape = (element) => {
+    for (const type of ["keydown", "keyup"]) (element || document.activeElement || document.body).dispatchEvent(new KeyboardEvent(type, { key: "Escape", code: "Escape", bubbles: true }));
+  };
+
+  /**
+   * Pick the condition in a <select>, a radio group, or a dropdown. Returns
+   * "picked", "missing" when the list opened without the wanted option (it is
+   * closed again), or null when the page has no condition field yet.
+   */
+  async function chooseCondition(label) {
     const wanted = norm(label);
     for (const select of document.querySelectorAll("select")) {
       if (!isVisible(select)) continue;
@@ -172,26 +226,30 @@
     }
     // Options can carry an explanation after the name ("Bardzo dobryUżywany
     // przedmiot…" on Vinted); once a dropdown is open, those count too.
-    const clickable = (loose = false) => [...document.querySelectorAll("button, [role='option'], [role='radio'], [role='menuitem'], label, li")]
+    // Real options rank before look-alike buttons and labels elsewhere.
+    const clickable = (loose = false) => [...document.querySelectorAll("[role='option'], [role='radio'], [role='menuitem'], button, label, li")]
       .filter((element) => isVisible(element))
-      .map((element) => ({ element, text: norm(element.textContent) }))
+      .map((element) => ({ element, text: norm(element.textContent), option: element.matches("[role='option'], [role='radio'], [role='menuitem']") ? 0 : 1 }))
       .filter(({ text }) => text === wanted || (loose && text.startsWith(wanted)))
-      .sort((a, b) => a.text.length - b.text.length)
+      .sort((a, b) => a.option - b.option || a.text.length - b.text.length)
       .map(({ element }) => element);
     let target = clickable()[0];
+    let opener = null;
     if (!target) {
       // Custom dropdowns list their options only once opened.
-      const opener = [...document.querySelectorAll("button, [role='combobox'], [aria-haspopup], input[readonly], div[tabindex], input[name*='condition' i], input[data-testid*='condition' i]")]
-        .find((element) => isVisible(element) && /\b(stan|condition)\b/.test(norm(describe(element) + " " + element.textContent)));
-      if (!opener || !openDropdown) return false;
-      conditionOpenedOn.add(location.href);
+      opener = conditionOpener();
+      if (!opener) return null;
       opener.click();
       await wait(500);
       target = clickable(true)[0];
+      if (!target) {
+        pressEscape(opener);
+        return "missing";
+      }
     }
-    if (!target) return false;
     target.click();
-    return true;
+    await wait(200);
+    return "picked";
   }
 
   function findPhotoInput() {
@@ -234,6 +292,9 @@
     { kind: "condition", label: "Condition" },
     { kind: "photos", label: "Photos" },
     { kind: "category", label: "Category", channels: ["Allegro Lokalnie", "Vinted"] },
+    { kind: "brand", label: "Brand", channels: ["Vinted"] },
+    // Rechecked on every change until done: the operator completes it.
+    { kind: "details", label: "Item details", channels: ["Allegro Lokalnie"], live: true },
     { kind: "delivery", label: "Shipping" },
     { kind: "promotion", label: "Promotion", channels: ["Allegro Lokalnie"] },
   ].filter((field) => !field.channels || field.channels.includes(channel));
@@ -244,10 +305,15 @@
   // "Next" buttons that only move between steps; every site's publish
   // button ("Dodaj ogłoszenie", "Wystaw…", Vinted's "Dodaj") is never pressed.
   // OLX shows the rest of its form after the title. Allegro Lokalnie's first
-  // page is left alone, since its product and features need a person.
+  // page moves on once its product and required features are picked too.
   const NEXT_STEPS = {
     OLX: [{ button: /^dalej$/, ready: () => results.get("title")?.ok && !findField("price") }],
     "Allegro Lokalnie": [
+      {
+        button: /^kolejny krok$/,
+        ready: () => onPage("/wystaw") && results.get("title")?.ok && results.get("category")?.ok
+          && hasText(findField("description")) && allegroItemDetails()?.ok,
+      },
       { button: /^kolejny krok$/, ready: () => onPage("/wystaw/szczegoly") && results.get("price")?.ok && results.has("delivery") },
       { button: /^kolejny krok$/, ready: () => onPage("/wystaw/wyroznij") && results.get("promotion")?.ok },
     ],
@@ -264,27 +330,119 @@
     return true;
   }
 
-  /** Allegro Lokalnie suggests categories from the title; take the first. */
+  const hasText = (field) => Boolean(field) && !isEmpty(field);
+
+  /**
+   * Allegro Lokalnie's item details after the category: the catalogue
+   * product, the condition and the required features (Cechy) such as
+   * "Nośnik*". The product and features depend on the item, so they stay the
+   * operator's; this tracks what is left, which gates the next step.
+   */
+  function allegroItemDetails() {
+    if (!onPage("/wystaw")) return null;
+    if (!visible("h1, h2, h3, h4").some((heading) => /^(cechy|stan)\*?$/.test(norm(heading.textContent)))) return null;
+    const missing = visible("[role='combobox']")
+      .map((element) => ({ element, own: describe(element) }))
+      .filter(({ element, own }) => (own.includes("*") || CONDITION_WORD.test(norm(own))) && /^wybierz/.test(norm(element.textContent)))
+      .map(({ own }) => own.split("|").map((part) => part.trim()).filter((part) => part && !/^downshift/.test(part)).at(-1)?.replace(/\*$/, "") || "a feature");
+    const products = visible("[data-testid='product-item']");
+    const productMissing = products.length > 0 && !products.some((item) => item.querySelector("input:checked"));
+    if (!missing.length && !productMissing) return { ok: true, final: true, note: "done" };
+    const todo = [...(productMissing ? ["the product or “Żaden z powyższych”"] : []), ...new Set(missing)];
+    return { ok: false, final: false, note: `pick ${todo.join(", ")}` };
+  }
+
+  /**
+   * Vinted's brand: search the title's first words and take only a result
+   * named exactly that; anything else is left to the operator.
+   */
+  async function chooseVintedBrand(job) {
+    const input = document.querySelector("[data-testid='brand-select-dropdown-input']");
+    if (!input || !isVisible(input)) return null;
+    if (input.value) return { ok: true, final: true, note: "already chosen" };
+    const [first = "", second = ""] = (job.flip.listing?.title || job.flip.title).trim().split(/\s+/);
+    const names = [...new Set([`${first} ${second}`.trim(), first])].filter((name) => /\p{L}{2}/u.test(name));
+    input.click();
+    await wait(500);
+    const search = visible("input").find((element) => element !== input && /search|szukaj/.test(norm(describe(element))) && /brand|mark/.test(norm(describe(element))));
+    if (!search) {
+      pressEscape(input);
+      return { ok: false, final: true, note: "choose it yourself" };
+    }
+    for (const name of names) {
+      setValue(search, name, { blur: false });
+      await wait(900);
+      const firstLine = (element) => norm((element.innerText || element.textContent).split("\n")[0]);
+      const match = visible("[role='option'], [role='radio'], [role='button'], li, label")
+        .filter((element) => !element.contains(search) && firstLine(element) === norm(name))
+        .sort((a, b) => a.textContent.length - b.textContent.length)[0];
+      if (!match) continue;
+      match.click();
+      await wait(300);
+      return { ok: true, final: true, note: `${name}, check it` };
+    }
+    pressEscape(search);
+    return { ok: false, final: true, note: "no exact match, choose it yourself" };
+  }
+
+  // --- Choosing a category ------------------------------------------------------
+
+  /** Words worth matching on, as typed: no model codes, numbers or short fillers. */
+  // Paths run together ("Kultura i rozrywkaMuzyka") are split at the capital.
+  const words = (text) => [...new Set((text || "").replace(/(\p{Ll})(\p{Lu})|(\p{Lu})(\p{Lu}\p{Ll})/gu, "$1$3 $2$4").split(/[^\p{L}]+/u).filter((word) => word.length > 3))];
+  // Polish inflects ("słuchawki", "słuchawkowe"): words match on their first five letters.
+  const stem = (word) => norm(word).slice(0, 5);
+
+  /**
+   * How well a category fits the item. The category keyword from Scout
+   * ("Słuchawki") counts three times as much as a word of the title, and
+   * each word of the category's own name that says nothing about the item
+   * costs half, so "Słuchawki" beats "Słuchawki dla dzieci".
+   */
+  function categoryScore(text, job, leaf = "") {
+    const stems = new Set(words(text).map(stem));
+    const hits = (list) => list.filter((word) => stems.has(stem(word))).length;
+    const item = [...words(job.flip.listing?.category), ...words(job.flip.listing?.title || job.flip.title)];
+    const itemStems = new Set(item.map(stem));
+    const unrelated = words(leaf).filter((word) => !itemStems.has(stem(word))).length;
+    return hits(words(job.flip.listing?.category)) * 3 + hits(words(job.flip.listing?.title || job.flip.title)) - unrelated / 2;
+  }
+
+  /** The best-scoring element; the site's own order breaks ties. */
+  function bestCategory(elements, job, leafOf) {
+    return elements
+      .map((element, index) => ({ element, index, score: categoryScore(element.textContent, job, leafOf(element)) }))
+      .sort((a, b) => b.score - a.score || a.index - b.index)[0];
+  }
+
+  /** Allegro Lokalnie suggests categories from the title; take the one that fits best. */
   async function chooseCategory(job) {
     if (channel === "Allegro Lokalnie") {
       const suggestions = visible("[data-testid='suggested-category-selection']");
       if (!suggestions.length) return null;
-      const chosen = suggestions.find((label) => label.querySelector("input:checked")) || suggestions[0];
+      const best = bestCategory(suggestions, job, categoryName);
+      const checked = suggestions.find((label) => label.querySelector("input:checked"));
+      // A suggestion already picked stays unless another fits better.
+      const chosen = checked && categoryScore(checked.textContent, job, categoryName(checked)) >= best.score ? checked : best.element;
       if (!chosen.querySelector("input:checked")) chosen.click();
-      return { ok: true, final: true, note: `${categoryName(chosen)}, check it` };
+      return { ok: true, final: true, note: `${categoryName(chosen)}${best.score > 0 ? "" : ", Allegro's first guess"}, check it` };
     }
-    if (channel === "Vinted") return chooseVintedCategory(job.flip.listing?.title || job.flip.title);
+    if (channel === "Vinted") return chooseVintedCategory(job);
     return null;
   }
 
   // "Kultura i rozrywkaMuzyka": the path is run together; show the leaf.
-  const categoryName = (element) => element.textContent.trim().split(/(?<=\p{Ll})(?=\p{Lu})/u).at(-1) || element.textContent.trim();
+  const categoryName = (element) => element.textContent.trim().split(/(?<=\p{Ll})(?=\p{Lu})|(?<=\p{Lu})(?=\p{Lu}\p{Ll})/u).at(-1) || element.textContent.trim();
 
   /**
-   * Vinted has no suggestions: open its category search and try the title's
-   * words, longest first, until one finds categories; pick the first.
+   * Vinted has no suggestions: search its categories with Scout's category
+   * keyword, then with the title's longest words, and take the result that
+   * fits the item best.
    */
-  async function chooseVintedCategory(title) {
+  // "SłuchawkiElektronika > Audio": the result's own name comes first.
+  const vintedLeaf = (element) => element.textContent.trim().split(/(?<=\p{Ll})(?=\p{Lu})/u)[0];
+
+  async function chooseVintedCategory(job) {
     const input = document.querySelector("[data-testid='catalog-select-dropdown-input']");
     if (!input || !isVisible(input)) return null;
     if (input.value) return { ok: true, final: true, note: "already chosen" };
@@ -292,19 +450,21 @@
     await wait(500);
     const search = document.querySelector("input[name='catalog-search-input']");
     if (!search) return { ok: false, final: true, note: "choose it yourself" };
-    const words = [...new Set(title.split(/[\s,/()-]+/).filter((word) => word.length > 3 && !/\d/.test(word)))]
-      .sort((a, b) => b.length - a.length)
-      .slice(0, 4);
-    for (const word of words) {
+    const category = (job.flip.listing?.category || "").trim();
+    const titleWords = words(job.flip.listing?.title || job.flip.title).sort((a, b) => b.length - a.length).slice(0, 4);
+    const queries = [...new Set([category, ...(words(category).length > 1 ? words(category) : []), ...titleWords])].filter(Boolean).slice(0, 6);
+    for (const query of queries) {
       // Typing into the search, without leaving it, which closes the list.
-      setValue(search, word, { blur: false });
+      setValue(search, query, { blur: false });
       await wait(900);
-      const result = visible("[role='radio'][id^='catalog-search'], [id^='catalog-search-'][id$='-result'], [data-testid^='catalog-search-'][data-testid$='-result']")[0];
-      if (!result) continue;
-      result.click();
+      const results = visible("[role='radio'][id^='catalog-search'], [id^='catalog-search-'][id$='-result'], [data-testid^='catalog-search-'][data-testid$='-result']");
+      if (!results.length) continue;
+      const { element } = bestCategory(results, job, vintedLeaf);
+      element.click();
       await wait(300);
-      return { ok: true, final: true, note: `${result.textContent.trim().split(/(?<=\p{Ll})(?=\p{Lu})/u)[0]}, check it` };
+      return { ok: true, final: true, note: `${vintedLeaf(element)}, check it` };
     }
+    pressEscape(search);
     return { ok: false, final: true, note: "no match, choose it yourself" };
   }
 
@@ -371,26 +531,31 @@
   async function fillField(kind, job, { following }) {
     const listing = job.flip.listing;
     const price = listing?.prices?.[channel] ?? listing?.basePrice ?? null;
-    if (kind === "title" || kind === "description" || kind === "price") {
-      const value = kind === "title" ? listing?.title || job.flip.title
-        : kind === "description" ? listing?.description || ""
-        : price ? String(Math.round(price)) : "";
-      if (!value) return { ok: false, final: true, note: kind === "price" ? "none set in Scout" : "none in Scout yet" };
+    if (kind === "price") {
+      if (!price) return { ok: false, final: true, note: "none set in Scout" };
+      const field = findField(kind);
+      if (!field) return null;
+      if (following && !isEmpty(field)) return { ok: true, final: true, note: "already filled" };
+      return fillPrice(field, price);
+    }
+    if (kind === "title" || kind === "description") {
+      const value = kind === "title" ? listing?.title || job.flip.title : listing?.description || "";
+      if (!value) return { ok: false, final: true, note: "none in Scout yet" };
       const field = findField(kind);
       if (!field) return null;
       if (following && !isEmpty(field)) return { ok: true, final: true, note: "already filled" };
       const ok = setValue(field, value);
-      return { ok, final: ok, note: ok ? (kind === "price" ? `${value} zł` : "") : "check it, the site may have changed it" };
+      return { ok, final: ok, note: ok ? "" : "check it, the site may have changed it" };
     }
     if (kind === "condition") {
       if (!listing?.condition) return { ok: false, final: true, note: "not set in Scout" };
       const label = CONDITION_LABELS[listing.condition]?.[channel];
       if (!label) return { ok: false, final: true, note: "choose it yourself" };
-      // While following, a custom dropdown is opened once per page, not on
-      // every change the page makes.
-      const openDropdown = !following || !conditionOpenedOn.has(location.href);
-      const picked = await chooseCondition(label, { openDropdown });
-      return picked ? { ok: true, final: true, note: label } : null;
+      // A list that opened without the option is retried on the next change
+      // the page makes, up to the attempt limit, then left to the operator.
+      const picked = await chooseCondition(label);
+      if (!picked) return null;
+      return picked === "picked" ? { ok: true, final: true, note: label } : { ok: false, final: false, note: `pick “${label}” yourself` };
     }
     if (kind === "photos") {
       if (!job.flip.photos.length) return { ok: false, final: true, note: "none in Scout yet" };
@@ -401,6 +566,8 @@
       return { ok: attached === photos.length, final: attached > 0, note: `${attached} of ${photos.length}${reason ? `, ${reason}` : ""}` };
     }
     if (kind === "category") return chooseCategory(job);
+    if (kind === "brand") return chooseVintedBrand(job);
+    if (kind === "details") return allegroItemDetails();
     if (kind === "delivery") {
       if (!job.parcelSize) return { ok: false, final: true, note: "choose it yourself, or set a parcel size in Options" };
       return chooseDelivery(job.parcelSize);
@@ -412,7 +579,6 @@
   // kind -> { ok, note } for fields that are done; anything missing is pending.
   const results = new Map();
   const attempts = new Map();
-  const conditionOpenedOn = new Set();
   const MAX_ATTEMPTS = 3;
   let following = false;
   let filling = false;
@@ -424,8 +590,8 @@
     filling = true;
     let filledNow = 0;
     try {
-      for (const { kind } of FIELDS) {
-        if (results.has(kind)) continue;
+      for (const { kind, live } of FIELDS) {
+        if (results.has(kind) && !(live && !results.get(kind).ok)) continue;
         let outcome;
         try {
           outcome = await fillField(kind, job, { following: !firstPress });
@@ -433,6 +599,10 @@
           outcome = { ok: false, final: true, note: error.message };
         }
         if (!outcome) continue;
+        if (live) {
+          results.set(kind, outcome);
+          continue;
+        }
         // A site that keeps clearing a field gets three tries, then it is
         // left for the operator instead of fighting their own typing.
         attempts.set(kind, (attempts.get(kind) || 0) + 1);
@@ -448,11 +618,14 @@
     return filledNow;
   }
 
+  /** Every field has its outcome and every live one is done. */
+  const settled = () => FIELDS.every(({ kind, live }) => results.has(kind) && (!live || results.get(kind).ok));
+
   function startFollowing(job) {
     following = true;
     if (observer) return;
     observer = new MutationObserver(() => {
-      if (results.size === FIELDS.length) return;
+      if (settled()) return;
       clearTimeout(observeTimer);
       observeTimer = setTimeout(() => { void fillAvailable(job); }, 700);
     });
@@ -586,7 +759,7 @@
       return item;
     }));
     if (fillButton) fillButton.textContent = following ? "Fill again" : "Fill this form";
-    const waiting = FIELDS.filter(({ kind }) => !results.has(kind)).length;
+    const waiting = FIELDS.filter(({ kind, live }) => !results.has(kind) || (live && !results.get(kind).ok)).length;
     if (!following) return;
     setStatus(waiting
       ? "Go through the form. Scout fills the rest as each step appears. Check everything, then publish."
@@ -611,14 +784,13 @@
     header.append(logo(), el("span", "brand", "Scout"), el("span", "chip", channel), el("span", "spacer"), minimize, close);
 
     const main = el("main");
-    main.append(el("div", "kicker", price ? `Listing · ${Math.round(price)} zł` : "Listing"), el("div", "title", listing?.title || job.flip.title));
+    main.append(el("div", "kicker", price ? `Listing · ${formatPrice(price)} zł` : "Listing"), el("div", "title", listing?.title || job.flip.title));
     resultList = el("ul");
     statusLine = el("p", "status", "Open the first step of the form, then press Fill. Scout keeps filling as later steps appear.");
     fillButton = button("Fill this form", "primary", async () => {
       // A press refills this page even if a field was done on an earlier one.
       for (const [kind, outcome] of results) if (!outcome.ok) results.delete(kind);
       attempts.clear();
-      conditionOpenedOn.clear();
       setStatus("Filling…");
       startFollowing(job);
       await fillAvailable(job, { firstPress: true });

@@ -1,4 +1,5 @@
 import { DEFAULT_FEE_PRESETS, FLIP_CHANNELS, LISTING_CONDITIONS, isFlipChannel, normalizeFeePresets, saleFee, type FeePresets, type FlipChannel, type FlipListing, type ListingCondition } from '../src/profit';
+import sharp from 'sharp';
 import type { Flip, FlipPhoto, FlipsData } from '../src/types';
 import { ServiceError } from './service';
 
@@ -6,6 +7,12 @@ const FEE_PRESETS_KEY = 'flip_fee_presets';
 /** More than any of the three marketplaces takes per listing. */
 export const MAX_FLIP_PHOTOS = 20;
 export const MAX_FLIP_PHOTO_BYTES = 10 * 1024 * 1024;
+/** Long edge of a stored photo; the marketplaces show no more than this. */
+export const MAX_FLIP_PHOTO_EDGE = 2000;
+
+// One image at a time and no decoded-image cache: the server is small.
+sharp.concurrency(1);
+sharp.cache(false);
 
 /** Recognise the image by its bytes, never by the declared type. */
 export function sniffImageMime(data: Uint8Array): 'image/jpeg' | 'image/png' | 'image/webp' | null {
@@ -13,6 +20,27 @@ export function sniffImageMime(data: Uint8Array): 'image/jpeg' | 'image/png' | '
   if (data.length >= 8 && [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a].every((byte, index) => data[index] === byte)) return 'image/png';
   if (data.length >= 12 && String.fromCharCode(...data.subarray(0, 4)) === 'RIFF' && String.fromCharCode(...data.subarray(8, 12)) === 'WEBP') return 'image/webp';
   return null;
+}
+
+/**
+ * Store every photo as WebP: about a third of a JPEG's size at the same look,
+ * and all three marketplaces take it. The camera's rotation is applied and the
+ * metadata (GPS position included) is dropped. A WebP that is already small
+ * enough is kept as it is, so it is never compressed twice.
+ */
+export async function toWebp(data: Uint8Array): Promise<Buffer> {
+  try {
+    const image = sharp(data, { failOn: 'error', limitInputPixels: 100_000_000 });
+    const { format, width = 0, height = 0, orientation } = await image.metadata();
+    if (format === 'webp' && Math.max(width, height) <= MAX_FLIP_PHOTO_EDGE && (orientation ?? 1) === 1) return Buffer.from(data);
+    return await image
+      .rotate()
+      .resize({ width: MAX_FLIP_PHOTO_EDGE, height: MAX_FLIP_PHOTO_EDGE, fit: 'inside', withoutEnlargement: true })
+      .webp({ quality: 85 })
+      .toBuffer();
+  } catch {
+    throw new ServiceError('The photo could not be read as an image', 415);
+  }
 }
 
 function listingFromJson(value: unknown): FlipListing | null {
@@ -33,6 +61,7 @@ function listingFromJson(value: unknown): FlipListing | null {
     title: typeof raw.title === 'string' ? raw.title : '',
     description: typeof raw.description === 'string' ? raw.description : '',
     condition,
+    ...(typeof raw.category === 'string' && raw.category.trim() ? { category: raw.category.trim().slice(0, 80) } : {}),
     prices,
     basePrice: typeof raw.basePrice === 'number' && Number.isFinite(raw.basePrice) && raw.basePrice > 0 ? raw.basePrice : null,
   };
@@ -148,17 +177,43 @@ export class FlipStore {
     return this.get(id);
   }
 
-  addPhoto(flipId: number, data: Uint8Array): FlipPhoto {
+  async addPhoto(flipId: number, data: Uint8Array): Promise<FlipPhoto> {
     this.get(flipId);
     if (data.byteLength > MAX_FLIP_PHOTO_BYTES) throw new ServiceError('Photos can be at most 10 MB', 413);
-    const mime = sniffImageMime(data);
-    if (!mime) throw new ServiceError('Photos must be JPEG, PNG or WebP', 415);
+    if (!sniffImageMime(data)) throw new ServiceError('Photos must be JPEG, PNG or WebP', 415);
+    this.assertPhotoRoom(flipId);
+    const webp = await toWebp(data);
+    // Checked again after converting: other uploads may have landed meanwhile.
+    this.get(flipId);
+    this.assertPhotoRoom(flipId);
+    const position = Number((this.db.prepare('SELECT COALESCE(MAX(position), -1) + 1 AS next FROM flip_photos WHERE flip_id = ?').get(flipId) as { next: number }).next);
+    const result = this.db.prepare('INSERT INTO flip_photos (flip_id, position, mime, data, byte_size, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(flipId, position, 'image/webp', webp, webp.byteLength, new Date().toISOString());
+    this.onChange({ id: flipId });
+    return { id: Number(result.lastInsertRowid), mime: 'image/webp', byteSize: webp.byteLength };
+  }
+
+  private assertPhotoRoom(flipId: number) {
     const count = Number((this.db.prepare('SELECT COUNT(*) AS count FROM flip_photos WHERE flip_id = ?').get(flipId) as { count: number }).count);
     if (count >= MAX_FLIP_PHOTOS) throw new ServiceError(`A flip can have at most ${MAX_FLIP_PHOTOS} photos`, 400);
-    const position = Number((this.db.prepare('SELECT COALESCE(MAX(position), -1) + 1 AS next FROM flip_photos WHERE flip_id = ?').get(flipId) as { next: number }).next);
-    const result = this.db.prepare('INSERT INTO flip_photos (flip_id, position, mime, data, byte_size, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(flipId, position, mime, data, data.byteLength, new Date().toISOString());
-    this.onChange({ id: flipId });
-    return { id: Number(result.lastInsertRowid), mime, byteSize: data.byteLength };
+  }
+
+  /**
+   * Convert photos stored before WebP became the format, one at a time.
+   * Returns how many were converted; unreadable ones are left as they are.
+   */
+  async convertStoredPhotosToWebp(): Promise<number> {
+    const ids = (this.db.prepare("SELECT id FROM flip_photos WHERE mime != 'image/webp' ORDER BY id").all() as Array<{ id: number }>).map((row) => Number(row.id));
+    let converted = 0;
+    for (const id of ids) {
+      const row = this.db.prepare('SELECT flip_id, data FROM flip_photos WHERE id = ?').get(id) as { flip_id: number; data: Uint8Array } | undefined;
+      if (!row) continue;
+      let webp: Buffer;
+      try { webp = await toWebp(row.data); } catch { continue; }
+      this.db.prepare("UPDATE flip_photos SET mime = 'image/webp', data = ?, byte_size = ? WHERE id = ?").run(webp, webp.byteLength, id);
+      this.onChange({ id: Number(row.flip_id) });
+      converted += 1;
+    }
+    return converted;
   }
 
   photo(photoId: number): { mime: string; data: Uint8Array } | null {

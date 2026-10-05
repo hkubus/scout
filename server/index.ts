@@ -668,6 +668,7 @@ app.put('/api/flips/:id/listing', async (request, reply) => {
     title: z.string().trim().max(200),
     description: z.string().max(9000),
     condition: z.enum(LISTING_CONDITIONS).nullable(),
+    category: z.string().trim().max(80).optional(),
     prices: z.object(Object.fromEntries(FLIP_CHANNELS.map((channel) => [channel, flipAmount.positive().optional()])) as Record<(typeof FLIP_CHANNELS)[number], z.ZodOptional<z.ZodNumber>>).strict(),
     basePrice: flipAmount.positive().nullable(),
   }).strict().nullable().safeParse(request.body);
@@ -678,13 +679,27 @@ app.post('/api/flips/:id/listing-draft', async (request, reply) => {
   const params = flipIdParams.safeParse(request.params);
   if (!params.success) return reply.code(400).send({ error: 'A valid flip id is required' });
   const flip = flips.get(params.data.id);
-  if (!flip.listingKey) return reply.code(409).send({ error: 'This flip was not added from a Scout listing, so there is nothing to draft from' });
+  if (!flip.listingKey) {
+    // Not bought through Scout: write it from what the operator has so far.
+    const notes = z.object({
+      title: z.string().trim().max(200).optional(),
+      description: z.string().max(9000).optional(),
+      condition: z.enum(LISTING_CONDITIONS).nullable().optional(),
+    }).strip().safeParse(request.body ?? {});
+    if (!notes.success) return reply.code(400).send({ error: 'Invalid listing notes' });
+    const draft = await service.draftResaleListingFromNotes({
+      title: notes.data.title || flip.listing?.title || flip.title,
+      notes: [notes.data.description ?? flip.listing?.description ?? '', flip.note].filter((text) => text.trim()).join('\n\n'),
+      condition: notes.data.condition ?? flip.listing?.condition ?? null,
+    });
+    return { draft, photosAdded: 0, flip };
+  }
   // Photos come along only while the flip has none, so a redraft never
   // duplicates them or undoes the operator's own selection.
   const { draft, images } = await service.draftResaleListing(flip.listingKey, { photos: flip.photos.length === 0 });
   let added = 0;
   for (const image of images.slice(0, MAX_FLIP_PHOTOS)) {
-    try { flips.addPhoto(flip.id, image.data); added += 1; } catch { /* unreadable or oversized image: skip it */ }
+    try { await flips.addPhoto(flip.id, image.data); added += 1; } catch { /* unreadable or oversized image: skip it */ }
   }
   return { draft, photosAdded: added, flip: flips.get(flip.id) };
 });
@@ -694,7 +709,7 @@ app.post('/api/flips/:id/photos', async (request, reply) => {
   const params = flipIdParams.safeParse(request.params);
   if (!params.success) return reply.code(400).send({ error: 'A valid flip id is required' });
   if (!Buffer.isBuffer(request.body)) return reply.code(415).send({ error: 'Send the photo as the request body with an image/jpeg, image/png or image/webp content type' });
-  return reply.code(201).send({ photo: flips.addPhoto(params.data.id, request.body) });
+  return reply.code(201).send({ photo: await flips.addPhoto(params.data.id, request.body) });
 });
 app.put('/api/flips/:id/photos/order', async (request, reply) => {
   const params = flipIdParams.safeParse(request.params);
@@ -1119,3 +1134,9 @@ process.once('SIGINT', () => { void shutdown('SIGINT'); });
 await app.listen({ port, host });
 service.logDiagnostic(`started · ${formatMemoryLine()}`);
 service.schedulerTick();
+// Flip photos stored before WebP became the format are converted in the
+// background; an interrupted pass resumes on the next start.
+void flips.convertStoredPhotosToWebp().then(
+  (count) => { if (count) service.logDiagnostic(`converted ${count} flip photo${count === 1 ? '' : 's'} to WebP`); },
+  (error) => { if (!shuttingDown) app.log.warn({ err: error }, 'Converting flip photos to WebP stopped'); },
+);

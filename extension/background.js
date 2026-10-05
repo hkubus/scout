@@ -72,7 +72,10 @@ async function photoPayloads(flip) {
   const photos = [];
   for (const [index, photo] of flip.photos.entries()) {
     const response = await scout(`/api/flip-photos/${photo.id}`);
-    photos.push({ name: `photo-${index + 1}.${extension[photo.mime] || "jpg"}`, type: photo.mime, data: base64(await response.arrayBuffer()) });
+    // The served type, not the listed one: a photo converted to WebP since
+    // can still come from the browser's cache as the earlier JPEG.
+    const type = (response.headers.get("content-type") || photo.mime).split(";")[0].trim();
+    photos.push({ name: `photo-${index + 1}.${extension[type] || "jpg"}`, type, data: base64(await response.arrayBuffer()) });
   }
   return photos;
 }

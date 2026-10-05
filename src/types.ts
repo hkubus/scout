@@ -657,9 +657,12 @@ export interface ResaleListingDraft {
   title: string;
   description: string;
   condition: import('./profit').ListingCondition | null;
+  /** The item's kind as marketplaces name categories; empty when unknown. */
+  category: string;
   /** `ai` when OpenRouter rewrote it, `copy` when it is the original text. */
   method: 'ai' | 'copy';
-  source: { marketplace: string; title: string; url: string; description: string | null };
+  /** The listing it was bought through; null when written from the operator's notes. */
+  source: { marketplace: string; title: string; url: string; description: string | null } | null;
 }
 
 export interface FlipsData {

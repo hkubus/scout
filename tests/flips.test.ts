@@ -4,9 +4,10 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase } from '../server/db';
-import { FlipStore, MAX_FLIP_PHOTOS, sniffImageMime } from '../server/flips';
+import sharp from 'sharp';
+import { FlipStore, MAX_FLIP_PHOTO_EDGE, MAX_FLIP_PHOTOS, sniffImageMime, toWebp } from '../server/flips';
 import { ServiceError } from '../server/service';
-import { DEFAULT_FEE_PRESETS, suggestedListingPrice, estimateFlipNet, flipNet, normalizeFeePresets, quarterOf, saleFee, salesRecord, salesRecordCsv } from '../src/profit';
+import { DEFAULT_FEE_PRESETS, listingConditionFromLabel, roundToNines, suggestedListingPrice, estimateFlipNet, flipNet, normalizeFeePresets, quarterOf, saleFee, salesRecord, salesRecordCsv } from '../src/profit';
 
 function fixture() {
   const directory = mkdtempSync(join(tmpdir(), 'scout-flips-'));
@@ -89,11 +90,12 @@ test('flip updates reject incomplete or impossible sales and unknown ids', () =>
   } finally { context.close(); }
 });
 
-const JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46]);
-const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0]);
+const image = (width: number, height: number) => sharp({ create: { width, height, channels: 3, background: { r: 200, g: 40, b: 40 } } });
 
-test('listing drafts and photos are stored per flip, checked by their bytes, and ordered', () => {
+test('listing drafts and photos are stored per flip as WebP, checked by their bytes, and ordered', async () => {
   const context = fixture();
+  const JPEG = await image(40, 30).jpeg().toBuffer();
+  const PNG = await image(30, 40).png().toBuffer();
   try {
     const flip = context.store.create({ title: 'RTX 3070', buyChannel: 'Vinted', boughtOn: '2026-09-28', buyPrice: 1150 });
     assert.equal(flip.listing, null);
@@ -101,20 +103,25 @@ test('listing drafts and photos are stored per flip, checked by their bytes, and
     const listing = { title: 'Gigabyte RTX 3070 Eagle OC 8GB', description: 'Sprawna, bez kopania.', condition: 'good' as const, prices: { OLX: 1450, 'Allegro Lokalnie': 1525 }, basePrice: 1450 };
     assert.deepEqual(context.store.setListing(flip.id, listing).listing, listing);
 
-    const first = context.store.addPhoto(flip.id, JPEG);
-    const second = context.store.addPhoto(flip.id, PNG);
-    assert.deepEqual([first.mime, second.mime], ['image/jpeg', 'image/png']);
+    const first = await context.store.addPhoto(flip.id, JPEG);
+    const second = await context.store.addPhoto(flip.id, PNG);
+    assert.deepEqual([first.mime, second.mime], ['image/webp', 'image/webp']);
     assert.deepEqual(context.store.get(flip.id).photos.map((photo) => photo.id), [first.id, second.id]);
     assert.deepEqual(context.store.orderPhotos(flip.id, [second.id, first.id]).photos.map((photo) => photo.id), [second.id, first.id]);
     assert.throws(() => context.store.orderPhotos(flip.id, [first.id]), /exactly once/);
-    assert.deepEqual([...context.store.photo(first.id)!.data], [...JPEG]);
+    const stored = context.store.photo(first.id)!;
+    assert.equal(sniffImageMime(stored.data), 'image/webp');
+    assert.equal(stored.data.byteLength, first.byteSize);
+    assert.deepEqual(await sharp(stored.data).metadata().then(({ width, height }) => [width, height]), [40, 30]);
     assert.equal(context.store.list().flips[0].photos.length, 2);
 
     // Declared types are never trusted: HTML or SVG is refused by content.
-    assert.throws(() => context.store.addPhoto(flip.id, new TextEncoder().encode('<svg onload=alert(1)>')), (error: unknown) => error instanceof ServiceError && error.status === 415);
+    await assert.rejects(context.store.addPhoto(flip.id, new TextEncoder().encode('<svg onload=alert(1)>')), (error: unknown) => error instanceof ServiceError && error.status === 415);
+    // Bytes that only look like a JPEG are refused when decoding.
+    await assert.rejects(context.store.addPhoto(flip.id, new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46])), (error: unknown) => error instanceof ServiceError && error.status === 415);
     assert.equal(sniffImageMime(new TextEncoder().encode('RIFF\0\0\0\0WEBPVP8 ')), 'image/webp');
-    for (let index = 2; index < MAX_FLIP_PHOTOS; index += 1) context.store.addPhoto(flip.id, JPEG);
-    assert.throws(() => context.store.addPhoto(flip.id, JPEG), /at most 20 photos/);
+    for (let index = 2; index < MAX_FLIP_PHOTOS; index += 1) await context.store.addPhoto(flip.id, JPEG);
+    await assert.rejects(context.store.addPhoto(flip.id, JPEG), /at most 20 photos/);
 
     context.store.deletePhoto(first.id);
     assert.equal(context.store.get(flip.id).photos.length, MAX_FLIP_PHOTOS - 1);
@@ -123,6 +130,47 @@ test('listing drafts and photos are stored per flip, checked by their bytes, and
     assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM flip_photos').get() as { count: number }).count, 0);
     assert.equal(context.store.setListing(context.store.create({ title: 'x', buyChannel: 'OLX', boughtOn: '2026-09-01', buyPrice: 1 }).id, null).listing, null);
   } finally { context.close(); }
+});
+
+test('photos are turned upright, shrunk to the size limit, and older ones converted to WebP', async () => {
+  // A phone photo stored sideways with an EXIF rotation, larger than the limit.
+  const sideways = await image(3000, 1500).jpeg().withMetadata({ orientation: 6 }).toBuffer();
+  const upright = await sharp(await toWebp(sideways)).metadata();
+  assert.equal(upright.format, 'webp');
+  assert.deepEqual([upright.width, upright.height], [MAX_FLIP_PHOTO_EDGE / 2, MAX_FLIP_PHOTO_EDGE]);
+  assert.equal(upright.orientation, undefined);
+  // A small WebP is kept byte for byte.
+  const small = await image(20, 20).webp().toBuffer();
+  assert.deepEqual(await toWebp(small), small);
+
+  const context = fixture();
+  try {
+    const flip = context.store.create({ title: 'Lampa', buyChannel: 'OLX', boughtOn: '2026-09-28', buyPrice: 50 });
+    const png = await image(10, 10).png().toBuffer();
+    const insert = context.db.prepare('INSERT INTO flip_photos (flip_id, position, mime, data, byte_size, created_at) VALUES (?, ?, ?, ?, ?, ?)');
+    const old = Number(insert.run(flip.id, 0, 'image/png', png, png.byteLength, '2026-09-28T10:00:00Z').lastInsertRowid);
+    const broken = Number(insert.run(flip.id, 1, 'image/jpeg', Buffer.from([0xff, 0xd8, 0xff]), 3, '2026-09-28T10:00:00Z').lastInsertRowid);
+    assert.equal(await context.store.convertStoredPhotosToWebp(), 1);
+    assert.equal(context.store.photo(old)!.mime, 'image/webp');
+    assert.equal(sniffImageMime(context.store.photo(old)!.data), 'image/webp');
+    assert.equal(context.store.photo(broken)!.mime, 'image/jpeg', 'an unreadable photo is left alone');
+    assert.equal(await context.store.convertStoredPhotosToWebp(), 0);
+  } finally { context.close(); }
+});
+
+test('prices round to the nearest 9,99 and marketplace condition labels map to Scout conditions', () => {
+  assert.equal(roundToNines(1450), 1449.99);
+  assert.equal(roundToNines(1525), 1529.99);
+  assert.equal(roundToNines(134.99), 139.99);
+  assert.equal(roundToNines(129.99), 129.99);
+  assert.equal(roundToNines(5), 9.99);
+  assert.equal(roundToNines(4), 4, 'no 9,99 price is near enough');
+  const labels: Array<[string | null, string | null]> = [
+    ['Nowe', 'new'], ['Nowy', 'new'], ['Nowy bez metki', 'new'], ['Nowy z metką', 'new-with-tags'],
+    ['Bardzo dobry', 'like-new'], ['Używany - jak nowy', 'like-new'], ['Używane', 'good'], ['Dobry', 'good'],
+    ['Uszkodzone', 'damaged'], ['Zadowalający', 'damaged'], ['Used', 'good'], ['', null], [null, null], ['Inne', null],
+  ];
+  for (const [label, condition] of labels) assert.equal(listingConditionFromLabel(label), condition, String(label));
 });
 
 test('suggested listing prices leave the same amount on every platform', () => {
@@ -142,17 +190,18 @@ test('a resale draft starts from the saved original listing and falls back to it
   const seen: Array<{ title: string; description: string | null }> = [];
   let fail = false;
   let fetched = 0;
+  let answerCondition: 'good' | null = 'good';
   const service = new ScoutService(db, () => {}, {
     writeResaleListing: async (context) => {
       seen.push({ title: context.title, description: context.description });
       if (fail) throw new Error('provider down');
-      return { title: 'Sony WH-1000XM4 słuchawki', description: 'Sprzedam słuchawki.\n- etui w zestawie', condition: 'good' };
+      return { title: 'Sony WH-1000XM4 słuchawki', description: 'Sprzedam słuchawki.\n- etui w zestawie', condition: answerCondition, category: 'Słuchawki' };
     },
     fetchListingDetailHtml: async () => { fetched += 1; throw new Error('offline'); },
   });
   try {
     const now = new Date().toISOString();
-    const saved = db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run('OLX', 'a1', 'Sony WH-1000XM4 okazja', 500, 'https://www.olx.pl/d/oferta/a1', now, now);
+    const saved = db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, condition, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run('OLX', 'a1', 'Sony WH-1000XM4 okazja', 500, 'https://www.olx.pl/d/oferta/a1', 'Uszkodzone', now, now);
     db.prepare(`INSERT INTO listing_detail_snapshots (listing_id, marketplace, external_listing_id, title, price_pln, url, description, state_hash, captured_at)
       VALUES (?, 'OLX', 'a1', 'Sony WH-1000XM4 okazja', 500, 'https://www.olx.pl/d/oferta/a1', ?, 'h1', ?)`).run(saved.lastInsertRowid, 'Etui w zestawie. Odbiór Kraków, tel 600100200.', now);
 
@@ -160,13 +209,25 @@ test('a resale draft starts from the saved original listing and falls back to it
     assert.deepEqual(none, [], 'photos are only fetched when asked for');
     assert.equal(written.method, 'ai');
     assert.equal(written.condition, 'good');
-    assert.equal(written.source.description, 'Etui w zestawie. Odbiór Kraków, tel 600100200.');
+    assert.equal(written.category, 'Słuchawki');
+    assert.equal(written.source!.description, 'Etui w zestawie. Odbiór Kraków, tel 600100200.');
     assert.deepEqual(seen[0], { title: 'Sony WH-1000XM4 okazja', description: 'Etui w zestawie. Odbiór Kraków, tel 600100200.' });
     assert.equal(fetched, 0, 'a saved description is used without fetching the page');
 
+    // When AI can't tell the condition, the original's own label decides.
+    answerCondition = null;
+    assert.equal((await service.draftResaleListing('OLX:a1')).draft.condition, 'damaged');
+
+    // A flip not bought through Scout is written from the operator's notes.
+    const fromNotes = await service.draftResaleListingFromNotes({ title: 'Słuchawki Sony', notes: 'Etui, kabel.', condition: 'good' });
+    assert.equal(fromNotes.source, null);
+    assert.deepEqual(seen.at(-1), { title: 'Słuchawki Sony', description: 'Etui, kabel.' });
+
     fail = true;
+    await assert.rejects(service.draftResaleListingFromNotes({ title: 'x', notes: '', condition: null }), (error: unknown) => error instanceof ServiceError && error.status === 502);
     const { draft: copied } = await service.draftResaleListing('OLX:a1');
     assert.equal(copied.method, 'copy');
+    assert.equal(copied.condition, 'damaged', 'a copied draft keeps the original condition');
     assert.equal(copied.description, 'Etui w zestawie. Odbiór Kraków, tel 600100200.');
 
     // Without a saved description the live page is tried; a failure still drafts.

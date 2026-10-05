@@ -13,6 +13,7 @@ import {
   flipCost,
   flipNet,
   quarterOf,
+  roundToNines,
   saleFee,
   salesRecord,
   salesRecordCsv,
@@ -226,7 +227,9 @@ const MAX_PHOTO_EDGE = 2000;
 
 /**
  * Phone photos are several megabytes; the marketplaces resize them anyway.
- * Shrink to 2000 px on the long edge as JPEG, keeping small JPEGs as they are.
+ * Shrink to 2000 px on the long edge as WebP, keeping small WebPs and JPEGs
+ * as they are. The server stores everything as WebP, converting JPEGs and
+ * browsers that can't encode WebP (Safari sends JPEG).
  */
 async function prepareForUpload(file: File): Promise<Blob> {
   let bitmap: ImageBitmap;
@@ -236,7 +239,7 @@ async function prepareForUpload(file: File): Promise<Blob> {
     throw new Error(`${file.name}: this browser can't read the image. Export it as JPEG (HEIC is not supported).`);
   }
   const scale = Math.min(1, MAX_PHOTO_EDGE / Math.max(bitmap.width, bitmap.height));
-  if (scale === 1 && file.type === "image/jpeg" && file.size <= 4 * 1024 * 1024) {
+  if (scale === 1 && (file.type === "image/jpeg" || file.type === "image/webp") && file.size <= 4 * 1024 * 1024) {
     bitmap.close();
     return file;
   }
@@ -245,7 +248,12 @@ async function prepareForUpload(file: File): Promise<Blob> {
   canvas.height = Math.round(bitmap.height * scale);
   canvas.getContext("2d")!.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
   bitmap.close();
-  return new Promise((resolve, reject) => canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error(`${file.name}: could not convert the image`))), "image/jpeg", 0.88));
+  const encode = (type: string, quality: number) => new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, type, quality));
+  // A browser without a WebP encoder hands back a PNG instead; send JPEG then.
+  const webp = await encode("image/webp", 0.85);
+  const blob = webp?.type === "image/webp" ? webp : await encode("image/jpeg", 0.88);
+  if (!blob) throw new Error(`${file.name}: could not convert the image`);
+  return blob;
 }
 
 function ListingDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; feePresets: FeePresets; onClose: () => void; onSaved: (flip: Flip) => void }) {
@@ -253,6 +261,9 @@ function ListingDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; fee
   const [title, setTitle] = useState(draft?.title ?? flip.title);
   const [description, setDescription] = useState(draft?.description ?? "");
   const [condition, setCondition] = useState<ListingCondition | "">(draft?.condition ?? "");
+  const [category, setCategory] = useState(draft?.category ?? "");
+  // Remembered in this browser, like the search page's AI toggle.
+  const [nines, setNines] = useState(() => localStorage.getItem("scout-listing-round-nines") === "1");
   const [basePrice, setBasePrice] = useState(draft?.basePrice ? String(draft.basePrice) : "");
   const [prices, setPrices] = useState<Record<string, string>>(() => Object.fromEntries(LISTING_PLATFORMS.map((channel) => [channel, draft?.prices[channel] ? String(draft.prices[channel]) : ""])));
   const [photos, setPhotos] = useState<FlipPhoto[]>(flip.photos);
@@ -262,34 +273,42 @@ function ListingDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; fee
   const [drafting, setDrafting] = useState(false);
   const [draftNote, setDraftNote] = useState<string | null>(null);
   const base = toAmount(basePrice);
-  const suggestion = (channel: FlipChannel) => (Number.isFinite(base) && base > 0 ? suggestedListingPrice(base, feePresets[channel]) : null);
+  const suggestion = (channel: FlipChannel) => {
+    const suggested = Number.isFinite(base) && base > 0 ? suggestedListingPrice(base, feePresets[channel]) : null;
+    return suggested && nines ? roundToNines(suggested) : suggested;
+  };
   const priceFor = (channel: FlipChannel) => {
     const entered = prices[channel]?.trim() ? toAmount(prices[channel]) : null;
-    return entered !== null && Number.isFinite(entered) && entered > 0 ? entered : suggestion(channel);
+    if (entered !== null && Number.isFinite(entered) && entered > 0) return nines ? roundToNines(entered) : entered;
+    return suggestion(channel);
   };
   const valid = Boolean(title.trim()) && (basePrice.trim() === "" || (Number.isFinite(base) && base > 0)) && LISTING_PLATFORMS.every((channel) => !prices[channel]?.trim() || (Number.isFinite(toAmount(prices[channel])) && toAmount(prices[channel]) > 0));
 
   const applyDraft = ({ draft: written, photosAdded, flip: updated }: { draft: ResaleListingDraft; photosAdded: number; flip: Flip }, replace: { title: boolean; text: boolean }) => {
     if (photosAdded) setPhotos(updated.photos);
     const photoNote = photosAdded ? ` Added ${photosAdded} photo${photosAdded === 1 ? "" : "s"} from it.` : "";
+    const from = written.source ? `the original ${written.source.marketplace} listing` : "your notes";
     if (!replace.text) {
-      if (photosAdded) setDraftNote(`Added ${photosAdded} photo${photosAdded === 1 ? "" : "s"} from the original ${written.source.marketplace} listing.`);
+      if (photosAdded) setDraftNote(`Added ${photosAdded} photo${photosAdded === 1 ? "" : "s"} from ${from}.`);
       return;
     }
     if (replace.title && written.title) setTitle(written.title);
     if (written.description) setDescription(written.description);
     if (written.condition) setCondition((current) => current || written.condition!);
+    if (written.category) setCategory((current) => current || written.category);
     setDraftNote((!written.description
-      ? `The original ${written.source.marketplace} listing has no description Scout could read.`
+      ? `${from[0].toUpperCase()}${from.slice(1)} has no description Scout could read.`
       : written.method === "ai"
-        ? `Written from the original ${written.source.marketplace} listing. Check it before saving.`
-        : `Copied from the original ${written.source.marketplace} listing because AI is not configured. Remove anything about the previous seller.`) + photoNote);
+        ? `Written from ${from}. Check it before saving.`
+        : `Copied from ${from} because AI is not configured. Remove anything about the previous seller.`) + photoNote);
   };
   const redraft = async () => {
     setDrafting(true);
     setError(null);
     try {
-      applyDraft(await api.draftFlipListing(flip.id), { title: true, text: true });
+      // A flip not bought through Scout is written from what is typed so far.
+      const notes = flip.listingKey ? {} : { title: title.trim(), description, condition: condition || null };
+      applyDraft(await api.draftFlipListing(flip.id, notes), { title: true, text: true });
     } catch (draftError) {
       setError(errorMessage(draftError));
     } finally {
@@ -342,6 +361,7 @@ function ListingDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; fee
       title: title.trim(),
       description,
       condition: condition || null,
+      ...(category.trim() ? { category: category.trim() } : {}),
       basePrice: Number.isFinite(base) && base > 0 ? base : null,
       prices: Object.fromEntries(LISTING_PLATFORMS.flatMap((channel) => { const price = priceFor(channel); return price ? [[channel, price]] : []; })),
     };
@@ -363,13 +383,12 @@ function ListingDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; fee
     >
       <p className="field-hint">What the Scout browser extension fills into the OLX, Allegro Lokalnie and Vinted forms. You check each form and publish it yourself.</p>
       <label className="field-label">Title <span>{title.trim().length} characters</span><input value={title} onChange={(event) => setTitle(event.target.value)} maxLength={200} /></label>
-      <label className="field-label">Description <span>{description.length} characters</span><textarea rows={9} value={description} disabled={drafting} onChange={(event) => setDescription(event.target.value)} maxLength={9000} placeholder={drafting ? "Writing a description from the original listing…" : "Model, condition, what's included, tested how"} /></label>
-      {flip.listingKey ? (
-        <div className="listing-draft-row">
-          <button type="button" className="panel-link" disabled={drafting} onClick={() => void redraft()}>{drafting ? <LoaderCircle size={14} className="spin" /> : <Sparkles size={14} />}{drafting ? "Writing…" : "Rewrite from the original listing"}</button>
-          {draftNote ? <small className="field-hint">{draftNote}</small> : null}
-        </div>
-      ) : null}
+      <label className="field-label">Description <span>{description.length} characters</span><textarea rows={9} value={description} disabled={drafting} onChange={(event) => setDescription(event.target.value)} maxLength={9000} placeholder={drafting ? "Writing a description…" : "Model, condition, what's included, tested how"} /></label>
+      <div className="listing-draft-row">
+        <button type="button" className="panel-link" disabled={drafting || (!flip.listingKey && !title.trim())} onClick={() => void redraft()} title={flip.listingKey ? undefined : "Uses the title, the description so far and the flip's note"}>{drafting ? <LoaderCircle size={14} className="spin" /> : <Sparkles size={14} />}{drafting ? "Writing…" : flip.listingKey ? "Rewrite from the original listing" : "Write with AI from these notes"}</button>
+        {draftNote ? <small className="field-hint">{draftNote}</small> : null}
+      </div>
+      <label className="field-label">Category<input value={category} onChange={(event) => setCategory(event.target.value)} maxLength={80} placeholder="Kind of item, e.g. Słuchawki; the extension picks the closest category" /></label>
       <div className="field-row">
         <label className="field-label">Condition<select value={condition} onChange={(event) => setCondition(event.target.value as ListingCondition | "")}><option value="">Set on each site</option>{LISTING_CONDITIONS.map((option) => <option key={option} value={option}>{LISTING_CONDITION_LABELS[option].label}</option>)}</select></label>
         <label className="field-label">You want to receive <span>before fees, PLN</span><input inputMode="decimal" value={basePrice} onChange={(event) => setBasePrice(event.target.value)} placeholder="e.g. 1450" /></label>
@@ -384,12 +403,18 @@ function ListingDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; fee
               <label key={channel}>
                 <strong>{channel}</strong>
                 <input inputMode="decimal" aria-label={`${channel} asking price`} value={prices[channel]} placeholder={suggestion(channel) ? String(suggestion(channel)) : "—"} onChange={(event) => setPrices((current) => ({ ...current, [channel]: event.target.value }))} />
-                <small>{price ? `${formatZl(price - fee)} after ${fee ? formatZl(fee) + " fee" : "no fee"}` : "set a price"}</small>
+                <small>{!price ? "set a price" : nines && prices[channel]?.trim() && price !== toAmount(prices[channel])
+                  ? `Lists at ${formatZl(price)}${fee ? `, ${formatZl(price - fee)} after fee` : ", no fee"}`
+                  : `${formatZl(price - fee)} after ${fee ? formatZl(fee) + " fee" : "no fee"}`}</small>
               </label>
             );
           })}
         </div>
       </div>
+      <label className="check-option check-option--inline listing-nines" title="1450 becomes 1449,99 and 1525 becomes 1529,99; prices under 5 zł stay as they are">
+        <input type="checkbox" checked={nines} onChange={(event) => { setNines(event.target.checked); localStorage.setItem("scout-listing-round-nines", event.target.checked ? "1" : "0"); }} />
+        <span><strong>End prices in …9,99</strong><small>Rounds each asking price to the nearest one, like 1449,99 or 1529,99</small></span>
+      </label>
       <div className="field-label">
         <span>Photos <span>{photos.length} of 20 · first one is the cover</span></span>
         <div className="listing-photos">
@@ -411,7 +436,7 @@ function ListingDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; fee
             </label>
           ) : null}
         </div>
-        <small className="field-hint">Photos are resized to at most 2000 px and stored on your Scout server. The iOS app can add them straight from your phone.</small>
+        <small className="field-hint">Photos are resized to at most 2000 px and stored as WebP on your Scout server. The iOS app can add them straight from your phone.</small>
       </div>
       {error ? <div className="form-error" role="alert"><AlertTriangle size={15} />{error}</div> : null}
     </Modal>

@@ -22,6 +22,7 @@ import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './mark
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
 import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft } from '../src/types';
+import { listingConditionFromLabel } from '../src/profit';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -2567,16 +2568,35 @@ export class ScoutService {
     }
 
     const source = { marketplace, title: String(row.title), url, description };
+    // The original's own condition label, used when AI can't say or is off.
+    const sourceCondition = listingConditionFromLabel(row.condition ? String(row.condition) : null);
     const { apiKey, model } = this.deepSeekConfig();
     if (apiKey) {
       try {
         const written = await this.aiResaleListing({ marketplace, title: source.title, condition: row.condition ? String(row.condition) : null, description }, { apiKey, model });
-        return { draft: { ...written, method: 'ai', source }, images };
+        return { draft: { ...written, condition: written.condition ?? sourceCondition, method: 'ai', source }, images };
       } catch (error) {
         this.log('error', 'diagnostics', `Resale draft for ${marketplace} ${listingId}: AI failed, returning the original text — ${error instanceof Error ? error.message : String(error)}`);
       }
     }
-    return { draft: { title: source.title.slice(0, 70), description: description ?? '', condition: null, method: 'copy', source }, images };
+    return { draft: { title: source.title.slice(0, 70), description: description ?? '', condition: sourceCondition, category: '', method: 'copy', source }, images };
+  }
+
+  /**
+   * Write a listing for a flip that was not bought through Scout, from the
+   * operator's own title and notes. Needs OpenRouter; there is no original
+   * text to copy instead.
+   */
+  async draftResaleListingFromNotes(input: { title: string; notes: string; condition: string | null }): Promise<ResaleListingDraft> {
+    const { apiKey, model } = this.deepSeekConfig();
+    if (!apiKey) throw new ServiceError('Writing a listing needs an OpenRouter API key in Settings', 409);
+    try {
+      const written = await this.aiResaleListing({ marketplace: null, title: input.title, condition: input.condition, description: input.notes.trim() || null }, { apiKey, model });
+      return { ...written, method: 'ai', source: null };
+    } catch (error) {
+      this.log('error', 'diagnostics', `Resale draft from notes: AI failed — ${error instanceof Error ? error.message : String(error)}`);
+      throw new ServiceError(`AI could not write the listing: ${error instanceof Error ? error.message : String(error)}`, 502);
+    }
   }
 
   /**

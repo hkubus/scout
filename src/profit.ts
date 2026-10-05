@@ -157,22 +157,53 @@ export function salesRecordCsv(rows: SalesRecordRow[]) {
   ].join("\r\n");
 }
 
-export const LISTING_CONDITIONS = ["new", "like-new", "good", "damaged"] as const;
+export const LISTING_CONDITIONS = ["new-with-tags", "new", "like-new", "good", "damaged"] as const;
 export type ListingCondition = (typeof LISTING_CONDITIONS)[number];
 
 /** How each marketplace words Scout's listing conditions, for form filling. */
 export const LISTING_CONDITION_LABELS: Record<ListingCondition, { label: string; OLX: string; "Allegro Lokalnie": string; Vinted: string }> = {
+  "new-with-tags": { label: "New with tags", OLX: "Nowe", "Allegro Lokalnie": "Nowy", Vinted: "Nowy z metką" },
   new: { label: "New", OLX: "Nowe", "Allegro Lokalnie": "Nowy", Vinted: "Nowy bez metki" },
   "like-new": { label: "Used, like new", OLX: "Używane", "Allegro Lokalnie": "Używany", Vinted: "Bardzo dobry" },
   good: { label: "Used, good", OLX: "Używane", "Allegro Lokalnie": "Używany", Vinted: "Dobry" },
   damaged: { label: "Damaged / for parts", OLX: "Uszkodzone", "Allegro Lokalnie": "Uszkodzony", Vinted: "Zadowalający" },
 };
 
+/**
+ * Scout's condition for a marketplace's own wording ("Używane", "Bardzo
+ * dobry", "Nowy z metką", "Used"), or null when it can't tell.
+ */
+export function listingConditionFromLabel(label: string | null | undefined): ListingCondition | null {
+  const text = (label ?? "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/ł/g, "l").trim();
+  if (!text) return null;
+  if (/bez metki/.test(text)) return "new";
+  if (/\bz metk|with tags|z etykiet/.test(text)) return "new-with-tags";
+  if (/uszkodz|na czesci|zadowalaj|damaged|for parts|broken/.test(text)) return "damaged";
+  if (/^now[eya]\b|^new\b|brand new/.test(text)) return "new";
+  if (/bardzo dobr|jak nowy|like new|very good|idealn/.test(text)) return "like-new";
+  if (/uzywan|dobry|used|good|refurb|odnowion/.test(text)) return "good";
+  return null;
+}
+
+/**
+ * The nearest price ending in 9.99 (1450 → 1449.99, 1525 → 1529.99), the way
+ * shops price. Prices under 5 zł have no such neighbour and are kept.
+ */
+export function roundToNines(price: number) {
+  if (!Number.isFinite(price) || price < 5) return price;
+  return Number((Math.round((price + 0.01) / 10) * 10 - 0.01).toFixed(2));
+}
+
 /** What the operator wants to post for a flip. */
 export interface FlipListing {
   title: string;
   description: string;
   condition: ListingCondition | null;
+  /**
+   * The item's kind as marketplaces name their categories ("Słuchawki",
+   * "Karty graficzne"); the extension searches and ranks categories by it.
+   */
+  category?: string;
   /** Asking price per platform; missing platforms fall back to `basePrice`. */
   prices: Partial<Record<FlipChannel, number>>;
   /** What the operator wants to receive before fees; drives the suggestions. */
