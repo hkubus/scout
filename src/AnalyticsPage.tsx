@@ -135,7 +135,7 @@ export default function AnalyticsPage({
 
           <div className="analytics-stat-grid">
             <div className="analytics-stat"><span>Tracked listings</span><strong>{formatCount(data.overview.trackedListings)}</strong><small>{formatCount(data.overview.newListings)} new in range</small></div>
-            <div className="analytics-stat"><span>Strong deals</span><strong>{formatCount(data.overview.strongDeals)}</strong><small>≥12% below typical</small></div>
+            <div className="analytics-stat"><span>Strong deals</span><strong>{formatCount(data.overview.strongDeals)}</strong><small>Strong+ by % and zł saved</small></div>
             <div className="analytics-stat"><span>Median discount</span><strong>{formatPercent(data.overview.medianDiscountPercent)}</strong><small>below typical</small></div>
             <div className="analytics-stat"><span>Median move</span><strong className={trendChange === null || watchId === "All" ? "" : trendChange < 0 ? "analytics-value--positive" : trendChange > 0 ? "analytics-value--negative" : ""}>{watchId === "All" ? "—" : formatPercent(trendChange)}</strong><small>{watchId === "All" ? "pick a watch" : "first vs latest day"}</small></div>
           </div>

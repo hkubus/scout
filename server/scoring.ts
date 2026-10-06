@@ -106,6 +106,34 @@ export function scoreDealFromStats(stats: PriceStats, price: number, options: Sc
   return { typical, mad, deviation, discountPercent, confidence, isReady, qualifies };
 }
 
+/** Typical price at which a deal's strength equals its plain discount percentage. */
+export const DEAL_STRENGTH_REFERENCE_PLN = 400;
+
+/** Tier lower bounds on the blended deal index (see dealStrength). */
+const DEAL_STRENGTH_TIERS = [
+  { strength: 5, index: 30, minPercent: 20 },
+  { strength: 4, index: 20, minPercent: 13 },
+  { strength: 3, index: 12, minPercent: 8 },
+] as const;
+
+/**
+ * Deal-strength tier (5 Exceptional, 4 Very strong, 3 Strong, 2 Watch, 1 none)
+ * from both the discount percentage and the PLN saved, so 100 zł off 600 zł
+ * outranks 50 zł off 200 zł. The index is the geometric mean of the two,
+ * scaled to equal the percentage at a DEAL_STRENGTH_REFERENCE_PLN typical:
+ * percent × √(typical / 400). Each tier also needs about two-thirds of its
+ * index in plain percent (asking prices on expensive items swing widely), so
+ * a small relative dip cannot ride the PLN amount alone. Returns null when
+ * there is no usable typical.
+ */
+export function dealStrength(price: number, typical: number | null): number | null {
+  if (typical === null || !Number.isFinite(typical) || typical <= 0 || !Number.isFinite(price)) return null;
+  const percent = ((typical - price) / typical) * 100;
+  if (percent <= 0) return 1;
+  const index = percent * Math.sqrt(typical / DEAL_STRENGTH_REFERENCE_PLN);
+  return DEAL_STRENGTH_TIERS.find((tier) => index >= tier.index && percent >= tier.minPercent)?.strength ?? 2;
+}
+
 function ownMad(stats: PriceStats, typical: number) {
   let mad = stats.madByTypical.get(typical);
   if (mad === undefined) {

@@ -1131,7 +1131,7 @@ function Overview({
             <div className="empty-state">
               <Search size={25} />
               <strong>No strong deals right now</strong>
-              <span>Listings at least 12% below their typical price show up here.</span>
+              <span>Strong-or-better listings, weighing both % and zł below typical, show up here.</span>
             </div>
           }
         />

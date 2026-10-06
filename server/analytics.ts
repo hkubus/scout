@@ -6,7 +6,7 @@
  * heuristics, never confirmed sale prices.
  */
 
-import { median } from './scoring';
+import { dealStrength, median } from './scoring';
 import type {
   AnalyticsDiscountBucket,
   AnalyticsMarketplaceDeals,
@@ -28,8 +28,10 @@ export interface AnalyticsObservation {
   firstSeenAt: string;
 }
 
-/** The Strong tier's lower bound (see dealStrengthFromDiscount), so every "strong" count means the same thing. */
-export const STRONG_DEAL_DISCOUNT_PERCENT = 12;
+/** Strong or better on the feed's deal-strength scale, so every "strong" count means the same thing. */
+export function isStrongDeal(row: Pick<AnalyticsObservation, 'price' | 'typical'>): boolean {
+  return (dealStrength(row.price, row.typical) ?? 0) >= 3;
+}
 
 export function discountPercentFor(row: Pick<AnalyticsObservation, 'price' | 'typical'>): number | null {
   return row.typical !== null && Number.isFinite(row.typical) && row.typical > 0
@@ -67,11 +69,12 @@ export function dealOverview(observations: AnalyticsObservation[], cutoff: strin
     const existing = firstSeen.get(observation.listingId);
     if (!existing || observation.firstSeenAt < existing) firstSeen.set(observation.listingId, observation.firstSeenAt);
   }
-  const values = discounts(latestPerListing(observations));
+  const latest = latestPerListing(observations);
+  const values = discounts(latest);
   return {
     trackedListings: firstSeen.size,
     newListings: Array.from(firstSeen.values()).filter((value) => value >= cutoff).length,
-    strongDeals: values.filter((value) => value >= STRONG_DEAL_DISCOUNT_PERCENT).length,
+    strongDeals: latest.filter(isStrongDeal).length,
     medianDiscountPercent: median(values),
   };
 }
@@ -87,10 +90,7 @@ export function trendPoints(observations: AnalyticsObservation[]): AnalyticsTren
   return Array.from(daily.entries()).sort(([left], [right]) => left.localeCompare(right)).map(([date, rows]) => {
     const list = Array.from(rows.values());
     const prices = list.map((row) => row.price);
-    const strongDealCount = list.filter((row) => {
-      const discount = discountPercentFor(row);
-      return discount !== null && discount >= STRONG_DEAL_DISCOUNT_PERCENT;
-    }).length;
+    const strongDealCount = list.filter(isStrongDeal).length;
     return {
       date,
       medianPrice: median(prices),
@@ -139,7 +139,8 @@ export function watchLeaderboard(observations: AnalyticsObservation[]): Analytic
     byWatch.set(observation.watchId, entry);
   }
   return Array.from(byWatch.entries()).map(([watchId, entry]) => {
-    const values = discounts(Array.from(entry.latest.values()));
+    const latest = Array.from(entry.latest.values());
+    const values = discounts(latest);
     const lastSeenAt = Array.from(entry.latest.values()).reduce<string | null>(
       (latest, observation) => (latest === null || observation.observedAt > latest ? observation.observedAt : latest),
       null,
@@ -148,7 +149,7 @@ export function watchLeaderboard(observations: AnalyticsObservation[]): Analytic
       watchId,
       watchName: entry.watchName,
       listings: entry.listings.size,
-      strongDeals: values.filter((value) => value >= STRONG_DEAL_DISCOUNT_PERCENT).length,
+      strongDeals: latest.filter(isStrongDeal).length,
       medianDiscountPercent: median(values),
       lastSeenAt,
     };
@@ -169,7 +170,7 @@ export function marketplaceDeals(observations: AnalyticsObservation[]): Analytic
     return {
       marketplace,
       listings: rows.length,
-      strongDeals: values.filter((value) => value >= STRONG_DEAL_DISCOUNT_PERCENT).length,
+      strongDeals: rows.filter(isStrongDeal).length,
       medianDiscountPercent: median(values),
     };
   }).sort((left, right) => right.listings - left.listings || left.marketplace.localeCompare(right.marketplace));

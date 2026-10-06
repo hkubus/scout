@@ -180,9 +180,9 @@ function WatchRow({
   const readiness = Number.isFinite(watch.readiness) ? Math.min(100, Math.max(0, watch.readiness)) : 0;
   const tags = watchTags(watch);
   const deals = [
-    { key: "exceptional", count: watch.dealCounts.exceptional, label: "Exceptional", title: "30%+ below typical" },
-    { key: "very-strong", count: watch.dealCounts.veryStrong, label: "Very strong", title: "20%+ below typical" },
-    { key: "strong", count: watch.dealCounts.strong, label: "Strong", title: "12%+ below typical" },
+    { key: "exceptional", count: watch.dealCounts.exceptional, label: "Exceptional", title: "About 30%+ below typical, weighted by zł saved" },
+    { key: "very-strong", count: watch.dealCounts.veryStrong, label: "Very strong", title: "About 20%+ below typical, weighted by zł saved" },
+    { key: "strong", count: watch.dealCounts.strong, label: "Strong", title: "About 12%+ below typical, weighted by zł saved" },
   ].filter((deal) => deal.count > 0);
   const learning = watch.status === "Learning" && readiness < 100;
   return (
@@ -421,7 +421,7 @@ export function WatchAnalyticsDialog({ watch, onClose }: { watch: Watch; onClose
                 <div className="analytics-stat"><span>Current median</span><strong>{formatAnalyticsPrice(current?.medianPrice ?? null)}</strong><small>latest daily snapshot</small></div>
                 <div className="analytics-stat"><span>Trend</span><strong className={trendClass}>{trend === null ? "Learning" : `${trend > 0 ? "+" : ""}${trend.toFixed(1)}%`}</strong><small>versus first day in range</small></div>
                 <div className="analytics-stat"><span>Current listings</span><strong>{current?.listingCount ?? 0}</strong><small>latest observed day</small></div>
-                <div className="analytics-stat"><span>Strong+ rate</span><strong>{current?.strongDealRate === null || current?.strongDealRate === undefined ? "Learning" : `${current.strongDealRate.toFixed(0)}%`}</strong><small>{current?.strongDealCount ?? 0} listings ≥12% below typical</small></div>
+                <div className="analytics-stat"><span>Strong+ rate</span><strong>{current?.strongDealRate === null || current?.strongDealRate === undefined ? "Learning" : `${current.strongDealRate.toFixed(0)}%`}</strong><small>{current?.strongDealCount ?? 0} Strong+ listings</small></div>
               </div>
               <section className="analytics-section">
                 <div className="analytics-section-heading"><h3>Median asking price</h3><span>Middle 50% shaded</span></div>

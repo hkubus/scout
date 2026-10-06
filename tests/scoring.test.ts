@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, median, pooledVariantSpread, priceStats, scoreDeal, scoreDealFromStats, type PooledSpread } from '../server/scoring';
+import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, pooledVariantSpread, priceStats, scoreDeal, scoreDealFromStats, type PooledSpread } from '../server/scoring';
 
 test('typicalOverride seeds the typical for display while the own baseline is empty', () => {
   const result = scoreDeal([], 1000, { typicalOverride: 2000, observedHours: 1 });
@@ -149,4 +149,26 @@ test('scoreDealFromStats with shared bucket stats equals the legacy scoreDeal fo
     }
   }
   assert.equal(compared, 7500);
+});
+
+test('deal strength weighs złoty saved as well as the discount percentage', () => {
+  // 100 zł off 600 zł (16.7%) beats 50 zł off 200 zł (25%).
+  assert.equal(dealStrength(500, 600), 4);
+  assert.equal(dealStrength(150, 200), 3);
+  // At the 400 zł reference typical the plain percentage tiers apply.
+  assert.equal(dealStrength(280, 400), 5);
+  assert.equal(dealStrength(320, 400), 4);
+  assert.equal(dealStrength(352, 400), 3);
+  assert.equal(dealStrength(360, 400), 2);
+  // Big percentages on cheap items saving little are demoted.
+  assert.equal(dealStrength(30, 50), 3);
+  // A small relative dip on an expensive item cannot ride the PLN amount alone.
+  assert.equal(dealStrength(1800, 2000), 3);
+  assert.equal(dealStrength(2640, 3000), 3);
+  assert.equal(dealStrength(2550, 3000), 4);
+  assert.equal(dealStrength(2850, 3000), 2);
+  assert.equal(dealStrength(400, 400), 1);
+  assert.equal(dealStrength(450, 400), 1);
+  assert.equal(dealStrength(100, null), null);
+  assert.equal(dealStrength(100, 0), null);
 });
