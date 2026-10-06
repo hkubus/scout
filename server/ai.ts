@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { NormalizedListing } from './marketplaces';
-import type { ListingDescriptionVerification } from '../src/types';
+import type { ListingDescriptionVerification, VerificationCheck } from '../src/types';
 
 export const DEFAULT_DEEPSEEK_MODEL = 'deepseek/deepseek-v4-flash';
 export const OPENROUTER_CHAT_COMPLETIONS_URL = 'https://openrouter.ai/api/v1/chat/completions';
@@ -43,7 +43,48 @@ export interface ListingDescriptionVerificationContext {
   query?: string | null;
   includedTerms?: string | null;
   excludedTerms?: string | null;
+  /** Operator-written things to look for while verifying this watch's deals. */
+  checks?: VerificationCheck[] | null;
 }
+
+/**
+ * A watch's own verification check. `require` holds the alert unless the
+ * listing clearly satisfies it; `exclude` rejects only when the verifier is
+ * near-certain the listing matches it.
+ */
+export type { VerificationCheck };
+export const VERIFICATION_CHECKS_MAX = 8;
+export const VERIFICATION_CHECK_MAX_CHARS = 120;
+
+export function parseVerificationChecks(value: unknown): VerificationCheck[] {
+  let raw = value;
+  if (typeof raw === 'string') {
+    try { raw = JSON.parse(raw); } catch { return []; }
+  }
+  if (!Array.isArray(raw)) return [];
+  const checks: VerificationCheck[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const record = item as Record<string, unknown>;
+    const text = typeof record.text === 'string' ? record.text.replace(/\s+/g, ' ').trim().slice(0, VERIFICATION_CHECK_MAX_CHARS) : '';
+    if (!text) continue;
+    checks.push({ text, mode: record.mode === 'exclude' ? 'exclude' : 'require' });
+    if (checks.length >= VERIFICATION_CHECKS_MAX) break;
+  }
+  return checks;
+}
+
+/** Model-facing check list; null when the watch has none so prompts stay unchanged. */
+export function verificationChecksForModel(checks: VerificationCheck[] | null | undefined) {
+  return checks?.length ? checks.map((check) => ({ mode: check.mode, check: check.text })) : null;
+}
+
+export const VERIFICATION_CHECKS_INSTRUCTIONS = [
+  'The operator also listed `checks` for this watch.',
+  'For a check with mode=require, return pass only when the listing clearly shows the check is true; return reject when it clearly shows the check is false; otherwise return unknown.',
+  'For a check with mode=exclude, return reject only when the listing makes it certain the check is true; never reject on an exclude check from suspicion, implication, or missing information.',
+  'Name every failed or unconfirmed check in issues.',
+].join(' ');
 
 export const listingRelevanceSchema = z.object({
   relevant: z.boolean(),
@@ -201,6 +242,8 @@ export function listingDescriptionVerificationInputHash(context: ListingDescript
       query: normalizeCacheText(context.query),
       includedTerms: normalizeCacheTerms(context.includedTerms ?? ''),
       excludedTerms: normalizeCacheTerms(context.excludedTerms ?? ''),
+      // Only present when set, so watches without checks keep their cached verdicts.
+      ...(context.checks?.length ? { checks: context.checks.map((check) => `${check.mode}:${normalizeCacheText(check.text)}`).sort() } : {}),
     }))
     .digest('hex');
 }
@@ -467,6 +510,7 @@ export async function verifyListingDescriptionWithDeepSeek(
               'Return decision=reject when the title itself shows the listing is for an accessory, part, or replacement component (for example a fan, cooler, cooling, case, cable, adapter, or battery) rather than the sought item named by the watch query — even when that accessory is functional.',
               'Return decision=unknown when the description is missing, ambiguous, contradictory, too short to establish condition, or does not provide enough evidence. Do not infer safety from a low price, title, or general product knowledge.',
               'Do not reject ordinary cosmetic wear or a normal used condition by itself. Use supplied facts only and return JSON only. When a field needs more than its maximum length, summarize it briefly instead of failing.',
+              ...(context.checks?.length ? [VERIFICATION_CHECKS_INSTRUCTIONS] : []),
             ].join(' '),
           },
           {
@@ -479,6 +523,7 @@ export async function verifyListingDescriptionWithDeepSeek(
               query: context.query?.trim() || null,
               includedTerms: context.includedTerms?.trim() || null,
               excludedTerms: context.excludedTerms?.trim() || null,
+              ...(context.checks?.length ? { checks: verificationChecksForModel(context.checks) } : {}),
             }),
           },
         ],

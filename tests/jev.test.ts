@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULT_JEV_MODEL, FUZZY_MATCH_MIN_CONFIDENCE, JEV_DECISIONS_URL, NEGOTIABILITY_MIN_CONFIDENCE, RELEVANCE_UNSURE_HIGH, RELEVANCE_UNSURE_LOW, VERIFICATION_MIN_CONFIDENCE, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchVariantWithJev, isFuzzyMatchUnsure, isNegotiabilityUnsure, isRelevanceUnsure, isVerificationUnsure, resolveJevModel, verifyListingDescriptionWithJev } from '../server/jev';
+import { DEFAULT_JEV_MODEL, EXCLUDE_CHECK_MIN_CONFIDENCE, FUZZY_MATCH_MIN_CONFIDENCE, JEV_DECISIONS_URL, NEGOTIABILITY_MIN_CONFIDENCE, RELEVANCE_UNSURE_HIGH, RELEVANCE_UNSURE_LOW, VERIFICATION_MIN_CONFIDENCE, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchVariantWithJev, isFuzzyMatchUnsure, isNegotiabilityUnsure, isRelevanceUnsure, isVerificationUnsure, resolveJevModel, verifyListingDescriptionWithJev, classifyChecksWithJev, summarizeCheckResults } from '../server/jev';
 import { DEFAULT_VISION_MODEL, VISION_MAX_IMAGES, classifyListingRelevanceWithVision, resolveVisionModel, verifyListingDescriptionWithVision } from '../server/vision';
 
 const relevanceContext = {
@@ -394,4 +394,85 @@ test('maps positional variant choices back to the watch variant ids', async () =
   assert.deepEqual(await run({ type: 'choice', choice: 'V1', confidence: 0.6 }), { variantId: '13-mini', decision: 'variant', confidence: 0.6, unsure: true }, 'low confidence stays unsure');
   assert.deepEqual(await run({ type: 'choice', choice: 'none', confidence: 0.95 }), { variantId: null, decision: 'none', confidence: 0.95, unsure: false });
   assert.deepEqual(await run({ type: 'choice', choice: 'v9', confidence: 0.95 }), { variantId: null, decision: 'unknown', confidence: 0.95, unsure: true }, 'unknown ids never assign');
+});
+
+test('asks one question per watch check and applies require/exclude thresholds in code', async () => {
+  const checks = [
+    { text: 'includes original charger', mode: 'require' as const },
+    { text: 'iCloud locked', mode: 'exclude' as const },
+  ];
+  const run = async (answers: Record<string, unknown>) => {
+    let body: Record<string, any> = {};
+    const result = await verifyListingDescriptionWithJev(
+      { ...verificationContext, checks },
+      { apiKey: 'sk-or-v1-test' },
+      (_input, init) => {
+        body = JSON.parse(String(init?.body));
+        return Promise.resolve(Response.json({ model: 'm', answers: { verification: { type: 'choice', choice: 'pass', confidence: 0.9 }, ...answers } }));
+      },
+    );
+    return { result, body };
+  };
+
+  // Both checks satisfied/clear: the base pass stands.
+  const clean = await run({ check1: { type: 'choice', choice: 'yes', confidence: 0.8 }, check2: { type: 'choice', choice: 'no', confidence: 0.9 } });
+  assert.deepEqual(Object.keys(clean.body.questions).sort(), ['check1', 'check2', 'verification']);
+  assert.match(clean.body.questions.check1.instructions, /includes original charger/);
+  assert.deepEqual(clean.body.state.watch.checks, ['includes original charger', 'iCloud locked']);
+  assert.equal(clean.result.decision, 'pass');
+  assert.deepEqual(clean.result.issues, []);
+
+  // An exclude match below the near-certain bar does not reject.
+  const likely = await run({ check1: { type: 'choice', choice: 'yes', confidence: 0.8 }, check2: { type: 'choice', choice: 'yes', confidence: EXCLUDE_CHECK_MIN_CONFIDENCE - 0.01 } });
+  assert.equal(likely.result.decision, 'pass');
+
+  // A near-certain exclude match rejects without escalation.
+  const hit = await run({ check1: { type: 'choice', choice: 'yes', confidence: 0.8 }, check2: { type: 'choice', choice: 'yes', confidence: 0.97 } });
+  assert.equal(hit.result.decision, 'reject');
+  assert.equal(hit.result.unsure, false);
+  assert.deepEqual(hit.result.issues, ['Excluded: iCloud locked']);
+
+  // A confident "no" on a require check rejects.
+  const missing = await run({ check1: { type: 'choice', choice: 'no', confidence: 0.85 } });
+  assert.equal(missing.result.decision, 'reject');
+  assert.deepEqual(missing.result.issues, ['Missing required: includes original charger']);
+
+  // An unanswered require check holds the pass as an unsure unknown (vision escalates).
+  const unconfirmed = await run({});
+  assert.equal(unconfirmed.result.decision, 'unknown');
+  assert.equal(unconfirmed.result.unsure, true);
+  assert.deepEqual(unconfirmed.result.issues, ['Could not confirm: includes original charger']);
+});
+
+test('sends watch checks to vision verification only when set', async () => {
+  const bodies: Array<Record<string, any>> = [];
+  const fetcher = (_input: unknown, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    return Promise.resolve(Response.json({ choices: [{ message: { content: JSON.stringify({ verdict: 'pass', confidence: 0.8, issues: [] }) } }] }));
+  };
+  const input = { marketplace: 'OLX', title: 'iPhone 13', description: 'Sprawny.', imageUrls: [] };
+  await verifyListingDescriptionWithVision(input, { apiKey: 'k', model: 'm' }, fetcher as typeof fetch);
+  await verifyListingDescriptionWithVision({ ...input, checks: [{ text: 'iCloud locked', mode: 'exclude' }] }, { apiKey: 'k', model: 'm' }, fetcher as typeof fetch);
+  assert.doesNotMatch(bodies[0].messages[0].content, /checks/);
+  assert.equal(JSON.parse(bodies[0].messages[1].content[0].text).checks, undefined);
+  assert.match(bodies[1].messages[0].content, /mode=exclude/);
+  assert.deepEqual(JSON.parse(bodies[1].messages[1].content[0].text).checks, [{ mode: 'exclude', check: 'iCloud locked' }]);
+});
+
+test('classifies manual-search checks without a deal-safety question', async () => {
+  let body: Record<string, any> = {};
+  const results = await classifyChecksWithJev(
+    { marketplace: 'OLX', title: 'iPhone 13', description: 'Blokada iCloud.', checks: [{ text: 'iCloud locked', mode: 'exclude' }, { text: 'includes charger', mode: 'require' }] },
+    { apiKey: 'k' },
+    (_input, init) => {
+      body = JSON.parse(String(init?.body));
+      return Promise.resolve(Response.json({ model: 'm', answers: { check1: { type: 'choice', choice: 'yes', confidence: 0.99 }, check2: { type: 'choice', choice: 'unknown', confidence: 0.5 } } }));
+    },
+  );
+  assert.equal(body.session_id, 'scout:jev-checks:v1');
+  assert.deepEqual(Object.keys(body.questions).sort(), ['check1', 'check2']);
+  assert.deepEqual(body.state.checks, ['iCloud locked', 'includes charger']);
+  assert.deepEqual(results.map((result) => result.outcome), ['hit', 'unconfirmed']);
+  assert.equal(summarizeCheckResults(results), 'rejected');
+  assert.equal(summarizeCheckResults([results[1]]), 'unconfirmed');
 });

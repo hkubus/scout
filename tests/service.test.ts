@@ -1915,7 +1915,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals', '030_perf_indexes', '031_flips', '032_flip_listings']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals', '030_perf_indexes', '031_flips', '032_flip_listings', '033_verification_checks']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -2405,7 +2405,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 34);
+    assert.equal(after.migrations.count, 35);
   } finally { context.close(); }
 });
 
@@ -3003,6 +3003,67 @@ test('rescues term near-misses in manual search on confident Jev pass', async ()
   }
 });
 
+test('manual search runs Jev checks: hides rejects, tags the rest, and caches description-backed verdicts', async () => {
+  const restore = liveJevEnv();
+  const calls: Array<Record<string, any>> = [];
+  const detailFetches: string[] = [];
+  const result = (outcome: string) => [{ text: 'includes charger', mode: 'require', answer: 'yes', confidence: 0.9, outcome }];
+  const context = fixture({
+    classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.9, unsure: false }),
+    classifyChecksWithJev: async (ctx: any) => {
+      calls.push({ ...ctx });
+      const text = String(ctx.description ?? '');
+      if (text.includes('icloud')) return [{ text: 'iCloud locked', mode: 'exclude', answer: 'yes', confidence: 0.98, outcome: 'hit' }];
+      if (text.includes('ladowarka')) return result('satisfied') as any;
+      return [{ text: 'includes charger', mode: 'require', answer: 'unknown', confidence: null, outcome: 'unconfirmed' }];
+    },
+    fetchListingDetailHtml: async (url: string) => {
+      detailFetches.push(url);
+      return '<meta property="og:description" content="Sam telefon, bez dodatkow.">';
+    },
+  });
+  try {
+    const offer = (id: string, title: string, description?: string) => ({
+      id, url: `https://www.olx.pl/d/oferta/${id}`, title, created_time: new Date().toISOString(),
+      ...(description ? { description } : {}),
+      params: [{ key: 'price', value: { value: 1500, currency: 'PLN', negotiable: false } }],
+    });
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      offer('IP-1', 'iPhone 13 128GB', 'Komplet, oryginalna ladowarka w zestawie.'),
+      offer('IP-2', 'iPhone 13 zablokowany', 'Blokada icloud, na czesci.'),
+      offer('IP-3', 'iPhone 13 niebieski'),
+    ], metadata: { visible_total_count: 3 } } });
+    const checks = [{ text: 'includes charger', mode: 'require' as const }, { text: 'iCloud locked', mode: 'exclude' as const }];
+    const search = () => context.service.manualSearch({ query: 'iphone 13', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', verificationChecks: checks });
+
+    const first = await search();
+    const byTitle = Object.fromEntries(first.listings.map((listing) => [listing.title, listing]));
+    assert.deepEqual(Object.keys(byTitle).sort(), ['iPhone 13 128GB', 'iPhone 13 niebieski']);
+    assert.equal(byTitle['iPhone 13 128GB'].jevCheck, 'passed');
+    assert.equal(byTitle['iPhone 13 niebieski'].jevCheck, 'unconfirmed');
+    assert.match(byTitle['iPhone 13 niebieski'].jevCheckNote ?? '', /Could not confirm: includes charger/);
+    assert.match(first.sources[0].message, /1 hidden by Jev checks/);
+    assert.equal(first.sources[0].count, 2);
+    // OLX returned two descriptions; only the third needed its detail page.
+    assert.deepEqual(detailFetches, ['https://www.olx.pl/d/oferta/IP-3']);
+    assert.equal(calls.length, 3);
+    assert.deepEqual(calls[0].checks, checks);
+
+    // Every verdict had a description, so a repeat search spends no Jev calls.
+    const second = await search();
+    assert.equal(calls.length, 3);
+    assert.deepEqual(second.listings.map((listing) => listing.jevCheck).sort(), ['passed', 'unconfirmed']);
+
+    // Without checks nothing is tagged.
+    const plain = await context.service.manualSearch({ query: 'iphone 13', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any' });
+    assert.equal(plain.listings.length, 3);
+    assert.ok(plain.listings.every((listing) => listing.jevCheck === undefined));
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
 test('keeps deterministic drops when fuzzy rescue is unsure', async () => {
   const restore = liveJevEnv();
   const context = fixture({
@@ -3349,6 +3410,52 @@ test('passes the watch query into description verification', async () => {
     assert.equal(await (context.service as any).verifyHighPriorityDealOnce(unsure), true);
     assert.equal(visionInputs.length, 1);
     assert.equal(visionInputs[0].query, 'unsure-query');
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('watch verification checks reach Jev and vision, store failed checks as issues, and key the cache', async () => {
+  const restore = liveJevEnv();
+  const seen: Array<Record<string, any>> = [];
+  const visionInputs: Array<Record<string, any>> = [];
+  const context = fixture({
+    verifyListingDescriptionWithJev: async (ctx: any) => {
+      seen.push({ ...ctx });
+      return { decision: 'reject', confidence: 0.97, unsure: false, issues: ['Excluded: iCloud locked'] };
+    },
+    verifyListingDescriptionWithVision: async (input: any) => {
+      visionInputs.push({ ...input });
+      return { decision: 'unknown', confidence: 0.6, issues: [], imagesSeen: 0 };
+    },
+  });
+  (context.service as any).fetchPublicPage = async () => '<meta property="og:description" content="Telefon zablokowany na iCloud.">';
+  try {
+    seedWatch(context.db, 'checks-watch', { query: 'iphone 13' });
+    const checks = [{ text: 'includes charger', mode: 'require' }, { text: 'iCloud locked', mode: 'exclude' }];
+    context.db.prepare('UPDATE watches SET verification_checks_json = ? WHERE id = ?').run(JSON.stringify(checks), 'checks-watch');
+    const now = new Date().toISOString();
+    context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run('OLX', 'live-1', 'PS5 console', 2000, 'https://www.olx.pl/d/oferta/live-1', now, now);
+    assert.deepEqual(context.service.getWatches().find((watch) => watch.id === 'checks-watch')?.verificationChecks, checks);
+
+    const candidate = {
+      watchId: 'checks-watch', listing: liveListing(), typical: 2500, discountPercent: 25, confidence: 0.9,
+      requiresDescriptionVerification: true, query: 'iphone 13', includedTerms: '', excludedTerms: '', verificationChecks: checks,
+    };
+    assert.equal(await (context.service as any).verifyHighPriorityDealOnce(candidate), false);
+    assert.deepEqual(seen[0].checks, checks);
+    const stored = context.db.prepare('SELECT ai_description_verification_json, ai_description_verification_input_hash FROM listings WHERE listing_id = ?').get('live-1') as { ai_description_verification_json: string; ai_description_verification_input_hash: string };
+    assert.deepEqual(JSON.parse(stored.ai_description_verification_json).issues, ['Excluded: iCloud locked']);
+    const withoutChecks = listingDescriptionVerificationInputHash({ marketplace: 'OLX', title: seen[0].title, condition: seen[0].condition, description: seen[0].description, query: 'iphone 13', includedTerms: null, excludedTerms: null });
+    assert.notEqual(stored.ai_description_verification_input_hash, withoutChecks);
+
+    // An unsure answer escalates to vision with the same checks.
+    const unsure = { ...candidate, listing: liveListing({ listingId: 'live-2', url: 'https://www.olx.pl/d/oferta/live-2' }) };
+    (context.service as any).jevVerification = async (ctx: any) => { seen.push({ ...ctx }); return { decision: 'unknown', confidence: 0.7, unsure: true, issues: ['Could not confirm: includes charger'] }; };
+    assert.equal(await (context.service as any).verifyHighPriorityDealOnce(unsure), false);
+    assert.deepEqual(visionInputs[0].checks, checks);
   } finally {
     restore();
     context.close();
