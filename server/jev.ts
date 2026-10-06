@@ -25,6 +25,7 @@ const JEV_TERM_MATCH_SESSION_ID = 'scout:jev-term-match:v1';
 const JEV_NEGOTIABILITY_SESSION_ID = 'scout:jev-negotiability:v1';
 const JEV_CONDITION_SESSION_ID = 'scout:jev-condition:v1';
 const JEV_VARIANT_SESSION_ID = 'scout:jev-variant:v1';
+const JEV_CHECKS_SESSION_ID = 'scout:jev-checks:v1';
 
 /** Model is configurable: explicit config wins, then env, then the alias. */
 export function resolveJevModel(configured?: string | null): string {
@@ -169,6 +170,46 @@ export function checkIssue(result: JevCheckResult): string | null {
   if (result.outcome === 'failed') return `Missing required: ${result.text}`;
   if (result.outcome === 'unconfirmed') return `Could not confirm: ${result.text}`;
   return null;
+}
+
+/**
+ * One neutral question per check (is it true?); code applies the mode and its
+ * threshold. `statePath` names where the check texts sit in the request state.
+ */
+function checkQuestions(checks: VerificationCheck[], statePath: string) {
+  const questions: Record<string, unknown> = {};
+  checks.forEach((check, index) => {
+    questions[`check${index + 1}`] = {
+      type: 'choice',
+      instructions: `Judging only from \`listing.title\`, \`listing.condition\`, and \`listing.description\` (\`${statePath}[${index}]\`), is this true of the listed item: "${check.text}"? Read any language and tolerate misspellings or missing diacritics. Do not infer from price, photos you cannot see, or general product knowledge.`,
+      criteria: {
+        yes: 'The listing states or plainly shows this is true.',
+        no: 'The listing states or plainly shows this is false.',
+        unknown: 'The listing does not say, or is ambiguous or contradictory about it.',
+      },
+    };
+  });
+  return questions;
+}
+
+/**
+ * A missing or malformed check answer counts as unknown: an exclude check
+ * stays clear and a require check stays unconfirmed, never a trusted pass.
+ */
+function parseCheckResults(answers: Record<string, unknown>, checks: VerificationCheck[]): JevCheckResult[] {
+  return checks.map((check, index): JevCheckResult => {
+    const answer = choiceAnswerSchema.safeParse(answers[`check${index + 1}`]);
+    const choice = answer.success && (answer.data.choice === 'yes' || answer.data.choice === 'no') ? answer.data.choice : 'unknown';
+    const confidence = answer.success && typeof answer.data.confidence === 'number' && Number.isFinite(answer.data.confidence) ? answer.data.confidence : null;
+    return { text: check.text, mode: check.mode, answer: choice, confidence, outcome: checkOutcome(check.mode, choice, confidence) };
+  });
+}
+
+/** Overall result of a check list: any hit or failure rejects; any unconfirmed require check is unconfirmed. */
+export function summarizeCheckResults(results: JevCheckResult[]): 'passed' | 'rejected' | 'unconfirmed' {
+  if (results.some((result) => result.outcome === 'hit' || result.outcome === 'failed')) return 'rejected';
+  if (results.some((result) => result.outcome === 'unconfirmed')) return 'unconfirmed';
+  return 'passed';
 }
 
 /**
@@ -338,20 +379,6 @@ export async function verifyListingDescriptionWithJev(
   fetcher: typeof fetch = fetch,
 ): Promise<JevVerificationJudgment> {
   const checks = context.checks ?? [];
-  // One question per watch check, asked in the same call. The question is
-  // neutral (is it true?); code applies the mode and its threshold.
-  const checkQuestions: Record<string, unknown> = {};
-  checks.forEach((check, index) => {
-    checkQuestions[`check${index + 1}`] = {
-      type: 'choice',
-      instructions: `Judging only from \`listing.title\`, \`listing.condition\`, and \`listing.description\` (\`watch.checks[${index}]\`), is this true of the listed item: "${check.text}"? Read any language and tolerate misspellings or missing diacritics. Do not infer from price, photos you cannot see, or general product knowledge.`,
-      criteria: {
-        yes: 'The listing states or plainly shows this is true.',
-        no: 'The listing states or plainly shows this is false.',
-        unknown: 'The listing does not say, or is ambiguous or contradictory about it.',
-      },
-    };
-  });
   const answers = await postDecisions({
     model: resolveJevModel(config.model),
     session_id: JEV_VERIFICATION_SESSION_ID,
@@ -370,7 +397,7 @@ export async function verifyListingDescriptionWithJev(
       },
     },
     questions: {
-      ...checkQuestions,
+      ...checkQuestions(checks, 'watch.checks'),
       verification: {
         type: 'choice',
         instructions: 'Given `listing.title`, `listing.condition`, `listing.description`, and the sought item named by `watch.query`, is this second-hand listing safe to surface as a very strong or exceptional deal? Judge the stated condition, not the description length: marketplace descriptions are often one line, and a short but explicit statement that the item works is enough evidence. Read any language and tolerate missing diacritics or misspellings (e.g. Polish `sprawny`, `w pelni sprawny`, `dziala bez zarzutu`; Romanian `perfect functional`, `functioneaza perfect`; German `voll funktionsfähig`). Pickup, shipping, payment, or thank-you lines are neutral and neither add nor remove evidence.',
@@ -390,15 +417,35 @@ export async function verifyListingDescriptionWithJev(
     ? parsed.data.confidence
     : null;
   const base: JevVerificationJudgment = { decision, confidence, unsure: isVerificationUnsure(decision, confidence) };
-  // A missing or malformed check answer counts as unknown: an exclude check
-  // stays clear and a require check stays unconfirmed, never a trusted pass.
-  const results = checks.map((check, index): JevCheckResult => {
-    const answer = choiceAnswerSchema.safeParse(answers[`check${index + 1}`]);
-    const choice = answer.success && (answer.data.choice === 'yes' || answer.data.choice === 'no') ? answer.data.choice : 'unknown';
-    const checkConfidence = answer.success && typeof answer.data.confidence === 'number' && Number.isFinite(answer.data.confidence) ? answer.data.confidence : null;
-    return { text: check.text, mode: check.mode, answer: choice, confidence: checkConfidence, outcome: checkOutcome(check.mode, choice, checkConfidence) };
-  });
+  const results = parseCheckResults(answers, checks);
   return combineVerificationChecks(base, results);
+}
+
+/**
+ * Manual-search checks: the same per-check questions as deal verification,
+ * without the deal-safety verdict, over whatever description is at hand.
+ */
+export async function classifyChecksWithJev(
+  context: { marketplace: string; title: string; condition?: string | null; description?: string | null; checks: VerificationCheck[] },
+  config: { apiKey: string; model?: string | null },
+  fetcher: typeof fetch = fetch,
+): Promise<JevCheckResult[]> {
+  if (!context.checks.length) return [];
+  const answers = await postDecisions({
+    model: resolveJevModel(config.model),
+    session_id: JEV_CHECKS_SESSION_ID,
+    state: {
+      listing: {
+        marketplace: context.marketplace,
+        title: context.title,
+        condition: context.condition ?? null,
+        description: context.description ?? null,
+      },
+      checks: context.checks.map((check) => check.text),
+    },
+    questions: checkQuestions(context.checks, 'checks'),
+  }, config.apiKey, 'listing checks', fetcher);
+  return parseCheckResults(answers, context.checks);
 }
 
 /** P1: near-miss rescue for deterministic term filtering. Only a confident pass widens results; unknown/reject keeps the drop. */

@@ -13,6 +13,7 @@ import {
 import { api } from "./api";
 import { marketplaceColors } from "./data";
 import { OlxCategoryPicker } from "./OlxCategoryPicker";
+import { VerificationChecksEditor, cleanVerificationChecks } from "./VerificationChecksEditor";
 import type { WatchPreset } from "./presets";
 import type { Marketplace, MarketWatch, NotificationRecord, OlxCategory, SellerType, VariantGroup, VerificationCheck, Watch } from "./types";
 
@@ -65,7 +66,7 @@ export function WatchDialog({
   const [sellerType, setSellerType] = useState<SellerType | null>(initialWatch?.sellerType ?? preset?.sellerType ?? null);
   const [ignorePromoted, setIgnorePromoted] = useState(initialWatch?.ignorePromoted ?? false);
   const [aiRelevance, setAiRelevance] = useState(initialWatch?.aiRelevance ?? preset?.aiRelevance ?? true);
-  const [verificationChecks, setVerificationChecks] = useState<VerificationCheck[]>(initialWatch?.verificationChecks ?? []);
+  const [verificationChecks, setVerificationChecks] = useState<VerificationCheck[]>(initialWatch?.verificationChecks ?? preset?.verificationChecks ?? []);
   const [variantGroups, setVariantGroups] = useState<VariantGroup[]>(initialWatch?.variantGroups ?? []);
   // New watches wait for listings and then propose their own groups.
   const [variantGroupsAuto, setVariantGroupsAuto] = useState(initialWatch ? Boolean(initialWatch.variantGroupsAuto) : true);
@@ -175,7 +176,7 @@ export function WatchDialog({
         olxCategory: sources.includes("OLX") ? olxCategory : null,
         sellerType,
         ignorePromoted,
-        verificationChecks: cleanVerificationChecks,
+        verificationChecks: cleanVerificationChecks(verificationChecks),
       });
     } catch (submitError) {
       setError(errorMessage(submitError));
@@ -200,16 +201,6 @@ export function WatchDialog({
     setVariantGroups((current) =>
       current.map((group, position) => (position === index ? { ...group, ...patch } : group)),
     );
-  const addVerificationCheck = () =>
-    setVerificationChecks((current) =>
-      current.length >= 8 ? current : [...current, { text: "", mode: "require" }],
-    );
-  const updateVerificationCheck = (index: number, patch: Partial<VerificationCheck>) =>
-    setVerificationChecks((current) =>
-      current.map((check, position) => (position === index ? { ...check, ...patch } : check)),
-    );
-  const removeVerificationCheck = (index: number) =>
-    setVerificationChecks((current) => current.filter((_, position) => position !== index));
   const removeVariant = (index: number) =>
     setVariantGroups((current) => current.filter((_, position) => position !== index));
   const suggestVariants = async () => {
@@ -237,10 +228,7 @@ export function WatchDialog({
     || initialWatch.typoVariants || initialWatch.variantGroups.length || initialWatch.referenceMarketWatchId
     || initialWatch.exactUrls.length || initialWatch.sensitivity !== 1 || Object.keys(initialWatch.sourceIntervals ?? {}).length
     || initialWatch.verificationChecks?.length
-  )));
-  const cleanVerificationChecks = verificationChecks
-    .map((check) => ({ ...check, text: check.text.trim() }))
-    .filter((check) => check.text);
+  )) || Boolean(preset?.verificationChecks?.length));
   const cleanVariantGroups = variantGroups
     .map((group) => ({ ...group, label: group.label.trim(), terms: group.terms.trim() }))
     .filter((group) => group.label && group.terms);
@@ -435,43 +423,11 @@ export function WatchDialog({
             </div>
             <div className="field-label">
               <span title="Before a very strong or exceptional deal alerts, Jev reads the listing description and photos. Require: hold the alert unless the listing clearly shows it. Exclude: reject only when Jev is near-certain the listing matches it.">Jev verification checks</span>
-              <div className="variant-editor">
-                {verificationChecks.map((check, index) => (
-                  <div className="variant-row verification-check-row" key={index}>
-                    <select
-                      value={check.mode}
-                      onChange={(event) => updateVerificationCheck(index, { mode: event.target.value === "exclude" ? "exclude" : "require" })}
-                      aria-label="Check mode"
-                    >
-                      <option value="require">Require</option>
-                      <option value="exclude">Exclude</option>
-                    </select>
-                    <input
-                      value={check.text}
-                      maxLength={120}
-                      onChange={(event) => updateVerificationCheck(index, { text: event.target.value })}
-                      placeholder={check.mode === "exclude" ? "e.g. iCloud locked" : "e.g. includes original charger"}
-                    />
-                    <button
-                      type="button"
-                      className="icon-button"
-                      onClick={() => removeVerificationCheck(index)}
-                      aria-label={`Remove ${check.text || "check"}`}
-                    >
-                      <X size={16} />
-                    </button>
-                  </div>
-                ))}
-                <div className="variant-actions">
-                  <button type="button" className="ghost-button" disabled={verificationChecks.length >= 8} onClick={addVerificationCheck}>
-                    <Plus size={15} />
-                    Add check
-                  </button>
-                </div>
-                {verificationChecks.length ? (
-                  <small className="field-hint">Require holds the alert unless the listing clearly shows it. Exclude rejects only when Jev is near-certain.</small>
-                ) : null}
-              </div>
+              <VerificationChecksEditor
+                checks={verificationChecks}
+                onChange={setVerificationChecks}
+                hint="Require holds the alert unless the listing clearly shows it. Exclude rejects only when Jev is near-certain."
+              />
             </div>
             <div className="field-label">
               <span title="Each variant learns its own typical price and alerts separately. The most specific match wins; unmatched listings share an “Other” typical.">Model variants</span>

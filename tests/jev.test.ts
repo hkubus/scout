@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULT_JEV_MODEL, EXCLUDE_CHECK_MIN_CONFIDENCE, FUZZY_MATCH_MIN_CONFIDENCE, JEV_DECISIONS_URL, NEGOTIABILITY_MIN_CONFIDENCE, RELEVANCE_UNSURE_HIGH, RELEVANCE_UNSURE_LOW, VERIFICATION_MIN_CONFIDENCE, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchVariantWithJev, isFuzzyMatchUnsure, isNegotiabilityUnsure, isRelevanceUnsure, isVerificationUnsure, resolveJevModel, verifyListingDescriptionWithJev } from '../server/jev';
+import { DEFAULT_JEV_MODEL, EXCLUDE_CHECK_MIN_CONFIDENCE, FUZZY_MATCH_MIN_CONFIDENCE, JEV_DECISIONS_URL, NEGOTIABILITY_MIN_CONFIDENCE, RELEVANCE_UNSURE_HIGH, RELEVANCE_UNSURE_LOW, VERIFICATION_MIN_CONFIDENCE, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchVariantWithJev, isFuzzyMatchUnsure, isNegotiabilityUnsure, isRelevanceUnsure, isVerificationUnsure, resolveJevModel, verifyListingDescriptionWithJev, classifyChecksWithJev, summarizeCheckResults } from '../server/jev';
 import { DEFAULT_VISION_MODEL, VISION_MAX_IMAGES, classifyListingRelevanceWithVision, resolveVisionModel, verifyListingDescriptionWithVision } from '../server/vision';
 
 const relevanceContext = {
@@ -457,4 +457,22 @@ test('sends watch checks to vision verification only when set', async () => {
   assert.equal(JSON.parse(bodies[0].messages[1].content[0].text).checks, undefined);
   assert.match(bodies[1].messages[0].content, /mode=exclude/);
   assert.deepEqual(JSON.parse(bodies[1].messages[1].content[0].text).checks, [{ mode: 'exclude', check: 'iCloud locked' }]);
+});
+
+test('classifies manual-search checks without a deal-safety question', async () => {
+  let body: Record<string, any> = {};
+  const results = await classifyChecksWithJev(
+    { marketplace: 'OLX', title: 'iPhone 13', description: 'Blokada iCloud.', checks: [{ text: 'iCloud locked', mode: 'exclude' }, { text: 'includes charger', mode: 'require' }] },
+    { apiKey: 'k' },
+    (_input, init) => {
+      body = JSON.parse(String(init?.body));
+      return Promise.resolve(Response.json({ model: 'm', answers: { check1: { type: 'choice', choice: 'yes', confidence: 0.99 }, check2: { type: 'choice', choice: 'unknown', confidence: 0.5 } } }));
+    },
+  );
+  assert.equal(body.session_id, 'scout:jev-checks:v1');
+  assert.deepEqual(Object.keys(body.questions).sort(), ['check1', 'check2']);
+  assert.deepEqual(body.state.checks, ['iCloud locked', 'includes charger']);
+  assert.deepEqual(results.map((result) => result.outcome), ['hit', 'unconfirmed']);
+  assert.equal(summarizeCheckResults(results), 'rejected');
+  assert.equal(summarizeCheckResults([results[1]]), 'unconfirmed');
 });

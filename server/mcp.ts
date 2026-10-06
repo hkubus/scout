@@ -165,6 +165,8 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       olxCategoryId: z.number().int().positive().optional().describe('OLX only: search one category; ids come from scout_olx_categories.'),
       page: z.number().int().min(1).max(10).optional().default(1),
       aiRelevance: z.boolean().optional().default(true),
+      verificationChecks: z.array(z.object({ text: z.string().trim().min(1).max(120), mode: z.enum(['require', 'exclude']) })).max(8).optional()
+        .describe('Jev reads each result: exclude hides near-certain matches; require-confirmed results come back with jevCheck "passed".'),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ olxCategoryId, ...input }) => {

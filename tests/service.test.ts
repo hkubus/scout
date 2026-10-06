@@ -3003,6 +3003,67 @@ test('rescues term near-misses in manual search on confident Jev pass', async ()
   }
 });
 
+test('manual search runs Jev checks: hides rejects, tags the rest, and caches description-backed verdicts', async () => {
+  const restore = liveJevEnv();
+  const calls: Array<Record<string, any>> = [];
+  const detailFetches: string[] = [];
+  const result = (outcome: string) => [{ text: 'includes charger', mode: 'require', answer: 'yes', confidence: 0.9, outcome }];
+  const context = fixture({
+    classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.9, unsure: false }),
+    classifyChecksWithJev: async (ctx: any) => {
+      calls.push({ ...ctx });
+      const text = String(ctx.description ?? '');
+      if (text.includes('icloud')) return [{ text: 'iCloud locked', mode: 'exclude', answer: 'yes', confidence: 0.98, outcome: 'hit' }];
+      if (text.includes('ladowarka')) return result('satisfied') as any;
+      return [{ text: 'includes charger', mode: 'require', answer: 'unknown', confidence: null, outcome: 'unconfirmed' }];
+    },
+    fetchListingDetailHtml: async (url: string) => {
+      detailFetches.push(url);
+      return '<meta property="og:description" content="Sam telefon, bez dodatkow.">';
+    },
+  });
+  try {
+    const offer = (id: string, title: string, description?: string) => ({
+      id, url: `https://www.olx.pl/d/oferta/${id}`, title, created_time: new Date().toISOString(),
+      ...(description ? { description } : {}),
+      params: [{ key: 'price', value: { value: 1500, currency: 'PLN', negotiable: false } }],
+    });
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      offer('IP-1', 'iPhone 13 128GB', 'Komplet, oryginalna ladowarka w zestawie.'),
+      offer('IP-2', 'iPhone 13 zablokowany', 'Blokada icloud, na czesci.'),
+      offer('IP-3', 'iPhone 13 niebieski'),
+    ], metadata: { visible_total_count: 3 } } });
+    const checks = [{ text: 'includes charger', mode: 'require' as const }, { text: 'iCloud locked', mode: 'exclude' as const }];
+    const search = () => context.service.manualSearch({ query: 'iphone 13', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', verificationChecks: checks });
+
+    const first = await search();
+    const byTitle = Object.fromEntries(first.listings.map((listing) => [listing.title, listing]));
+    assert.deepEqual(Object.keys(byTitle).sort(), ['iPhone 13 128GB', 'iPhone 13 niebieski']);
+    assert.equal(byTitle['iPhone 13 128GB'].jevCheck, 'passed');
+    assert.equal(byTitle['iPhone 13 niebieski'].jevCheck, 'unconfirmed');
+    assert.match(byTitle['iPhone 13 niebieski'].jevCheckNote ?? '', /Could not confirm: includes charger/);
+    assert.match(first.sources[0].message, /1 hidden by Jev checks/);
+    assert.equal(first.sources[0].count, 2);
+    // OLX returned two descriptions; only the third needed its detail page.
+    assert.deepEqual(detailFetches, ['https://www.olx.pl/d/oferta/IP-3']);
+    assert.equal(calls.length, 3);
+    assert.deepEqual(calls[0].checks, checks);
+
+    // Every verdict had a description, so a repeat search spends no Jev calls.
+    const second = await search();
+    assert.equal(calls.length, 3);
+    assert.deepEqual(second.listings.map((listing) => listing.jevCheck).sort(), ['passed', 'unconfirmed']);
+
+    // Without checks nothing is tagged.
+    const plain = await context.service.manualSearch({ query: 'iphone 13', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any' });
+    assert.equal(plain.listings.length, 3);
+    assert.ok(plain.listings.every((listing) => listing.jevCheck === undefined));
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
 test('keeps deterministic drops when fuzzy rescue is unsure', async () => {
   const restore = liveJevEnv();
   const context = fixture({

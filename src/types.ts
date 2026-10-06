@@ -105,6 +105,10 @@ export interface Listing {
   promoted?: boolean | null;
   /** From the marketplace's business-account flag; null when unknown. */
   sellerType?: SellerType | null;
+  /** Manual search only: Jev's verdict on the search's checks (rejected listings are not returned). */
+  jevCheck?: "passed" | "unconfirmed" | "unchecked";
+  /** Failed or unconfirmed checks, or why the listing was not checked. */
+  jevCheckNote?: string;
   listingId?: string;
   decision?: ListingDecision | null;
   note?: string;
@@ -387,6 +391,8 @@ export interface SearchFilters {
   searchId?: string;
   /** Run the Jev/LLM relevance filter for this search; default true when omitted. */
   aiRelevance?: boolean;
+  /** Things for Jev to confirm (require) or rule out (exclude) on each result. */
+  verificationChecks?: VerificationCheck[];
 }
 
 export interface SearchSourceStatus {
