@@ -9,7 +9,7 @@ import type { Browser, BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, type SellerType, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult, olxDetailHint } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
-import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, writeResaleListingWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext } from './ai';
+import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, writeResaleListingWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseVerificationChecks, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type VerificationCheck } from './ai';
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchVariantWithJev, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
 import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, verifyListingDescriptionWithVision, visionToVerification } from './vision';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
@@ -48,6 +48,8 @@ type DealNotificationCandidate = {
   query?: string;
   includedTerms?: string;
   excludedTerms?: string;
+  /** Watch-specific things the verifier must confirm (require) or rule out (exclude). */
+  verificationChecks?: VerificationCheck[];
   /** Model-variant bucket this listing was scored against, when the watch groups variants. */
   variantKey?: string | null;
   variantLabel?: string | null;
@@ -1131,7 +1133,7 @@ export class ScoutService {
   ) {
     try {
       const vision = await verifyListingDescriptionWithVision(
-        { marketplace: context.marketplace, title: context.title, condition: context.condition, description: context.description, imageUrls: galleryImageUrls },
+        { marketplace: context.marketplace, title: context.title, condition: context.condition, description: context.description, imageUrls: galleryImageUrls, query: context.query, includedTerms: context.includedTerms, excludedTerms: context.excludedTerms, checks: context.checks },
         { apiKey: shadow.apiKey, model: shadow.visionModel },
       );
       this.logJevShadow({
@@ -1200,6 +1202,7 @@ export class ScoutService {
       query: context.query,
       includedTerms: context.includedTerms,
       excludedTerms: context.excludedTerms,
+      checks: context.checks,
     };
     const visionConfig = { apiKey: live.apiKey, model: live.visionModel };
 
@@ -1212,7 +1215,7 @@ export class ScoutService {
           decision: judgment.decision,
           confidence: judgment.confidence ?? 0,
           summary: `Jev verification ${judgment.decision}.`,
-          issues: [],
+          issues: judgment.issues ?? [],
           evidence: [],
         };
         this.logJevLive('verification', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: false });
@@ -1246,7 +1249,7 @@ export class ScoutService {
           decision: judgment.decision,
           confidence: judgment.confidence ?? 0,
           summary: `Jev leaned ${judgment.decision} (confidence ${confidence}); vision tiebreak failed.`.slice(0, 240),
-          issues: [],
+          issues: judgment.issues ?? [],
           evidence: [],
         };
       }
@@ -1897,6 +1900,7 @@ export class ScoutService {
       query: candidate.query?.trim() ? candidate.query : null,
       includedTerms: candidate.includedTerms?.trim() ? candidate.includedTerms : null,
       excludedTerms: candidate.excludedTerms?.trim() ? candidate.excludedTerms : null,
+      checks: candidate.verificationChecks?.length ? candidate.verificationChecks : null,
     };
     const inputHash = listingDescriptionVerificationInputHash(context);
     // Everything up to the fresh AI call is synchronous, so the snapshot and
@@ -2244,6 +2248,7 @@ export class ScoutService {
       shippingOnly: Boolean(row.shipping_only),
       typoVariants: Boolean(row.typo_variants),
       aiRelevance: row.ai_relevance === undefined ? true : Boolean(row.ai_relevance),
+      verificationChecks: parseVerificationChecks(row.verification_checks_json),
       referenceMarketWatchId: row.reference_market_watch_id ?? null,
       variantGroups,
       variantGroupsAuto: !variantGroups.length && row.variant_groups_auto !== undefined && Boolean(row.variant_groups_auto),
@@ -5115,6 +5120,7 @@ export class ScoutService {
         query: String(row.query ?? ''),
         includedTerms: String(row.included_terms ?? ''),
         excludedTerms: String(row.excluded_terms ?? ''),
+        verificationChecks: parseVerificationChecks(row.verification_checks_json),
         variantKey,
         variantLabel,
       };

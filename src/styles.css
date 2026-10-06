@@ -899,6 +899,8 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 @media (max-width: 720px) {
   .variant-row { grid-template-columns: 1fr; }
 }
+.variant-row.verification-check-row { grid-template-columns: auto 1fr auto; }
+.verification-check-row select { min-height: 38px; }
 
 .login-shell { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: var(--bg); }
 .login-card { width: min(380px, 100%); display: grid; gap: 4px; padding: 28px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }

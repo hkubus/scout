@@ -223,6 +223,8 @@ export interface Watch {
   shippingOnly: boolean;
   typoVariants: boolean;
   aiRelevance: boolean;
+  /** Things Jev looks for while verifying this watch's very strong and exceptional deals. */
+  verificationChecks?: VerificationCheck[];
   variantGroups: VariantGroup[];
   /** No groups yet and Scout will propose them from listing titles once enough are saved. */
   variantGroupsAuto?: boolean;
@@ -240,6 +242,15 @@ export interface Watch {
   /** Skip paid placements and highlights. */
   ignorePromoted?: boolean;
   archivedAt?: string | null;
+}
+
+/**
+ * `require`: hold the alert unless the listing clearly shows it.
+ * `exclude`: reject only when Jev is near-certain the listing matches it.
+ */
+export interface VerificationCheck {
+  text: string;
+  mode: "require" | "exclude";
 }
 
 export interface WatchAnalyticsPoint {
