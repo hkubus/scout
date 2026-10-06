@@ -14,7 +14,7 @@ import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyLis
 import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, verifyListingDescriptionWithVision, visionToVerification } from './vision';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { Limiter, mapPool } from './limiter';
-import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, median, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
+import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
 import { normalizeFilterText } from './text';
 import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assignVariant, finalizeVariantSuggestions, parseVariantGroups, suggestVariantGroupsFromTitles, variantLabelFor, type VariantGroup, type VariantSample } from './variants';
@@ -425,7 +425,7 @@ function analyticsPriceStats(rows: WatchAnalyticsObservation[]) {
   const prices = rows.map((row) => row.price).filter(Number.isFinite);
   const medianPrice = median(prices);
   const baselinedRows = rows.filter((row) => row.typical !== null && row.typical > 0);
-  const strongDealCount = baselinedRows.filter((row) => ((row.typical! - row.price) / row.typical!) * 100 >= 18).length;
+  const strongDealCount = baselinedRows.filter((row) => (dealStrength(row.price, row.typical) ?? 0) >= 3).length;
   return {
     medianPrice,
     lowerPrice: percentile(prices, 0.25),
@@ -597,17 +597,6 @@ export function validateDiscordWebhook(value: string) {
     throw new ServiceError('Webhook must be an HTTPS Discord webhook URL');
   }
   return url.toString();
-}
-
-/**
- * Deal-strength tier from a discount percentage, matching the label mapping
- * used when storing listings: 5 Exceptional (>=30%), 4 Very strong (>=20%),
- * 3 Strong (>=12%), 2 Watch (>0%), 1 none. A null discount (no typical yet)
- * yields null so callers can distinguish "not scoreable" from "no discount".
- */
-function dealStrengthFromDiscount(discountPercent: number | null): number | null {
-  if (discountPercent === null || !Number.isFinite(discountPercent)) return null;
-  return discountPercent >= 30 ? 5 : discountPercent >= 20 ? 4 : discountPercent >= 12 ? 3 : discountPercent > 0 ? 2 : 1;
 }
 
 function dealLabelFromStrength(strength: number): DealLabel {
@@ -1192,8 +1181,9 @@ export class ScoutService {
   /**
    * Live description verification (Phase 2): Jev decides; unsure or Jev
    * failure escalates to exactly one vision call over the gallery photos.
-   * Vision failure propagates so the caller keeps today's fail-open alert
-   * behavior for provider outages.
+   * When vision fails after an unsure Jev answer, Jev's lean decides; when
+   * Jev failed too, the error propagates so the caller keeps the fail-open
+   * alert behavior for provider outages.
    */
   private async verifyDescriptionLive(
     context: ListingDescriptionVerificationContext,
@@ -1248,6 +1238,18 @@ export class ScoutService {
           ? { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: true }
           : { jevError: jevFailed },
         { visionError: message.slice(0, 500) });
+      // A failed tiebreak must not discard a Jev answer we already have: the
+      // unsure verdict stands as the lean (a 0.59 pass still alerts).
+      if (judgment) {
+        const confidence = judgment.confidence === null ? 'none' : judgment.confidence.toFixed(2);
+        return {
+          decision: judgment.decision,
+          confidence: judgment.confidence ?? 0,
+          summary: `Jev leaned ${judgment.decision} (confidence ${confidence}); vision tiebreak failed.`.slice(0, 240),
+          issues: [],
+          evidence: [],
+        };
+      }
       throw visionError;
     }
   }
@@ -2268,13 +2270,12 @@ export class ScoutService {
     const typical = showTypical && associationTypical !== null && associationTypical !== undefined ? Number(associationTypical) : null;
     const price = Number(row.price_pln);
     const belowTypical = typical && typical > 0 ? -Math.max(0, ((typical - price) / typical) * 100) : null;
-    const discount = belowTypical === null ? 0 : Math.abs(belowTypical);
-    const dealStrength = row.watch_deal_strength === null || row.watch_deal_strength === undefined
-      ? discount >= 30 ? 5 : discount >= 20 ? 4 : discount >= 12 ? 3 : discount > 0 ? 2 : 1
+    const strength = row.watch_deal_strength === null || row.watch_deal_strength === undefined
+      ? dealStrength(price, typical) ?? 1
       : Number(row.watch_deal_strength);
     const dealLabel: DealLabel = row.watch_deal_label === 'Exceptional' || row.watch_deal_label === 'Very strong' || row.watch_deal_label === 'Strong' || row.watch_deal_label === 'Watch'
       ? row.watch_deal_label
-      : dealStrength >= 5 ? 'Exceptional' : dealStrength === 4 ? 'Very strong' : dealStrength === 3 ? 'Strong' : 'Watch';
+      : dealLabelFromStrength(strength);
     const marketplaceListingKey = `${row.marketplace}:${row.listing_id}`;
     const associationId = row.watch_listing_id === null || row.watch_listing_id === undefined
       ? row.watch_id ? `${row.watch_id}:${marketplaceListingKey}` : undefined
@@ -2297,7 +2298,7 @@ export class ScoutService {
       belowTypical,
       observed: relativeTime(row.watch_last_seen_at ?? row.last_seen_at),
       observedAt: row.watch_last_seen_at ?? row.last_seen_at,
-      dealStrength,
+      dealStrength: strength,
       dealLabel,
       image: row.image_url || '',
       url: row.url,
@@ -5055,7 +5056,7 @@ export class ScoutService {
     // typical. Once own samples reach the floor, own history always wins.
     const useReference = referenceMedian !== null && baseline.prices.length < (pooled ? VARIANT_MIN_SAMPLES : BASELINE_MIN_SAMPLES);
     const score = scoreDealFromStats(baseline.stats ?? priceStats(baseline.prices), price, { observedHours, sensitivity: Number(row.sensitivity ?? 1), ...(useReference ? { typicalOverride: referenceMedian } : {}), ...(pooled ? { pooled } : {}) });
-    return { score, useReference, dealStrength: dealStrengthFromDiscount(score.discountPercent) };
+    return { score, useReference, dealStrength: score.discountPercent === null ? null : dealStrength(price, score.typical) };
   }
 
   private storeListing(row: WatchRow, listing: NormalizedListing, scanId: number, baselines: WatchBaselines, referenceMedian: number | null = null, assignment?: VariantAssignment): DealNotificationCandidate | null {

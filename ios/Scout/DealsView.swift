@@ -26,7 +26,7 @@ struct DealsView: View {
                     let deals = topDeals(dashboard.listings)
                     Section {
                         if deals.isEmpty {
-                            ContentUnavailableView("No strong deals right now", systemImage: "tag", description: Text("Listings at least 12% below their typical price show up here."))
+                            ContentUnavailableView("No strong deals right now", systemImage: "tag", description: Text("Strong-or-better listings, weighing both % and zł below typical, show up here."))
                         }
                         ForEach(deals, id: \.rowID) { listing in
                             NavigationLink(value: ListingLink(listing)) {

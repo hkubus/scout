@@ -101,7 +101,7 @@ test('verifies a description through a Jev Choice with confidence', async () => 
   assert.deepEqual(result, { decision: 'pass', confidence: 0.82, unsure: false });
   const body = JSON.parse(String(requestInit?.body)) as Record<string, any>;
   assert.equal(body.model, '~typesafe/jev-latest');
-  assert.equal(body.session_id, 'scout:jev-verification:v1');
+  assert.equal(body.session_id, 'scout:jev-verification:v2');
   assert.deepEqual(Object.keys(body.questions.verification.criteria).sort(), ['pass', 'reject', 'unknown']);
 });
 

@@ -25,9 +25,9 @@ export type ListingsPreset = {
 
 const strengthOptions = [
   { value: "1", label: "All strengths" },
-  { value: "3", label: "Strong+ (≥12%)" },
-  { value: "4", label: "Very strong+ (≥20%)" },
-  { value: "5", label: "Exceptional (≥30%)" },
+  { value: "3", label: "Strong+" },
+  { value: "4", label: "Very strong+" },
+  { value: "5", label: "Exceptional" },
 ];
 const decisionOptions = [
   { value: "All", label: "Any decision" },

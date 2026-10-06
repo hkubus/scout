@@ -180,11 +180,11 @@ test('scores a new listing against its own model baseline during a scan', async 
 
     const stored = context.db.prepare(`SELECT wl.variant_key AS variant_key, wl.typical_pln AS typical_pln, wl.deal_strength AS deal_strength
       FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE l.listing_id = ?`).get('new-super') as { variant_key: string; typical_pln: number; deal_strength: number };
-    // 820 zł is 18% below the 1660 Super baseline (1000) but above the blended
-    // watch median (800), so grouping is what makes this a Strong deal.
+    // 820 zł is 18% (180 zł) below the 1660 Super baseline (1000) but above the
+    // blended watch median (800), so grouping is what makes this a Very strong deal.
     assert.equal(stored.variant_key, 'gtx-1660-super');
     assert.equal(stored.typical_pln, 1000);
-    assert.equal(stored.deal_strength, 3);
+    assert.equal(stored.deal_strength, 4);
 
     const watch = context.service.getWatches().find((item) => item.id === 'variant-scan')!;
     assert.equal(watch.variants.find((variant) => variant.key === 'gtx-1660-super')?.samples, 31);

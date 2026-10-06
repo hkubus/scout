@@ -98,7 +98,7 @@ struct AnalyticsView: View {
         Section("Overview") {
             StatGrid(items: [
                 StatGrid.Item(title: "Tracked listings", value: "\(data.overview.trackedListings)", detail: "\(data.overview.newListings) new in range"),
-                StatGrid.Item(title: "Strong deals", value: "\(data.overview.strongDeals)", detail: "≥12% below typical"),
+                StatGrid.Item(title: "Strong deals", value: "\(data.overview.strongDeals)", detail: "Strong+ by % and zł saved"),
                 StatGrid.Item(title: "Median discount", value: Format.percent(data.overview.medianDiscountPercent), detail: "below typical"),
                 StatGrid.Item(title: "Median move", value: store.watchId == nil ? "—" : Format.percent(medianMove(data.trend)), detail: store.watchId == nil ? "pick a watch" : "first to last day"),
             ])

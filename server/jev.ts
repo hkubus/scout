@@ -20,7 +20,7 @@ export const JEV_DECISIONS_URL = 'https://openrouter.ai/api/alpha/decisions';
 export const DEFAULT_JEV_MODEL = '~typesafe/jev-latest';
 
 const JEV_RELEVANCE_SESSION_ID = 'scout:jev-relevance:v2';
-const JEV_VERIFICATION_SESSION_ID = 'scout:jev-verification:v1';
+const JEV_VERIFICATION_SESSION_ID = 'scout:jev-verification:v2';
 const JEV_TERM_MATCH_SESSION_ID = 'scout:jev-term-match:v1';
 const JEV_NEGOTIABILITY_SESSION_ID = 'scout:jev-negotiability:v1';
 const JEV_CONDITION_SESSION_ID = 'scout:jev-condition:v1';
@@ -300,11 +300,11 @@ export async function verifyListingDescriptionWithJev(
     questions: {
       verification: {
         type: 'choice',
-        instructions: 'Given `listing.title`, `listing.condition`, `listing.description`, and the sought item named by `watch.query`, is this second-hand listing safe to surface as a very strong or exceptional deal?',
+        instructions: 'Given `listing.title`, `listing.condition`, `listing.description`, and the sought item named by `watch.query`, is this second-hand listing safe to surface as a very strong or exceptional deal? Judge the stated condition, not the description length: marketplace descriptions are often one line, and a short but explicit statement that the item works is enough evidence. Read any language and tolerate missing diacritics or misspellings (e.g. Polish `sprawny`, `w pelni sprawny`, `dziala bez zarzutu`; Romanian `perfect functional`, `functioneaza perfect`; German `voll funktionsfähig`). Pickup, shipping, payment, or thank-you lines are neutral and neither add nor remove evidence.',
         criteria: {
-          pass: 'The description clearly says the sought item is functional and discloses no material problem.',
+          pass: 'The description explicitly states the item works (however briefly, in any language) and discloses no material problem; the title identifies the sought item rather than an accessory or part.',
           reject: 'Explicit broken, defective, non-working, repair/for-parts, missing essential component, fake/replica, or another material issue — or the title shows the listing is for an accessory, part, or replacement component (fan, cooler, cooling, case, cable, adapter, battery) rather than the sought item itself, even when that accessory is functional.',
-          unknown: 'Description missing, ambiguous, contradictory, too short to establish condition, or otherwise not enough evidence. Do not infer safety from a low price, title, or general product knowledge.',
+          unknown: 'Description missing, ambiguous, or contradictory, or it never states whether the item works (e.g. only pickup, price, or contact details). Do not infer safety from a low price, title, or general product knowledge.',
         },
       },
     },

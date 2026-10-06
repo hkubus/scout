@@ -725,8 +725,9 @@ test('aggregates watch analytics by daily listing snapshots', () => {
     assert.deepEqual(analytics.points.map((point) => point.medianPrice), [1225, 1600]);
     assert.equal(analytics.current.lowerPrice, 1400);
     assert.equal(analytics.current.upperPrice, 1700);
-    assert.equal(analytics.current.strongDealCount, 1);
-    assert.equal(analytics.current.strongDealRate, 1 / 3 * 100);
+    // 10-20% off 1500-2000 zł typicals saves 200-300 zł, so all three are Strong+.
+    assert.equal(analytics.current.strongDealCount, 3);
+    assert.equal(analytics.current.strongDealRate, 100);
     assert.equal(analytics.sources.find((source) => source.source === 'OLX')?.listingCount, 2);
     assert.equal(analytics.sources.find((source) => source.source === 'Vinted')?.medianPrice, 1600);
     assert.ok((analytics.medianChangePercent ?? 0) > 30);
@@ -2364,7 +2365,8 @@ test('seeds fresh listings from a reference series band for display only', async
     await (context.service as any).runWatch(row);
 
     const association = context.db.prepare('SELECT typical_pln, typical_source, deal_label FROM watch_listings WHERE watch_id = ?').get('ref-watch') as { typical_pln: number; typical_source: string; deal_label: string };
-    assert.deepEqual({ ...association, typical_pln: 300 }, { typical_pln: 300, typical_source: 'reference-band', deal_label: 'Very strong' });
+    // 20% off a 300 zł typical saves only 60 zł, so it rates Strong rather than Very strong.
+    assert.deepEqual({ ...association, typical_pln: 300 }, { typical_pln: 300, typical_source: 'reference-band', deal_label: 'Strong' });
     const feed = context.service.getListings();
     assert.equal(feed[0].typical, 300);
     assert.equal(feed[0].typicalSource, 'reference-band');
@@ -2830,6 +2832,12 @@ test('verifies high-priority deals live with Jev and vision escalation', async (
     verifyListingDescriptionWithVision: async () => { throw new VisionError('Vision 502', 502); },
   });
   (failing.service as any).fetchPublicPage = async () => detailHtml;
+  let unsureDecision: { decision: 'pass' | 'reject' | 'unknown'; confidence: number | null; unsure: boolean } = { decision: 'pass', confidence: 0.59, unsure: true };
+  const unsureJev = fixture({
+    verifyListingDescriptionWithJev: async () => unsureDecision,
+    verifyListingDescriptionWithVision: async () => { throw new VisionError('OpenRouter returned vision verification that was not valid JSON', 502, 'format'); },
+  });
+  (unsureJev.service as any).fetchPublicPage = async () => detailHtml;
   try {
     assert.equal(await (context.service as any).verifyHighPriorityDealOnce(candidate), true);
     assert.equal(visionCalls.length, 0);
@@ -2840,10 +2848,18 @@ test('verifies high-priority deals live with Jev and vision escalation', async (
     assert.equal((visionCalls[0].imageUrls as string[]).length, 1);
     // Vision outage keeps today's fail-open alert behavior.
     assert.equal(await (failing.service as any).verifyHighPriorityDealOnce(candidate), true);
+    // A malformed vision reply after an unsure Jev answer falls back to the
+    // Jev lean instead of holding the alert as unknown.
+    const leaningPass = { ...candidate, listing: liveListing({ listingId: 'live-3', url: 'https://www.olx.pl/d/oferta/live-3' }) };
+    const leaningReject = { ...candidate, listing: liveListing({ listingId: 'live-4', url: 'https://www.olx.pl/d/oferta/live-4' }) };
+    assert.equal(await (unsureJev.service as any).verifyHighPriorityDealOnce(leaningPass), true);
+    unsureDecision = { decision: 'reject', confidence: 0.55, unsure: true };
+    assert.equal(await (unsureJev.service as any).verifyHighPriorityDealOnce(leaningReject), false);
   } finally {
     restore();
     context.close();
     failing.close();
+    unsureJev.close();
   }
 });
 
@@ -3387,13 +3403,14 @@ test('named variants become ready at 10 own samples with the spread pooled acros
 
     const captured: Array<{ listing: { listingId: string }; typical: number; discountPercent: number }> = [];
     (context.service as any).processDealCandidates = async (candidates: typeof captured) => { captured.push(...candidates); };
-    // 19% below the Pro median: a Strong deal that must clear the z-score on
-    // the pooled within-variant spread.
+    // 19% below the Pro median: below the 20% alert bypass, so it must clear
+    // the z-score on the pooled within-variant spread. Saving ~500 zł makes it
+    // Very strong on the feed's scale.
     (context.service as any).fetchOlxApi = olxListings([{ id: 'strong-pro', title: 'iPhone 13 Pro 128GB', price: 2106 }]);
     await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('pooled-watch'));
     assert.deepEqual(captured.map((candidate) => [candidate.listing.listingId, candidate.typical, Math.round(candidate.discountPercent)]), [['strong-pro', 2600, 19]]);
     const stored = context.db.prepare("SELECT wl.variant_key, wl.variant_source, wl.deal_label FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE l.listing_id = 'strong-pro'").get() as Record<string, unknown>;
-    assert.deepEqual({ ...stored }, { variant_key: 'pro', variant_source: 'rule', deal_label: 'Strong' });
+    assert.deepEqual({ ...stored }, { variant_key: 'pro', variant_source: 'rule', deal_label: 'Very strong' });
   } finally { context.close(); }
 });
 
@@ -3570,7 +3587,7 @@ test('moves a listing to a variant manually, re-scores it, and keeps the pick ac
     const moved = context.service.setListingVariant('manual-variant-watch', key, 'pro');
     assert.deepEqual([moved.listing.variantKey, moved.listing.variantLabel, moved.listing.variantSource], ['pro', '13 Pro', 'manual']);
     assert.equal(moved.listing.typical, 2600);
-    assert.equal(moved.listing.dealLabel, 'Very strong');
+    assert.equal(moved.listing.dealLabel, 'Exceptional');
     assert.deepEqual(moved.variantGroups?.map((group) => group.id), ['mini', 'base', 'pro']);
 
     // A scan that sees the listing again, and a variant edit, both keep the manual pick.
