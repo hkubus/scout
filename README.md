@@ -86,6 +86,15 @@ Settings supports Discord webhooks and ntfy topics. Each channel has its own min
 
 An alert needs a ready baseline (30 comparable samples and 6 hours of watch history), an 18%+ discount below the learned median, and — for discounts between 18% and 20% — a robust price-deviation score of at least 3.1 (scaled by watch sensitivity). A **Very strong** discount (20%+ below the median) alerts as soon as the watch is ready even when the watch's own price spread fails that deviation test, so a heterogeneous search cannot keep silencing genuine discounts forever. Higher-priority deals are still subject to the description-verification safeguard below.
 
+Each watch can also set two alert rules of its own:
+
+- **Target price:** a listing at or below it alerts at once, even while the watch is still learning. It goes to every configured channel, whatever that channel's minimum priority or digest setting, with a "Target price hit" title. The feed marks such listings with a **Target** chip.
+- **Minimum saving:** a deal alert also needs the listing to be at least this many złoty below the typical price. It keeps cheap items with a big percentage but a tiny saving from alerting. Target-price hits ignore it, and it never changes the feed or the deal labels.
+
+ntfy alerts attach the listing photo, which the phone downloads from the marketplace. Alongside the price they show the typical price, the złoty saved, the estimated net, and the listing's condition, seller type, shipping and age. Discord embeds carry the same context.
+
+**Estimated net** (the feed's *Est. net* column and the alerts) is what reselling at the typical asking price on the same marketplace would leave after that platform's seller fee from the [Flips](#flips-ledger) fee presets, minus the buy price. It is built from asking prices, not completed sales, so treat it as an upper estimate. It is display-only and never decides whether a deal alerts.
+
 Daily deal digests can be enabled for Discord, ntfy, or both at a configurable server-local time. On digest-enabled channels, Strong and Very strong deals are bundled into one ranked daily summary while Exceptional deals remain immediate. Empty digests are suppressed, unchanged listings are not repeated, and meaningful price drops or priority increases can appear in a later digest. Digest creation and per-channel delivery are durable and use the same capped retry behavior as immediate alerts.
 
 ## Manual search
@@ -163,7 +172,7 @@ The **Flips** page records what you bought, where it is listed for sale, and wha
   - Sales per platform are counted against the DAC7 reporting threshold (30 sales or 2 000 € a year per platform).
   - The page produces the simplified sales record (*uproszczona ewidencja sprzedaży*): one row per day with that day's sales and the running total for the quarter, downloadable as CSV. These figures are estimates for your own records, not tax advice.
 
-The ledger is private bookkeeping. Nothing in scanning, scoring, bands or alerts reads it, so your own buy and sale prices never mix with marketplace asking prices. Retention never prunes it. It is included in `/api/export` and database backups, but hidden from the Debug API: it is left out of the table list, refused in read-only SQL, and emptied in debug snapshots.
+The ledger is private bookkeeping. Nothing in scanning, scoring, bands or alerts reads it (only the fee presets feed the display-only estimated net), so your own buy and sale prices never mix with marketplace asking prices. Retention never prunes it. It is included in `/api/export` and database backups, but hidden from the Debug API: it is left out of the table list, refused in read-only SQL, and emptied in debug snapshots.
 
 ### Listing on OLX, Allegro Lokalnie and Vinted
 

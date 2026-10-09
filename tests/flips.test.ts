@@ -7,7 +7,7 @@ import { openDatabase } from '../server/db';
 import sharp from 'sharp';
 import { FlipStore, MAX_FLIP_PHOTO_EDGE, MAX_FLIP_PHOTOS, sniffImageMime, toWebp } from '../server/flips';
 import { ServiceError } from '../server/service';
-import { DEFAULT_FEE_PRESETS, listingConditionFromLabel, roundToNines, suggestedListingPrice, estimateFlipNet, flipNet, normalizeFeePresets, quarterOf, saleFee, salesRecord, salesRecordCsv } from '../src/profit';
+import { DEFAULT_FEE_PRESETS, estimatedNetAtTypical, listingConditionFromLabel, roundToNines, suggestedListingPrice, estimateFlipNet, flipNet, normalizeFeePresets, quarterOf, saleFee, salesRecord, salesRecordCsv } from '../src/profit';
 
 function fixture() {
   const directory = mkdtempSync(join(tmpdir(), 'scout-flips-'));
@@ -264,4 +264,13 @@ test('a resale draft starts from the saved original listing and falls back to it
     db.close();
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('estimates the net of reselling at the typical after the seller fee', () => {
+  assert.equal(estimatedNetAtTypical(700, 1000, { percent: 0, fixed: 0 }), 300);
+  // Allegro Lokalnie 4,9%: 1000 − 49 − 700.
+  assert.equal(estimatedNetAtTypical(700, 1000, { percent: 4.9, fixed: 0 }), 251);
+  assert.equal(estimatedNetAtTypical(1100, 1000, { percent: 0, fixed: 5 }), -105);
+  assert.equal(estimatedNetAtTypical(700, null, { percent: 0, fixed: 0 }), null);
+  assert.equal(estimatedNetAtTypical(700, 0, { percent: 0, fixed: 0 }), null);
 });

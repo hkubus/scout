@@ -27,6 +27,8 @@ struct WatchEditorView: View {
     @State private var draft: WatchDraft
     @State private var minPrice: String
     @State private var maxPrice: String
+    @State private var targetPrice: String
+    @State private var minSaving: String
     @State private var saving = false
     @State private var error: String?
 
@@ -38,6 +40,8 @@ struct WatchEditorView: View {
         _draft = State(initialValue: request.draft)
         _minPrice = State(initialValue: request.draft.minPrice.map { String(Int($0)) } ?? "")
         _maxPrice = State(initialValue: request.draft.maxPrice.map { String(Int($0)) } ?? "")
+        _targetPrice = State(initialValue: request.draft.targetPrice.map { String(Int($0)) } ?? "")
+        _minSaving = State(initialValue: request.draft.minSaving.map { String(Int($0)) } ?? "")
     }
 
     private var isNew: Bool { request.watchID == nil }
@@ -80,6 +84,18 @@ struct WatchEditorView: View {
                     if draft.sources.contains(.olx) {
                         Text("OLX searches every category by default, so a GPU query is mostly whole PCs. Pick the item's own category for a cleaner typical price.")
                     }
+                }
+
+                // Alert rules only; the feed and typical prices ignore them.
+                Section {
+                    TextField("Target price (zł)", text: $targetPrice)
+                        .keyboardType(.numberPad)
+                    TextField("Minimum saving (zł)", text: $minSaving)
+                        .keyboardType(.numberPad)
+                } header: {
+                    Text("Alerts")
+                } footer: {
+                    Text("Target price: alert as soon as a listing is at or below this, even while learning. Minimum saving: only alert on deals at least this many zł below typical.")
                 }
 
                 Section {
@@ -143,6 +159,8 @@ struct WatchEditorView: View {
             }
             .onChange(of: minPrice) { _, text in draft.minPrice = Self.price(text) }
             .onChange(of: maxPrice) { _, text in draft.maxPrice = Self.price(text) }
+            .onChange(of: targetPrice) { _, text in draft.targetPrice = Self.price(text) }
+            .onChange(of: minSaving) { _, text in draft.minSaving = Self.price(text) }
             .interactiveDismissDisabled(saving)
         }
     }

@@ -111,6 +111,7 @@ struct ListingDetailView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                    if listing.isTargetHit { TargetChip(font: .caption.weight(.semibold)) }
                 }
                 if let typical = listing.typical {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -126,6 +127,11 @@ struct ListingDetailView: View {
                         Text(verbatim: "typical \(Format.pln(typical))" + (listing.typicalSource == "reference-band" ? " (research)" : ""))
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
+                    }
+                    // The server's estimate with the platform's preset fee.
+                    if let net = listing.estimatedNet {
+                        EstimatedNetText(net: net, suffix: "net at typical")
+                            .font(.subheadline.weight(.semibold))
                     }
                 } else {
                     Text("Typical price is still learning")
