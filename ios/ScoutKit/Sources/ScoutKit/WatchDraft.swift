@@ -6,6 +6,8 @@ import Foundation
 /// baselines) are left to the web app; a PATCH without them leaves them as is.
 public struct WatchDraft: Hashable, Sendable {
     public static let conditions = ["Any", "New", "Like new", "Very good", "Good"]
+    /// The server's upper bound for the target price and minimum saving, in PLN.
+    public static let alertAmountLimit: Double = 1_000_000
     public static let sensitivities: [(label: String, value: Double)] = [("Conservative", 0.8), ("Balanced", 1), ("Sensitive", 1.3)]
 
     public var name: String
@@ -19,6 +21,10 @@ public struct WatchDraft: Hashable, Sendable {
     public var interval: Int
     public var minPrice: Double?
     public var maxPrice: Double?
+    /// Alert at once on a listing at or below this, even while learning.
+    public var targetPrice: Double?
+    /// Deal alerts also need the listing at least this many złoty below typical.
+    public var minSaving: Double?
     public var shippingOnly: Bool
     public var typoVariants: Bool
     public var aiRelevance: Bool
@@ -42,6 +48,8 @@ public struct WatchDraft: Hashable, Sendable {
         interval: Int = 5,
         minPrice: Double? = nil,
         maxPrice: Double? = nil,
+        targetPrice: Double? = nil,
+        minSaving: Double? = nil,
         shippingOnly: Bool = false,
         typoVariants: Bool = false,
         aiRelevance: Bool = true,
@@ -60,6 +68,8 @@ public struct WatchDraft: Hashable, Sendable {
         self.interval = interval
         self.minPrice = minPrice
         self.maxPrice = maxPrice
+        self.targetPrice = targetPrice
+        self.minSaving = minSaving
         self.shippingOnly = shippingOnly
         self.typoVariants = typoVariants
         self.aiRelevance = aiRelevance
@@ -81,6 +91,8 @@ public struct WatchDraft: Hashable, Sendable {
             interval: Int(watch.interval),
             minPrice: watch.minPrice,
             maxPrice: watch.maxPrice,
+            targetPrice: watch.targetPrice,
+            minSaving: watch.minSaving,
             shippingOnly: watch.shippingOnly,
             typoVariants: watch.typoVariants,
             aiRelevance: watch.aiRelevance,
@@ -138,6 +150,8 @@ public struct WatchDraft: Hashable, Sendable {
         if let minPrice, minPrice < 0 { return "The minimum price can't be negative." }
         if let maxPrice, maxPrice <= 0 { return "The maximum price must be above zero." }
         if let minPrice, let maxPrice, minPrice > maxPrice { return "The minimum price can't exceed the maximum." }
+        if let targetPrice, !(targetPrice > 0 && targetPrice <= Self.alertAmountLimit) { return "The target price must be above zero and at most 1 000 000 zł." }
+        if let minSaving, !(minSaving >= 0 && minSaving <= Self.alertAmountLimit) { return "The minimum saving must be between 0 and 1 000 000 zł." }
         return nil
     }
 
@@ -195,11 +209,12 @@ public struct WatchDraft: Hashable, Sendable {
 extension WatchDraft: Encodable {
     private enum CodingKeys: String, CodingKey {
         case name, query, terms, excluded, sources, location, condition, interval
-        case minPrice, maxPrice, shippingOnly, typoVariants, aiRelevance, sensitivity
+        case minPrice, maxPrice, targetPrice, minSaving, shippingOnly, typoVariants, aiRelevance, sensitivity
         case olxCategory, sellerType, ignorePromoted
     }
 
-    // Prices are always sent, as null when empty, so an edit can clear them.
+    // Prices, the target and the minimum saving are always sent, as null when
+    // empty, so an edit can clear them.
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(name, forKey: .name)
@@ -212,6 +227,8 @@ extension WatchDraft: Encodable {
         try container.encode(interval, forKey: .interval)
         try container.encode(minPrice, forKey: .minPrice)
         try container.encode(maxPrice, forKey: .maxPrice)
+        try container.encode(targetPrice, forKey: .targetPrice)
+        try container.encode(minSaving, forKey: .minSaving)
         try container.encode(shippingOnly, forKey: .shippingOnly)
         try container.encode(typoVariants, forKey: .typoVariants)
         try container.encode(aiRelevance, forKey: .aiRelevance)
@@ -238,6 +255,8 @@ extension WatchDraft: Decodable {
         interval = try container.decodeIfPresent(Int.self, forKey: .interval) ?? interval
         minPrice = try container.decodeIfPresent(Double.self, forKey: .minPrice)
         maxPrice = try container.decodeIfPresent(Double.self, forKey: .maxPrice)
+        targetPrice = try container.decodeIfPresent(Double.self, forKey: .targetPrice)
+        minSaving = try container.decodeIfPresent(Double.self, forKey: .minSaving)
         shippingOnly = try container.decodeIfPresent(Bool.self, forKey: .shippingOnly) ?? shippingOnly
         typoVariants = try container.decodeIfPresent(Bool.self, forKey: .typoVariants) ?? typoVariants
         aiRelevance = try container.decodeIfPresent(Bool.self, forKey: .aiRelevance) ?? aiRelevance

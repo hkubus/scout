@@ -1,9 +1,8 @@
 import { DEFAULT_FEE_PRESETS, FLIP_CHANNELS, LISTING_CONDITIONS, isFlipChannel, normalizeFeePresets, saleFee, type FeePresets, type FlipChannel, type FlipListing, type ListingCondition } from '../src/profit';
 import sharp from 'sharp';
 import type { Flip, FlipPhoto, FlipsData } from '../src/types';
-import { ServiceError } from './service';
+import { FEE_PRESETS_KEY, ServiceError } from './service';
 
-const FEE_PRESETS_KEY = 'flip_fee_presets';
 /** More than any of the three marketplaces takes per listing. */
 export const MAX_FLIP_PHOTOS = 20;
 export const MAX_FLIP_PHOTO_BYTES = 10 * 1024 * 1024;

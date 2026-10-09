@@ -77,7 +77,33 @@ public actor DemoTransport: HTTPTransport {
                 dashboard.listings[index].promoted = index % 3 == 2
             }
         }
+        // Alert rules: the headphones have a target the cheapest pair meets,
+        // the deck needs a real saving before a deal alerts.
+        for index in dashboard.watches.indices {
+            switch dashboard.watches[index].id {
+            case "watch-sony": dashboard.watches[index].targetPrice = 800
+            case "watch-deck": dashboard.watches[index].minSaving = 300
+            case "watch-xbox": dashboard.watches[index].targetPrice = 450
+            default: break
+            }
+        }
+        dashboard.listings = withAlertFields(dashboard.listings, watches: dashboard.watches)
         return dashboard
+    }
+
+    /// `estimatedNet` and `targetHit` as the server derives them: resale at the
+    /// typical price on the same marketplace after its default fee, and the
+    /// price against the watch's target.
+    static func withAlertFields(_ listings: [Listing], watches: [Watch]) -> [Listing] {
+        listings.map { listing in
+            var listing = listing
+            listing.estimatedNet = listing.typical.map {
+                Profit.estimate(buyPrice: listing.price, buyCosts: 0, resalePrice: $0, preset: FeePresets.defaults[FlipChannel(listing.marketplace)]).net.rounded()
+            }
+            let target = watches.first { $0.id == listing.watchId }?.targetPrice
+            listing.targetHit = target.map { listing.price <= $0 } ?? false
+            return listing
+        }
     }
 
     public static func fixture<T: Decodable>(_ name: String) -> T {
@@ -157,6 +183,7 @@ public actor DemoTransport: HTTPTransport {
             }
             let body = (try? JSONSerialization.jsonObject(with: request.httpBody ?? Data())) as? [String: Any] ?? [:]
             apply(body, to: &dashboard.watches[index])
+            dashboard.listings = Self.withAlertFields(dashboard.listings, watches: dashboard.watches)
             return try respond(["ok": true])
         case "POST /api/search":
             let filters = try JSONDecoder().decode(SearchFilters.self, from: request.httpBody ?? Data())
@@ -328,6 +355,8 @@ public actor DemoTransport: HTTPTransport {
             result.watchId = nil
             result.associationId = nil
             result.decision = nil
+            result.estimatedNet = nil
+            result.targetHit = nil
             return result
         }
         let sources = filters.sources.map { source -> SearchSourceStatus in
@@ -380,7 +409,8 @@ public actor DemoTransport: HTTPTransport {
             typoVariants: draft.typoVariants, aiRelevance: draft.aiRelevance, variantGroups: [], variants: [],
             dealCounts: WatchDealCounts(exceptional: 0, veryStrong: 0, strong: 0), referenceMarketWatchId: nil,
             minPrice: draft.minPrice, maxPrice: draft.maxPrice, archivedAt: nil,
-            olxCategory: draft.olxCategory, sellerType: draft.sellerType?.rawValue, ignorePromoted: draft.ignorePromoted
+            olxCategory: draft.olxCategory, sellerType: draft.sellerType?.rawValue, ignorePromoted: draft.ignorePromoted,
+            targetPrice: draft.targetPrice, minSaving: draft.minSaving
         )
     }
 
@@ -396,6 +426,8 @@ public actor DemoTransport: HTTPTransport {
         if let value = body["interval"] as? Double { watch.interval = value }
         if body.keys.contains("minPrice") { watch.minPrice = body["minPrice"] as? Double }
         if body.keys.contains("maxPrice") { watch.maxPrice = body["maxPrice"] as? Double }
+        if body.keys.contains("targetPrice") { watch.targetPrice = body["targetPrice"] as? Double }
+        if body.keys.contains("minSaving") { watch.minSaving = body["minSaving"] as? Double }
         if let value = body["shippingOnly"] as? Bool { watch.shippingOnly = value }
         if let value = body["typoVariants"] as? Bool { watch.typoVariants = value }
         if let value = body["aiRelevance"] as? Bool { watch.aiRelevance = value }

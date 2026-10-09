@@ -64,6 +64,8 @@ export function WatchDialog({
   const [olxCategory, setOlxCategory] = useState<OlxCategory | null>(initialWatch?.olxCategory ?? preset?.olxCategory ?? null);
   const [sellerType, setSellerType] = useState<SellerType | null>(initialWatch?.sellerType ?? preset?.sellerType ?? null);
   const [ignorePromoted, setIgnorePromoted] = useState(initialWatch?.ignorePromoted ?? false);
+  const [targetPrice, setTargetPrice] = useState(initialWatch?.targetPrice ? String(initialWatch.targetPrice) : "");
+  const [minSaving, setMinSaving] = useState(initialWatch?.minSaving ? String(initialWatch.minSaving) : "");
   const [aiRelevance, setAiRelevance] = useState(initialWatch?.aiRelevance ?? preset?.aiRelevance ?? true);
   const [variantGroups, setVariantGroups] = useState<VariantGroup[]>(initialWatch?.variantGroups ?? []);
   // New watches wait for listings and then propose their own groups.
@@ -77,10 +79,14 @@ export function WatchDialog({
   const numericInterval = Number(interval);
   const numericMin = minPrice === "" ? null : Number(minPrice);
   const numericMax = maxPrice === "" ? null : Number(maxPrice);
+  const numericTarget = targetPrice === "" ? null : Number(targetPrice);
+  const numericMinSaving = minSaving === "" ? null : Number(minSaving);
   const validPrices =
     (numericMin === null || numericMin >= 0) &&
     (numericMax === null || numericMax > 0) &&
-    (numericMin === null || numericMax === null || numericMin <= numericMax);
+    (numericMin === null || numericMax === null || numericMin <= numericMax) &&
+    (numericTarget === null || (Number.isFinite(numericTarget) && numericTarget > 0 && numericTarget <= 1_000_000)) &&
+    (numericMinSaving === null || (Number.isFinite(numericMinSaving) && numericMinSaving >= 0 && numericMinSaving <= 1_000_000));
   const validSourceIntervals = Object.entries(sourceIntervals).every(([, raw]) => {
     if (raw === "") return true;
     const minutes = Number(raw);
@@ -174,6 +180,8 @@ export function WatchDialog({
         olxCategory: sources.includes("OLX") ? olxCategory : null,
         sellerType,
         ignorePromoted,
+        targetPrice: numericTarget,
+        minSaving: numericMinSaving || null,
       });
     } catch (submitError) {
       setError(errorMessage(submitError));
@@ -299,6 +307,16 @@ export function WatchDialog({
             <label className="field-label">
               Maximum price (zł)
               <input type="number" min="1" value={maxPrice} onChange={(event) => setMaxPrice(event.target.value)} placeholder="No maximum" />
+            </label>
+          </div>
+          <div className="field-row">
+            <label className="field-label" title="Alerts as soon as a listing is at or below this price, even while the watch is still learning, on every alert channel.">
+              Target price (zł) <span className="field-hint-inline">alerts even while learning</span>
+              <input type="number" min="1" step="1" value={targetPrice} onChange={(event) => setTargetPrice(event.target.value)} placeholder="No target" />
+            </label>
+            <label className="field-label" title="Deal alerts also need the listing to be at least this many złoty below the typical price. Target-price hits ignore it.">
+              Minimum saving (zł) <span className="field-hint-inline">alerts only</span>
+              <input type="number" min="0" step="1" value={minSaving} onChange={(event) => setMinSaving(event.target.value)} placeholder="Any saving" />
             </label>
           </div>
           <div className="field-row">

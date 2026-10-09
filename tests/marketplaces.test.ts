@@ -735,6 +735,42 @@ test('ntfy alerts can open the Scout iOS app with the marketplace page as an act
   assert.equal(web.actions, undefined);
 });
 
+test('ntfy alerts attach the photo and carry price, resale and seller context', () => {
+  const posted = new Date(Date.now() - 3 * 60 * 60_000).toISOString();
+  const listing = { marketplace: 'OLX' as const, listingId: 'ctx-1', title: 'RTX 3070', price: 900, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/ctx-1', imageUrl: 'https://ireland.apollo.olxcdn.com/v1/files/abc/image', condition: 'Używane', sellerType: 'private' as const, shippingAvailable: true, postedAt: posted, observedAt: posted };
+  const payload = buildNtfyPayload({ listing, typical: 1400, discountPercent: 35.7, confidence: 94, estimatedNet: 500 }, 'scout-deals');
+  assert.equal(payload.attach, listing.imageUrl);
+  assert.equal(payload.title, 'Exceptional deal · OLX');
+  const lines = payload.message.split('\n');
+  assert.match(lines[1], /^900 zł · typical 1\s?400 zł · 35\.7% below \(−500 zł\) · 94% confidence$/);
+  assert.match(lines[2], /^≈ \+500 zł net if resold at typical on OLX$/);
+  assert.equal(lines[3], 'Używane · Private seller · Shipping · posted 3 h ago');
+  assert.equal(lines.at(-1), listing.url);
+  // Only https images are attached.
+  assert.equal(buildNtfyPayload({ listing: { ...listing, imageUrl: 'http://example.com/a.jpg' }, typical: 1400, discountPercent: 35.7, confidence: 94 }, 'scout-deals').attach, undefined);
+});
+
+test('target-price hits alert as their own kind, also before a typical is learned', () => {
+  const listing = { marketplace: 'Vinted' as const, listingId: 'target-1', title: 'Ryzen 5 5600', price: 280, currency: 'PLN' as const, url: 'https://www.vinted.pl/items/1', observedAt: '2026-08-22T00:00:00.000Z' };
+  const learning = buildNtfyPayload({ listing, typical: null, discountPercent: null, confidence: 0, targetPrice: 300 }, 'scout-deals');
+  assert.equal(learning.title, 'Target price hit · Vinted');
+  assert.equal(learning.priority, 4);
+  assert.deepEqual(learning.tags, ['dart', 'moneybag']);
+  assert.match(learning.message, /280 zł · typical not learned yet/);
+  assert.match(learning.message, /At or below your 300 zł target/);
+  assert.doesNotMatch(learning.message, /net if resold/);
+  // A target hit that is also an exceptional deal keeps the top priority.
+  assert.equal(buildNtfyPayload({ listing, typical: 500, discountPercent: 44, confidence: 90, targetPrice: 300 }, 'scout-deals').priority, 5);
+
+  const embed = buildDiscordEmbed({ listing, typical: null, discountPercent: null, confidence: 0, targetPrice: 300 }).embeds[0];
+  const field = (name: string) => embed.fields.find((item) => item.name === name)?.value;
+  assert.equal(field('Target price'), '≤ 300 zł');
+  assert.equal(field('Typical price'), 'Still learning');
+  assert.equal(field('Below typical'), undefined);
+  assert.equal(field('Confidence'), undefined);
+  assert.match(embed.description ?? '', /Target price hit/);
+});
+
 test('rejects unsafe ntfy endpoints and invalid topics', () => {
   assert.throws(() => validateNtfyConfig({ serverUrl: 'https://example.com?token=secret', topic: 'scout-deals' }), /credentials or query/);
   assert.throws(() => validateNtfyConfig({ serverUrl: 'http://example.com', topic: 'scout-deals' }), /HTTPS/);

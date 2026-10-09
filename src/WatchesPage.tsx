@@ -44,6 +44,8 @@ function watchTags(watch: Watch) {
     watch.terms ? `include: ${watch.terms}` : null,
     watch.excluded ? `exclude: ${watch.excluded}` : null,
     watch.minPrice !== null || watch.maxPrice !== null ? priceRangeLabel(watch) : null,
+    watch.targetPrice ? `target ≤ ${watch.targetPrice.toLocaleString("pl-PL")} zł` : null,
+    watch.minSaving ? `alerts save ≥ ${watch.minSaving.toLocaleString("pl-PL")} zł` : null,
     watch.shippingOnly ? "shipping only" : null,
     watch.olxCategory && watch.sources.includes("OLX") ? `OLX: ${watch.olxCategory.label}` : null,
     watch.sellerType ? (watch.sellerType === "private" ? "private sellers" : "business sellers") : null,

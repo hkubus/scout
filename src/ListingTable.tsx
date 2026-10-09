@@ -46,6 +46,7 @@ export default memo(function ListingTable({
         <span role="columnheader">Price</span>
         <span role="columnheader">Typical</span>
         <span role="columnheader">vs typical</span>
+        <span role="columnheader" title="What reselling at the typical asking price on the same marketplace would net after its seller fee">Est. net</span>
         <span role="columnheader">Age</span>
         <span role="columnheader" aria-label="Actions" />
       </div>
@@ -96,6 +97,7 @@ const ListingRow = memo(function ListingRow({ listing, onSelect, onToggleHidden 
       <strong className={`discount-cell discount-cell--${discount.tone}`} role="cell" title={dealTierLabel(listing)}>
         {discount.text}
       </strong>
+      <NetCell listing={listing} />
       <span className={`age-cell${age.old ? " age-cell--old" : ""}`} role="cell" title={age.detail}>{age.label}</span>
       <div className="row-actions" role="cell">
         {onToggleHidden ? (
@@ -126,6 +128,21 @@ const ListingRow = memo(function ListingRow({ listing, onSelect, onToggleHidden 
   && previous.onToggleHidden === next.onToggleHidden
   && sameListingFields(previous.listing, next.listing));
 
+/** Estimated net at the typical; an estimate from asking prices, so it stays muted when unknown. */
+function NetCell({ listing }: { listing: Listing }) {
+  const net = listing.estimatedNet ?? null;
+  if (net === null || listing.typical === null) return <span className="net-cell net-cell--empty" role="cell">—</span>;
+  return (
+    <span
+      className={`net-cell ${net >= 0 ? "result-positive" : "result-negative"}`}
+      role="cell"
+      title={`If resold at the typical ${formatPln(listing.typical)} on ${listing.marketplace}, after its seller fee. An estimate from asking prices, not sales.`}
+    >
+      {net >= 0 ? "+" : "−"}{Math.abs(net).toLocaleString("pl-PL")} zł
+    </span>
+  );
+}
+
 /**
  * At most two short chips after the subtitle: the triage decision first, then
  * the state or signal that matters most. Age has its own column.
@@ -133,6 +150,7 @@ const ListingRow = memo(function ListingRow({ listing, onSelect, onToggleHidden 
 function ListingChips({ listing }: { listing: Listing }) {
   const chips: ReactNode[] = [];
   if (listing.decision) chips.push(<em key="decision" className={`decision-chip decision-chip--${listing.decision}`}>{decisionLabels[listing.decision]}</em>);
+  if (listing.targetHit) chips.push(<em key="target" className="decision-chip decision-chip--target" title="At or below the watch's target price">Target</em>);
   if (listing.hidden) chips.push(<em key="hidden" className="decision-chip decision-chip--hidden" title="Manually hidden from the overview and alerts"><EyeOff size={11} />Hidden</em>);
   if (listing.aiFiltered) chips.push(<em key="ai" className="decision-chip decision-chip--ai-filtered" title="Hidden by AI relevance filtering">Filtered by AI</em>);
   if (listing.variantLabel) chips.push(<em key="variant" className="decision-chip decision-chip--variant" title={`Scored against the “${listing.variantLabel}” model typical, not the watch-wide blend${listing.variantSource === "jev" ? " · placed by AI" : listing.variantSource === "manual" ? " · set manually" : ""}`}>{listing.variantLabel}</em>);

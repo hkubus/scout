@@ -642,6 +642,105 @@ final class WatchDraftTests: XCTestCase {
     }
 }
 
+final class AlertRuleTests: XCTestCase {
+    // `GET /api/watches` without the alert rules, as older servers send it.
+    private let watchJSON = #"{"id":"watch-deck","name":"Steam Deck OLED 512GB","query":"steam deck oled 512gb","terms":"","excluded":"","sources":["OLX"],"location":"Polska","condition":"Any","samples":0,"targetSamples":30,"observationHours":0,"readiness":0,"status":"Learning","interval":5,"sourceIntervals":{},"nextScan":"in 30m","enabled":true,"exactUrls":[],"sensitivity":1,"shippingOnly":false,"typoVariants":false,"aiRelevance":true,"referenceMarketWatchId":null,"variantGroups":[],"variants":[],"dealCounts":{"exceptional":0,"veryStrong":0,"strong":0},"minPrice":null,"maxPrice":null,"archivedAt":null"#
+
+    private func watch(_ extra: String) throws -> Watch {
+        try JSONDecoder().decode(Watch.self, from: Data((watchJSON + extra + "}").utf8))
+    }
+
+    private func listing(_ change: (inout [String: Any]) -> Void) throws -> Listing {
+        let listing = try XCTUnwrap(DemoTransport.dashboard().listings.first)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(listing)) as? [String: Any])
+        object.removeValue(forKey: "estimatedNet")
+        object.removeValue(forKey: "targetHit")
+        change(&object)
+        return try JSONDecoder().decode(Listing.self, from: JSONSerialization.data(withJSONObject: object))
+    }
+
+    func testDecodesWatchAlertRulesPresentAbsentOrNull() throws {
+        let set = try watch(#","targetPrice":1500,"minSaving":250.5"#)
+        XCTAssertEqual(set.targetPrice, 1500)
+        XCTAssertEqual(set.minSaving, 250.5)
+        let cleared = try watch(#","targetPrice":null,"minSaving":null"#)
+        XCTAssertNil(cleared.targetPrice)
+        XCTAssertNil(cleared.minSaving)
+        let older = try watch("")
+        XCTAssertNil(older.targetPrice)
+        XCTAssertNil(older.minSaving)
+    }
+
+    func testDecodesListingNetAndTargetPresentAbsentOrNull() throws {
+        let set = try listing { $0["estimatedNet"] = -42; $0["targetHit"] = true }
+        XCTAssertEqual(set.estimatedNet, -42)
+        XCTAssertTrue(set.isTargetHit)
+        let cleared = try listing { $0["estimatedNet"] = NSNull(); $0["targetHit"] = false }
+        XCTAssertNil(cleared.estimatedNet)
+        XCTAssertFalse(cleared.isTargetHit)
+        let older = try listing { _ in }
+        XCTAssertNil(older.estimatedNet)
+        XCTAssertNil(older.targetHit)
+        XCTAssertFalse(older.isTargetHit)
+    }
+
+    func testDraftSendsAlertRulesAndNullSoEditsCanClearThem() throws {
+        func body(_ draft: WatchDraft) throws -> [String: Any] {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(draft)) as? [String: Any])
+        }
+        let empty = try body(WatchDraft(query: "x"))
+        XCTAssertTrue(empty["targetPrice"] is NSNull)
+        XCTAssertTrue(empty["minSaving"] is NSNull)
+        let set = try body(WatchDraft(query: "x", targetPrice: 1500, minSaving: 0))
+        XCTAssertEqual(set["targetPrice"] as? Double, 1500)
+        XCTAssertEqual(set["minSaving"] as? Double, 0)
+
+        // Editing keeps the watch's rules, and the body decodes back.
+        let draft = WatchDraft(watch: try watch(#","targetPrice":1500,"minSaving":250"#))
+        XCTAssertEqual(draft.targetPrice, 1500)
+        XCTAssertEqual(draft.minSaving, 250)
+        let decoded = try JSONDecoder().decode(WatchDraft.self, from: JSONEncoder().encode(draft))
+        XCTAssertEqual(decoded.targetPrice, 1500)
+        XCTAssertEqual(decoded.minSaving, 250)
+    }
+
+    func testValidatesAlertRulesLikeTheServer() {
+        XCTAssertNil(WatchDraft(query: "x", targetPrice: 1_000_000, minSaving: 0).validationError)
+        XCTAssertNil(WatchDraft(query: "x", minSaving: 1_000_000).validationError)
+        XCTAssertEqual(WatchDraft(query: "x", targetPrice: 0).validationError, "The target price must be above zero and at most 1 000 000 zł.")
+        XCTAssertEqual(WatchDraft(query: "x", targetPrice: 1_000_001).validationError, "The target price must be above zero and at most 1 000 000 zł.")
+        XCTAssertEqual(WatchDraft(query: "x", minSaving: -1).validationError, "The minimum saving must be between 0 and 1 000 000 zł.")
+        XCTAssertEqual(WatchDraft(query: "x", minSaving: 1_000_001).validationError, "The minimum saving must be between 0 and 1 000 000 zł.")
+    }
+
+    func testDemoShowsAndEditsAlertRules() async throws {
+        let client = ScoutClient(baseURL: DemoTransport.baseURL, transport: DemoTransport())
+        let dashboard = try await client.dashboard()
+        let sony = try XCTUnwrap(dashboard.listings.first { $0.watchId == "watch-sony" })
+        XCTAssertTrue(sony.isTargetHit)
+        // 1199 typical − 4.9% Allegro Lokalnie fee − 749.
+        XCTAssertEqual(sony.estimatedNet, 391)
+        XCTAssertEqual(dashboard.listings.first { $0.key == "OLX:890231" }?.estimatedNet, 1100)
+        XCTAssertFalse(dashboard.listings.contains { $0.estimatedNet == nil })
+        XCTAssertEqual(dashboard.listings.filter(\.isTargetHit).count, 1)
+        XCTAssertEqual(dashboard.watches.first { $0.id == "watch-deck" }?.minSaving, 300)
+
+        var draft = WatchDraft(watch: try XCTUnwrap(dashboard.watches.first { $0.id == "watch-sony" }))
+        draft.targetPrice = nil
+        draft.minSaving = 150
+        try await client.updateWatch(id: "watch-sony", draft: draft)
+        let edited = try await client.watches().first { $0.id == "watch-sony" }
+        XCTAssertNil(edited?.targetPrice)
+        XCTAssertEqual(edited?.minSaving, 150)
+        let listings = try await client.listings(ListingsQuery(watchId: "watch-sony")).listings
+        XCTAssertFalse(listings.contains(where: \.isTargetHit))
+
+        let created = try await client.createWatch(WatchDraft(query: "rtx 3080", targetPrice: 1400, minSaving: 200))
+        XCTAssertEqual(created.targetPrice, 1400)
+        XCTAssertEqual(created.minSaving, 200)
+    }
+}
+
 final class MarketTests: XCTestCase {
     private let client = ScoutClient(baseURL: DemoTransport.baseURL, transport: DemoTransport())
 

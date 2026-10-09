@@ -105,6 +105,13 @@ export interface Listing {
   promoted?: boolean | null;
   /** From the marketplace's business-account flag; null when unknown. */
   sellerType?: SellerType | null;
+  /**
+   * What reselling at the typical asking price on the same marketplace would
+   * net after its seller fee, in whole zł; null without a typical. Display-only.
+   */
+  estimatedNet?: number | null;
+  /** The price is at or below the watch's target price. */
+  targetHit?: boolean;
   listingId?: string;
   decision?: ListingDecision | null;
   note?: string;
@@ -239,6 +246,10 @@ export interface Watch {
   sellerType?: SellerType | null;
   /** Skip paid placements and highlights. */
   ignorePromoted?: boolean;
+  /** Alert as soon as a listing is at or below this price, even while learning. */
+  targetPrice?: number | null;
+  /** Deal alerts also need the listing to be this many zł below the typical. */
+  minSaving?: number | null;
   archivedAt?: string | null;
 }
 

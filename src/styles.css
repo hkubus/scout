@@ -141,7 +141,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .select-control select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-soft); }
 .select-control svg { position: absolute; right: 11px; pointer-events: none; color: var(--muted); }
 .listing-table-wrap { width: 100%; }
-.listing-table { display: grid; grid-template-columns: minmax(260px, 2.7fr) 1.05fr .85fr .9fr .75fr .7fr 60px; align-items: center; column-gap: 16px; padding: 10px 14px; }
+.listing-table { display: grid; grid-template-columns: minmax(260px, 2.7fr) 1.05fr .85fr .9fr .75fr .75fr .7fr 60px; align-items: center; column-gap: 16px; padding: 10px 14px; }
 .listing-table--head { min-height: 34px; padding-top: 0; padding-bottom: 6px; color: var(--muted); font-size: 12px; font-weight: 500; }
 .listing-row { min-height: 64px; border-top: 1px solid var(--line); font-size: 13px; color: var(--text); }
 .listing-row, .research-listing-row { content-visibility: auto; contain-intrinsic-size: auto 72px; }
@@ -175,6 +175,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .typical-cell { color: var(--muted); white-space: nowrap; }
 .typical-cell sup { margin-left: 1px; color: var(--teal); }
 .age-cell { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.net-cell { color: var(--muted); font-size: 13px; font-weight: 600; white-space: nowrap; }
 .age-cell--old::after { content: " · old"; color: var(--soft); }
 .external-link { display: inline-grid; place-items: center; color: var(--blue); }
 .external-link:hover { color: var(--blue-deep); }
@@ -627,12 +628,14 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 /* Below ~1000px the listing table stacks: the item on top, its numbers on one line below. */
 @media (max-width: 1000px) {
   .listing-table--head { display: none; }
-  .listing-table { grid-template-columns: minmax(0, 1fr) auto auto auto auto auto; column-gap: 12px; row-gap: 7px; padding: 11px 8px; }
+  .listing-table { grid-template-columns: minmax(0, 1fr) auto auto auto auto auto auto; column-gap: 12px; row-gap: 7px; padding: 11px 8px; }
   .listing-row .listing-item { grid-column: 1 / -1; }
   .listing-row .marketplace-cell { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: 11px; }
   .listing-row .price-cell { font-size: 14px; }
   .listing-row .typical-cell { font-size: 12px; }
   .listing-row .typical-cell::before { content: "typ. "; }
+  .listing-row .net-cell::before { content: "net "; color: var(--muted); font-weight: 400; }
+  .listing-row .net-cell--empty { display: none; }
   .filters-toggle { display: inline-flex; }
   .listing-filters { display: none; width: 100%; }
   .listing-filters--open { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
@@ -679,6 +682,9 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
   .main-content { padding-left: 13px; padding-right: 13px; }
   .mobile-bar { margin-left: -13px; margin-right: -13px; padding-left: 13px; padding-right: 13px; }
   .listing-row .row-action--hide { display: none; }
+  .listing-row .price-cell { white-space: nowrap; }
+  /* The net estimate already implies the typical, so the typical gives way on phones. */
+  .listing-row:has(.net-cell:not(.net-cell--empty)) .typical-cell { display: none; }
   .primary-button { padding: 0 13px; }
   .fresh-section { padding-top: 19px; }
   .listing-table--head { display: none; }
@@ -765,6 +771,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .decision-chip--age-old { color: var(--muted); background: var(--surface-muted); }
 .decision-chip--promoted { color: var(--muted); background: var(--surface-muted); border: 1px solid var(--line-strong); font-weight: 600; }
 .decision-chip--business { color: var(--blue); background: var(--blue-soft); font-weight: 600; }
+.decision-chip--target { color: var(--green); background: rgba(58, 171, 97, .12); font-weight: 650; }
 .snapshot-price-history { margin-top: 12px; display: grid; gap: 8px; }
 .snapshot-price-history > strong { font-size: 12px; }
 .listing-drawer-backdrop { position: fixed; inset: 0; z-index: 60; display: flex; justify-content: flex-end; background: rgba(12, 17, 26, .48); backdrop-filter: blur(3px); }

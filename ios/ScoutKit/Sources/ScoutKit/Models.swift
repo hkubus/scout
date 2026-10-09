@@ -101,6 +101,12 @@ public struct Listing: Codable, Hashable, Sendable {
     public var promoted: Bool?
     /// `private` or `business` from the marketplace's own flag; nil when unknown.
     public var sellerType: String?
+    /// Whole złoty that reselling at the typical asking price on the same
+    /// marketplace would net after its seller fee, minus this price. An
+    /// estimate from asking prices; nil without a typical or on older servers.
+    public var estimatedNet: Double?
+    /// The price is at or below the watch's target price. Missing on older servers.
+    public var targetHit: Bool?
 
     /// Unique per row in watch-scoped lists, where `id` can repeat.
     public var rowID: String { associationId ?? id }
@@ -109,6 +115,7 @@ public struct Listing: Codable, Hashable, Sendable {
     public var observedDate: Date? { ScoutDate.parse(observedAt) }
     public var postedDate: Date? { ScoutDate.parse(postedAt) }
     public var isBusinessSeller: Bool { sellerType == SellerType.business.rawValue }
+    public var isTargetHit: Bool { targetHit == true }
     /// Bumped well after posting (more than an hour later).
     public var bumpedDate: Date? {
         guard let posted = postedDate, let refreshed = ScoutDate.parse(refreshedAt), refreshed.timeIntervalSince(posted) > 3600 else { return nil }
@@ -223,6 +230,12 @@ public struct Watch: Codable, Hashable, Sendable, Identifiable {
     public var sellerType: String?
     /// Skip paid placements and highlights. Missing on older servers.
     public var ignorePromoted: Bool?
+    /// PLN. A listing at or below this alerts at once, even while learning.
+    /// nil is no target; missing on older servers.
+    public var targetPrice: Double?
+    /// PLN. Deal alerts also need the listing this far below typical; target
+    /// hits ignore it. nil is no floor; missing on older servers.
+    public var minSaving: Double?
 
     public var isArchived: Bool { archivedAt != nil || status == "Archived" }
 }

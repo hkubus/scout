@@ -139,6 +139,12 @@ struct WatchDetailView: View {
                     if watch.minPrice != nil || watch.maxPrice != nil {
                         LabeledContent("Price", value: "\(watch.minPrice.map(Format.pln) ?? "any") – \(watch.maxPrice.map(Format.pln) ?? "any")")
                     }
+                    if let target = watch.targetPrice {
+                        LabeledContent("Alert at or below", value: Format.pln(target))
+                    }
+                    if let saving = watch.minSaving {
+                        LabeledContent("Minimum saving", value: Format.pln(saving))
+                    }
                     LabeledContent("Scan interval", value: Format.minutes(watch.interval))
                     LabeledContent("Next scan", value: watch.nextScan)
                 }
