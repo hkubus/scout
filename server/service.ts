@@ -23,10 +23,13 @@ import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './mark
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
 import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport } from '../src/types';
-import { listingConditionFromLabel } from '../src/profit';
+import { estimatedNetAtTypical, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, type FeePresets } from '../src/profit';
 
 type Database = any;
 type WatchRow = Record<string, any>;
+
+/** Settings key for the Flips page's seller-fee presets. */
+export const FEE_PRESETS_KEY = 'flip_fee_presets';
 type ListingRelevanceSearch = Pick<ListingRelevanceContext, 'query' | 'includedTerms' | 'excludedTerms'>;
 type RelevanceFilterResult = {
   listings: NormalizedListing[];
@@ -41,10 +44,15 @@ type RelevanceFilterResult = {
 type DealNotificationCandidate = {
   watchId: string;
   listing: NormalizedListing;
-  typical: number;
-  discountPercent: number;
+  /** Null while the watch is still learning; only target-price hits are candidates then. */
+  typical: number | null;
+  discountPercent: number | null;
   confidence: number;
   requiresDescriptionVerification: boolean;
+  /** The watch's target price, set when the listing is at or below it. */
+  targetPrice?: number | null;
+  /** Display-only resale estimate carried into the alert text. */
+  estimatedNet?: number | null;
   /** Watch search terms naming the sought item; verification uses them to reject accessories/parts. */
   query?: string;
   includedTerms?: string;
@@ -876,6 +884,11 @@ export class ScoutService {
   private getSetting(key: string) {
     const row = this.stmt('SELECT value FROM settings WHERE key = ?').get(key) as { value?: string } | undefined;
     return row?.value ?? null;
+  }
+
+  /** The operator's seller-fee presets from the Flips page, for resale estimates. */
+  private feePresets(): FeePresets {
+    return normalizeFeePresets(parseJson<unknown>(this.getSetting(FEE_PRESETS_KEY), {}));
   }
 
   private setSetting(key: string, value: string) {
@@ -2162,11 +2175,11 @@ export class ScoutService {
           if (this.isListingHidden(candidate.listing)) continue;
           if (candidate.requiresDescriptionVerification) {
             // notifyDeal re-plans after the awaits, since state can change.
-            const plan = this.planDealNotification(candidate.watchId, candidate.listing, candidate.discountPercent, context);
+            const plan = this.planDealNotification(candidate.watchId, candidate.listing, candidate.discountPercent, context, false, isTargetHit(candidate.targetPrice));
             if (!plan.channels.length && !plan.digestDue && this.hasFreshDescriptionVerification(candidate, context)) continue;
             if (!await this.verifyHighPriorityDeal(candidate, context)) continue;
           }
-          await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence, context, candidate.variantLabel ?? null);
+          await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence, context, candidate.variantLabel ?? null, { targetPrice: candidate.targetPrice ?? null, estimatedNet: candidate.estimatedNet ?? null });
         }
       }
     };
@@ -2344,11 +2357,13 @@ export class ScoutService {
       olxCategory: olxCategoryFromJson(row.olx_category_json),
       sellerType: sellerTypeFromRow(row.seller_type),
       ignorePromoted: Boolean(row.ignore_promoted),
+      targetPrice: watchPlnFromRow(row.target_price_pln),
+      minSaving: watchPlnFromRow(row.min_saving_pln),
       archivedAt: row.archived_at ?? null,
     };
   }
 
-  private listingFromRow(row: Record<string, any>, baselineReady: boolean, variantGroups: VariantGroup[] = []): Listing {
+  private listingFromRow(row: Record<string, any>, baselineReady: boolean, variantGroups: VariantGroup[] = [], feePresets: FeePresets = this.feePresets()): Listing {
     const typicalSource = row.typical_source === 'reference-band' || row.typical_source === 'own-history' ? row.typical_source : null;
     const associationTypical = row.watch_typical_pln ?? row.typical_pln;
     // An own-history typical is only written once the listing's own variant is
@@ -2402,6 +2417,8 @@ export class ScoutService {
       refreshedAt: row.refreshed_at ?? null,
       promoted: row.promoted === null || row.promoted === undefined ? null : Boolean(row.promoted),
       sellerType: row.seller_type === 'private' || row.seller_type === 'business' ? row.seller_type : null,
+      estimatedNet: isFlipChannel(row.marketplace) ? estimatedNetAtTypical(price, typical, feePresets[row.marketplace]) : null,
+      targetHit: listingHitsTarget({ target_price_pln: row.watch_target_price_pln }, price),
       listingId: String(row.listing_id),
       decision: parseListingDecision(row.listing_decision),
       note: typeof row.listing_note === 'string' ? row.listing_note : '',
@@ -3230,7 +3247,7 @@ export class ScoutService {
     const total = Number((this.stmt(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(500, Math.floor(options.pageSize ?? 200)));
-    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.posted_at, l.refreshed_at, l.promoted, l.seller_type, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.variant_key AS variant_key, wl.variant_source AS variant_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, a.decision AS listing_decision, a.note AS listing_note, a.hidden AS listing_hidden, l.ai_description_verification_json, l.ai_description_verification_at, l.ai_description_verification_status, l.ai_description_verification_error, CASE WHEN ${aiFilteredPredicate} THEN 1 ELSE 0 END AS ai_filtered
+    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.subtitle, l.price_pln, l.typical_pln, l.url, l.image_url, l.condition, l.location, l.shipping_available, l.price_negotiable, l.posted_at, l.refreshed_at, l.promoted, l.seller_type, l.last_seen_at, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.variant_key AS variant_key, wl.variant_source AS variant_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.enabled AS watch_enabled, w.archived_at AS watch_archived_at, w.shipping_only AS watch_shipping_only, w.min_price_pln AS watch_min_price_pln, w.max_price_pln AS watch_max_price_pln, w.target_price_pln AS watch_target_price_pln, a.decision AS listing_decision, a.note AS listing_note, a.hidden AS listing_hidden, l.ai_description_verification_json, l.ai_description_verification_at, l.ai_description_verification_status, l.ai_description_verification_error, CASE WHEN ${aiFilteredPredicate} THEN 1 ELSE 0 END AS ai_filtered
       FROM listings l
       JOIN watch_listings wl ON wl.listing_id = l.id
       JOIN watches w ON w.id = wl.watch_id
@@ -3238,7 +3255,8 @@ export class ScoutService {
       WHERE ${where}
       ORDER BY ${orderBy} LIMIT ? OFFSET ?`).all(...params, pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
     const watches = new Map((knownWatches ?? this.getWatches()).map((watch) => [watch.id, watch]));
-    const listings = rows.map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100, watches.get(row.watch_id)?.variantGroups ?? []));
+    const feePresets = this.feePresets();
+    const listings = rows.map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100, watches.get(row.watch_id)?.variantGroups ?? [], feePresets));
     return { listings, pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
   }
 
@@ -3248,7 +3266,7 @@ export class ScoutService {
 
   listingDetail(key: string, watchId?: string | null): ListingDetail {
     const { marketplace, listingId } = parseListingKey(key);
-    const row = this.stmt(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.variant_key AS variant_key, wl.variant_source AS variant_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, a.decision AS listing_decision, a.note AS listing_note, a.hidden AS listing_hidden, a.updated_at AS action_updated_at
+    const row = this.stmt(`SELECT l.*, wl.id AS watch_listing_id, wl.watch_id, wl.first_seen_at AS watch_first_seen_at, wl.last_seen_at AS watch_last_seen_at, wl.typical_pln AS watch_typical_pln, wl.typical_source AS typical_source, wl.variant_key AS variant_key, wl.variant_source AS variant_source, wl.deal_strength AS watch_deal_strength, wl.deal_label AS watch_deal_label, w.name AS watch_name, w.target_price_pln AS watch_target_price_pln, a.decision AS listing_decision, a.note AS listing_note, a.hidden AS listing_hidden, a.updated_at AS action_updated_at
       FROM listings l
       LEFT JOIN watch_listings wl ON wl.listing_id = l.id AND (? IS NULL OR wl.watch_id = ?)
       LEFT JOIN watches w ON w.id = wl.watch_id
@@ -4406,8 +4424,9 @@ export class ScoutService {
       const payload = parseJson<Record<string, any>>(row.payload_json, {});
       const embed = payload.embeds?.[0];
       const below = embed?.fields?.find((field: any) => field.name === 'Below typical')?.value;
+      const target = embed?.fields?.find((field: any) => field.name === 'Target price')?.value;
       const digest = payload._scoutDigest as { channel?: string; count?: number } | undefined;
-      return { id: Number(row.id), title: embed?.title ?? payload.title ?? (payload.test ? `${payload.channel === 'ntfy' ? 'ntfy' : 'Discord'} test notification` : row.listing_key), reason: digest ? `${digest.count ?? 0} deals · ${digest.channel ?? 'daily digest'}` : below ? `${below} below typical` : payload.test ? `${payload.channel === 'ntfy' ? 'ntfy' : 'Webhook'} connectivity test` : 'Deal alert', observedAt: row.sent_at ?? row.created_at, status: row.status };
+      return { id: Number(row.id), title: embed?.title ?? payload.title ?? (payload.test ? `${payload.channel === 'ntfy' ? 'ntfy' : 'Discord'} test notification` : row.listing_key), reason: digest ? `${digest.count ?? 0} deals · ${digest.channel ?? 'daily digest'}` : target ? `Target price hit (${target})` : below ? `${below} below typical` : payload.test ? `${payload.channel === 'ntfy' ? 'ntfy' : 'Webhook'} connectivity test` : 'Deal alert', observedAt: row.sent_at ?? row.created_at, status: row.status };
     }), pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
   }
 
@@ -4589,7 +4608,7 @@ export class ScoutService {
           // Everything else is kept without an AI call.
           const strongEnough = (listing: NormalizedListing) => {
             const { score, dealStrength } = this.variantDealScore(row, listing.price, baselines, variants.get(listing).key, referenceMedian);
-            return score.qualifies || (dealStrength ?? 0) >= 4;
+            return score.qualifies || (dealStrength ?? 0) >= 4 || listingHitsTarget(row, listing.price);
           };
           try {
             if (!matchingExact.length) {
@@ -5322,35 +5341,43 @@ export class ScoutService {
     } else {
       observationId = Number(this.stmt('INSERT INTO observations (listing_id, watch_id, watch_listing_id, scan_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?, ?)').run(stored.id, row.id, association.id, scanId, listing.price, observedAt).lastInsertRowid);
     }
+    // A target-price hit alerts even while the watch is learning; the
+    // minimum saving applies to deal alerts only.
+    const targetPrice = listingHitsTarget(row, listing.price) ? watchPlnFromRow(row.target_price_pln) : null;
+    const candidate = (typical: number | null, discountPercent: number | null, confidence: number, dealStrength: number | null): DealNotificationCandidate => ({
+      watchId: String(row.id),
+      listing,
+      typical,
+      discountPercent,
+      confidence,
+      requiresDescriptionVerification: (dealStrength ?? 0) >= 4,
+      query: String(row.query ?? ''),
+      includedTerms: String(row.included_terms ?? ''),
+      excludedTerms: String(row.excluded_terms ?? ''),
+      verificationChecks: parseVerificationChecks(row.verification_checks_json),
+      variantKey,
+      variantLabel,
+      targetPrice,
+      estimatedNet: estimatedNetAtTypical(listing.price, typical, this.feePresets()[listing.marketplace]),
+    });
     if (score.isReady && score.typical !== null) {
       const discountPercent = score.discountPercent ?? 0;
       const dealStrength = scoredStrength ?? 1;
       const dealLabel = dealLabelFromStrength(dealStrength);
       this.stmt("UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, typical_source = 'own-history', last_seen_at = ? WHERE id = ?").run(score.typical, dealStrength, dealLabel, observedAt, association.id);
       this.stmt('UPDATE observations SET baseline_pln = ?, discount_percent = ?, deal_strength = ?, deal_label = ? WHERE id = ?').run(score.typical, discountPercent, dealStrength, dealLabel, observationId);
-      if (score.qualifies) return {
-        watchId: String(row.id),
-        listing,
-        typical: score.typical,
-        discountPercent,
-        confidence: score.confidence,
-        requiresDescriptionVerification: dealStrength >= 4,
-        query: String(row.query ?? ''),
-        includedTerms: String(row.included_terms ?? ''),
-        excludedTerms: String(row.excluded_terms ?? ''),
-        verificationChecks: parseVerificationChecks(row.verification_checks_json),
-        variantKey,
-        variantLabel,
-      };
+      if ((score.qualifies && meetsMinSaving(row, listing.price, score.typical)) || targetPrice !== null) return candidate(score.typical, discountPercent, score.confidence, dealStrength);
     } else if (useReference && score.typical !== null) {
-      // Band-seeded display values; the readiness gate is untouched, so no
-      // alerts fire earlier than they would without a reference series.
+      // Band-seeded display values; the readiness gate is untouched, so only
+      // a target-price hit alerts before the watch's own baseline is ready.
       const discountPercent = score.discountPercent ?? 0;
       const dealStrength = scoredStrength ?? 1;
       const dealLabel = dealLabelFromStrength(dealStrength);
       this.stmt("UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, typical_source = 'reference-band', last_seen_at = ? WHERE id = ?").run(score.typical, dealStrength, dealLabel, observedAt, association.id);
+      if (targetPrice !== null) return candidate(score.typical, discountPercent, score.confidence, dealStrength);
     } else {
       this.stmt('UPDATE observations SET baseline_pln = NULL, discount_percent = NULL WHERE id = ?').run(observationId);
+      if (targetPrice !== null) return candidate(null, null, 0, null);
     }
     return null;
   }
@@ -5511,12 +5538,14 @@ export class ScoutService {
     return payload._scout as {
       watchId: string;
       listing: NormalizedListing;
-      typical: number;
-      discountPercent: number;
+      typical: number | null;
+      discountPercent: number | null;
       confidence: number;
       priority: NotificationPriority;
       sequence: number;
       variantLabel?: string | null;
+      targetPrice?: number | null;
+      estimatedNet?: number | null;
     } | undefined;
   }
 
@@ -5563,26 +5592,29 @@ export class ScoutService {
     watchId?: string;
     sequence?: number;
     listing: NormalizedListing;
-    typical: number;
-    discountPercent: number;
+    typical: number | null;
+    discountPercent: number | null;
     confidence: number;
     priority: NotificationPriority;
     attemptCount: number;
     encryptedDiscord?: string;
     ntfy: NtfyConfig | null;
     variantLabel?: string | null;
+    targetPrice?: number | null;
+    estimatedNet?: number | null;
     legacy?: boolean;
   }) {
+    const alert = { listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence, variantLabel: input.variantLabel, targetPrice: input.targetPrice ?? null, estimatedNet: input.estimatedNet ?? null };
     const started = nowIso();
     try {
       if (input.channel === 'Discord') {
         if (!input.encryptedDiscord) throw new Error('Discord webhook is not configured');
-        const response = await fetch(validateDiscordWebhook(decryptSecret(input.encryptedDiscord)), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(buildDiscordEmbed({ listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence, variantLabel: input.variantLabel })), signal: AbortSignal.timeout(12_000) });
+        const response = await fetch(validateDiscordWebhook(decryptSecret(input.encryptedDiscord)), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(buildDiscordEmbed(alert)), signal: AbortSignal.timeout(12_000) });
         discardResponse(response, 'discord-webhook');
         if (!response.ok) throw new Error(`Discord returned ${response.status}`);
       } else {
         if (!input.ntfy) throw new Error('ntfy is not configured');
-        await publishNtfy(input.ntfy, buildNtfyPayload({ listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence, variantLabel: input.variantLabel }, input.ntfy.topic, input.priority, { openInApp: input.ntfy.openInApp, watchId: input.watchId }));
+        await publishNtfy(input.ntfy, buildNtfyPayload(alert, input.ntfy.topic, input.priority, { openInApp: input.ntfy.openInApp, watchId: input.watchId }));
       }
       const finished = nowIso();
       this.transaction(() => {
@@ -5621,8 +5653,8 @@ export class ScoutService {
    * alert state and deliveries, so planning every channel before any write
    * decides exactly what the interleaved loop used to.
    */
-  private planDealNotification(watchId: string, listing: NormalizedListing, discountPercent: number, context?: ScanNotifyContext, legacy = false) {
-    const priority = priorityFromDiscount(discountPercent);
+  private planDealNotification(watchId: string, listing: NormalizedListing, discountPercent: number | null, context?: ScanNotifyContext, legacy = false, targetHit = false) {
+    const priority = priorityFromDiscount(discountPercent ?? 0);
     const channels: Array<{ channel: 'Discord' | 'ntfy'; sequence: number; eventKey: string; deliveryKey: string }> = [];
     if (this.isListingHidden(listing)) return { hidden: true, priority, encryptedDiscord: null, ntfy: null, digestQualifies: false, digestDue: false, channels };
     const encryptedDiscord = context?.encryptedDiscord ?? this.getSetting('discord_webhook');
@@ -5631,7 +5663,9 @@ export class ScoutService {
     const digest = context?.digest ?? this.dailyDigestConfig();
     const discordMinimum = context?.discordMinimumPriority ?? this.discordMinimumPriority();
     const digestSelected = (channel: DigestChannel) => digest.enabled && (channel === 'Discord' ? digest.discord : digest.ntfy);
-    if (!legacy && priority !== 'exceptional') {
+    // A target-price hit is the operator's explicit ask: it goes out at once
+    // on every configured channel, whatever their minimum priority or digest.
+    if (!legacy && !targetHit && discountPercent !== null && priority !== 'exceptional') {
       plan.digestQualifies = (digestSelected('Discord') && Boolean(encryptedDiscord) && meetsMinimumPriority(priority, discordMinimum))
         || (digestSelected('ntfy') && Boolean(ntfy) && meetsMinimumPriority(priority, ntfy?.minimumPriority ?? 'exceptional'));
       // queueDailyDigestCandidate's own check: a digest row is added only
@@ -5639,8 +5673,8 @@ export class ScoutService {
       plan.digestDue = plan.digestQualifies && this.shouldAlert(this.latestDigestCandidate(watchId, listing), listing.price, priority);
     }
     const eligible: Array<'Discord' | 'ntfy'> = [];
-    if (encryptedDiscord && meetsMinimumPriority(priority, discordMinimum) && (priority === 'exceptional' || !digestSelected('Discord'))) eligible.push('Discord');
-    if (ntfy && meetsMinimumPriority(priority, ntfy.minimumPriority) && (priority === 'exceptional' || !digestSelected('ntfy'))) eligible.push('ntfy');
+    if (encryptedDiscord && (targetHit || meetsMinimumPriority(priority, discordMinimum) && (priority === 'exceptional' || !digestSelected('Discord')))) eligible.push('Discord');
+    if (ntfy && (targetHit || meetsMinimumPriority(priority, ntfy.minimumPriority) && (priority === 'exceptional' || !digestSelected('ntfy')))) eligible.push('ntfy');
     for (const channel of eligible) {
       let sequence = 1;
       let eventKey = notificationKey(listing);
@@ -5667,27 +5701,30 @@ export class ScoutService {
   private async notifyDeal(
     watchIdOrListing: string | NormalizedListing,
     listingOrTypical: NormalizedListing | number,
-    typicalOrDiscount: number,
-    discountOrConfidence: number,
+    typicalOrDiscount: number | null,
+    discountOrConfidence: number | null,
     maybeConfidence?: number,
     context?: ScanNotifyContext,
     variantLabel?: string | null,
+    extras: { targetPrice?: number | null; estimatedNet?: number | null } = {},
   ) {
     const legacy = typeof watchIdOrListing !== 'string';
     const watchId = legacy ? '__legacy__' : watchIdOrListing;
     const listing = (legacy ? watchIdOrListing : listingOrTypical) as NormalizedListing;
-    const typical = (legacy ? listingOrTypical : typicalOrDiscount) as number;
-    const discountPercent = legacy ? typicalOrDiscount : discountOrConfidence;
-    const confidence = legacy ? discountOrConfidence : maybeConfidence!;
-    const plan = this.planDealNotification(watchId, listing, discountPercent, context, legacy);
+    const typical = (legacy ? listingOrTypical : typicalOrDiscount) as number | null;
+    const discountPercent = (legacy ? typicalOrDiscount : discountOrConfidence) as number | null;
+    const confidence = (legacy ? discountOrConfidence : maybeConfidence) as number;
+    const targetPrice = extras.targetPrice ?? null;
+    const estimatedNet = extras.estimatedNet ?? null;
+    const plan = this.planDealNotification(watchId, listing, discountPercent, context, legacy, isTargetHit(targetPrice));
     if (plan.hidden) return;
     const { priority, encryptedDiscord, ntfy } = plan;
-    if (plan.digestQualifies) this.queueDailyDigestCandidate(watchId, listing, typical, discountPercent, confidence, priority);
+    if (plan.digestQualifies && typical !== null && discountPercent !== null) this.queueDailyDigestCandidate(watchId, listing, typical, discountPercent, confidence, priority);
     if (!plan.channels.length) return;
 
     const planned: Array<{ channel: 'Discord' | 'ntfy'; eventKey: string; deliveryKey: string; sequence?: number; claim: { id: number; attemptCount: number }; legacy: boolean }> = [];
     for (const { channel, sequence, eventKey, deliveryKey } of plan.channels) {
-      const payload = { ...buildDiscordEmbed({ listing, typical, discountPercent, confidence, variantLabel }), _scout: { watchId, listing, typical, discountPercent, confidence, priority, sequence, variantLabel } };
+      const payload = { ...buildDiscordEmbed({ listing, typical, discountPercent, confidence, variantLabel, targetPrice, estimatedNet }), _scout: { watchId, listing, typical, discountPercent, confidence, priority, sequence, variantLabel, targetPrice, estimatedNet } };
       this.stmt('INSERT OR IGNORE INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(eventKey, JSON.stringify(payload), 'pending', nowIso());
       const claim = this.claimNotificationDelivery(deliveryKey, channel);
       if (claim) planned.push({ channel, eventKey, deliveryKey, sequence: legacy ? undefined : sequence, claim, legacy });
@@ -5708,6 +5745,8 @@ export class ScoutService {
       encryptedDiscord: encryptedDiscord ?? undefined,
       ntfy,
       variantLabel,
+      targetPrice,
+      estimatedNet,
       legacy: item.legacy,
     })));
   }
@@ -5748,14 +5787,16 @@ export class ScoutService {
         watchId: meta.watchId === '__legacy__' ? undefined : meta.watchId,
         sequence: meta.sequence,
         listing: meta.listing,
-        typical: Number(meta.typical),
-        discountPercent: Number(meta.discountPercent),
+        typical: meta.typical === null ? null : Number(meta.typical),
+        discountPercent: meta.discountPercent === null ? null : Number(meta.discountPercent),
         confidence: Number(meta.confidence),
         priority: meta.priority,
         attemptCount: claim.attemptCount,
         encryptedDiscord: this.getSetting('discord_webhook') ?? undefined,
         ntfy: this.ntfyConfig(),
         variantLabel: meta.variantLabel,
+        targetPrice: meta.targetPrice ?? null,
+        estimatedNet: meta.estimatedNet ?? null,
         legacy: meta.watchId === '__legacy__',
       });
     }
@@ -5802,6 +5843,29 @@ export class ScoutService {
   private finishRun(id: number, status: string, message: string, backoffUntil: string | null = null) {
     this.stmt('UPDATE connector_runs SET status = ?, message = ?, finished_at = ?, backoff_until = ? WHERE id = ?').run(status, message, nowIso(), backoffUntil, id);
   }
+}
+
+/** A watch's optional złoty amount (target price, minimum saving); null when unset. */
+export function watchPlnFromRow(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  const amount = Number(value);
+  return Number.isFinite(amount) && amount > 0 ? amount : null;
+}
+
+function isTargetHit(targetPrice: number | null | undefined): targetPrice is number {
+  return typeof targetPrice === 'number' && targetPrice > 0;
+}
+
+/** True when the price is at or below the watch's target price. */
+export function listingHitsTarget(row: WatchRow, price: number) {
+  const target = watchPlnFromRow(row.target_price_pln);
+  return target !== null && Number.isFinite(price) && price > 0 && price <= target;
+}
+
+/** Deal alerts also need the listing to sit this many złoty below the typical. */
+export function meetsMinSaving(row: WatchRow, price: number, typical: number) {
+  const floor = watchPlnFromRow(row.min_saving_pln);
+  return floor === null || typical - price >= floor;
 }
 
 export function sellerTypeFromRow(value: unknown): SellerType | null {

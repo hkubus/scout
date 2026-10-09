@@ -3,6 +3,7 @@ import { lookup } from 'node:dns/promises';
 import type { NormalizedListing } from './marketplaces';
 import type { NotificationPriority } from '../src/types';
 import { discardResponse } from './fetch-diagnostics';
+import { formatAge } from '../src/listingSignals';
 
 const processFetch = globalThis.fetch;
 
@@ -65,6 +66,8 @@ export interface NtfyPayload {
   priority: number;
   tags: string[];
   click: string;
+  /** Image URL ntfy clients fetch and show with the notification. */
+  attach?: string;
   actions?: NtfyAction[];
 }
 
@@ -139,35 +142,81 @@ async function assertSafeNtfyDestination(serverUrl: string) {
 
 export interface DealNotificationInput {
   listing: NormalizedListing;
-  typical: number;
-  discountPercent: number;
+  /** Null while the watch is still learning; only target-price hits alert then. */
+  typical: number | null;
+  discountPercent: number | null;
   confidence: number;
   observedAt?: string;
   /** Model variant the typical describes, when the watch groups variants. */
   variantLabel?: string | null;
+  /** The watch's target price, set when the listing is at or below it. */
+  targetPrice?: number | null;
+  /** Display-only estimate of what reselling at the typical would net (whole zł). */
+  estimatedNet?: number | null;
+}
+
+const pln = (value: number) => `${Math.round(value).toLocaleString('pl-PL')} zł`;
+const signedPln = (value: number) => `${value >= 0 ? '+' : '−'}${pln(Math.abs(value))}`;
+
+/** Price against the typical, or a note that the typical isn't learned yet. */
+function priceLine(input: DealNotificationInput) {
+  const { listing, typical, discountPercent } = input;
+  const price = `${listing.price.toLocaleString('pl-PL')} zł`;
+  if (typical === null || discountPercent === null) return `${price} · typical not learned yet`;
+  const saving = typical - listing.price;
+  return `${price} · typical ${pln(typical)} · ${discountPercent.toFixed(1)}% below${saving > 0 ? ` (${signedPln(-saving)})` : ''} · ${input.confidence}% confidence`;
+}
+
+export function estimatedNetLine(estimatedNet: number, marketplace: string) {
+  return `≈ ${signedPln(estimatedNet)} net if resold at typical on ${marketplace}`;
+}
+
+/** Condition, seller, shipping and posting age: what decides whether to message the seller. */
+export function listingContextLine(listing: NormalizedListing, now = Date.now()) {
+  const posted = listing.postedAt ? formatAge(listing.postedAt, now) : null;
+  return [
+    listing.condition?.trim() || null,
+    listing.sellerType === 'business' ? 'Business seller' : listing.sellerType === 'private' ? 'Private seller' : null,
+    listing.marketplace === 'Vinted' || listing.shippingAvailable === true ? 'Shipping' : listing.shippingAvailable === false ? 'Pickup only' : null,
+    listing.promoted ? 'Promoted' : null,
+    posted ? `posted ${posted} ago` : null,
+  ].filter(Boolean).join(' · ');
+}
+
+function safeImageUrl(listing: NormalizedListing) {
+  return listing.imageUrl && /^https:\/\//i.test(listing.imageUrl) ? listing.imageUrl.slice(0, 2_000) : undefined;
 }
 
 export function buildNtfyPayload(
   input: DealNotificationInput,
   topic: string,
-  priority = priorityFromDiscount(input.discountPercent),
+  priority = priorityFromDiscount(input.discountPercent ?? 0),
   options: { openInApp?: boolean; watchId?: string | null } = {},
 ): NtfyPayload {
   const { listing } = input;
+  const targetHit = input.targetPrice !== null && input.targetPrice !== undefined;
   const tags = priority === 'exceptional' ? ['rotating_light', 'moneybag'] : priority === 'very-strong' ? ['warning', 'moneybag'] : ['moneybag'];
+  const context = listingContextLine(listing);
+  const image = safeImageUrl(listing);
   return {
     topic,
-    title: `${notificationPriorityLabel(priority)} deal · ${listing.marketplace}`,
+    title: targetHit ? `Target price hit · ${listing.marketplace}` : `${notificationPriorityLabel(priority)} deal · ${listing.marketplace}`,
     message: [
       listing.title,
       ...(input.variantLabel ? [`Variant: ${input.variantLabel}`] : []),
-      `${listing.price.toLocaleString('pl-PL')} zł · ${input.discountPercent.toFixed(1)}% below typical · ${input.confidence}% confidence`,
+      priceLine(input),
+      ...(targetHit ? [`At or below your ${pln(input.targetPrice!)} target`] : []),
+      ...(input.estimatedNet !== null && input.estimatedNet !== undefined ? [estimatedNetLine(input.estimatedNet, listing.marketplace)] : []),
+      ...(context ? [context] : []),
       listing.url,
     ].join('\n'),
-    priority: ntfyPriorityNumber(priority),
-    tags,
+    // A target the operator set by hand is worth at least a high-priority push.
+    priority: targetHit ? Math.max(4, ntfyPriorityNumber(priority)) : ntfyPriorityNumber(priority),
+    tags: targetHit ? ['dart', ...tags] : tags,
     // In app mode the marketplace page stays one tap away as an action button.
     click: options.openInApp ? scoutAppListingLink(listing, options.watchId) : listing.url,
+    // ntfy clients download the photo from the marketplace and show it inline.
+    ...(image ? { attach: image } : {}),
     ...(options.openInApp ? { actions: [{ action: 'view' as const, label: 'Open listing', url: listing.url, clear: true }] } : {}),
   };
 }
@@ -195,24 +244,29 @@ export async function publishNtfy(config: NtfyConfig, payload: NtfyPayload, fetc
 export function buildDiscordEmbed(input: DealNotificationInput) {
   const { listing } = input;
   const safeTitle = listing.title.replace(/[\r\n]+/g, ' ').trim().slice(0, 256) || 'Scout deal';
-  const safeImageUrl = listing.imageUrl && /^https:\/\//i.test(listing.imageUrl) ? listing.imageUrl.slice(0, 2_000) : undefined;
+  const image = safeImageUrl(listing);
+  const targetHit = input.targetPrice !== null && input.targetPrice !== undefined;
+  const context = listingContextLine(listing);
   return {
     username: 'Scout',
     embeds: [{
       title: safeTitle,
       url: listing.url,
-      color: input.discountPercent >= 30 ? 0xf15a35 : 0xf4b734,
-      thumbnail: safeImageUrl ? { url: safeImageUrl } : undefined,
+      ...(targetHit || context ? { description: [targetHit ? `Target price hit: at or below ${pln(input.targetPrice!)}` : null, context || null].filter(Boolean).join('\n') } : {}),
+      color: targetHit ? 0x2f9e44 : (input.discountPercent ?? 0) >= 30 ? 0xf15a35 : 0xf4b734,
+      thumbnail: image ? { url: image } : undefined,
       fields: [
         { name: 'Marketplace', value: listing.marketplace, inline: true },
         ...(input.variantLabel ? [{ name: 'Variant', value: input.variantLabel, inline: true }] : []),
         { name: 'Price', value: `${listing.price.toLocaleString('pl-PL')} zł`, inline: true },
-        { name: 'Typical price', value: `${input.typical.toLocaleString('pl-PL')} zł`, inline: true },
-        { name: 'Below typical', value: `${input.discountPercent.toFixed(1)}%`, inline: true },
-        { name: 'Confidence', value: `${input.confidence}%`, inline: true },
+        ...(targetHit ? [{ name: 'Target price', value: `≤ ${pln(input.targetPrice!)}`, inline: true }] : []),
+        { name: 'Typical price', value: input.typical === null ? 'Still learning' : `${input.typical.toLocaleString('pl-PL')} zł`, inline: true },
+        ...(input.discountPercent === null ? [] : [{ name: 'Below typical', value: `${input.discountPercent.toFixed(1)}%`, inline: true }]),
+        ...(input.estimatedNet === null || input.estimatedNet === undefined ? [] : [{ name: 'Est. net at typical', value: `≈ ${signedPln(input.estimatedNet)} on ${listing.marketplace}`, inline: true }]),
+        ...(input.typical === null ? [] : [{ name: 'Confidence', value: `${input.confidence}%`, inline: true }]),
         { name: 'Observed', value: input.observedAt ?? listing.observedAt, inline: true },
       ],
-      footer: { text: 'Scout · public-page monitor' },
+      footer: { text: 'Scout · public-page monitor · asking prices' },
     }],
   };
 }

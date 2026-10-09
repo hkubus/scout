@@ -1915,7 +1915,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals', '030_perf_indexes', '031_flips', '032_flip_listings', '033_verification_checks']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals', '030_perf_indexes', '031_flips', '032_flip_listings', '033_verification_checks', '033_watch_alert_targets']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -2405,7 +2405,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 35);
+    assert.equal(after.migrations.count, 36);
   } finally { context.close(); }
 });
 
@@ -4027,6 +4027,69 @@ test('shares one locally launched Chromium across renders with a context each, a
     await service.closeBrowser();
     if (previousPath === undefined) delete process.env.SCOUT_CHROMIUM_PATH; else process.env.SCOUT_CHROMIUM_PATH = previousPath;
     if (previousWs !== undefined) process.env.SCOUT_BROWSER_WS = previousWs;
+    context.close();
+  }
+});
+
+test('target prices alert while learning on every channel, and the minimum saving gates deal alerts', async () => {
+  const context = fixture();
+  const originalFetch = globalThis.fetch;
+  const ntfyBodies: Array<Record<string, any>> = [];
+  globalThis.fetch = (async (input, init) => {
+    if (String(input).startsWith('https://ntfy.sh')) ntfyBodies.push(JSON.parse(String(init?.body)));
+    return new Response(null, { status: 200 });
+  }) as typeof fetch;
+  try {
+    seedWatch(context.db, 'target-watch');
+    context.db.prepare('UPDATE watches SET target_price_pln = 500 WHERE id = ?').run('target-watch');
+    // ntfy only takes Exceptional deals, yet a target hit still goes out.
+    context.service.saveSettings({ ntfy: { serverUrl: 'https://ntfy.sh', topic: 'scout-target', minimumPriority: 'exceptional' } });
+    const service = context.service as any;
+    const row = () => context.db.prepare('SELECT * FROM watches WHERE id = ?').get('target-watch');
+    const listing = (id: string, price: number) => ({ marketplace: 'OLX' as const, listingId: id, title: `CPU ${id}`, price, currency: 'PLN' as const, url: `https://www.olx.pl/d/oferta/cpu-${id}`, observedAt: new Date().toISOString() });
+    const store = (id: string, price: number) => service.storeListing(row(), listing(id, price), service.createScan('target-watch', 'watch', 'OLX'), service.watchBaselines(row()));
+
+    assert.equal(store('above-target', 520), null);
+    const learningHit = store('learning-hit', 480);
+    assert.ok(learningHit);
+    assert.equal(learningHit.typical, null);
+    assert.equal(learningHit.targetPrice, 500);
+    await service.processDealCandidates([learningHit], () => service.scanNotifyContext());
+    assert.equal(ntfyBodies.length, 1);
+    assert.equal(ntfyBodies[0].title, 'Target price hit · OLX');
+    assert.match(ntfyBodies[0].message, /typical not learned yet/);
+    // No digest row: a target hit is immediate.
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM daily_digest_candidates').get() as { count: number }).count, 0);
+
+    // A ready baseline around 1 000 zł.
+    for (let index = 0; index < 32; index += 1) store(`base-${index}`, 990 + (index % 5) * 5);
+    context.db.prepare('UPDATE observations SET observed_at = ? WHERE watch_id = ?').run(new Date(Date.now() - 8 * 60 * 60_000).toISOString(), 'target-watch');
+    context.db.prepare('UPDATE watches SET target_price_pln = NULL, min_saving_pln = 400 WHERE id = ?').run('target-watch');
+    // About 33% below, but under 400 zł saved: no alert.
+    assert.equal(store('small-saving', 670), null);
+    context.db.prepare('UPDATE watches SET min_saving_pln = 300 WHERE id = ?').run('target-watch');
+    const deal = store('big-saving', 670);
+    assert.ok(deal);
+    assert.equal(deal.targetPrice, null);
+    assert.equal(deal.estimatedNet, Math.round(deal.typical - 670));
+    // The floor does not touch the feed: the small-saving row is still scored.
+    const feed = context.service.listingsPage({ page: 1, pageSize: 100 }).listings;
+    const smallSaving = feed.find((item) => item.listingId === 'small-saving')!;
+    assert.ok(smallSaving.typical);
+
+    // Estimated net in the feed follows the operator's fee presets and the target flag.
+    context.db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('flip_fee_presets', ?, ?)").run(JSON.stringify({ OLX: { percent: 10, fixed: 0 } }), new Date().toISOString());
+    context.db.prepare('UPDATE watches SET target_price_pln = 700 WHERE id = ?').run('target-watch');
+    const refreshed = context.service.listingsPage({ page: 1, pageSize: 100 }).listings;
+    const bigSaving = refreshed.find((item) => item.listingId === 'big-saving')!;
+    assert.equal(bigSaving.estimatedNet, Math.round(bigSaving.typical! * 0.9 - 670));
+    assert.equal(bigSaving.targetHit, true);
+    assert.equal(refreshed.find((item) => item.listingId === 'base-0')!.targetHit, false);
+    const watch = context.service.watchById('target-watch')!;
+    assert.equal(watch.targetPrice, 700);
+    assert.equal(watch.minSaving, 300);
+  } finally {
+    globalThis.fetch = originalFetch;
     context.close();
   }
 });

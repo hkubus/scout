@@ -94,6 +94,17 @@ export function estimateFlipNet(input: { buyPrice: number; buyCosts: number; res
 }
 
 /**
+ * What buying at `price` and reselling at the typical asking price on a
+ * channel would net after its seller fee, in whole złoty; null without a
+ * typical. Asking prices overstate what an item sells for, so callers label
+ * it as an estimate.
+ */
+export function estimatedNetAtTypical(price: number, typical: number | null | undefined, preset: FeePreset) {
+  if (typical === null || typical === undefined || !Number.isFinite(typical) || typical <= 0 || !Number.isFinite(price)) return null;
+  return Math.round(estimateFlipNet({ buyPrice: price, buyCosts: 0, resalePrice: typical, preset }).net);
+}
+
+/**
  * Działalność nierejestrowana: quarterly revenue (przychód, the full sale
  * price) may not exceed 225% of the minimum wage. From 2026 the limit is
  * quarterly; earlier years used a different, monthly rule, so no limit is

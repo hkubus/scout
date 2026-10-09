@@ -35,6 +35,8 @@ export const eventResources: Readonly<Record<string, readonly LiveResource[]>> =
   // Analytics counts ordinary watch scans only, so research scans leave it alone.
   "market-watch": ["market"],
   "listing-action": ["dashboard", "listings", "analytics"],
+  // Listings carry an estimated net computed from the seller-fee presets.
+  "fee-presets": ["dashboard", "listings"],
 };
 
 /** Pages that fetch their own data on mount and refetch when their refresh key changes. */

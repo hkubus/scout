@@ -46,6 +46,11 @@ enum Format {
         return "\(Int(elapsed / (365 * 86_400))) y"
     }
 
+    /// "+1 100 zł" or "−45 zł", for signed estimates.
+    static func signedPLN(_ value: Double) -> String {
+        (value < 0 ? "−" : "+") + pln(abs(value))
+    }
+
     /// Money with up to two decimals, for ledger amounts.
     static func zl(_ value: Double) -> String {
         value.formatted(.currency(code: "PLN").precision(.fractionLength(0...2)).locale(Locale(identifier: "pl_PL")))
@@ -189,16 +194,20 @@ struct ListingRow: View {
                     Text(Format.pln(listing.price))
                         .font(.headline)
                         .monospacedDigit()
+                    if listing.isTargetHit { TargetChip() }
                     // Only a real discount is coloured; at or above typical stays quiet.
                     if let below = listing.belowTypical, below < 0 {
                         Text("−\(Int(abs(below).rounded()))%")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(listing.dealStrength >= 3 ? listing.dealLabel.color : .primary)
                     }
-                    if let typical = listing.typical {
-                        Text("typ. \(Format.pln(typical))")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    // On a narrow row the estimate matters more than the typical.
+                    ViewThatFits(in: .horizontal) {
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            typicalText
+                            netText
+                        }
+                        if listing.estimatedNet != nil { netText } else { typicalText }
                     }
                 }
                 Text(meta)
@@ -212,12 +221,57 @@ struct ListingRow: View {
         .opacity(listing.aiFiltered == true ? 0.55 : 1)
     }
 
+    @ViewBuilder
+    private var typicalText: some View {
+        if let typical = listing.typical {
+            Text("typ. \(Format.pln(typical))")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var netText: some View {
+        if let net = listing.estimatedNet {
+            EstimatedNetText(net: net)
+                .font(.caption.weight(.medium))
+        }
+    }
+
     private var meta: String {
         var parts = [listing.marketplace.rawValue]
         if listing.shippingAvailable == false { parts.append("pickup only") }
         if listing.aiFiltered == true { parts.append("filtered by AI") }
         parts.append(listing.observedDate.map(Format.relative) ?? listing.observed)
         return parts.joined(separator: " · ")
+    }
+}
+
+/// The listing is at or below its watch's target price.
+struct TargetChip: View {
+    var font: Font = .caption2.weight(.semibold)
+
+    var body: some View {
+        Text("Target")
+            .font(font)
+            .padding(.horizontal, 5)
+            .background(Color.scoutGreen.opacity(0.14), in: Capsule())
+            .foregroundStyle(Color.scoutGreen)
+            .accessibilityLabel("At or below target price")
+    }
+}
+
+/// Server estimate of reselling at the typical asking price on the same
+/// marketplace after its fee. Asking prices, so always marked approximate.
+struct EstimatedNetText: View {
+    var net: Double
+    var suffix = "net"
+
+    var body: some View {
+        Text(verbatim: "≈ \(Format.signedPLN(net)) \(suffix)")
+            .monospacedDigit()
+            .foregroundStyle(net >= 0 ? Color.scoutGreen : Color.red)
+            .lineLimit(1)
     }
 }
 
@@ -529,11 +583,16 @@ struct ListingPreview: View {
                     Text(Format.pln(listing.price))
                         .font(.title3.weight(.bold))
                         .monospacedDigit()
+                    if listing.isTargetHit { TargetChip() }
                     if let below = listing.belowTypical, below < 0 {
                         Text(Format.versusTypical(below))
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(listing.dealStrength >= 3 ? listing.dealLabel.color : .primary)
                     }
+                }
+                if let net = listing.estimatedNet {
+                    EstimatedNetText(net: net, suffix: "net at typical")
+                        .font(.caption.weight(.medium))
                 }
                 Text(verbatim: ([listing.marketplace.rawValue, listing.condition, listing.location] as [String?]).compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
                     .font(.caption)

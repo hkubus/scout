@@ -8,7 +8,7 @@ import sharp from 'sharp';
 import { FlipStore, MAX_FLIP_PHOTO_EDGE, MAX_FLIP_PHOTOS, sniffImageMime, toWebp } from '../server/flips';
 import { ServiceError } from '../server/service';
 import type { PurchaseScreenshotReading } from '../server/vision';
-import { DEFAULT_FEE_PRESETS, listingConditionFromLabel, roundToNines, suggestedListingPrice, estimateFlipNet, flipNet, normalizeFeePresets, quarterOf, saleFee, salesRecord, salesRecordCsv } from '../src/profit';
+import { DEFAULT_FEE_PRESETS, estimatedNetAtTypical, listingConditionFromLabel, roundToNines, suggestedListingPrice, estimateFlipNet, flipNet, normalizeFeePresets, quarterOf, saleFee, salesRecord, salesRecordCsv } from '../src/profit';
 
 function fixture() {
   const directory = mkdtempSync(join(tmpdir(), 'scout-flips-'));
@@ -365,4 +365,13 @@ test('the purchase reader sends the screenshot and tidies what the model returns
   assert.deepEqual(reading, { isPurchase: true, platform: 'Allegro Lokalnie', title: 'Lampa biurkowa', itemPrice: 89.99, extraCosts: 0, currency: 'PLN', date: null });
   assert.equal(body.model, 'vision/test');
   assert.deepEqual(body.messages[1].content[1], { type: 'image_url', image_url: { url: 'data:image/webp;base64,AAAA' } });
+});
+
+test('estimates the net of reselling at the typical after the seller fee', () => {
+  assert.equal(estimatedNetAtTypical(700, 1000, { percent: 0, fixed: 0 }), 300);
+  // Allegro Lokalnie 4,9%: 1000 − 49 − 700.
+  assert.equal(estimatedNetAtTypical(700, 1000, { percent: 4.9, fixed: 0 }), 251);
+  assert.equal(estimatedNetAtTypical(1100, 1000, { percent: 0, fixed: 5 }), -105);
+  assert.equal(estimatedNetAtTypical(700, null, { percent: 0, fixed: 0 }), null);
+  assert.equal(estimatedNetAtTypical(700, 0, { percent: 0, fixed: 0 }), null);
 });
