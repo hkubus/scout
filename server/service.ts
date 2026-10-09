@@ -9,8 +9,8 @@ import type { Browser, BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, type SellerType, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult, olxDetailHint } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
-import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, writeResaleListingWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext } from './ai';
-import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyWatchVariantWithJev, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
+import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, writeResaleListingWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseVerificationChecks, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type VerificationCheck } from './ai';
+import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyChecksWithJev, classifyWatchVariantWithJev, summarizeCheckResults, checkIssue, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
 import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, verifyListingDescriptionWithVision, visionToVerification } from './vision';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { Limiter, mapPool } from './limiter';
@@ -56,6 +56,8 @@ type DealNotificationCandidate = {
   query?: string;
   includedTerms?: string;
   excludedTerms?: string;
+  /** Watch-specific things the verifier must confirm (require) or rule out (exclude). */
+  verificationChecks?: VerificationCheck[];
   /** Model-variant bucket this listing was scored against, when the watch groups variants. */
   variantKey?: string | null;
   variantLabel?: string | null;
@@ -139,6 +141,13 @@ const MATCH_VISIBILITY_MS = 12 * 60 * 60_000;
  * client pages past it with `page` instead of losing results silently.
  */
 const MANUAL_SEARCH_RESULT_CAP = 200;
+/**
+ * Manual-search Jev checks, per source per page: at most this many uncached
+ * Jev calls, and detail-page fetches for at most this many listings whose
+ * description the search API did not already return. The rest stay unchecked.
+ */
+const SEARCH_CHECK_JEV_BUDGET = 40;
+const SEARCH_CHECK_DETAIL_BUDGET = 12;
 const NIGHT_START_HOUR = 22;
 const NIGHT_END_HOUR = 8;
 const MAX_RESEARCH_DETAIL_CHECKS = 100;
@@ -231,6 +240,7 @@ export interface ScoutServiceDependencies {
   classifyNegotiabilityWithJev?: typeof classifyNegotiabilityWithJev;
   classifyConditionMatchWithJev?: typeof classifyConditionMatchWithJev;
   classifyWatchVariantWithJev?: typeof classifyWatchVariantWithJev;
+  classifyChecksWithJev?: typeof classifyChecksWithJev;
   suggestVariantGroups?: typeof suggestVariantGroupsWithDeepSeek;
   writeResaleListing?: typeof writeResaleListingWithDeepSeek;
   classifyListingRelevanceWithVision?: typeof classifyListingRelevanceWithVision;
@@ -651,6 +661,7 @@ export class ScoutService {
   private readonly jevNegotiability: typeof classifyNegotiabilityWithJev;
   private readonly jevConditionMatch: typeof classifyConditionMatchWithJev;
   private readonly jevVariant: typeof classifyWatchVariantWithJev;
+  private readonly jevChecks: typeof classifyChecksWithJev;
   private readonly aiVariantSuggestions: typeof suggestVariantGroupsWithDeepSeek;
   private readonly aiResaleListing: typeof writeResaleListingWithDeepSeek;
   private readonly visionRelevance: typeof classifyListingRelevanceWithVision;
@@ -674,6 +685,7 @@ export class ScoutService {
     this.jevNegotiability = dependencies.classifyNegotiabilityWithJev ?? classifyNegotiabilityWithJev;
     this.jevConditionMatch = dependencies.classifyConditionMatchWithJev ?? classifyConditionMatchWithJev;
     this.jevVariant = dependencies.classifyWatchVariantWithJev ?? classifyWatchVariantWithJev;
+    this.jevChecks = dependencies.classifyChecksWithJev ?? classifyChecksWithJev;
     this.aiVariantSuggestions = dependencies.suggestVariantGroups ?? suggestVariantGroupsWithDeepSeek;
     this.aiResaleListing = dependencies.writeResaleListing ?? writeResaleListingWithDeepSeek;
     this.visionRelevance = dependencies.classifyListingRelevanceWithVision ?? classifyListingRelevanceWithVision;
@@ -1144,7 +1156,7 @@ export class ScoutService {
   ) {
     try {
       const vision = await verifyListingDescriptionWithVision(
-        { marketplace: context.marketplace, title: context.title, condition: context.condition, description: context.description, imageUrls: galleryImageUrls },
+        { marketplace: context.marketplace, title: context.title, condition: context.condition, description: context.description, imageUrls: galleryImageUrls, query: context.query, includedTerms: context.includedTerms, excludedTerms: context.excludedTerms, checks: context.checks },
         { apiKey: shadow.apiKey, model: shadow.visionModel },
       );
       this.logJevShadow({
@@ -1213,6 +1225,7 @@ export class ScoutService {
       query: context.query,
       includedTerms: context.includedTerms,
       excludedTerms: context.excludedTerms,
+      checks: context.checks,
     };
     const visionConfig = { apiKey: live.apiKey, model: live.visionModel };
 
@@ -1225,7 +1238,7 @@ export class ScoutService {
           decision: judgment.decision,
           confidence: judgment.confidence ?? 0,
           summary: `Jev verification ${judgment.decision}.`,
-          issues: [],
+          issues: judgment.issues ?? [],
           evidence: [],
         };
         this.logJevLive('verification', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: false });
@@ -1259,7 +1272,7 @@ export class ScoutService {
           decision: judgment.decision,
           confidence: judgment.confidence ?? 0,
           summary: `Jev leaned ${judgment.decision} (confidence ${confidence}); vision tiebreak failed.`.slice(0, 240),
-          issues: [],
+          issues: judgment.issues ?? [],
           evidence: [],
         };
       }
@@ -1532,6 +1545,77 @@ export class ScoutService {
   }
 
   /**
+   * Manual-search Jev checks. Listings Jev rejects (a near-certain exclude
+   * match or a confidently missing requirement) are dropped; the rest come
+   * back tagged passed / unconfirmed / unchecked so the page can show only
+   * confirmed matches. Descriptions come from the OLX offers API for free and
+   * from a bounded number of detail pages otherwise; title-only judgments are
+   * never cached, so a later search with a description can still decide.
+   */
+  private async applySearchChecks(listings: NormalizedListing[], checks: VerificationCheck[]): Promise<{
+    listings: NormalizedListing[];
+    status: Map<NormalizedListing, { state: 'passed' | 'unconfirmed' | 'unchecked'; note: string }>;
+    rejected: number;
+    inactive: boolean;
+  }> {
+    const status = new Map<NormalizedListing, { state: 'passed' | 'unconfirmed' | 'unchecked'; note: string }>();
+    const live = this.jevLiveConfig();
+    if (!checks.length || !listings.length || !live) {
+      if (checks.length) for (const listing of listings) status.set(listing, { state: 'unchecked', note: 'Jev checks need an OpenRouter key and Jev live mode' });
+      return { listings, status, rejected: 0, inactive: Boolean(checks.length && listings.length && !live) };
+    }
+    const checksKey = checks.map((check) => `${check.mode}:${check.text.toLowerCase()}`).sort();
+    let jevCalls = 0;
+    let detailFetches = 0;
+    const outcomes = await mapPool(listings, jevCheckConcurrency(), async (listing): Promise<'rejected' | 'passed' | 'unconfirmed' | 'unchecked'> => {
+      const inputHash = createHash('sha256').update(JSON.stringify({
+        version: 1, marketplace: listing.marketplace, listingId: listing.listingId, title: listing.title, condition: listing.condition ?? null, checks: checksKey,
+      })).digest('hex');
+      const cached = this.readFuzzyCache(inputHash, live.jevModel, 'checks');
+      if (cached) {
+        const parsed = parseJson<{ summary?: string; issues?: string[] }>(cached.decision, {});
+        if (parsed.summary === 'rejected') return 'rejected';
+        if (parsed.summary === 'passed' || parsed.summary === 'unconfirmed') {
+          status.set(listing, { state: parsed.summary, note: (parsed.issues ?? []).join(' · ') });
+          return parsed.summary;
+        }
+      }
+      if (jevCalls >= SEARCH_CHECK_JEV_BUDGET) {
+        status.set(listing, { state: 'unchecked', note: 'Jev check budget for this search used up' });
+        return 'unchecked';
+      }
+      jevCalls += 1;
+      let description = olxDetailHint(listing)?.description ?? null;
+      if (!description && detailFetches < SEARCH_CHECK_DETAIL_BUDGET) {
+        detailFetches += 1;
+        try {
+          description = parseListingDescription(await this.detailHtml(listing.url, listing.marketplace), listing.marketplace);
+        } catch {
+          description = null;
+        }
+      }
+      try {
+        const results = await this.jevChecks({ marketplace: listing.marketplace, title: listing.title, condition: listing.condition, description, checks }, { apiKey: live.apiKey, model: live.jevModel });
+        const summary = summarizeCheckResults(results);
+        const issues = results.map(checkIssue).filter((issue): issue is string => issue !== null);
+        if (description) this.writeFuzzyCache(inputHash, live.jevModel, 'checks', JSON.stringify({ summary, issues, results }), null, summary !== 'rejected');
+        if (summary === 'rejected') return 'rejected';
+        status.set(listing, { state: summary, note: issues.join(' · ') + (description ? '' : `${issues.length ? ' · ' : ''}Judged from the title only`) });
+        return summary;
+      } catch (error) {
+        status.set(listing, { state: 'unchecked', note: `Jev check failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 200) });
+        return 'unchecked';
+      }
+    });
+    return {
+      listings: listings.filter((_, index) => outcomes[index] !== 'rejected'),
+      status,
+      rejected: outcomes.filter((outcome) => outcome === 'rejected').length,
+      inactive: false,
+    };
+  }
+
+  /**
    * P1/P3: rescue deterministic near-misses with Jev. Only listings that fail
    * exactly one fuzzy dimension (terms XOR condition) while passing price,
    * shipping, and location are considered, at most 10 per call, fail-closed
@@ -1542,7 +1626,7 @@ export class ScoutService {
    * verdict is cached in `jev_fuzzy_cache` by input hash + model so repeat
    * scans reuse it instead of re-spending on the same near-miss title.
    */
-  private readFuzzyCache(inputHash: string, model: string, task: 'term-match' | 'condition' | 'variant'): { rescued: boolean; decision: string } | null {
+  private readFuzzyCache(inputHash: string, model: string, task: 'term-match' | 'condition' | 'variant' | 'checks'): { rescued: boolean; decision: string } | null {
     try {
       const row = this.stmt('SELECT rescued, decision FROM jev_fuzzy_cache WHERE input_hash = ? AND model = ? AND task = ?').get(inputHash, model, task) as { rescued?: number; decision?: string } | undefined;
       if (!row || row.rescued === undefined || row.rescued === null) return null;
@@ -1553,7 +1637,7 @@ export class ScoutService {
     }
   }
 
-  private writeFuzzyCache(inputHash: string, model: string, task: 'term-match' | 'condition' | 'variant', decision: string, confidence: number | null, rescued: boolean) {
+  private writeFuzzyCache(inputHash: string, model: string, task: 'term-match' | 'condition' | 'variant' | 'checks', decision: string, confidence: number | null, rescued: boolean) {
     try {
       this.stmt(`INSERT INTO jev_fuzzy_cache (input_hash, model, task, decision, confidence, rescued, checked_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1910,6 +1994,7 @@ export class ScoutService {
       query: candidate.query?.trim() ? candidate.query : null,
       includedTerms: candidate.includedTerms?.trim() ? candidate.includedTerms : null,
       excludedTerms: candidate.excludedTerms?.trim() ? candidate.excludedTerms : null,
+      checks: candidate.verificationChecks?.length ? candidate.verificationChecks : null,
     };
     const inputHash = listingDescriptionVerificationInputHash(context);
     // Everything up to the fresh AI call is synchronous, so the snapshot and
@@ -2257,6 +2342,7 @@ export class ScoutService {
       shippingOnly: Boolean(row.shipping_only),
       typoVariants: Boolean(row.typo_variants),
       aiRelevance: row.ai_relevance === undefined ? true : Boolean(row.ai_relevance),
+      verificationChecks: parseVerificationChecks(row.verification_checks_json),
       referenceMarketWatchId: row.reference_market_watch_id ?? null,
       variantGroups,
       variantGroupsAuto: !variantGroups.length && row.variant_groups_auto !== undefined && Boolean(row.variant_groups_auto),
@@ -3292,10 +3378,27 @@ export class ScoutService {
         } catch (error) {
           this.log('error', 'watch', `Manual search AI relevance fallback to deterministic: ${error instanceof Error ? error.message : String(error)}`.slice(0, 500));
         }
+        let capped = relevant.slice(0, MANUAL_SEARCH_RESULT_CAP);
+        const truncated = relevant.length > capped.length;
+        // Jev checks run after relevance on the capped page only. Fail-open:
+        // an unexpected throw leaves every listing unchecked, never hidden.
+        const checks = input.verificationChecks ?? [];
+        let checkStatus = new Map<NormalizedListing, { state: 'passed' | 'unconfirmed' | 'unchecked'; note: string }>();
+        let checksNote = '';
+        let hiddenByChecks = 0;
+        if (checks.length) {
+          try {
+            const checked = await this.applySearchChecks(capped, checks);
+            capped = checked.listings;
+            checkStatus = checked.status;
+            hiddenByChecks = checked.rejected;
+            checksNote = checked.inactive ? ' · Jev checks inactive' : checked.rejected ? ` · ${checked.rejected} hidden by Jev checks` : '';
+          } catch (error) {
+            this.log('error', 'watch', `Manual search Jev checks skipped: ${error instanceof Error ? error.message : String(error)}`.slice(0, 500));
+          }
+        }
         // One transaction for the whole batch: each upsert would otherwise be
         // its own implicit commit (an fsync per listing before WAL=NORMAL).
-        const capped = relevant.slice(0, MANUAL_SEARCH_RESULT_CAP);
-        const truncated = relevant.length > capped.length;
         this.transaction(() => {
           for (const listing of capped) this.storeManualListing(listing);
         });
@@ -3307,11 +3410,13 @@ export class ScoutService {
           dealStrength: 1, dealLabel: 'Watch', image: listing.imageUrl ?? '', url: listing.url, watch: 'Manual search',
           condition: listing.condition, location: listing.location, shippingAvailable: listing.shippingAvailable ?? null, priceNegotiable: listing.priceNegotiable ?? null,
           postedAt: listing.postedAt ?? null, refreshedAt: listing.refreshedAt ?? null, promoted: listing.promoted ?? null, sellerType: listing.sellerType ?? null,
+          ...(checkStatus.has(listing) ? { jevCheck: checkStatus.get(listing)!.state, jevCheckNote: checkStatus.get(listing)!.note } : {}),
         }));
+        const matches = relevant.length - hiddenByChecks;
         const status: SearchSourceStatus = {
-          source, status: 'ok', count: relevant.length, pendingShipping, durationMs: Date.now() - started,
-          message: relevant.length
-            ? `${relevant.length} matches${relevanceNote}${truncated ? ` · showing the first ${MANUAL_SEARCH_RESULT_CAP}` : ''}`
+          source, status: 'ok', count: matches, pendingShipping, durationMs: Date.now() - started,
+          message: matches
+            ? `${matches} matches${relevanceNote}${checksNote}${truncated ? ` · showing the first ${MANUAL_SEARCH_RESULT_CAP}` : ''}`
             : 'No matching listings',
         };
         // Stream this source to the originating client so a fast marketplace is
@@ -5131,6 +5236,7 @@ export class ScoutService {
       query: String(row.query ?? ''),
       includedTerms: String(row.included_terms ?? ''),
       excludedTerms: String(row.excluded_terms ?? ''),
+      verificationChecks: parseVerificationChecks(row.verification_checks_json),
       variantKey,
       variantLabel,
       targetPrice,

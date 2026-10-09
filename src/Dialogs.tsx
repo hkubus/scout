@@ -13,8 +13,9 @@ import {
 import { api } from "./api";
 import { marketplaceColors } from "./data";
 import { OlxCategoryPicker } from "./OlxCategoryPicker";
+import { VerificationChecksEditor, cleanVerificationChecks } from "./VerificationChecksEditor";
 import type { WatchPreset } from "./presets";
-import type { Marketplace, MarketWatch, NotificationRecord, OlxCategory, SellerType, VariantGroup, Watch } from "./types";
+import type { Marketplace, MarketWatch, NotificationRecord, OlxCategory, SellerType, VariantGroup, VerificationCheck, Watch } from "./types";
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
@@ -67,6 +68,7 @@ export function WatchDialog({
   const [targetPrice, setTargetPrice] = useState(initialWatch?.targetPrice ? String(initialWatch.targetPrice) : "");
   const [minSaving, setMinSaving] = useState(initialWatch?.minSaving ? String(initialWatch.minSaving) : "");
   const [aiRelevance, setAiRelevance] = useState(initialWatch?.aiRelevance ?? preset?.aiRelevance ?? true);
+  const [verificationChecks, setVerificationChecks] = useState<VerificationCheck[]>(initialWatch?.verificationChecks ?? preset?.verificationChecks ?? []);
   const [variantGroups, setVariantGroups] = useState<VariantGroup[]>(initialWatch?.variantGroups ?? []);
   // New watches wait for listings and then propose their own groups.
   const [variantGroupsAuto, setVariantGroupsAuto] = useState(initialWatch ? Boolean(initialWatch.variantGroupsAuto) : true);
@@ -182,6 +184,7 @@ export function WatchDialog({
         ignorePromoted,
         targetPrice: numericTarget,
         minSaving: numericMinSaving || null,
+        verificationChecks: cleanVerificationChecks(verificationChecks),
       });
     } catch (submitError) {
       setError(errorMessage(submitError));
@@ -232,7 +235,8 @@ export function WatchDialog({
     initialWatch.condition !== "Any" || initialWatch.sellerType || initialWatch.olxCategory || initialWatch.ignorePromoted
     || initialWatch.typoVariants || initialWatch.variantGroups.length || initialWatch.referenceMarketWatchId
     || initialWatch.exactUrls.length || initialWatch.sensitivity !== 1 || Object.keys(initialWatch.sourceIntervals ?? {}).length
-  )));
+    || initialWatch.verificationChecks?.length
+  )) || Boolean(preset?.verificationChecks?.length));
   const cleanVariantGroups = variantGroups
     .map((group) => ({ ...group, label: group.label.trim(), terms: group.terms.trim() }))
     .filter((group) => group.label && group.terms);
@@ -434,6 +438,14 @@ export function WatchDialog({
                 <input type="checkbox" checked={typoVariants} onChange={(event) => setTypoVariants(event.target.checked)} />
                 <strong>Also search typo variants</strong>
               </label>
+            </div>
+            <div className="field-label">
+              <span title="Before a very strong or exceptional deal alerts, Jev reads the listing description and photos. Require: hold the alert unless the listing clearly shows it. Exclude: reject only when Jev is near-certain the listing matches it.">Jev verification checks</span>
+              <VerificationChecksEditor
+                checks={verificationChecks}
+                onChange={setVerificationChecks}
+                hint="Require holds the alert unless the listing clearly shows it. Exclude rejects only when Jev is near-certain."
+              />
             </div>
             <div className="field-label">
               <span title="Each variant learns its own typical price and alerts separately. The most specific match wins; unmatched listings share an “Other” typical.">Model variants</span>

@@ -8,7 +8,8 @@ import type { WatchPreset } from "./presets";
 import { OlxCategoryPicker } from "./OlxCategoryPicker";
 import { listingAge } from "./listingSignals";
 import { formatPln, ListingThumbnail, PageHeader } from "./ui";
-import type { Listing, Marketplace, OlxCategory, SearchFilters, SearchSourceStatus } from "./types";
+import { VerificationChecksEditor, cleanVerificationChecks } from "./VerificationChecksEditor";
+import type { Listing, Marketplace, OlxCategory, SearchFilters, SearchSourceStatus, VerificationCheck } from "./types";
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
@@ -42,6 +43,12 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
   const [aiRelevance, setAiRelevance] = useState(
     () => localStorage.getItem("scout-search-ai-relevance") !== "0",
   );
+  const [verificationChecks, setVerificationChecks] = useState<VerificationCheck[]>([]);
+  // The checks the shown results were searched with, so editing the form
+  // does not relabel results it has not re-run.
+  const [searchedChecks, setSearchedChecks] = useState<VerificationCheck[]>([]);
+  // Require checks mean "only matches": unconfirmed rows hide unless asked for.
+  const [showUnconfirmed, setShowUnconfirmed] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [sources, setSources] = useState<Marketplace[]>([
     "OLX",
@@ -80,11 +87,18 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
     olxCategory: sources.includes("OLX") ? olxCategory : null,
     page: targetPage,
     aiRelevance,
+    verificationChecks: cleanVerificationChecks(verificationChecks),
   });
   // Counted on the collapsed Filters button, so hidden filters are never a surprise.
   const activeFilters = [minPrice, maxPrice, terms.trim(), excluded.trim()].filter(Boolean).length
     + (condition !== "Any" ? 1 : 0) + (ownerType !== "Any" ? 1 : 0) + (shippingOnly ? 1 : 0)
-    + (olxCategory && sources.includes("OLX") ? 1 : 0) + (aiRelevance ? 0 : 1);
+    + (olxCategory && sources.includes("OLX") ? 1 : 0) + (aiRelevance ? 0 : 1)
+    + (cleanVerificationChecks(verificationChecks).length ? 1 : 0);
+  const requiresConfirmation = searchedChecks.some((check) => check.mode === "require");
+  const visibleListings = requiresConfirmation && !showUnconfirmed
+    ? listings.filter((listing) => listing.jevCheck === "passed")
+    : listings;
+  const hiddenUnconfirmed = listings.length - visibleListings.length;
   const toggleSource = (source: Marketplace) =>
     setSources((current) =>
       current.includes(source)
@@ -119,6 +133,7 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
     setError(null);
     setSearched(true);
     setListings([]);
+    setSearchedChecks(cleanVerificationChecks(verificationChecks));
     setPage(1);
     setExhausted(false);
     setSourceStatuses(sources.map((source): SearchSourceStatus => ({ source, status: "searching", count: 0, pendingShipping: 0, durationMs: 0, message: "Searching…" })));
@@ -257,6 +272,14 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
                 <input placeholder="e.g. broken, parts" value={excluded} onChange={(event) => setExcluded(event.target.value)} />
               </label>
             </div>
+            <div className="field-label search-jev-checks">
+              <span title="Jev reads each result's description. Require: show only listings that clearly have it. Exclude: hide only listings Jev is near-certain match it.">Jev checks</span>
+              <VerificationChecksEditor
+                checks={verificationChecks}
+                onChange={setVerificationChecks}
+                hint="Require shows only listings Jev confirms. Exclude hides only near-certain matches. Slower: Jev reads each result, fetching up to 12 detail pages per marketplace."
+              />
+            </div>
             {sources.includes("OLX") ? (
               <div className="search-olx-category">
                 <OlxCategoryPicker query={query} value={olxCategory} onChange={setOlxCategory} />
@@ -327,11 +350,17 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
         <div className="section-heading-row">
           <h2>
             {searched
-              ? `${listings.length} ${listings.length === 1 ? "result" : "results"}${loading ? " so far…" : ""}`
+              ? `${visibleListings.length} ${visibleListings.length === 1 ? "result" : "results"}${loading ? " so far…" : ""}`
               : "Results"}
           </h2>
           {searched && !loading ? (
             <div className="search-results-actions">
+              {requiresConfirmation && (hiddenUnconfirmed || showUnconfirmed) ? (
+                <label className="check-option" title="Listings Jev could not confirm, or did not get to check">
+                  <input type="checkbox" checked={showUnconfirmed} onChange={(event) => setShowUnconfirmed(event.target.checked)} />
+                  <strong>Show unconfirmed{hiddenUnconfirmed ? ` (${hiddenUnconfirmed})` : ""}</strong>
+                </label>
+              ) : null}
               <span className="toolbar-meta">Sorted by lowest price</span>
               {listings.length && !exhausted && page < 10 ? (
                 <button className="outline-button" type="button" disabled={loadingMore} onClick={loadMore}>
@@ -339,12 +368,12 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
                   {loadingMore ? "Loading…" : "Load more"}
                 </button>
               ) : null}
-              <button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly, aiRelevance, olxCategory: sources.includes("OLX") ? olxCategory : null, sellerType: ownerType === "Any" ? null : ownerType.toLowerCase() as "private" | "business" })}><Bell size={15} />Save as watch</button>
+              <button className="outline-button" type="button" onClick={() => onSaveWatch({ query: query.trim(), terms: terms.trim(), excluded: excluded.trim(), sources, condition, minPrice: numericMin, maxPrice: numericMax, shippingOnly, aiRelevance, olxCategory: sources.includes("OLX") ? olxCategory : null, sellerType: ownerType === "Any" ? null : ownerType.toLowerCase() as "private" | "business", verificationChecks: cleanVerificationChecks(verificationChecks) })}><Bell size={15} />Save as watch</button>
             </div>
           ) : null}
         </div>
-        {listings.length ? (
-          <SearchResultsTable listings={listings} onSelect={onSelectListing} />
+        {visibleListings.length ? (
+          <SearchResultsTable listings={visibleListings} onSelect={onSelectListing} />
         ) : loading ? (
           <div className="table-loading">
             <LoaderCircle size={20} className="spin" />
@@ -357,7 +386,9 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
               {searched ? "No matching listings" : "Ready when you are"}
             </strong>
             <span>
-              {searched
+              {searched && hiddenUnconfirmed
+                ? `Jev could not confirm ${hiddenUnconfirmed} ${hiddenUnconfirmed === 1 ? "listing" : "listings"} against your Require checks. Tick “Show unconfirmed” to see them.`
+                : searched
                 ? "Try widening the price range or removing a filter."
                 : "Choose filters and search across the selected marketplaces."}
             </span>
@@ -451,6 +482,9 @@ function SignalChips({ listing }: { listing: Listing }) {
     <>
       {age ? <em className={`decision-chip decision-chip--age decision-chip--age-${age.freshness}`} title={age.detail}>{age.label.replace("Posted ", "").replace(" ago", "")}</em> : null}
       {listing.sellerType === "business" ? <em className="decision-chip decision-chip--business" title="The marketplace marks this seller as a business account">Business</em> : null}
+      {listing.jevCheck === "passed" ? <em className="decision-chip decision-chip--jev-passed" title={listing.jevCheckNote || "Jev confirmed every check"}>Jev ✓</em> : null}
+      {listing.jevCheck === "unconfirmed" ? <em className="decision-chip decision-chip--jev-unconfirmed" title={listing.jevCheckNote}>Unconfirmed</em> : null}
+      {listing.jevCheck === "unchecked" ? <em className="decision-chip decision-chip--jev-unconfirmed" title={listing.jevCheckNote}>Not checked</em> : null}
     </>
   );
 }

@@ -112,6 +112,10 @@ export interface Listing {
   estimatedNet?: number | null;
   /** The price is at or below the watch's target price. */
   targetHit?: boolean;
+  /** Manual search only: Jev's verdict on the search's checks (rejected listings are not returned). */
+  jevCheck?: "passed" | "unconfirmed" | "unchecked";
+  /** Failed or unconfirmed checks, or why the listing was not checked. */
+  jevCheckNote?: string;
   listingId?: string;
   decision?: ListingDecision | null;
   note?: string;
@@ -230,6 +234,8 @@ export interface Watch {
   shippingOnly: boolean;
   typoVariants: boolean;
   aiRelevance: boolean;
+  /** Things Jev looks for while verifying this watch's very strong and exceptional deals. */
+  verificationChecks?: VerificationCheck[];
   variantGroups: VariantGroup[];
   /** No groups yet and Scout will propose them from listing titles once enough are saved. */
   variantGroupsAuto?: boolean;
@@ -251,6 +257,15 @@ export interface Watch {
   /** Deal alerts also need the listing to be this many zł below the typical. */
   minSaving?: number | null;
   archivedAt?: string | null;
+}
+
+/**
+ * `require`: hold the alert unless the listing clearly shows it.
+ * `exclude`: reject only when Jev is near-certain the listing matches it.
+ */
+export interface VerificationCheck {
+  text: string;
+  mode: "require" | "exclude";
 }
 
 export interface WatchAnalyticsPoint {
@@ -387,6 +402,8 @@ export interface SearchFilters {
   searchId?: string;
   /** Run the Jev/LLM relevance filter for this search; default true when omitted. */
   aiRelevance?: boolean;
+  /** Things for Jev to confirm (require) or rule out (exclude) on each result. */
+  verificationChecks?: VerificationCheck[];
 }
 
 export interface SearchSourceStatus {

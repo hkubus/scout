@@ -271,6 +271,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .search-filters { margin-top: 2px; padding-top: 2px; }
 .search-checks { display: flex; flex-wrap: wrap; gap: 10px 24px; margin-top: 18px; }
 .search-checks .check-option { align-items: center; }
+.search-jev-checks { margin-top: 14px; }
 .filter-label { display: block; margin-bottom: 8px; color: var(--text); font-size: 12px; font-weight: 600; }
 .check-option { display: flex; align-items: flex-start; gap: 9px; color: var(--text); font-size: 12px; cursor: pointer; }
 .check-option input { width: 16px; height: 16px; margin: 1px 0 0; accent-color: var(--blue); }
@@ -772,6 +773,8 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .decision-chip--promoted { color: var(--muted); background: var(--surface-muted); border: 1px solid var(--line-strong); font-weight: 600; }
 .decision-chip--business { color: var(--blue); background: var(--blue-soft); font-weight: 600; }
 .decision-chip--target { color: var(--green); background: rgba(58, 171, 97, .12); font-weight: 650; }
+.decision-chip--jev-passed { color: var(--green); background: rgba(58, 171, 97, .12); font-weight: 600; }
+.decision-chip--jev-unconfirmed { color: var(--muted); background: var(--surface-muted); border: 1px dashed var(--line-strong); font-weight: 600; }
 .snapshot-price-history { margin-top: 12px; display: grid; gap: 8px; }
 .snapshot-price-history > strong { font-size: 12px; }
 .listing-drawer-backdrop { position: fixed; inset: 0; z-index: 60; display: flex; justify-content: flex-end; background: rgba(12, 17, 26, .48); backdrop-filter: blur(3px); }
@@ -906,6 +909,8 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 @media (max-width: 720px) {
   .variant-row { grid-template-columns: 1fr; }
 }
+.variant-row.verification-check-row { grid-template-columns: auto 1fr auto; }
+.verification-check-row select { min-height: 38px; }
 
 .login-shell { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: var(--bg); }
 .login-card { width: min(380px, 100%); display: grid; gap: 4px; padding: 28px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }

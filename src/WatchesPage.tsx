@@ -51,6 +51,7 @@ function watchTags(watch: Watch) {
     watch.sellerType ? (watch.sellerType === "private" ? "private sellers" : "business sellers") : null,
     watch.ignorePromoted ? "no promoted" : null,
     watch.aiRelevance ? "AI relevance" : null,
+    watch.verificationChecks?.length ? `${watch.verificationChecks.length} Jev check${watch.verificationChecks.length === 1 ? "" : "s"}` : null,
     watch.exactUrls.length ? `${watch.exactUrls.length} exact URL${watch.exactUrls.length === 1 ? "" : "s"}` : null,
   ].filter((tag): tag is string => Boolean(tag));
 }
