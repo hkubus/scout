@@ -969,6 +969,18 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .listing-photos figure:first-child img { border: 2px solid var(--blue); }
 .listing-photos figcaption { display: flex; justify-content: space-between; }
 .listing-photos figcaption .icon-button { width: 26px; height: 26px; }
+.flip-import { display: grid; gap: 7px; margin-top: 19px; padding: 12px; border: 1px dashed var(--line-strong); border-radius: 7px; background: var(--surface-muted); }
+.flip-import-label { color: var(--text); font-size: 12px; font-weight: 600; }
+.flip-import-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; }
+.flip-import-row input { width: 100%; min-height: 40px; padding: 0 11px; border: 1px solid var(--line-strong); border-radius: 7px; outline: 0; background: var(--surface); color: var(--text); font-size: 13px; }
+.flip-import-row input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-soft); }
+.flip-import-row .outline-button { display: inline-flex; align-items: center; gap: 6px; }
+.flip-import-file { cursor: pointer; }
+.flip-import-file input { display: none; }
+.flip-import-file.is-disabled { opacity: .5; cursor: not-allowed; }
+.flip-import-warning { display: flex; align-items: center; gap: 6px; margin-top: 3px; color: var(--orange); }
+.flip-import-warning svg { flex: 0 0 auto; }
+@media (max-width: 560px) { .flip-import-row { grid-template-columns: 1fr 1fr; } .flip-import-row input { grid-column: 1 / -1; } }
 .listing-photo-add { display: grid; place-items: center; align-content: center; gap: 6px; aspect-ratio: 1; border: 1px dashed var(--line-strong); border-radius: 7px; color: var(--muted); font-size: 11px; cursor: pointer; text-align: center; }
 .listing-photo-add input { display: none; }
 @media (max-width: 760px) { .listing-prices { grid-template-columns: 1fr; } }

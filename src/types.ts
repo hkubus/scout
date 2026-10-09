@@ -686,3 +686,22 @@ export interface FlipsData {
   flips: Flip[];
   feePresets: import('./profit').FeePresets;
 }
+
+/** A purchase read from an offer link or a screenshot, to prefill a new flip. */
+export interface FlipImport {
+  title: string;
+  buyChannel: import('./profit').FlipChannel;
+  buyPrice: number | null;
+  /** Shipping and buyer fees on top of the item, when the source shows them. */
+  buyCosts: number | null;
+  /** Only when the source shows the purchase date. */
+  boughtOn: string | null;
+  /** Set only when Scout tracks the listing, so a resale draft can use it. */
+  listingKey: string | null;
+  watchId: string | null;
+  url: string | null;
+  /** `scout`: a listing Scout tracks; `page`: the live offer page; `screenshot`: read by the vision model. */
+  method: 'scout' | 'page' | 'screenshot';
+  /** Things the operator should check before saving. */
+  warnings: string[];
+}

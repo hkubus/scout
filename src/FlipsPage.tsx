@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, ArrowLeft, ArrowRight, Check, Download, ImagePlus, LoaderCircle, Megaphone, MoreHorizontal, Pencil, Plus, RotateCcw, Sparkles, Trash2, Wallet, X } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ArrowRight, Check, Download, ImagePlus, Link2, LoaderCircle, Megaphone, MoreHorizontal, Pencil, Plus, RotateCcw, Sparkles, Trash2, Wallet, X } from "lucide-react";
 import { api, forgetInFlightGets } from "./api";
 import { subscribe, subscribeStatus } from "./events";
 import {
@@ -23,7 +23,7 @@ import {
   type ListingCondition,
 } from "./profit";
 import { dayMonth, dayMonthYear, formatDate } from "./format";
-import type { Flip, FlipPhoto, ResaleListingDraft } from "./types";
+import type { Flip, FlipImport, FlipPhoto, ResaleListingDraft } from "./types";
 import { PageHeader } from "./ui";
 
 type ToastType = "success" | "error" | "info";
@@ -121,6 +121,10 @@ function FlipDialog({ flip, onClose, onSaved }: { flip: Flip | null; onClose: ()
   const [note, setNote] = useState(flip?.note ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Prefilling a new flip from an offer link or a purchase screenshot.
+  const [importUrl, setImportUrl] = useState("");
+  const [importing, setImporting] = useState<"url" | "screenshot" | null>(null);
+  const [imported, setImported] = useState<FlipImport | null>(null);
   const price = toAmount(buyPrice);
   const costs = toAmount(buyCosts);
   const valid = Boolean(title.trim() && boughtOn && buyPrice.trim() && Number.isFinite(price) && Number.isFinite(costs));
@@ -130,21 +134,97 @@ function FlipDialog({ flip, onClose, onSaved }: { flip: Flip | null; onClose: ()
     setError(null);
     try {
       const body = { title: title.trim(), boughtOn, buyChannel, buyPrice: price, buyCosts: costs, listedOn, note: note.trim() };
-      const result = flip ? await api.updateFlip(flip.id, body) : await api.createFlip(body);
+      const result = flip ? await api.updateFlip(flip.id, body) : await api.createFlip({ ...body, listingKey: imported?.listingKey ?? null, watchId: imported?.watchId ?? null });
       onSaved(result.flip);
     } catch (saveError) {
       setError(errorMessage(saveError));
       setBusy(false);
     }
   };
+  const applyImport = (result: FlipImport) => {
+    setImported(result);
+    if (result.title) setTitle(result.title);
+    setBuyChannel(result.buyChannel);
+    setBuyPrice(result.buyPrice === null ? "" : String(result.buyPrice));
+    setBuyCosts(result.buyCosts ? String(result.buyCosts) : "");
+    if (result.boughtOn) setBoughtOn(result.boughtOn);
+    // A listing Scout does not track stays reachable through the note.
+    if (result.url && !result.listingKey) setNote((current) => current.includes(result.url!) ? current : [current.trim(), result.url].filter(Boolean).join("\n"));
+  };
+  const runImport = async (kind: "url" | "screenshot", read: () => Promise<{ import: FlipImport }>) => {
+    setImporting(kind);
+    setError(null);
+    try {
+      applyImport((await read()).import);
+    } catch (importError) {
+      setError(errorMessage(importError));
+    } finally {
+      setImporting(null);
+    }
+  };
+  const importFromUrl = () => {
+    if (importUrl.trim() && !importing) void runImport("url", () => api.importFlipFromUrl(importUrl.trim()));
+  };
+  const importScreenshot = (file: File | null | undefined) => {
+    if (file && !importing) void runImport("screenshot", async () => api.importFlipFromScreenshot(await prepareForUpload(file)));
+  };
+  // A pasted image anywhere in the new-flip dialog is read as a screenshot.
+  useEffect(() => {
+    if (flip) return;
+    const onPaste = (event: ClipboardEvent) => {
+      const image = [...(event.clipboardData?.files ?? [])].find((file) => file.type.startsWith("image/"));
+      if (!image) return;
+      event.preventDefault();
+      importScreenshot(image);
+    };
+    document.addEventListener("paste", onPaste);
+    return () => document.removeEventListener("paste", onPaste);
+  });
+  const importSource = imported ? ({
+    scout: `Filled from the ${imported.buyChannel} listing Scout tracks.`,
+    page: `Filled from the ${imported.buyChannel} offer page.`,
+    screenshot: "Filled from the screenshot by AI.",
+  })[imported.method] : null;
   return (
     <Modal
       title={flip ? "Edit flip" : "Add a flip"}
       onClose={onClose}
-      busy={busy}
+      busy={busy || Boolean(importing)}
       footer={<><button className="outline-button" disabled={busy} onClick={onClose}>Cancel</button><button className="primary-button" disabled={!valid || busy} onClick={() => void save()}>{busy ? <LoaderCircle size={17} className="spin" /> : <Check size={17} />}{flip ? "Save flip" : "Add flip"}</button></>}
     >
-      <label className="field-label">Item<input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} placeholder="e.g. Gigabyte RTX 3070 Eagle" /></label>
+      {flip ? null : (
+        <div className="flip-import">
+          <span className="flip-import-label">Import from the offer</span>
+          <div className="flip-import-row">
+            <input
+              autoFocus
+              type="url"
+              value={importUrl}
+              disabled={Boolean(importing)}
+              onChange={(event) => setImportUrl(event.target.value)}
+              onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); importFromUrl(); } }}
+              placeholder="Paste an OLX, Allegro Lokalnie or Vinted link"
+              aria-label="Offer link"
+            />
+            <button className="outline-button" disabled={!importUrl.trim() || Boolean(importing)} onClick={importFromUrl}>
+              {importing === "url" ? <LoaderCircle size={16} className="spin" /> : <Link2 size={16} />}Import
+            </button>
+            <label className={`outline-button flip-import-file${importing ? " is-disabled" : ""}`}>
+              {importing === "screenshot" ? <LoaderCircle size={16} className="spin" /> : <ImagePlus size={16} />}Screenshot
+              <input type="file" accept="image/jpeg,image/png,image/webp" disabled={Boolean(importing)} onChange={(event) => { importScreenshot(event.target.files?.[0]); event.target.value = ""; }} />
+            </label>
+          </div>
+          {imported ? (
+            <div className="field-hint" role="status">
+              {importSource} Check the fields before saving.
+              {imported.warnings.map((warning) => <div key={warning} className="flip-import-warning"><AlertTriangle size={12} />{warning}</div>)}
+            </div>
+          ) : (
+            <small className="field-hint">Or paste a screenshot of the order or checkout here (Ctrl+V). Screenshots are read by AI and not stored.</small>
+          )}
+        </div>
+      )}
+      <label className="field-label">Item<input autoFocus={Boolean(flip)} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="e.g. Gigabyte RTX 3070 Eagle" /></label>
       <div className="field-row">
         <label className="field-label">Bought on<input type="date" value={boughtOn} onChange={(event) => setBoughtOn(event.target.value)} /></label>
         <label className="field-label">Bought from<select value={buyChannel} onChange={(event) => setBuyChannel(event.target.value as FlipChannel)}>{FLIP_CHANNELS.map((channel) => <option key={channel}>{channel}</option>)}</select></label>
