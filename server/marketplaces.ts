@@ -777,6 +777,53 @@ export function parseStructuredListings(html: string, marketplace: Marketplace) 
   return [...unique.values()];
 }
 
+/** The item an offer page is about, as far as its own markup says. */
+export interface OfferPageSummary {
+  title: string;
+  /** PLN; null when the page shows no price or prices it in another currency. */
+  price: number | null;
+  condition: string | null;
+  currency: string | null;
+}
+
+function metaContent(html: string, key: string) {
+  for (const match of html.matchAll(/<meta\b[^>]*>/gi)) {
+    const tag = match[0];
+    if ((attribute(tag, 'property') ?? attribute(tag, 'name'))?.toLowerCase() === key) return attribute(tag, 'content')?.trim() || undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Read one offer page: its schema.org Product first, then Open Graph and
+ * product meta tags. Unlike {@link parseStructuredListings} it never falls
+ * back to listing cards, which on an offer page are other sellers' offers.
+ */
+export function parseOfferPage(html: string): OfferPageSummary | null {
+  for (const match of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(match[1].trim()); } catch { continue; }
+    for (const item of flattenStructured(parsed)) {
+      const types = ([] as unknown[]).concat(item['@type']).map(String);
+      if (!types.some((type) => /^(?:Product|IndividualProduct|Offer)$/i.test(type))) continue;
+      const offer = Array.isArray(item.offers) ? item.offers[0] : item.offers ?? item;
+      const title = typeof item.name === 'string' ? item.name.trim().replace(/\s+/g, ' ') : '';
+      if (!title) continue;
+      const rawCurrency = offer?.priceCurrency ?? item.priceCurrency;
+      const currency = typeof rawCurrency === 'string' && rawCurrency.trim() ? rawCurrency.trim().toUpperCase() : null;
+      const price = currency && currency !== 'PLN' ? null : parsePolishPrice(offer?.price ?? item.price ?? null);
+      const condition = structuredConditionLabel(offer?.itemCondition) ?? structuredConditionLabel(item.itemCondition) ?? null;
+      return { title: decodeHtml(title), price, condition, currency };
+    }
+  }
+  const title = metaContent(html, 'og:title');
+  if (!title) return null;
+  const rawCurrency = metaContent(html, 'product:price:currency') ?? metaContent(html, 'og:price:currency');
+  const currency = rawCurrency ? rawCurrency.toUpperCase() : null;
+  const rawPrice = metaContent(html, 'product:price:amount') ?? metaContent(html, 'og:price:amount');
+  return { title: title.replace(/\s+/g, ' ').replace(/\s*[-|•]\s*(?:OLX(?:\.pl)?|Vinted|Allegro\s+Lokalnie)\s*$/i, ''), price: currency && currency !== 'PLN' ? null : parsePolishPrice(rawPrice ?? null), condition: null, currency };
+}
+
 export function exponentialBackoff(failures: number, baseMs = 5 * 60_000, maxMs = 6 * 60 * 60_000) {
   const safeFailures = Math.max(0, Math.floor(failures));
   return Math.min(maxMs, baseMs * (2 ** safeFailures));

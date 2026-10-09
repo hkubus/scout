@@ -115,7 +115,7 @@ app.addHook('onRequest', async (request, reply) => {
   const route = request.routeOptions.url;
   if (!isProtectedRoute(route)) return;
 
-  const expensive = route === '/mcp' || /\/search$|\/categories$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/listing-draft$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route);
+  const expensive = route === '/mcp' || /\/search$|\/categories$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/listing-draft$|\/flips\/import\/(?:url|screenshot)$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route);
   const limit = expensive ? 30 : 240;
   // Snapshot images use the general limit so a screen of saved photos loads.
   // Key on the route template, not the raw URL, so ids cannot mint new buckets.
@@ -730,6 +730,16 @@ app.post('/api/flips/:id/photos', async (request, reply) => {
   if (!params.success) return reply.code(400).send({ error: 'A valid flip id is required' });
   if (!Buffer.isBuffer(request.body)) return reply.code(415).send({ error: 'Send the photo as the request body with an image/jpeg, image/png or image/webp content type' });
   return reply.code(201).send({ photo: await flips.addPhoto(params.data.id, request.body) });
+});
+// Prefill a new flip from an offer link or a purchase screenshot; nothing is stored.
+app.post('/api/flips/import/url', async (request, reply) => {
+  const parsed = z.object({ url: z.string().trim().min(1).max(2000) }).strict().safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'An offer link is required' });
+  return { import: await service.importFlipFromUrl(parsed.data.url) };
+});
+app.post('/api/flips/import/screenshot', async (request, reply) => {
+  if (!Buffer.isBuffer(request.body)) return reply.code(415).send({ error: 'Send the screenshot as the request body with an image/jpeg, image/png or image/webp content type' });
+  return { import: await service.importFlipFromScreenshot(request.body) };
 });
 app.put('/api/flips/:id/photos/order', async (request, reply) => {
   const params = flipIdParams.safeParse(request.params);
