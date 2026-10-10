@@ -7,6 +7,7 @@ import { openDatabase } from '../server/db';
 import sharp from 'sharp';
 import { FlipStore, MAX_FLIP_PHOTO_EDGE, MAX_FLIP_PHOTOS, sniffImageMime, toWebp } from '../server/flips';
 import { ServiceError } from '../server/service';
+import type { PurchaseScreenshotReading } from '../server/vision';
 import { DEFAULT_FEE_PRESETS, estimatedNetAtTypical, listingConditionFromLabel, roundToNines, suggestedListingPrice, estimateFlipNet, flipNet, normalizeFeePresets, quarterOf, saleFee, salesRecord, salesRecordCsv } from '../src/profit';
 
 function fixture() {
@@ -264,6 +265,106 @@ test('a resale draft starts from the saved original listing and falls back to it
     db.close();
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('an offer page is read from its own product data, never from other offers on it', async () => {
+  const { parseOfferPage } = await import('../server/marketplaces');
+  const productPage = `<script type="application/ld+json">{"@type":"ItemList","itemListElement":[{"@type":"ListItem","name":"Inna oferta","offers":{"price":"10"}}]}</script>
+    <script type="application/ld+json">{"@context":"https://schema.org","@type":"Product","name":"RTX 3070 &amp; pudełko","offers":{"@type":"Offer","price":"1 199,99","priceCurrency":"PLN","itemCondition":"https://schema.org/UsedCondition"}}</script>`;
+  assert.deepEqual(parseOfferPage(productPage), { title: 'RTX 3070 & pudełko', price: 1199.99, condition: 'Używane', currency: 'PLN' });
+  const metaPage = '<meta property="og:title" content="Kurtka Patagonia M | Vinted"><meta property="product:price:amount" content="250.00"><meta property="product:price:currency" content="PLN">';
+  assert.deepEqual(parseOfferPage(metaPage), { title: 'Kurtka Patagonia M', price: 250, condition: null, currency: 'PLN' });
+  assert.equal(parseOfferPage('<meta property="og:title" content="Jacka"><meta property="product:price:amount" content="300"><meta property="product:price:currency" content="SEK">')!.price, null, 'a foreign price is not read as złoty');
+  assert.equal(parseOfferPage('<html><body>blocked</body></html>'), null);
+});
+
+test('a flip is prefilled from an offer link: a tracked listing first, else the live page', async () => {
+  const { ScoutService } = await import('../server/service');
+  const directory = mkdtempSync(join(tmpdir(), 'scout-flip-import-'));
+  const db = openDatabase(join(directory, 'scout.sqlite'));
+  const pages: string[] = [];
+  const service = new ScoutService(db, () => {}, {
+    fetchListingDetailHtml: async (url) => {
+      pages.push(url);
+      return '<script type="application/ld+json">{"@type":"Product","name":"Słuchawki Sony WH-1000XM4","offers":{"price":420,"priceCurrency":"PLN"}}</script>';
+    },
+  });
+  try {
+    const now = new Date().toISOString();
+    db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run('OLX', '9001', 'RTX 3070 Eagle', 1100, 'https://www.olx.pl/d/oferta/rtx-3070-CID99-ID1abc.html?reason=extended', now, now);
+    const tracked = await service.importFlipFromUrl(' https://www.olx.pl/d/oferta/rtx-3070-CID99-ID1abc.html#gallery ');
+    assert.equal(tracked.method, 'scout');
+    assert.equal(tracked.listingKey, 'OLX:9001', 'a tracked listing is linked so its resale draft can use it');
+    assert.deepEqual([tracked.title, tracked.buyChannel, tracked.buyPrice, tracked.boughtOn], ['RTX 3070 Eagle', 'OLX', 1100, null]);
+    assert.equal(tracked.url, 'https://www.olx.pl/d/oferta/rtx-3070-CID99-ID1abc.html', 'the link is kept without tracking parameters');
+    assert.equal(pages.length, 0, 'a tracked listing needs no page fetch');
+
+    const live = await service.importFlipFromUrl('https://www.vinted.pl/items/123-sluchawki');
+    assert.equal(live.method, 'page');
+    assert.deepEqual([live.title, live.buyChannel, live.buyPrice, live.listingKey], ['Słuchawki Sony WH-1000XM4', 'Vinted', 420, null]);
+    assert.deepEqual(pages, ['https://www.vinted.pl/items/123-sluchawki']);
+
+    await assert.rejects(service.importFlipFromUrl('https://allegro.pl/oferta/123'), (error: unknown) => error instanceof ServiceError && error.status === 400 && /OLX, Allegro Lokalnie or Vinted/.test(error.message));
+    await assert.rejects(service.importFlipFromUrl('http://www.olx.pl/d/oferta/x'), (error: unknown) => error instanceof ServiceError && error.status === 400);
+  } finally {
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a flip is prefilled from a purchase screenshot read by the vision model', async () => {
+  const { ScoutService } = await import('../server/service');
+  const directory = mkdtempSync(join(tmpdir(), 'scout-flip-screenshot-'));
+  const db = openDatabase(join(directory, 'scout.sqlite'));
+  const previousKey = process.env.SCOUT_OPENROUTER_API_KEY;
+  const seen: Array<{ imageDataUrl: string; today: string }> = [];
+  let reading: PurchaseScreenshotReading = { isPurchase: true, platform: 'Vinted', title: 'Kurtka Patagonia M', itemPrice: 180, extraCosts: 16.49, currency: 'PLN', date: '2026-10-05' };
+  const service = new ScoutService(db, () => {}, {
+    readPurchaseScreenshot: async (input) => { seen.push(input); return reading; },
+  });
+  const png = await sharp({ create: { width: 40, height: 80, channels: 3, background: '#fff' } }).png().toBuffer();
+  const today = new Date(2026, 9, 7, 12);
+  try {
+    delete process.env.SCOUT_OPENROUTER_API_KEY;
+    await assert.rejects(service.importFlipFromScreenshot(png, today), (error: unknown) => error instanceof ServiceError && error.status === 409);
+    process.env.SCOUT_OPENROUTER_API_KEY = 'test-key';
+
+    const result = await service.importFlipFromScreenshot(png, today);
+    assert.deepEqual(
+      [result.method, result.title, result.buyChannel, result.buyPrice, result.buyCosts, result.boughtOn, result.listingKey, result.warnings],
+      ['screenshot', 'Kurtka Patagonia M', 'Vinted', 180, 16.49, '2026-10-05', null, []],
+    );
+    assert.equal(seen[0].today, '2026-10-07');
+    assert.match(seen[0].imageDataUrl, /^data:image\/webp;base64,/);
+
+    reading = { ...reading, platform: null, currency: 'EUR', date: '2026-12-01' };
+    const foreign = await service.importFlipFromScreenshot(png, today);
+    assert.deepEqual([foreign.buyChannel, foreign.buyPrice, foreign.buyCosts, foreign.boughtOn], ['Other', null, null, null], 'foreign prices and future dates are left for the operator');
+    assert.equal(foreign.warnings.length, 2);
+
+    reading = { ...reading, title: null, itemPrice: null };
+    await assert.rejects(service.importFlipFromScreenshot(png, today), (error: unknown) => error instanceof ServiceError && error.status === 422);
+    await assert.rejects(service.importFlipFromScreenshot(Buffer.from('not an image'), today), (error: unknown) => error instanceof ServiceError && error.status === 415);
+  } finally {
+    if (previousKey === undefined) delete process.env.SCOUT_OPENROUTER_API_KEY;
+    else process.env.SCOUT_OPENROUTER_API_KEY = previousKey;
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('the purchase reader sends the screenshot and tidies what the model returns', async () => {
+  const { readPurchaseScreenshotWithVision } = await import('../server/vision');
+  let body: any;
+  const fetcher = (async (_url: string, init: RequestInit) => {
+    body = JSON.parse(String(init.body));
+    const content = JSON.stringify({ isPurchase: true, platform: 'allegro lokalnie', title: '  Lampa   biurkowa ', itemPrice: '89,99', extraCosts: 0, currency: 'zł', date: '2026-02-30x' });
+    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
+  }) as unknown as typeof fetch;
+  const reading = await readPurchaseScreenshotWithVision({ imageDataUrl: 'data:image/webp;base64,AAAA', today: '2026-10-07' }, { apiKey: 'k', model: 'vision/test' }, fetcher);
+  assert.deepEqual(reading, { isPurchase: true, platform: 'Allegro Lokalnie', title: 'Lampa biurkowa', itemPrice: 89.99, extraCosts: 0, currency: 'PLN', date: null });
+  assert.equal(body.model, 'vision/test');
+  assert.deepEqual(body.messages[1].content[1], { type: 'image_url', image_url: { url: 'data:image/webp;base64,AAAA' } });
 });
 
 test('estimates the net of reselling at the typical after the seller fee', () => {

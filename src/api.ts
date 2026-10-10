@@ -1,4 +1,4 @@
-import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, FeePresets, Flip, FlipListing, FlipPhoto, ListingCondition, FlipsData, NotificationPriority, NotificationRecord, OlxCategoryOption, PriceHistoryPoint, ResaleListingDraft, SearchFilters, SettingsData, VariantSuggestions, VerificationComparison, Watch, WatchAnalytics, Connector } from './types';
+import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, FeePresets, Flip, FlipImport, FlipListing, FlipPhoto, ListingCondition, FlipsData, NotificationPriority, NotificationRecord, OlxCategoryOption, PriceHistoryPoint, ResaleListingDraft, SearchFilters, SettingsData, VariantSuggestions, VerificationComparison, Watch, WatchAnalytics, Connector } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -123,6 +123,8 @@ export const api = {
   orderFlipPhotos: (id: number, ids: number[]) => request<{ flip: Flip }>(`/api/flips/${id}/photos/order`, json('PUT', { ids })),
   deleteFlipPhoto: (photoId: number) => request<{ ok: true }>(`/api/flip-photos/${photoId}`, json('DELETE')),
   flipPhotoUrl: (photoId: number) => `/api/flip-photos/${photoId}`,
+  importFlipFromUrl: (url: string) => request<{ import: FlipImport }>('/api/flips/import/url', json('POST', { url }), 60_000),
+  importFlipFromScreenshot: (image: Blob) => request<{ import: FlipImport }>('/api/flips/import/screenshot', { method: 'POST', headers: { 'content-type': image.type }, body: image }, 90_000),
   saveFeePresets: (presets: FeePresets) => request<{ feePresets: FeePresets }>('/api/flips/fee-presets', json('PUT', presets)),
   olxCategories: (query: string, signal?: AbortSignal) => request<{ categories: OlxCategoryOption[] }>(`/api/marketplaces/olx/categories?${new URLSearchParams({ query })}`, { signal }),
   search: (filters: SearchFilters, signal?: AbortSignal) => request<ManualSearchResponse>('/api/search', { ...json('POST', filters), signal }, 90_000),

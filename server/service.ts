@@ -7,11 +7,12 @@ import { connect as connectHttp2, type SecureClientSessionOptions } from 'node:h
 import { brotliDecompressSync, gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
 import type { Browser, BrowserContext } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
-import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, type SellerType, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult, olxDetailHint } from './marketplaces';
+import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseOfferPage, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, type SellerType, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult, olxDetailHint } from './marketplaces';
 import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, writeResaleListingWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseVerificationChecks, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type VerificationCheck } from './ai';
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyChecksWithJev, classifyWatchVariantWithJev, summarizeCheckResults, checkIssue, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
-import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, verifyListingDescriptionWithVision, visionToVerification } from './vision';
+import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, readPurchaseScreenshotWithVision, resolveVisionModel, verifyListingDescriptionWithVision, visionToVerification } from './vision';
+import { MAX_FLIP_PHOTO_BYTES, sniffImageMime, toWebp } from './flips';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { Limiter, mapPool } from './limiter';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
@@ -21,7 +22,7 @@ import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assi
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
-import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft } from '../src/types';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport } from '../src/types';
 import { estimatedNetAtTypical, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, type FeePresets } from '../src/profit';
 
 type Database = any;
@@ -245,6 +246,7 @@ export interface ScoutServiceDependencies {
   writeResaleListing?: typeof writeResaleListingWithDeepSeek;
   classifyListingRelevanceWithVision?: typeof classifyListingRelevanceWithVision;
   verifyListingDescriptionWithVision?: typeof verifyListingDescriptionWithVision;
+  readPurchaseScreenshot?: typeof readPurchaseScreenshotWithVision;
   fetchListingDetailHtml?: (url: string, marketplace: Marketplace) => Promise<string>;
   publicExposureWarning?: boolean;
   authEnabled?: boolean;
@@ -666,6 +668,7 @@ export class ScoutService {
   private readonly aiResaleListing: typeof writeResaleListingWithDeepSeek;
   private readonly visionRelevance: typeof classifyListingRelevanceWithVision;
   private readonly visionVerification: typeof verifyListingDescriptionWithVision;
+  private readonly readPurchaseScreenshot: typeof readPurchaseScreenshotWithVision;
   private readonly detailHtml: (url: string, marketplace: Marketplace) => Promise<string>;
   private readonly publicExposureWarning: boolean;
   private readonly authEnabled: boolean;
@@ -690,6 +693,7 @@ export class ScoutService {
     this.aiResaleListing = dependencies.writeResaleListing ?? writeResaleListingWithDeepSeek;
     this.visionRelevance = dependencies.classifyListingRelevanceWithVision ?? classifyListingRelevanceWithVision;
     this.visionVerification = dependencies.verifyListingDescriptionWithVision ?? verifyListingDescriptionWithVision;
+    this.readPurchaseScreenshot = dependencies.readPurchaseScreenshot ?? readPurchaseScreenshotWithVision;
     this.detailHtml = dependencies.fetchListingDetailHtml ?? ((url, marketplace) => this.fetchPublicPage(url, marketplace));
     this.publicExposureWarning = dependencies.publicExposureWarning ?? false;
     this.authEnabled = dependencies.authEnabled ?? false;
@@ -2703,6 +2707,120 @@ export class ScoutService {
       this.log('error', 'diagnostics', `Resale draft from notes: AI failed — ${error instanceof Error ? error.message : String(error)}`);
       throw new ServiceError(`AI could not write the listing: ${error instanceof Error ? error.message : String(error)}`, 502);
     }
+  }
+
+  /**
+   * Read a purchase from an offer link to prefill a new flip. A listing Scout
+   * tracks is taken as stored and linked, so its resale draft can reuse the
+   * original; anything else is read from the live offer page. Either way the
+   * price is the asking price, which the operator corrects if they haggled.
+   */
+  async importFlipFromUrl(rawUrl: string): Promise<FlipImport> {
+    const validation = validateSearchUrl(rawUrl.trim());
+    if (!validation.valid) {
+      throw new ServiceError(validation.reason === 'Marketplace domain is not approved' ? 'Paste an OLX, Allegro Lokalnie or Vinted offer link' : validation.reason, 400);
+    }
+    const { marketplace, url } = validation;
+    const bareUrl = new URL(url);
+    bareUrl.search = '';
+    bareUrl.hash = '';
+    // Offer pages need no query string; it only carries referrer tracking.
+    const bare = bareUrl.toString();
+    const askingPrice = 'The price is the asking price; change it if you paid less.';
+    // Stored URLs may carry tracking parameters, so match with or without them.
+    const sameUrl = 'marketplace = ? AND (url = ? OR url = ? OR substr(url, 1, ?) = ?)';
+    const urlArgs = [marketplace, url, bare, bare.length + 1, `${bare}?`];
+    const ordinary = this.stmt(`SELECT id, listing_id, title, price_pln FROM listings WHERE ${sameUrl} ORDER BY last_seen_at DESC, id DESC LIMIT 1`).get(...urlArgs) as Record<string, any> | undefined;
+    const research = ordinary ? undefined : this.stmt(`SELECT listing_id, title, last_price_pln AS price_pln FROM market_listings WHERE ${sameUrl} ORDER BY last_seen_at DESC, id DESC LIMIT 1`).get(...urlArgs) as Record<string, any> | undefined;
+    const known = ordinary ?? research;
+    if (known) {
+      const watch = ordinary ? this.stmt('SELECT watch_id FROM watch_listings WHERE listing_id = ? ORDER BY last_seen_at DESC, id DESC LIMIT 1').get(ordinary.id) as { watch_id?: string } | undefined : undefined;
+      return {
+        title: String(known.title).slice(0, 200),
+        buyChannel: marketplace,
+        buyPrice: Number(known.price_pln),
+        buyCosts: null,
+        boughtOn: null,
+        listingKey: `${marketplace}:${known.listing_id}`,
+        watchId: watch?.watch_id ?? null,
+        url: bare,
+        method: 'scout',
+        warnings: [askingPrice],
+      };
+    }
+
+    let summary: { title: string; price: number | null; currency: string | null } | null = null;
+    try {
+      summary = parseOfferPage(await this.detailHtml(url, marketplace));
+    } catch (error) {
+      this.log('info', 'diagnostics', `Flip import: could not fetch the ${marketplace} offer page — ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (summary?.price == null && summary?.currency == null) {
+      // The page was blocked or carried no price: try the connector's own
+      // detail route (the OLX offers API, Vinted's item page).
+      try {
+        const detail = await this.createConnectorAdapter(marketplace).fetchDetail(url);
+        if (detail.listing) summary = { title: detail.listing.title, price: detail.listing.price, currency: 'PLN' };
+      } catch { /* the page result, if any, stands */ }
+    }
+    if (!summary) throw new ServiceError(`Could not read the ${marketplace} offer. It may have ended, or ${marketplace} blocked the request; try a screenshot instead.`, 502);
+    const warnings = [askingPrice];
+    if (summary.currency && summary.currency !== 'PLN') warnings.unshift(`The offer is priced in ${summary.currency}; enter what you paid in złoty.`);
+    else if (summary.price === null) warnings.unshift('The offer page shows no price; enter what you paid.');
+    return {
+      title: summary.title.slice(0, 200),
+      buyChannel: marketplace,
+      buyPrice: summary.price,
+      buyCosts: null,
+      boughtOn: null,
+      listingKey: null,
+      watchId: null,
+      url: bare,
+      method: 'page',
+      warnings,
+    };
+  }
+
+  /**
+   * Read a purchase from a screenshot of an order, checkout or offer with the
+   * vision model. Needs OpenRouter; nothing is stored, the operator reviews
+   * the result in the new-flip form.
+   */
+  async importFlipFromScreenshot(data: Uint8Array, today = new Date()): Promise<FlipImport> {
+    const { apiKey } = this.deepSeekConfig();
+    if (!apiKey) throw new ServiceError('Reading a screenshot needs an OpenRouter API key in Settings', 409);
+    if (data.byteLength > MAX_FLIP_PHOTO_BYTES) throw new ServiceError('Screenshots can be at most 10 MB', 413);
+    if (!sniffImageMime(data)) throw new ServiceError('Screenshots must be JPEG, PNG or WebP', 415);
+    const image = await toWebp(data);
+    const todayDate = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    let reading: Awaited<ReturnType<typeof readPurchaseScreenshotWithVision>>;
+    try {
+      reading = await this.readPurchaseScreenshot({ imageDataUrl: `data:image/webp;base64,${image.toString('base64')}`, today: todayDate }, { apiKey, model: resolveVisionModel() });
+    } catch (error) {
+      this.log('error', 'diagnostics', `Flip import from a screenshot failed — ${error instanceof Error ? error.message : String(error)}`);
+      throw new ServiceError(`AI could not read the screenshot: ${error instanceof Error ? error.message : String(error)}`, 502);
+    }
+    if (!reading.title && reading.itemPrice === null) throw new ServiceError('No item or price found in that screenshot', 422);
+    const warnings: string[] = [];
+    if (!reading.isPurchase) warnings.push('This does not look like an order or offer; check every field.');
+    const foreign = reading.currency !== null && reading.currency !== 'PLN';
+    if (foreign) warnings.push(`The prices are in ${reading.currency}; enter what you paid in złoty.`);
+    if (!reading.platform) warnings.push('The platform was not recognised; pick where you bought it.');
+    if (!reading.title) warnings.push('No item name found; enter one.');
+    // A future date is a misreading; the form keeps today instead.
+    const boughtOn = reading.date && reading.date <= todayDate ? reading.date : null;
+    return {
+      title: reading.title ?? '',
+      buyChannel: reading.platform ?? 'Other',
+      buyPrice: foreign ? null : reading.itemPrice,
+      buyCosts: foreign ? null : reading.extraCosts,
+      boughtOn,
+      listingKey: null,
+      watchId: null,
+      url: null,
+      method: 'screenshot',
+      warnings,
+    };
   }
 
   /**
