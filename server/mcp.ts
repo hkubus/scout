@@ -35,6 +35,7 @@ export const SCOUT_MCP_TOOL_NAMES = [
   'scout_queue_scan',
   'scout_connectors',
   'scout_price_reference',
+  'scout_comparables',
 ] as const;
 
 export const SCOUT_MCP_DEBUG_TOOL_NAMES = [
@@ -119,6 +120,18 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
     annotations: { readOnlyHint: true, idempotentHint: true },
   }, async (input) => {
     try { return text(service.priceReference(input)); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_comparables', {
+    description: 'Other active listings of the same item as one listing: same watch and model variant, same condition class (new, used or damaged), seen by a scan within the last 12 h or two scan intervals. Cheapest first, with their median and how far this listing sits from it. Database only; asking prices.',
+    inputSchema: {
+      listingKey: z.string().min(3).max(500).describe('<Marketplace>:<listingId>'),
+      watchId: z.string().min(1).max(160).optional().describe('Place the listing in this watch instead of its most recent one.'),
+      limit: z.number().int().min(1).max(10).optional().describe('Comparables to return (default and max 10); count and median cover all of them.'),
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  }, async (input) => {
+    try { return text(service.comparables(input)); } catch (error) { return toolError(error); }
   });
 
   server.registerTool('scout_watch_analytics', {

@@ -227,7 +227,7 @@ curl -s -X POST http://127.0.0.1:3001/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-It is stateless (one fresh server per request, no session ids) and offers fourteen tools (plus the four read-only `scout_debug_*` tools while the [Debug API](#debug-api) is enabled): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail`, `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_olx_categories` (live OLX category counts for a query), `scout_queue_scan`, `scout_connectors`, and `scout_price_reference` (see below). `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. With auth enabled, MCP clients must send `Authorization: Bearer <token>` using a value from `SCOUT_API_TOKENS`.
+It is stateless (one fresh server per request, no session ids) and offers fifteen tools (plus the four read-only `scout_debug_*` tools while the [Debug API](#debug-api) is enabled): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail`, `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_olx_categories` (live OLX category counts for a query), `scout_queue_scan`, `scout_connectors`, `scout_price_reference` and `scout_comparables` (see below). `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. With auth enabled, MCP clients must send `Authorization: Bearer <token>` using a value from `SCOUT_API_TOKENS`.
 
 ### Negotiation tools
 
@@ -239,6 +239,12 @@ These tools serve [Hatbot](/root/hatbot/PLAN.md) (§16.4), which haggles on OLX,
   - A watch still learning its baseline uses its reference series' probable-sale band and says so (`typicalSource: "reference-band"`, `ready: false`). A research series uses its probable-sale band, or else the median asking price of its active listings.
   - `sources`, `minPrice` and `maxPrice` rank watches on those marketplaces first and are echoed under `filters.requested`; they do not re-filter stored prices.
   - Cost: database only, with no marketplace request and no AI call. At most five candidates are priced, at one baseline query each.
+- `scout_comparables({ listingKey, watchId?, limit? })` lists other active listings of the same item, cheapest first (at most 10). Each has its key, title, price, condition, location, shipping, days listed and URL. The result also gives `count` and `median` for all of them (the median from 3) and `vsMedian`, how far this listing sits from it in PLN and percent.
+  - **Same item**: the same watch and model variant as the listing's most recent watch association, or the watch given as `watchId`. A listing no watch has seen (a `scout_search` find) is placed by matching its title the way a scan would, and `watch.via` says `title-match`. With no matching watch, `watch` is `null` and the list is empty.
+  - **Similar condition**: the same class, new, used or damaged. Vinted's grades all count as used, because OLX only says Używane. When this listing's condition is unknown, every condition is included and a note says so.
+  - **Active**: seen by a scan within 12 hours (the feed's window), or within two scan intervals on a slower watch. Listings that are ended, hidden, AI-irrelevant or rejected by description verification are left out, as are those outside the watch's price and shipping filters.
+  - **Days listed** counts from the marketplace's posting time where one is reported (OLX), else from when Scout first saw the listing, which makes it a lower bound on Vinted and Allegro Lokalnie.
+  - Cost: database only. There is no `live` option: checking each comparable would take one detail request per listing. Use `scout_listing_detail` with `live: true` on the one you cite.
 
 ## iOS app
 

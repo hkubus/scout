@@ -347,6 +347,40 @@ export interface PriceReference {
   notes: string[];
 }
 
+/** Coarse condition class: Vinted's grades and OLX's Używane are all `used`. */
+export type ConditionClass = 'new' | 'used' | 'damaged';
+
+export interface ComparableListing {
+  /** `<Marketplace>:<listingId>`. */
+  key: string;
+  title: string;
+  price: number;
+  condition: string | null;
+  location: string | null;
+  /** Vinted always ships; null when the marketplace did not say. */
+  shipping: boolean | null;
+  /** Since the marketplace's posting time where it reports one (OLX), else since Scout first saw it. */
+  daysListed: number | null;
+  url: string;
+}
+
+/** scout_comparables: other active listings of the same item, cheapest first. */
+export interface Comparables {
+  listing: { key: string; price: number; condition: string | null; daysListed: number | null };
+  /** How the item was placed: its own watch association, or its title matched the way a scan would. Null when no watch tracks it. */
+  watch: { id: string; name: string; variant: string | null; via: 'association' | 'title-match' } | null;
+  /** The condition class comparables were limited to; null when this listing's condition is unknown. */
+  condition: ConditionClass | null;
+  /** All matching comparables; `comparables` holds the cheapest of them. */
+  count: number;
+  /** Median price of all matching comparables, from 3 of them. */
+  median: number | null;
+  /** This listing's price against that median: negative is below it. */
+  vsMedian: { pln: number; percent: number } | null;
+  comparables: ComparableListing[];
+  notes: string[];
+}
+
 export interface AnalyticsDiscountBucket {
   label: string;
   count: number;

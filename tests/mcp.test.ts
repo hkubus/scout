@@ -162,3 +162,36 @@ test('scout_price_reference prices a matched watch and returns a null best when 
     }
   } finally { context.close(); }
 });
+
+test('scout_comparables returns compact comparables and a tool error for an unknown listing', async () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at)
+      VALUES ('gpu-watch', 'GPU watch', 'rtx 3080', '["OLX"]', 1, ?, ?, ?)`).run(now, now, now);
+    const insertRow = context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, condition, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    [['subject', 2000], ['a', 1900], ['b', 2100], ['c', 2200]].forEach(([id, price]) => {
+      const { lastInsertRowid } = insertRow.run('OLX', id, `RTX 3080 ${id}`, price, `https://www.olx.pl/d/oferta/${id}`, 'Używane', now, now);
+      insertObservation.run(lastInsertRowid, 'gpu-watch', price, now);
+    });
+    const { server, client } = await connectedClient(context.service);
+    try {
+      const tool = (await client.listTools()).tools.find((entry) => entry.name === 'scout_comparables')!;
+      assert.deepEqual(tool.annotations, { readOnlyHint: true, idempotentHint: true });
+
+      const text = toolText(await client.callTool({ name: 'scout_comparables', arguments: { listingKey: 'OLX:subject', limit: 2 } }) as never);
+      const result = JSON.parse(text);
+      assert.equal(text, JSON.stringify(result), 'tool text is compact JSON');
+      assert.deepEqual(result.comparables.map((item: { key: string }) => item.key), ['OLX:a', 'OLX:b']);
+      assert.deepEqual([result.count, result.median, result.vsMedian], [3, 2100, { pln: -100, percent: -4.8 }]);
+
+      const missing = await client.callTool({ name: 'scout_comparables', arguments: { listingKey: 'OLX:nope' } }) as never as { isError?: boolean; content: Array<{ text?: string }> };
+      assert.equal(missing.isError, true);
+      assert.match(String(missing.content[0].text), /not in Scout's database/);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});

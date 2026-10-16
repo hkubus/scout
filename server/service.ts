@@ -19,11 +19,12 @@ import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStre
 import { pickVariantBatch, typoVariants } from './typos';
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
 import { matchQuality, matchQuery, type MatchCandidate, type QueryMatch } from './queryMatch';
+import { conditionClass, daysListed } from './negotiation';
 import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assignVariant, finalizeVariantSuggestions, parseVariantGroups, suggestVariantGroupsFromTitles, variantLabelFor, type VariantGroup, type VariantSample } from './variants';
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
-import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand } from '../src/types';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing } from '../src/types';
 import { estimatedNetAtTypical, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, type FeePresets } from '../src/profit';
 
 type Database = any;
@@ -170,6 +171,12 @@ const SALE_BAND_WINDOW_DAYS = 90;
 const PRICE_REFERENCE_CANDIDATES = 5;
 /** A research series' probable-sale band counts as ready from this many eligible samples. */
 const RESEARCH_READY_SAMPLES = 10;
+/** scout_comparables returns at most this many listings. */
+const COMPARABLES_LIMIT = 10;
+/** Its median needs this many comparables. */
+const COMPARABLES_MEDIAN_MIN = 3;
+/** Comparable titles are cut to this length; Hatbot pays per token. */
+const COMPARABLE_TITLE_CHARS = 100;
 /** Bounded per-scan capture of preserved listing copies (description + downloaded images). */
 const SNAPSHOT_CAPTURES_PER_SCAN = 8;
 const SNAPSHOT_MAX_IMAGES = 12;
@@ -3221,6 +3228,112 @@ export class ScoutService {
       typicalSource: priced ? 'research-asking' as const : null,
       observationHours,
     };
+  }
+
+  /**
+   * Other active listings of the same item (scout_comparables): the same watch
+   * and model variant, the same condition class, seen by a scan recently
+   * enough to still be up, inside the watch's own price and shipping filters.
+   * A listing with no watch (a manual search find) is placed by matching its
+   * title the way a scan would. Database only; asking prices.
+   */
+  comparables(input: { listingKey: string; watchId?: string | null; limit?: number }): Comparables {
+    const { marketplace, listingId } = parseListingKey(input.listingKey);
+    const limit = Math.max(1, Math.min(COMPARABLES_LIMIT, Math.floor(input.limit ?? COMPARABLES_LIMIT)));
+    const subject = this.stmt('SELECT id, title, price_pln, condition, posted_at, first_seen_at FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as Record<string, any> | undefined;
+    if (!subject) throw new ServiceError(`${input.listingKey} is not in Scout's database yet; find it with scout_search or a watch scan first`, 404);
+    const watchId = input.watchId ?? null;
+    if (watchId !== null && !this.stmt('SELECT 1 FROM watches WHERE id = ? AND archived_at IS NULL').get(watchId)) throw new ServiceError('Watch not found', 404);
+    const subjectPrice = Number(subject.price_pln);
+    const listing = { key: `${marketplace}:${listingId}`, price: subjectPrice, condition: subject.condition ?? null, daysListed: daysListed(subject.posted_at, subject.first_seen_at) };
+    const condition = conditionClass(subject.condition);
+    const notes = ['Asking prices, not completed sales.'];
+
+    // Placement: the listing's own association (newest first), else its title.
+    const association = this.stmt(`SELECT wl.watch_id, wl.variant_key FROM watch_listings wl JOIN watches w ON w.id = wl.watch_id
+      WHERE wl.listing_id = ? AND w.archived_at IS NULL AND (? IS NULL OR wl.watch_id = ?)
+      ORDER BY wl.last_seen_at DESC, wl.id DESC LIMIT 1`).get(subject.id, watchId, watchId) as { watch_id: string; variant_key: string | null } | undefined;
+    let row: WatchRow | undefined;
+    let variantKey: string | null = null;
+    let via: 'association' | 'title-match' = 'association';
+    if (association) {
+      row = this.stmt('SELECT * FROM watches WHERE id = ?').get(association.watch_id) as WatchRow;
+      variantKey = association.variant_key ?? null;
+    } else {
+      const rows = (watchId !== null
+        ? this.stmt('SELECT * FROM watches WHERE id = ?').all(watchId)
+        : this.stmt('SELECT * FROM watches WHERE archived_at IS NULL').all()) as WatchRow[];
+      const byId = new Map(rows.map((entry) => [String(entry.id), entry]));
+      const candidates: MatchCandidate[] = rows.map((entry) => ({
+        kind: 'watch', id: String(entry.id), name: String(entry.name), query: String(entry.query),
+        includedTerms: String(entry.included_terms ?? ''), excludedTerms: String(entry.excluded_terms ?? ''), groups: parseVariantGroups(entry.variant_groups_json),
+      }));
+      // A scan keeps a title that has every included term; the watch whose
+      // terms explain most of the title is the most specific one.
+      const placed = matchQuery(String(subject.title), candidates)
+        .filter((match) => match.match !== 'narrower')
+        .sort((a, b) => b.matchedTokens.length - a.matchedTokens.length
+          || Number(a.variantKey === OTHER_VARIANT_KEY) - Number(b.variantKey === OTHER_VARIANT_KEY))[0];
+      if (placed) {
+        row = byId.get(placed.candidate.id);
+        variantKey = placed.variantKey;
+        via = 'title-match';
+      }
+    }
+    if (!row) {
+      notes.push('No watch tracks this item, so Scout has no comparables for it.');
+      return { listing, watch: null, condition, count: 0, median: null, vsMedian: null, comparables: [], notes };
+    }
+    const groups = parseVariantGroups(row.variant_groups_json);
+    const bucketKey = groups.length ? variantKey ?? OTHER_VARIANT_KEY : null;
+    const watch = { id: String(row.id), name: String(row.name), variant: bucketKey === null ? null : variantLabelFor(bucketKey, groups), via };
+    if (bucketKey === OTHER_VARIANT_KEY) notes.push('This listing is in the watch\'s Other bucket, which mixes models.');
+
+    // A listing is still up if a scan saw it within the feed's freshness
+    // window, or within two of its marketplace's scan intervals when slower.
+    const sources = parseJson<Marketplace[]>(row.sources_json, []);
+    const intervals = watchSourceIntervals(sources, Number(row.interval_minutes), parseJson<Record<string, unknown>>(row.source_intervals_json, {}));
+    const now = Date.now();
+    const cutoffFor = (source: string) => new Date(now - Math.max(MATCH_VISIBILITY_MS, 2 * (intervals[source] ?? 0) * 60_000)).toISOString();
+    const earliest = [...sources, marketplace].map(cutoffFor).sort()[0];
+    const rows = this.stmt(`SELECT l.marketplace, l.listing_id, l.title, l.price_pln, l.url, l.condition, l.location, l.shipping_available, l.posted_at, l.first_seen_at, wl.last_seen_at AS seen_at
+      FROM watch_listings wl
+      JOIN listings l ON l.id = wl.listing_id
+      LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id
+      WHERE wl.watch_id = ? AND (? IS NULL OR COALESCE(wl.variant_key, ?) = ?) AND l.id != ?
+        AND wl.last_seen_at > ? AND l.price_pln > 0
+        AND COALESCE(l.availability_status, 'live') != 'terminal'
+        AND COALESCE(a.hidden, 0) = 0
+        AND COALESCE(l.ai_description_verification_status, '') != 'reject'
+        AND (? = 0 OR NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))))
+        AND (? = 0 OR l.marketplace = 'Vinted' OR l.shipping_available = 1)
+        AND (? IS NULL OR l.price_pln >= ?) AND (? IS NULL OR l.price_pln <= ?)`).all(
+      row.id, bucketKey, OTHER_VARIANT_KEY, bucketKey, subject.id,
+      earliest,
+      row.ai_relevance === false || row.ai_relevance === 0 ? 0 : 1,
+      row.shipping_only ? 1 : 0,
+      row.min_price_pln, row.min_price_pln, row.max_price_pln, row.max_price_pln,
+    ) as Array<Record<string, any>>;
+    const matching = rows
+      .filter((item) => String(item.seen_at) > cutoffFor(String(item.marketplace)))
+      .filter((item) => condition === null || conditionClass(item.condition) === condition)
+      .map((item): ComparableListing => ({
+        key: `${item.marketplace}:${item.listing_id}`,
+        title: String(item.title).slice(0, COMPARABLE_TITLE_CHARS),
+        price: Number(item.price_pln),
+        condition: item.condition ?? null,
+        location: item.location ?? null,
+        shipping: item.marketplace === 'Vinted' ? true : item.shipping_available === null || item.shipping_available === undefined ? null : Boolean(item.shipping_available),
+        daysListed: daysListed(item.posted_at, item.first_seen_at, now),
+        url: String(item.url),
+      }))
+      .sort((a, b) => a.price - b.price || (a.daysListed ?? 0) - (b.daysListed ?? 0) || a.key.localeCompare(b.key));
+    if (condition === null) notes.push('This listing\'s condition is unknown, so comparables of every condition are included.');
+    const middle = matching.length >= COMPARABLES_MEDIAN_MIN ? median(matching.map((item) => item.price)) : null;
+    const vsMedian = middle !== null && middle > 0 && subjectPrice > 0
+      ? { pln: roundPln(subjectPrice - middle)!, percent: Math.round(((subjectPrice - middle) / middle) * 1000) / 10 }
+      : null;
+    return { listing, watch, condition, count: matching.length, median: roundPln(middle), vsMedian, comparables: matching.slice(0, limit), notes };
   }
 
   /**
