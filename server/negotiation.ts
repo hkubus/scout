@@ -1,8 +1,10 @@
 /**
  * Pure helpers for the negotiation tools (scout_comparables,
- * scout_listing_detail's negotiation block).
+ * scout_listing_detail's negotiation block, recorded outcomes).
  */
 import { listingConditionFromLabel } from '../src/profit';
+import type { OutcomeShare } from '../src/types';
+import { percentile } from './scoring';
 import { normalizeFilterText } from './text';
 
 export type ConditionClass = 'new' | 'used' | 'damaged';
@@ -63,4 +65,16 @@ export function titleSimilarity(left: string, right: string) {
   let shared = 0;
   for (const word of a) if (b.has(word)) shared += 1;
   return shared / (a.size + b.size - shared);
+}
+
+/** A final price as a share of the asking price, to 2 decimals. */
+export function shareOfAsking(price: number | null, asking: number) {
+  return price !== null && price > 0 && asking > 0 ? Math.round((price / asking) * 100) / 100 : null;
+}
+
+/** How a set of recorded negotiations went: how many, how many agreed, and the median share of asking paid. */
+export function outcomeShare(rows: Array<{ outcome: string; asking: number; price: number | null }>): OutcomeShare {
+  const shares = rows.filter((row) => row.outcome === 'agreed').map((row) => shareOfAsking(row.price, row.asking)).filter((share): share is number => share !== null);
+  const median = percentile(shares, 0.5);
+  return { negotiations: rows.length, agreed: shares.length, shareOfAsking: median === null ? null : Math.round(median * 100) / 100 };
 }

@@ -40,7 +40,7 @@ test('exposes the documented Scout tool surface', async () => {
       const listed = await client.listTools();
       assert.deepEqual(listed.tools.map((tool) => tool.name).sort(), [...SCOUT_MCP_TOOL_NAMES].sort());
       // Hatbot's contract: every read tool says so; only these write.
-      const writers = new Set(['scout_queue_scan']);
+      const writers = new Set(['scout_queue_scan', 'scout_record_outcome']);
       for (const tool of listed.tools) assert.equal(tool.annotations?.readOnlyHint, !writers.has(tool.name), tool.name);
     } finally {
       await client.close();
@@ -218,6 +218,36 @@ test('scout_listing_detail adds the negotiation block and a compact format', asy
 
       const full = JSON.parse(toolText(await client.callTool({ name: 'scout_listing_detail', arguments: { key: 'OLX:11' } }) as never));
       assert.ok(Array.isArray(full.history) && full.negotiation && full.liveCheck === null);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});
+
+test('scout_record_outcome takes Hatbot\'s call, is idempotent per negotiation, and errors in the tool shape', async () => {
+  const context = fixture();
+  try {
+    const { server, client } = await connectedClient(context.service);
+    try {
+      const tool = (await client.listTools()).tools.find((entry) => entry.name === 'scout_record_outcome')!;
+      assert.deepEqual(tool.annotations, { readOnlyHint: false, destructiveHint: false, idempotentHint: true });
+
+      // What Hatbot's negotiate_close sends, plus its negotiation id.
+      const call = { negotiationId: 'neg-1', listingKey: 'OLX:11', outcome: 'agreed', price: 1700, asking: 2000, currency: 'PLN' };
+      const text = toolText(await client.callTool({ name: 'scout_record_outcome', arguments: call }) as never);
+      const recorded = JSON.parse(text);
+      assert.equal(text, JSON.stringify(recorded), 'tool text is compact JSON');
+      assert.deepEqual([recorded.created, recorded.shareOfAsking, recorded.watchId, recorded.role], [true, 0.85, null, 'buy']);
+      assert.equal(JSON.parse(toolText(await client.callTool({ name: 'scout_record_outcome', arguments: call }) as never)).created, false);
+      assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM negotiation_outcomes').get() as { count: number }).count, 1);
+
+      const failed = await client.callTool({ name: 'scout_record_outcome', arguments: { ...call, negotiationId: 'neg-2', price: null } }) as { isError?: boolean; content: Array<{ type: string; text?: string }> };
+      assert.equal(failed.isError, true);
+      assert.deepEqual(JSON.parse(toolText(failed)), { error: 'An agreed outcome needs its final price' });
+
+      const reference = JSON.parse(toolText(await client.callTool({ name: 'scout_price_reference', arguments: { query: 'rtx 3080' } }) as never));
+      assert.deepEqual(reference.outcomes.buy.marketplaces.OLX, { negotiations: 1, agreed: 1, shareOfAsking: 0.85 });
     } finally {
       await client.close();
       await server.close();

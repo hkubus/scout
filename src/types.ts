@@ -344,7 +344,46 @@ export interface PriceReference {
   /** The best-matching figure with a price from at least 4 samples, or null. Never a partial object. */
   best: PriceReferenceFigure | null;
   matches: PriceReferenceMatch[];
+  /** Final prices of the operator's own negotiations; null until one is recorded. Never part of typicalPrice. */
+  outcomes: PriceReferenceOutcomes | null;
   notes: string[];
+}
+
+export type NegotiationRole = 'buy' | 'sell';
+export type NegotiationOutcome = 'agreed' | 'lost' | 'abandoned' | 'expired';
+
+export interface OutcomeShare {
+  /** Negotiations recorded, whatever their outcome. */
+  negotiations: number;
+  agreed: number;
+  /** Median of final price ÷ asking price over the agreed ones, to 2 decimals; null with none agreed. */
+  shareOfAsking: number | null;
+}
+
+export interface RoleOutcomes extends OutcomeShare {
+  marketplaces: Partial<Record<Marketplace, OutcomeShare>>;
+  /** Watches among this query's matches that have outcomes. */
+  watches: Array<OutcomeShare & { id: string; name: string; marketplaces: Partial<Record<Marketplace, OutcomeShare>> }>;
+}
+
+/** Recorded outcomes by role; a role with none is left out. */
+export type PriceReferenceOutcomes = Partial<Record<NegotiationRole, RoleOutcomes>>;
+
+/** scout_record_outcome's reply: the stored outcome. */
+export interface RecordedOutcome {
+  negotiationId: string;
+  listingKey: string;
+  role: NegotiationRole;
+  outcome: NegotiationOutcome;
+  asking: number;
+  price: number | null;
+  shareOfAsking: number | null;
+  rounds: number | null;
+  date: string;
+  /** The watch the listing was placed in; null when no watch tracks it. */
+  watchId: string | null;
+  /** False when this negotiation id was already recorded; its row was updated instead. */
+  created: boolean;
 }
 
 /** Coarse condition class: Vinted's grades and OLX's Używane are all `used`. */

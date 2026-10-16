@@ -70,11 +70,12 @@ function stripLeadingComments(sql: string) {
 }
 
 /**
- * The operator's private bookkeeping (the flip ledger) is not debugging data:
- * it is left out of the table list, refused in read-only SQL, and emptied in
- * snapshots. Export it through the authenticated /api/export instead.
+ * The operator's private bookkeeping (the flip ledger and the outcomes of
+ * their negotiations) is not debugging data: it is left out of the table
+ * list, refused in read-only SQL, and emptied in snapshots. Export it through
+ * the authenticated /api/export instead.
  */
-const PRIVATE_TABLES = ['flips', 'flip_photos'];
+const PRIVATE_TABLES = ['flips', 'flip_photos', 'negotiation_outcomes'];
 const PRIVATE_TABLE_PATTERN = new RegExp(`\\b(?:${PRIVATE_TABLES.join('|')})\\b`, 'i');
 
 const quoteIdent = (name: string) => `"${name.replace(/"/g, '""')}"`;
@@ -84,6 +85,7 @@ const quoteIdent = (name: string) => `"${name.replace(/"/g, '""')}"`;
 // runs one statement, and prints rows as JSON with blobs and bigints made safe.
 const QUERY_CHILD = `
 const { DatabaseSync, constants } = require('node:sqlite');
+const privateTables = new Set(${JSON.stringify(PRIVATE_TABLES)});
 let input = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => { input += chunk; });
@@ -95,7 +97,7 @@ process.stdin.on('end', () => {
     db = new DatabaseSync(path, { readOnly: true });
     db.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 2000;');
     if (typeof db.setAuthorizer === 'function' && constants) {
-      db.setAuthorizer((action, table, column) => (action === constants.SQLITE_READ && (table === 'flips' || table === 'flip_photos') ? constants.SQLITE_DENY
+      db.setAuthorizer((action, table, column) => (action === constants.SQLITE_READ && privateTables.has(table) ? constants.SQLITE_DENY
         : action === constants.SQLITE_READ && table === 'marketplace_sessions' && column === 'storage_state_encrypted' ? constants.SQLITE_IGNORE : constants.SQLITE_OK));
     }
   } catch (error) { out({ error: 'open', message: String(error && error.message || error) }); return; }
@@ -245,7 +247,7 @@ export class ScoutDebug {
     const statementText = stripLeadingComments(sql);
     if (!READ_STATEMENT.test(statementText)) throw new ServiceError('Only SELECT, WITH, VALUES, EXPLAIN, and PRAGMA statements are allowed', 400);
     // Belt and braces with the child's authorizer, which older Node builds lack.
-    if (PRIVATE_TABLE_PATTERN.test(statementText)) throw new ServiceError('The flip ledger is private and not available through the debug API', 403);
+    if (PRIVATE_TABLE_PATTERN.test(statementText)) throw new ServiceError('The flip ledger and negotiation outcomes are private and not available through the debug API', 403);
     const limit = Math.min(Math.max(1, Math.trunc(maxRows)), QUERY_MAX_ROWS);
     const started = performance.now();
     const result = await runQueryChild({ path: this.databasePath, sql: statementText, params, maxRows: limit }, this.queryTimeoutMs);

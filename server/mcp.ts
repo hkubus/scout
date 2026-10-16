@@ -36,6 +36,7 @@ export const SCOUT_MCP_TOOL_NAMES = [
   'scout_connectors',
   'scout_price_reference',
   'scout_comparables',
+  'scout_record_outcome',
 ] as const;
 
 export const SCOUT_MCP_DEBUG_TOOL_NAMES = [
@@ -136,6 +137,26 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
     annotations: { readOnlyHint: true, idempotentHint: true },
   }, async (input) => {
     try { return text(service.comparables(input)); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_record_outcome', {
+    description: 'Record how one of your negotiations ended: asking price, final price and outcome. negotiationId is the idempotency key: recording it again updates the same outcome, and optional fields left out keep their stored values. Kept apart from every asking-price statistic; scout_price_reference reports it under outcomes as the final price\'s share of asking. PLN only.',
+    inputSchema: {
+      negotiationId: z.string().trim().min(1).max(160).describe('The caller\'s own negotiation id.'),
+      listingKey: z.string().min(3).max(500).describe('<Marketplace>:<listingId>'),
+      outcome: z.enum(['agreed', 'lost', 'abandoned', 'expired']),
+      asking: z.number().positive().max(10_000_000).describe('Asking price when the negotiation started, PLN.'),
+      price: z.number().positive().max(10_000_000).nullable().optional().describe('Final agreed price, PLN; required when agreed.'),
+      role: z.enum(['buy', 'sell']).optional().describe('Default buy.'),
+      rounds: z.number().int().min(0).max(1000).optional().describe('Offers exchanged.'),
+      date: z.string().regex(/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/).optional().describe('YYYY-MM-DD; default today.'),
+      note: z.string().max(1000).optional(),
+      currency: z.string().trim().max(8).optional().describe('Only PLN is accepted.'),
+      watchId: z.string().min(1).max(160).optional().describe('File it under this watch instead of the one the listing belongs to.'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  }, async (input) => {
+    try { return text(service.recordOutcome(input)); } catch (error) { return toolError(error); }
   });
 
   server.registerTool('scout_watch_analytics', {

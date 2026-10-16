@@ -19,12 +19,12 @@ import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStre
 import { pickVariantBatch, typoVariants } from './typos';
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
 import { matchQuality, matchQuery, type MatchCandidate, type QueryMatch } from './queryMatch';
-import { conditionClass, daysListed, priceDrops, titleSimilarity } from './negotiation';
+import { conditionClass, daysListed, outcomeShare, priceDrops, shareOfAsking, titleSimilarity } from './negotiation';
 import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assignVariant, finalizeVariantSuggestions, parseVariantGroups, suggestVariantGroupsFromTitles, variantLabelFor, type VariantGroup, type VariantSample } from './variants';
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
-import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, ListingLiveCheck, ListingNegotiation, Relist } from '../src/types';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes } from '../src/types';
 import { estimatedNetAtTypical, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, type FeePresets } from '../src/profit';
 
 type Database = any;
@@ -403,6 +403,8 @@ const EXPORT_TABLES = [
   // The operator's own flip ledger: their data, so it is exported, but
   // never exposed through the debug API.
   ['flips', 'flips'],
+  // Likewise the outcomes of the operator's negotiations (scout_record_outcome).
+  ['negotiationOutcomes', 'negotiation_outcomes'],
   ['listings', 'listings'],
   ['observations', 'observations'],
   ['listingRelevance', 'listing_relevance'],
@@ -3169,12 +3171,107 @@ export class ScoutService {
       p25: top.entry.p25, p75: top.entry.p75, samples: top.entry.samples, ready: top.entry.ready, basis: top.entry.basis, updatedAt: top.entry.updatedAt,
     } : null;
     const matches = priced.slice(0, limit).map(({ entry }) => entry);
+    const outcomes = this.negotiationOutcomes(matches.filter((entry) => entry.kind === 'watch'));
     const notes = ['Asking prices, not completed sales.'];
     if (matches.some((entry) => entry.typicalSource === 'reference-band' || entry.typicalSource === 'probable-sale-band')) {
       notes.push('Probable-sale bands use the last asking price of listings that disappeared, not confirmed sale prices.');
     }
     if (!matches.length) notes.push('No watch or research series matches this query.');
-    return { query: input.query, best, matches, notes };
+    if (outcomes) notes.push('outcomes are the final prices of your recorded negotiations as a share of asking; they are not part of any typical price.');
+    return { query: input.query, best, matches, outcomes, notes };
+  }
+
+  /**
+   * The operator's recorded negotiations, by role: overall, per marketplace,
+   * and per matched watch. Null until one is recorded.
+   */
+  private negotiationOutcomes(watches: Array<{ id: string; name: string }>): PriceReferenceOutcomes | null {
+    const rows = (this.stmt('SELECT marketplace, watch_id, role, outcome, asking_price_pln, final_price_pln FROM negotiation_outcomes').all() as Array<Record<string, any>>)
+      .map((row) => ({
+        marketplace: String(row.marketplace), watchId: row.watch_id === null ? null : String(row.watch_id), role: String(row.role), outcome: String(row.outcome),
+        asking: Number(row.asking_price_pln), price: row.final_price_pln === null ? null : Number(row.final_price_pln),
+      }));
+    if (!rows.length) return null;
+    type Row = (typeof rows)[number];
+    const byMarketplace = (items: Row[]) => Object.fromEntries(marketplaces
+      .filter((source) => items.some((item) => item.marketplace === source))
+      .map((source) => [source, outcomeShare(items.filter((item) => item.marketplace === source))])) as RoleOutcomes['marketplaces'];
+    const result: PriceReferenceOutcomes = {};
+    for (const role of ['buy', 'sell'] as const) {
+      const own = rows.filter((row) => row.role === role);
+      if (!own.length) continue;
+      result[role] = {
+        ...outcomeShare(own),
+        marketplaces: byMarketplace(own),
+        watches: watches.flatMap((watch) => {
+          const items = own.filter((item) => item.watchId === watch.id);
+          return items.length ? [{ id: watch.id, name: watch.name, ...outcomeShare(items), marketplaces: byMarketplace(items) }] : [];
+        }),
+      };
+    }
+    return result;
+  }
+
+  /**
+   * scout_record_outcome: how one of the operator's negotiations ended.
+   * Hatbot's negotiation id is the key, so recording it again updates that
+   * row, and optional fields left out keep their stored values. The listing
+   * need not be in Scout's database; when it is, the outcome is filed under
+   * the watch it was placed in at the first recording.
+   */
+  recordOutcome(input: {
+    negotiationId: string;
+    listingKey: string;
+    outcome: NegotiationOutcome;
+    asking: number;
+    price?: number | null;
+    role?: NegotiationRole;
+    rounds?: number;
+    date?: string;
+    note?: string;
+    currency?: string;
+    watchId?: string;
+  }): RecordedOutcome {
+    const { marketplace, listingId } = parseListingKey(input.listingKey);
+    if (input.currency !== undefined && input.currency.trim().toUpperCase() !== 'PLN') throw new ServiceError('Scout records prices in PLN only', 400);
+    const existing = this.stmt('SELECT * FROM negotiation_outcomes WHERE negotiation_id = ?').get(input.negotiationId) as Record<string, any> | undefined;
+    const price = input.price === undefined ? (existing?.final_price_pln ?? null) : input.price;
+    if (input.outcome === 'agreed' && price === null) throw new ServiceError('An agreed outcome needs its final price', 400);
+    let watchId: string | null;
+    if (input.watchId !== undefined) {
+      if (!this.stmt('SELECT 1 FROM watches WHERE id = ?').get(input.watchId)) throw new ServiceError('Watch not found', 404);
+      watchId = input.watchId;
+    } else if (existing && existing.marketplace === marketplace && existing.listing_id === listingId) {
+      watchId = existing.watch_id ?? null;
+    } else {
+      const listing = this.stmt('SELECT id, title FROM listings WHERE marketplace = ? AND listing_id = ?').get(marketplace, listingId) as { id: number; title: string } | undefined;
+      watchId = listing ? (this.placeListing(Number(listing.id), String(listing.title), null)?.row.id ?? null) : null;
+    }
+    const role = input.role ?? (existing?.role as NegotiationRole | undefined) ?? 'buy';
+    const rounds = input.rounds ?? (existing?.rounds ?? null);
+    const date = input.date ?? (existing?.decided_on as string | undefined) ?? this.localDateAndTime().date;
+    const note = input.note ?? String(existing?.note ?? '');
+    const now = nowIso();
+    this.stmt(`INSERT INTO negotiation_outcomes (negotiation_id, marketplace, listing_id, watch_id, role, outcome, asking_price_pln, final_price_pln, rounds, decided_on, note, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(negotiation_id) DO UPDATE SET marketplace = excluded.marketplace, listing_id = excluded.listing_id, watch_id = excluded.watch_id, role = excluded.role,
+        outcome = excluded.outcome, asking_price_pln = excluded.asking_price_pln, final_price_pln = excluded.final_price_pln, rounds = excluded.rounds,
+        decided_on = excluded.decided_on, note = excluded.note, updated_at = excluded.updated_at`).run(
+      input.negotiationId, marketplace, listingId, watchId, role, input.outcome, input.asking, price, rounds, date, note, now, now,
+    );
+    return {
+      negotiationId: input.negotiationId,
+      listingKey: `${marketplace}:${listingId}`,
+      role,
+      outcome: input.outcome,
+      asking: input.asking,
+      price,
+      shareOfAsking: input.outcome === 'agreed' ? shareOfAsking(price, input.asking) : null,
+      rounds,
+      date,
+      watchId: watchId === null ? null : String(watchId),
+      created: !existing,
+    };
   }
 
   /** A watch bucket's figures, scored exactly as scans score against it. */
@@ -3248,6 +3345,35 @@ export class ScoutService {
    * A listing with no watch (a manual search find) is placed by matching its
    * title the way a scan would. Database only; asking prices.
    */
+  /**
+   * The watch a listing belongs to: its own association (newest first), else
+   * its title matched the way a scan would. Null when no watch tracks it.
+   */
+  private placeListing(listingRowId: number, title: string, watchId: string | null): { row: WatchRow; variantKey: string | null; via: 'association' | 'title-match' } | null {
+    const association = this.stmt(`SELECT wl.watch_id, wl.variant_key FROM watch_listings wl JOIN watches w ON w.id = wl.watch_id
+      WHERE wl.listing_id = ? AND w.archived_at IS NULL AND (? IS NULL OR wl.watch_id = ?)
+      ORDER BY wl.last_seen_at DESC, wl.id DESC LIMIT 1`).get(listingRowId, watchId, watchId) as { watch_id: string; variant_key: string | null } | undefined;
+    if (association) {
+      return { row: this.stmt('SELECT * FROM watches WHERE id = ?').get(association.watch_id) as WatchRow, variantKey: association.variant_key ?? null, via: 'association' };
+    }
+    const rows = (watchId !== null
+      ? this.stmt('SELECT * FROM watches WHERE id = ?').all(watchId)
+      : this.stmt('SELECT * FROM watches WHERE archived_at IS NULL').all()) as WatchRow[];
+    const byId = new Map(rows.map((entry) => [String(entry.id), entry]));
+    const candidates: MatchCandidate[] = rows.map((entry) => ({
+      kind: 'watch', id: String(entry.id), name: String(entry.name), query: String(entry.query),
+      includedTerms: String(entry.included_terms ?? ''), excludedTerms: String(entry.excluded_terms ?? ''), groups: parseVariantGroups(entry.variant_groups_json),
+    }));
+    // A scan keeps a title that has every included term; the watch whose
+    // terms explain most of the title is the most specific one.
+    const placed = matchQuery(title, candidates)
+      .filter((match) => match.match !== 'narrower')
+      .sort((a, b) => b.matchedTokens.length - a.matchedTokens.length
+        || Number(a.variantKey === OTHER_VARIANT_KEY) - Number(b.variantKey === OTHER_VARIANT_KEY))[0];
+    const row = placed ? byId.get(placed.candidate.id) : undefined;
+    return placed && row ? { row, variantKey: placed.variantKey, via: 'title-match' } : null;
+  }
+
   comparables(input: { listingKey: string; watchId?: string | null; limit?: number }): Comparables {
     const { marketplace, listingId } = parseListingKey(input.listingKey);
     const limit = Math.max(1, Math.min(COMPARABLES_LIMIT, Math.floor(input.limit ?? COMPARABLES_LIMIT)));
@@ -3260,41 +3386,12 @@ export class ScoutService {
     const condition = conditionClass(subject.condition);
     const notes = ['Asking prices, not completed sales.'];
 
-    // Placement: the listing's own association (newest first), else its title.
-    const association = this.stmt(`SELECT wl.watch_id, wl.variant_key FROM watch_listings wl JOIN watches w ON w.id = wl.watch_id
-      WHERE wl.listing_id = ? AND w.archived_at IS NULL AND (? IS NULL OR wl.watch_id = ?)
-      ORDER BY wl.last_seen_at DESC, wl.id DESC LIMIT 1`).get(subject.id, watchId, watchId) as { watch_id: string; variant_key: string | null } | undefined;
-    let row: WatchRow | undefined;
-    let variantKey: string | null = null;
-    let via: 'association' | 'title-match' = 'association';
-    if (association) {
-      row = this.stmt('SELECT * FROM watches WHERE id = ?').get(association.watch_id) as WatchRow;
-      variantKey = association.variant_key ?? null;
-    } else {
-      const rows = (watchId !== null
-        ? this.stmt('SELECT * FROM watches WHERE id = ?').all(watchId)
-        : this.stmt('SELECT * FROM watches WHERE archived_at IS NULL').all()) as WatchRow[];
-      const byId = new Map(rows.map((entry) => [String(entry.id), entry]));
-      const candidates: MatchCandidate[] = rows.map((entry) => ({
-        kind: 'watch', id: String(entry.id), name: String(entry.name), query: String(entry.query),
-        includedTerms: String(entry.included_terms ?? ''), excludedTerms: String(entry.excluded_terms ?? ''), groups: parseVariantGroups(entry.variant_groups_json),
-      }));
-      // A scan keeps a title that has every included term; the watch whose
-      // terms explain most of the title is the most specific one.
-      const placed = matchQuery(String(subject.title), candidates)
-        .filter((match) => match.match !== 'narrower')
-        .sort((a, b) => b.matchedTokens.length - a.matchedTokens.length
-          || Number(a.variantKey === OTHER_VARIANT_KEY) - Number(b.variantKey === OTHER_VARIANT_KEY))[0];
-      if (placed) {
-        row = byId.get(placed.candidate.id);
-        variantKey = placed.variantKey;
-        via = 'title-match';
-      }
-    }
-    if (!row) {
+    const placement = this.placeListing(Number(subject.id), String(subject.title), watchId);
+    if (!placement) {
       notes.push('No watch tracks this item, so Scout has no comparables for it.');
       return { listing, watch: null, condition, count: 0, median: null, vsMedian: null, comparables: [], notes };
     }
+    const { row, variantKey, via } = placement;
     const groups = parseVariantGroups(row.variant_groups_json);
     const bucketKey = groups.length ? variantKey ?? OTHER_VARIANT_KEY : null;
     const watch = { id: String(row.id), name: String(row.name), variant: bucketKey === null ? null : variantLabelFor(bucketKey, groups), via };

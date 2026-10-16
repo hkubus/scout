@@ -196,7 +196,7 @@ test('ignores archived watches and says when nothing matches', () => {
     seedWatch(context.db, 'old', 'iphone 13', { archived: true });
     observe(context.db, 'old', shape.map((ratio, index) => [`iPhone 13 ${index}`, 2000 * ratio] as [string, number]));
     const result = context.service.priceReference({ query: 'iphone 13' });
-    assert.deepEqual(result, { query: 'iphone 13', best: null, matches: [], notes: ['Asking prices, not completed sales.', 'No watch or research series matches this query.'] });
+    assert.deepEqual(result, { query: 'iphone 13', best: null, matches: [], outcomes: null, notes: ['Asking prices, not completed sales.', 'No watch or research series matches this query.'] });
   } finally { context.close(); }
 });
 
