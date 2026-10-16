@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { openDatabase } from '../server/db';
+import { FlipStore } from '../server/flips';
 import { ScoutService } from '../server/service';
 import { MCP_DASHBOARD_LISTINGS, SCOUT_MCP_TOOL_NAMES, createScoutMcpServer } from '../server/mcp';
 
@@ -248,6 +249,27 @@ test('scout_record_outcome takes Hatbot\'s call, is idempotent per negotiation, 
 
       const reference = JSON.parse(toolText(await client.callTool({ name: 'scout_price_reference', arguments: { query: 'rtx 3080' } }) as never));
       assert.deepEqual(reference.outcomes.buy.marketplaces.OLX, { negotiations: 1, agreed: 1, shareOfAsking: 0.85 });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});
+
+test('scout_flips returns the ledger compactly and rejects an unknown status', async () => {
+  const context = fixture();
+  try {
+    new FlipStore(context.db).create({ title: 'RTX 3070', buyChannel: 'OLX', boughtOn: '2026-10-01', buyPrice: 1000, buyCosts: 20 });
+    const { server, client } = await connectedClient(context.service);
+    try {
+      const tool = (await client.listTools()).tools.find((entry) => entry.name === 'scout_flips')!;
+      assert.deepEqual(tool.annotations, { readOnlyHint: true, idempotentHint: true });
+      const text = toolText(await client.callTool({ name: 'scout_flips', arguments: { status: 'open' } }) as never);
+      const flips = JSON.parse(text);
+      assert.equal(text, JSON.stringify(flips), 'tool text is compact JSON');
+      assert.deepEqual([flips.open.count, flips.open.items[0].cost, flips.open.items[0].breakEven.Vinted, flips.sold], [1, 1020, 1020, undefined]);
+      const failed = await client.callTool({ name: 'scout_flips', arguments: { status: 'archived' } }) as { isError?: boolean };
+      assert.equal(failed.isError, true);
     } finally {
       await client.close();
       await server.close();

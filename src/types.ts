@@ -905,6 +905,45 @@ export interface FlipsData {
   feePresets: import('./profit').FeePresets;
 }
 
+/** scout_flips: a flip as an agent needs it, without photos, drafts or notes. */
+export interface AgentFlip {
+  id: number;
+  title: string;
+  listingKey: string | null;
+  watchId: string | null;
+  buyChannel: import('./profit').FlipChannel;
+  boughtOn: string;
+  buyPrice: number;
+  buyCosts: number;
+  /** buyPrice + buyCosts. */
+  cost: number;
+}
+
+export interface AgentOpenFlip extends AgentFlip {
+  listedOn: import('./profit').FlipChannel[];
+  /** The asking price per marketplace from the flip's listing, where it has one. */
+  askingPrices: Partial<Record<Marketplace, number>>;
+  /** The sale price on each marketplace that just covers the cost after its fee preset, before shipping the seller pays. */
+  breakEven: Partial<Record<Marketplace, number>>;
+}
+
+export interface AgentSoldFlip extends AgentFlip {
+  soldOn: string;
+  saleChannel: import('./profit').FlipChannel | null;
+  salePrice: number | null;
+  saleFee: number | null;
+  saleCosts: number | null;
+  net: number | null;
+}
+
+export interface AgentFlips {
+  feePresets: import('./profit').FeePresets;
+  /** Unsold flips, newest purchase first; count covers all of them. */
+  open?: { count: number; items: AgentOpenFlip[] };
+  /** Sold flips, newest sale first; count covers all of them. */
+  sold?: { count: number; items: AgentSoldFlip[] };
+}
+
 /** A purchase read from an offer link or a screenshot, to prefill a new flip. */
 export interface FlipImport {
   title: string;

@@ -172,7 +172,7 @@ The **Flips** page records what you bought, where it is listed for sale, and wha
   - Sales per platform are counted against the DAC7 reporting threshold (30 sales or 2 000 € a year per platform).
   - The page produces the simplified sales record (*uproszczona ewidencja sprzedaży*): one row per day with that day's sales and the running total for the quarter, downloadable as CSV. These figures are estimates for your own records, not tax advice.
 
-The ledger is private bookkeeping. Nothing in scanning, scoring, bands or alerts reads it (only the fee presets feed the display-only estimated net), so your own buy and sale prices never mix with marketplace asking prices. Retention never prunes it. It is included in `/api/export` and database backups, but hidden from the Debug API: it is left out of the table list, refused in read-only SQL, and emptied in debug snapshots.
+The ledger is private bookkeeping. Nothing in scanning, scoring, bands or alerts reads it (only the fee presets feed the display-only estimated net), so your own buy and sale prices never mix with marketplace asking prices. Retention never prunes it. It is included in `/api/export` and database backups, but hidden from the Debug API: it is left out of the table list, refused in read-only SQL, and emptied in debug snapshots. MCP clients, which hold an API token, can read buy and sale figures through `scout_flips`; notes, listings and photos are not exposed there.
 
 ### Listing on OLX, Allegro Lokalnie and Vinted
 
@@ -227,11 +227,13 @@ curl -s -X POST http://127.0.0.1:3001/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-It is stateless (one fresh server per request, no session ids) and offers sixteen tools (plus the four read-only `scout_debug_*` tools while the [Debug API](#debug-api) is enabled): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail` (see below), `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_olx_categories` (live OLX category counts for a query), `scout_queue_scan`, `scout_connectors`, and `scout_price_reference`, `scout_comparables` and `scout_record_outcome` (see below). `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. With auth enabled, MCP clients must send `Authorization: Bearer <token>` using a value from `SCOUT_API_TOKENS`.
+It is stateless (one fresh server per request, no session ids) and offers seventeen tools (plus the four read-only `scout_debug_*` tools while the [Debug API](#debug-api) is enabled): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail` (see below), `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_olx_categories` (live OLX category counts for a query), `scout_queue_scan`, `scout_connectors`, and `scout_price_reference`, `scout_comparables`, `scout_record_outcome` and `scout_flips` (see below). `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. With auth enabled, MCP clients must send `Authorization: Bearer <token>` using a value from `SCOUT_API_TOKENS`.
 
 ### Negotiation tools
 
-These tools serve [Hatbot](/root/hatbot/PLAN.md) (§16.4), which haggles on OLX, Allegro Lokalnie and Vinted. Listing keys are `<Marketplace>:<listingId>` and prices are PLN numbers. Outputs are compact JSON with capped lists. Every figure is an asking price, because marketplaces publish no completed-sale prices. The one exception is `scout_record_outcome`, which stores the final prices of your own negotiations and is reported only on its own.
+These tools serve [Hatbot](/root/hatbot/PLAN.md) (§16.4), which haggles on OLX, Allegro Lokalnie and Vinted. Listing keys are `<Marketplace>:<listingId>` and prices are PLN numbers. Outputs are compact JSON with capped lists. Every figure is an asking price, because marketplaces publish no completed-sale prices. The exceptions are your own prices: `scout_record_outcome` stores the final prices of your negotiations and they are only ever reported on their own, and `scout_flips` reads your flip ledger.
+
+The old `HAT_DEALS_HANDOFF.md`, written for Hatbot's predecessor, was removed in #32 and has not been restored. Two of its designs are built here: P0-4 as `scout_price_reference` and P1-3 as `scout_listing_detail`'s `live: true`. Hatbot's side of the interface is in its PLAN.md, §16.4.
 
 - `scout_price_reference({ query, sources?, minPrice?, maxPrice?, terms?, excluded?, include?, limit? })` returns Scout's typical used asking price for a free-text product. The query is matched against non-archived watches and research series using the scan's own term rules, so "rtx3080" matches "rtx 3080" and "iphone 5" never matches "iphone 15". A watch with model variants is priced from the bucket the query falls into.
   - Each match gives `match` (`exact`, `variant`, `broader` or `narrower`), the matched and unmatched tokens, the figures (`typicalPrice`, `p25`, `p75`, `samples`, `ready`, `basis`, `typicalSource`, `updatedAt`, `observationHours`) and the watch's filters.
@@ -272,6 +274,12 @@ These tools serve [Hatbot](/root/hatbot/PLAN.md) (§16.4), which haggles on OLX,
   - The reply echoes the stored outcome, its `shareOfAsking` and `created` (false when the id was already recorded).
   - Outcomes live in their own table (`negotiation_outcomes`). Like the flip ledger, nothing in scanning, scoring, bands or alerts reads it. Retention never prunes it, and it is included in `/api/export` and backups but hidden from the Debug API.
   - Annotations: `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: true`. Cost: one database write.
+- `scout_flips({ status?, limit? })` reads the [flip ledger](#flips-ledger) for a selling floor. `status` is `open`, `sold` or `all` (the default). Each list holds at most `limit` flips (20 by default, 50 at most) and a `count` of all of them.
+  - **Every flip**: id, title, listing key, watch id, where it was bought, when, buy price, buy costs and `cost` (the two together).
+  - **Open flips** add where they are listed, `askingPrices` per marketplace from the flip's listing (a platform without its own price uses the base price), and `breakEven`. That is the sale price on each marketplace that just covers the cost after its fee preset, before any shipping you pay.
+  - **Sold flips** add the sale date, channel, price, fee, costs and net.
+  - `feePresets` gives each channel's seller fee. Notes, listing drafts and photos are left out.
+  - Cost: database only.
 
 ## iOS app
 

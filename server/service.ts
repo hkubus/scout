@@ -12,7 +12,7 @@ import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type M
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, writeResaleListingWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseVerificationChecks, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type VerificationCheck } from './ai';
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyChecksWithJev, classifyWatchVariantWithJev, summarizeCheckResults, checkIssue, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
 import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, readPurchaseScreenshotWithVision, resolveVisionModel, verifyListingDescriptionWithVision, visionToVerification } from './vision';
-import { MAX_FLIP_PHOTO_BYTES, sniffImageMime, toWebp } from './flips';
+import { MAX_FLIP_PHOTO_BYTES, flipFromRow, sniffImageMime, toWebp } from './flips';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { Limiter, mapPool } from './limiter';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, percentile, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
@@ -24,8 +24,8 @@ import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assi
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
-import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes } from '../src/types';
-import { estimatedNetAtTypical, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, type FeePresets } from '../src/profit';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes, AgentFlip, AgentFlips } from '../src/types';
+import { estimatedNetAtTypical, flipCost, flipNet, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, suggestedListingPrice, type FeePresets } from '../src/profit';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -169,6 +169,9 @@ const DESCRIPTION_VERIFICATION_FRESH_MS = 6 * 60 * 60_000;
 const SALE_BAND_WINDOW_DAYS = 90;
 /** scout_price_reference prices at most this many matching candidates. */
 const PRICE_REFERENCE_CANDIDATES = 5;
+/** scout_flips: flips returned per status by default, and at most. */
+const AGENT_FLIPS_DEFAULT = 20;
+const AGENT_FLIPS_MAX = 50;
 /** A research series' probable-sale band counts as ready from this many eligible samples. */
 const RESEARCH_READY_SAMPLES = 10;
 /** scout_comparables returns at most this many listings. */
@@ -3345,6 +3348,53 @@ export class ScoutService {
    * A listing with no watch (a manual search find) is placed by matching its
    * title the way a scan would. Database only; asking prices.
    */
+  /**
+   * scout_flips: the operator's open and sold flips with what each cost and
+   * the fee presets, for a selling floor. Read from the flip ledger; nothing
+   * here feeds scanning or scoring.
+   */
+  flipsForAgent(input: { status?: 'open' | 'sold' | 'all'; limit?: number } = {}): AgentFlips {
+    const status = input.status ?? 'all';
+    const limit = Math.max(1, Math.min(AGENT_FLIPS_MAX, Math.floor(input.limit ?? AGENT_FLIPS_DEFAULT)));
+    const feePresets = this.feePresets();
+    const base = (flip: ReturnType<typeof flipFromRow>): AgentFlip => ({
+      id: flip.id, title: flip.title.slice(0, COMPARABLE_TITLE_CHARS), listingKey: flip.listingKey, watchId: flip.watchId,
+      buyChannel: flip.buyChannel, boughtOn: flip.boughtOn, buyPrice: flip.buyPrice, buyCosts: flip.buyCosts, cost: flipCost(flip),
+    });
+    const count = (where: string) => Number((this.stmt(`SELECT COUNT(*) AS count FROM flips WHERE ${where}`).get() as { count: number }).count);
+    const result: AgentFlips = { feePresets };
+    if (status !== 'sold') {
+      const rows = this.stmt('SELECT * FROM flips WHERE sold_on IS NULL ORDER BY bought_on DESC, id DESC LIMIT ?').all(limit) as Array<Record<string, any>>;
+      result.open = {
+        count: count('sold_on IS NULL'),
+        items: rows.map((row) => {
+          const flip = flipFromRow(row);
+          const askingPrices: Partial<Record<Marketplace, number>> = {};
+          const breakEven: Partial<Record<Marketplace, number>> = {};
+          for (const source of marketplaces) {
+            // Like the extension: a platform without its own price uses the base price.
+            const asking = flip.listing ? flip.listing.prices[source] ?? flip.listing.basePrice : null;
+            if (asking) askingPrices[source] = asking;
+            const floor = suggestedListingPrice(flipCost(flip), feePresets[source]);
+            if (floor !== null) breakEven[source] = floor;
+          }
+          return { ...base(flip), listedOn: flip.listedOn, askingPrices, breakEven };
+        }),
+      };
+    }
+    if (status !== 'open') {
+      const rows = this.stmt('SELECT * FROM flips WHERE sold_on IS NOT NULL ORDER BY sold_on DESC, id DESC LIMIT ?').all(limit) as Array<Record<string, any>>;
+      result.sold = {
+        count: count('sold_on IS NOT NULL'),
+        items: rows.map((row) => {
+          const flip = flipFromRow(row);
+          return { ...base(flip), soldOn: String(flip.soldOn), saleChannel: flip.saleChannel, salePrice: flip.salePrice, saleFee: flip.saleFee, saleCosts: flip.saleCosts, net: flipNet(flip) };
+        }),
+      };
+    }
+    return result;
+  }
+
   /**
    * The watch a listing belongs to: its own association (newest first), else
    * its title matched the way a scan would. Null when no watch tracks it.

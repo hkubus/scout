@@ -37,6 +37,7 @@ export const SCOUT_MCP_TOOL_NAMES = [
   'scout_price_reference',
   'scout_comparables',
   'scout_record_outcome',
+  'scout_flips',
 ] as const;
 
 export const SCOUT_MCP_DEBUG_TOOL_NAMES = [
@@ -157,6 +158,17 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   }, async (input) => {
     try { return text(service.recordOutcome(input)); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_flips', {
+    description: 'Your flip ledger: open flips (buy price, costs, where listed, asking price and break-even sale price per marketplace) and sold flips (sale price, fee, costs, net), plus each channel\'s fee preset. Your own prices, not marketplace asking prices. Database only.',
+    inputSchema: {
+      status: z.enum(['open', 'sold', 'all']).optional().describe('Default all.'),
+      limit: z.number().int().min(1).max(50).optional().describe('Flips per status (default 20); count covers all of them.'),
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  }, async (input) => {
+    try { return text(service.flipsForAgent(input)); } catch (error) { return toolError(error); }
   });
 
   server.registerTool('scout_watch_analytics', {
