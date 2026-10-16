@@ -34,6 +34,7 @@ export const SCOUT_MCP_TOOL_NAMES = [
   'scout_olx_categories',
   'scout_queue_scan',
   'scout_connectors',
+  'scout_price_reference',
 ] as const;
 
 export const SCOUT_MCP_DEBUG_TOOL_NAMES = [
@@ -101,6 +102,23 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
     annotations: { readOnlyHint: true },
   }, async ({ key, watchId }) => {
     try { return text(service.listingDetail(key, watchId ?? null)); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_price_reference', {
+    description: 'Scout\'s learned typical used asking price for a product, from free text: matched to deal watches (with model variants) and research series. best is null unless a match has a price from 4+ samples. No marketplace fetch and no AI call.',
+    inputSchema: {
+      query: z.string().trim().min(1).max(240),
+      sources: z.array(marketplace).min(1).max(3).optional().describe('Prefer candidates that watch these marketplaces.'),
+      minPrice: z.number().nonnegative().nullable().optional().describe('Echoed in filters.requested; never narrows the distribution.'),
+      maxPrice: z.number().positive().nullable().optional().describe('Echoed in filters.requested; never narrows the distribution.'),
+      terms: z.string().max(240).optional().describe('Comma-separated terms the product must also have.'),
+      excluded: z.string().max(240).optional().describe('Comma-separated terms that rule a candidate out.'),
+      include: z.array(z.enum(['watch', 'research'])).min(1).optional(),
+      limit: z.number().int().min(1).max(5).optional().describe('Matches to return (default 5).'),
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  }, async (input) => {
+    try { return text(service.priceReference(input)); } catch (error) { return toolError(error); }
   });
 
   server.registerTool('scout_watch_analytics', {

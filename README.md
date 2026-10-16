@@ -227,7 +227,18 @@ curl -s -X POST http://127.0.0.1:3001/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-It is stateless (one fresh server per request, no session ids) and offers thirteen tools (plus the four read-only `scout_debug_*` tools while the [Debug API](#debug-api) is enabled): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail`, `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_olx_categories` (live OLX category counts for a query), `scout_queue_scan`, and `scout_connectors`. `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. With auth enabled, MCP clients must send `Authorization: Bearer <token>` using a value from `SCOUT_API_TOKENS`.
+It is stateless (one fresh server per request, no session ids) and offers fourteen tools (plus the four read-only `scout_debug_*` tools while the [Debug API](#debug-api) is enabled): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail`, `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_olx_categories` (live OLX category counts for a query), `scout_queue_scan`, `scout_connectors`, and `scout_price_reference` (see below). `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. With auth enabled, MCP clients must send `Authorization: Bearer <token>` using a value from `SCOUT_API_TOKENS`.
+
+### Negotiation tools
+
+These tools serve [Hatbot](/root/hatbot/PLAN.md) (§16.4), which haggles on OLX, Allegro Lokalnie and Vinted. Listing keys are `<Marketplace>:<listingId>` and prices are PLN numbers. Outputs are compact JSON with capped lists. Every figure is an asking price: marketplaces publish no completed-sale prices.
+
+- `scout_price_reference({ query, sources?, minPrice?, maxPrice?, terms?, excluded?, include?, limit? })` returns Scout's typical used asking price for a free-text product. The query is matched against non-archived watches and research series using the scan's own term rules, so "rtx3080" matches "rtx 3080" and "iphone 5" never matches "iphone 15". A watch with model variants is priced from the bucket the query falls into.
+  - Each match gives `match` (`exact`, `variant`, `broader` or `narrower`), the matched and unmatched tokens, the figures (`typicalPrice`, `p25`, `p75`, `samples`, `ready`, `basis`, `typicalSource`, `updatedAt`, `observationHours`) and the watch's filters.
+  - `best` is the first match that names this product and has a price from at least 4 samples. It is `null` when the only candidates are a mixed Other bucket, a narrower watch, or a broader watch whose leftover word changes the model (a digit, or a word such as "pro", "ti" or "max").
+  - A watch still learning its baseline uses its reference series' probable-sale band and says so (`typicalSource: "reference-band"`, `ready: false`). A research series uses its probable-sale band, or else the median asking price of its active listings.
+  - `sources`, `minPrice` and `maxPrice` rank watches on those marketplaces first and are echoed under `filters.requested`; they do not re-filter stored prices.
+  - Cost: database only, with no marketplace request and no AI call. At most five candidates are priced, at one baseline query each.
 
 ## iOS app
 

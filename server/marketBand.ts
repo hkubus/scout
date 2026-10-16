@@ -8,6 +8,7 @@
  */
 
 import type { SaleBand } from '../src/types';
+import { percentile } from './scoring';
 
 /** A price last seen more than this long before disappearance is a stale asking price. */
 export const STALE_LIMIT_DAYS = 30;
@@ -20,15 +21,6 @@ export interface MarketBandSample {
   lastSeenAt: string;
   endedAt: string;
   endedReason: string | null;
-}
-
-function percentile(values: number[], fraction: number): number {
-  const sorted = values.slice().sort((left, right) => left - right);
-  const position = (sorted.length - 1) * fraction;
-  const lower = Math.floor(position);
-  const upper = Math.ceil(position);
-  if (lower === upper) return sorted[lower];
-  return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
 }
 
 /**

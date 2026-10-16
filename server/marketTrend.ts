@@ -5,23 +5,13 @@
  * the same chart component can render both.
  */
 
-import { median, pruneBefore } from './scoring';
+import { median, percentile, pruneBefore } from './scoring';
 import type { MarketWatchTrendPoint } from '../src/types';
 
 export interface MarketTrendObservation {
   marketListingId: number;
   price: number;
   observedAt: string;
-}
-
-function percentile(values: number[], fraction: number): number | null {
-  const sorted = values.filter(Number.isFinite).slice().sort((left, right) => left - right);
-  if (!sorted.length) return null;
-  const position = (sorted.length - 1) * fraction;
-  const lower = Math.floor(position);
-  const upper = Math.ceil(position);
-  if (lower === upper) return sorted[lower];
-  return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
 }
 
 export function bucketDailyObservations(observations: MarketTrendObservation[], days: number, now: string): MarketWatchTrendPoint[] {

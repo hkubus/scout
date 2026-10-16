@@ -39,6 +39,9 @@ test('exposes the documented Scout tool surface', async () => {
     try {
       const listed = await client.listTools();
       assert.deepEqual(listed.tools.map((tool) => tool.name).sort(), [...SCOUT_MCP_TOOL_NAMES].sort());
+      // Hatbot's contract: every read tool says so; only these write.
+      const writers = new Set(['scout_queue_scan']);
+      for (const tool of listed.tools) assert.equal(tool.annotations?.readOnlyHint, !writers.has(tool.name), tool.name);
     } finally {
       await client.close();
       await server.close();
@@ -117,6 +120,42 @@ test('scout_listings defaults to a compact page and scout_queue_scan surfaces se
       const queued = await client.callTool({ name: 'scout_queue_scan', arguments: {} }) as never as { isError?: boolean; content: Array<{ text?: string }> };
       assert.equal(queued.isError, true);
       assert.match(String(queued.content[0].text), /no enabled watches/i);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});
+
+test('scout_price_reference prices a matched watch and returns a null best when nothing matches', async () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at)
+      VALUES ('gpu-watch', 'GPU watch', 'rtx 3080', '["OLX"]', 1, ?, ?, ?)`).run(now, now, now);
+    const insertRow = context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)');
+    [1900, 2000, 2100, 2200].forEach((price, index) => {
+      const { lastInsertRowid } = insertRow.run('OLX', `gpu-${index}`, `RTX 3080 ${index}`, price, `https://www.olx.pl/d/oferta/gpu-${index}`, now, now);
+      insertObservation.run(lastInsertRowid, 'gpu-watch', price, now);
+    });
+    const { server, client } = await connectedClient(context.service);
+    try {
+      const tool = (await client.listTools()).tools.find((entry) => entry.name === 'scout_price_reference')!;
+      assert.deepEqual(tool.annotations, { readOnlyHint: true, idempotentHint: true });
+
+      const text = toolText(await client.callTool({ name: 'scout_price_reference', arguments: { query: 'RTX3080', sources: ['OLX'] } }) as never);
+      const reference = JSON.parse(text);
+      assert.equal(text, JSON.stringify(reference), 'tool text is compact JSON');
+      assert.deepEqual([reference.best.id, reference.best.typicalPrice, reference.best.samples, reference.best.ready], ['gpu-watch', 2050, 4, false]);
+      assert.equal(reference.matches[0].match, 'exact');
+
+      const none = JSON.parse(toolText(await client.callTool({ name: 'scout_price_reference', arguments: { query: 'steam deck' } }) as never));
+      assert.equal(none.best, null);
+      assert.deepEqual(none.matches, []);
+
+      const invalid = await client.callTool({ name: 'scout_price_reference', arguments: { query: '' } }) as never as { isError?: boolean };
+      assert.equal(invalid.isError, true);
     } finally {
       await client.close();
       await server.close();

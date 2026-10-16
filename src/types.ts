@@ -305,6 +305,48 @@ export interface WatchAnalytics {
   sources: WatchAnalyticsSource[];
 }
 
+/** Scout's typical price for one watch bucket or research series (scout_price_reference). */
+export interface PriceReferenceFigure {
+  kind: 'watch' | 'research';
+  id: string;
+  name: string;
+  /** The model variant's label on a grouped watch; null otherwise. */
+  variant: string | null;
+  /** Null below 4 samples. */
+  typicalPrice: number | null;
+  p25: number | null;
+  p75: number | null;
+  samples: number;
+  ready: boolean;
+  basis: string;
+  updatedAt: string | null;
+}
+
+export interface PriceReferenceMatch extends PriceReferenceFigure {
+  variantKey: string | null;
+  match: 'exact' | 'variant' | 'broader' | 'narrower';
+  matchedTokens: string[];
+  unmatchedTokens: string[];
+  typicalSource: 'own-history' | 'reference-band' | 'probable-sale-band' | 'research-asking' | null;
+  observationHours: number | null;
+  enabled: boolean;
+  filters: {
+    minPrice: number | null;
+    maxPrice: number | null;
+    shippingOnly: boolean;
+    sources: Marketplace[];
+    requested: { sources: Marketplace[] | null; minPrice: number | null; maxPrice: number | null };
+  };
+}
+
+export interface PriceReference {
+  query: string;
+  /** The best-matching figure with a price from at least 4 samples, or null. Never a partial object. */
+  best: PriceReferenceFigure | null;
+  matches: PriceReferenceMatch[];
+  notes: string[];
+}
+
 export interface AnalyticsDiscountBucket {
   label: string;
   count: number;

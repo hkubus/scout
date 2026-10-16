@@ -15,14 +15,15 @@ import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, 
 import { MAX_FLIP_PHOTO_BYTES, sniffImageMime, toWebp } from './flips';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { Limiter, mapPool } from './limiter';
-import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
+import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, percentile, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
-import { normalizeFilterText } from './text';
+import { normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
+import { matchQuality, matchQuery, type MatchCandidate, type QueryMatch } from './queryMatch';
 import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assignVariant, finalizeVariantSuggestions, parseVariantGroups, suggestVariantGroupsFromTitles, variantLabelFor, type VariantGroup, type VariantSample } from './variants';
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
-import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport } from '../src/types';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand } from '../src/types';
 import { estimatedNetAtTypical, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, type FeePresets } from '../src/profit';
 
 type Database = any;
@@ -72,7 +73,7 @@ type DealNotificationCandidate = {
  * reproduces the legacy watch-wide baseline exactly.
  */
 /** `stats` is filled once the bucket is complete, so every listing in a scan reuses its median and MAD. */
-type WatchVariantBucket = { prices: number[]; firstObservedAt: string | null; stats?: PriceStats };
+type WatchVariantBucket = { prices: number[]; firstObservedAt: string | null; latestObservedAt?: string | null; stats?: PriceStats };
 type WatchBaselines = {
   groups: VariantGroup[];
   buckets: Map<string, WatchVariantBucket>;
@@ -165,6 +166,10 @@ const VARIANT_JEV_BUDGET = 10;
 const DESCRIPTION_VERIFICATION_FRESH_MS = 6 * 60 * 60_000;
 /** Rolling window of ended listings that feed probable-sale bands. */
 const SALE_BAND_WINDOW_DAYS = 90;
+/** scout_price_reference prices at most this many matching candidates. */
+const PRICE_REFERENCE_CANDIDATES = 5;
+/** A research series' probable-sale band counts as ready from this many eligible samples. */
+const RESEARCH_READY_SAMPLES = 10;
 /** Bounded per-scan capture of preserved listing copies (description + downloaded images). */
 const SNAPSHOT_CAPTURES_PER_SCAN = 8;
 const SNAPSHOT_MAX_IMAGES = 12;
@@ -423,16 +428,6 @@ function timeOnly(value?: string | null) {
   return new Date(value).toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
-function percentile(values: number[], fraction: number) {
-  const sorted = values.filter(Number.isFinite).slice().sort((a, b) => a - b);
-  if (!sorted.length) return null;
-  const position = (sorted.length - 1) * fraction;
-  const lower = Math.floor(position);
-  const upper = Math.ceil(position);
-  if (lower === upper) return sorted[lower];
-  return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
-}
-
 type WatchAnalyticsObservation = {
   listingId: number;
   marketplace: Marketplace;
@@ -462,6 +457,11 @@ function duration(started?: string | null, finished?: string | null) {
   if (!started || !finished) return '—';
   const milliseconds = Math.max(0, Date.parse(finished) - Date.parse(started));
   return milliseconds < 1000 ? `${milliseconds} ms` : `${(milliseconds / 1000).toFixed(1)} s`;
+}
+
+/** Round a PLN figure to grosze; null stays null. */
+function roundPln(value: number | null | undefined) {
+  return value === null || value === undefined || !Number.isFinite(value) ? null : Math.round(value * 100) / 100;
 }
 
 function parseJson<T>(value: string | null | undefined, fallback: T): T {
@@ -3072,6 +3072,158 @@ export class ScoutService {
   }
 
   /**
+   * Scout's typical asking price for a free-text product (scout_price_reference).
+   * The query is matched to non-archived watches (with their model variants)
+   * and research series by the scan's own term rules; figures are computed
+   * for the best few candidates exactly as a scan would score against them.
+   * DB-only: no marketplace fetch and no AI call.
+   */
+  priceReference(input: {
+    query: string;
+    sources?: Marketplace[];
+    minPrice?: number | null;
+    maxPrice?: number | null;
+    terms?: string;
+    excluded?: string;
+    include?: Array<'watch' | 'research'>;
+    limit?: number;
+  }): PriceReference {
+    const kinds = new Set(input.include?.length ? input.include : ['watch', 'research']);
+    const limit = Math.max(1, Math.min(PRICE_REFERENCE_CANDIDATES, Math.floor(input.limit ?? PRICE_REFERENCE_CANDIDATES)));
+    const watchRows = kinds.has('watch') ? this.stmt('SELECT * FROM watches WHERE archived_at IS NULL').all() as WatchRow[] : [];
+    const researchRows = kinds.has('research') ? this.stmt('SELECT * FROM market_watches').all() as WatchRow[] : [];
+    type Source = { row: WatchRow; version: WatchRow | null; sources: Marketplace[]; enabled: boolean };
+    const sourceById = new Map<string, Source>();
+    const candidates: MatchCandidate[] = [];
+    for (const row of watchRows) {
+      sourceById.set(`watch:${row.id}`, { row, version: null, sources: parseJson<Marketplace[]>(row.sources_json, []), enabled: Boolean(row.enabled) });
+      candidates.push({ kind: 'watch', id: String(row.id), name: String(row.name), query: String(row.query), includedTerms: String(row.included_terms ?? ''), excludedTerms: String(row.excluded_terms ?? ''), groups: parseVariantGroups(row.variant_groups_json) });
+    }
+    for (const row of researchRows) {
+      const version = this.marketWatchVersion(row);
+      sourceById.set(`research:${row.id}`, { row, version, sources: parseJson<Marketplace[]>(version.sources_json, []), enabled: Boolean(row.enabled) });
+      candidates.push({ kind: 'research', id: String(row.id), name: String(row.name), query: String(version.query), includedTerms: String(version.included_terms ?? ''), excludedTerms: String(version.excluded_terms ?? ''), groups: [] });
+    }
+    const requested = input.sources?.length ? new Set(input.sources) : null;
+    const sourceOf = (match: QueryMatch) => sourceById.get(`${match.candidate.kind}:${match.candidate.id}`)!;
+    const overlaps = (match: QueryMatch) => !requested || sourceOf(match).sources.some((source) => requested.has(source));
+    // Figures cost a baseline query each, so only the best few by match
+    // quality are priced; readiness and samples then order those.
+    const flag = (value: boolean) => (value ? 0 : 1);
+    const preRanked = matchQuery(input.query, candidates, { terms: input.terms, excluded: input.excluded })
+      .sort((a, b) => matchQuality(a) - matchQuality(b) || flag(overlaps(a)) - flag(overlaps(b))
+        || flag(a.candidate.kind === 'watch') - flag(b.candidate.kind === 'watch') || flag(sourceOf(a).enabled) - flag(sourceOf(b).enabled))
+      .slice(0, PRICE_REFERENCE_CANDIDATES);
+    const requestedFilters = { sources: input.sources?.length ? [...input.sources] : null, minPrice: input.minPrice ?? null, maxPrice: input.maxPrice ?? null };
+    const priced = preRanked.map((match) => {
+      const source = sourceOf(match);
+      const figures = match.candidate.kind === 'watch' ? this.watchPriceFigures(source.row, match) : this.researchPriceFigures(source.row, source.version!);
+      const filterRow = source.version ?? source.row;
+      const entry: PriceReferenceMatch = {
+        kind: match.candidate.kind,
+        id: match.candidate.id,
+        name: match.candidate.name,
+        ...figures,
+        variantKey: match.variantKey,
+        match: match.match,
+        matchedTokens: match.matchedTokens,
+        unmatchedTokens: match.unmatchedTokens,
+        enabled: source.enabled,
+        filters: {
+          minPrice: watchPlnFromRow(filterRow.min_price_pln),
+          maxPrice: watchPlnFromRow(filterRow.max_price_pln),
+          shippingOnly: Boolean(filterRow.shipping_only),
+          sources: source.sources,
+          requested: requestedFilters,
+        },
+      };
+      return { match, entry, overlaps: overlaps(match) };
+    });
+    priced.sort((a, b) => matchQuality(a.match) - matchQuality(b.match) || flag(a.entry.ready) - flag(b.entry.ready) || flag(a.overlaps) - flag(b.overlaps)
+      || flag(a.entry.kind === 'watch') - flag(b.entry.kind === 'watch') || b.entry.samples - a.entry.samples || flag(a.entry.enabled) - flag(b.entry.enabled));
+    // A mixed Other bucket and a model-changing leftover are not this product.
+    const qualifies = ({ match, entry }: (typeof priced)[number]) => matchQuality(match) <= 1
+      && match.variantKey !== OTHER_VARIANT_KEY
+      && entry.typicalPrice !== null && entry.typicalPrice > 0 && entry.samples >= MIN_BAND_SAMPLES;
+    const top = priced.find(qualifies);
+    const best: PriceReferenceFigure | null = top ? {
+      kind: top.entry.kind, id: top.entry.id, name: top.entry.name, variant: top.entry.variant, typicalPrice: top.entry.typicalPrice,
+      p25: top.entry.p25, p75: top.entry.p75, samples: top.entry.samples, ready: top.entry.ready, basis: top.entry.basis, updatedAt: top.entry.updatedAt,
+    } : null;
+    const matches = priced.slice(0, limit).map(({ entry }) => entry);
+    const notes = ['Asking prices, not completed sales.'];
+    if (matches.some((entry) => entry.typicalSource === 'reference-band' || entry.typicalSource === 'probable-sale-band')) {
+      notes.push('Probable-sale bands use the last asking price of listings that disappeared, not confirmed sale prices.');
+    }
+    if (!matches.length) notes.push('No watch or research series matches this query.');
+    return { query: input.query, best, matches, notes };
+  }
+
+  /** A watch bucket's figures, scored exactly as scans score against it. */
+  private watchPriceFigures(row: WatchRow, match: QueryMatch) {
+    const baselines = this.watchBaselines(row);
+    const key = match.variantKey ?? OTHER_VARIANT_KEY;
+    const bucket = baselines.buckets.get(key) ?? { prices: [], firstObservedAt: null, latestObservedAt: null };
+    const named = key !== OTHER_VARIANT_KEY && baselines.groups.length > 0;
+    const band = row.reference_market_watch_id ? this.referenceBand(String(row.reference_market_watch_id)) : null;
+    const bandMedian = band && band.eligibleCount >= MIN_BAND_SAMPLES ? band.median : null;
+    const { score, useReference } = this.dealScore(row, 1, bucket, bandMedian, named ? baselines.pooled : null);
+    const variant = baselines.groups.length ? variantLabelFor(key, baselines.groups) : null;
+    const observationHours = bucket.firstObservedAt ? Math.max(0, Math.floor((Date.now() - Date.parse(bucket.firstObservedAt)) / 3_600_000)) : 0;
+    if (useReference && band) {
+      const reference = this.stmt('SELECT last_scan_at FROM market_watches WHERE id = ?').get(row.reference_market_watch_id) as { last_scan_at?: string | null } | undefined;
+      return {
+        variant, typicalPrice: roundPln(band.median), p25: roundPln(band.p25), p75: roundPln(band.p75), samples: band.eligibleCount, ready: false,
+        basis: 'probable-sale band, reference series', updatedAt: reference?.last_scan_at ?? null, typicalSource: 'reference-band' as const, observationHours,
+      };
+    }
+    const priced = bucket.prices.length >= MIN_BAND_SAMPLES && score.typical !== null;
+    return {
+      variant,
+      typicalPrice: priced ? roundPln(score.typical) : null,
+      p25: priced ? roundPln(percentile(bucket.prices, 0.25)) : null,
+      p75: priced ? roundPln(percentile(bucket.prices, 0.75)) : null,
+      samples: bucket.prices.length,
+      ready: score.isReady,
+      basis: 'asking prices, own history',
+      updatedAt: bucket.latestObservedAt ?? null,
+      typicalSource: 'own-history' as const,
+      observationHours,
+    };
+  }
+
+  /** A research series' probable-sale band, else the median asking price of its active listings. */
+  private researchPriceFigures(row: WatchRow, version: WatchRow) {
+    const band = this.referenceBand(String(row.id));
+    const created = version.created_at ? Date.parse(String(version.created_at)) : Number.NaN;
+    const observationHours = Number.isFinite(created) ? Math.max(0, Math.floor((Date.now() - created) / 3_600_000)) : null;
+    const updatedAt = row.last_scan_at ?? null;
+    if (band.eligibleCount >= MIN_BAND_SAMPLES && band.median !== null) {
+      return {
+        variant: null, typicalPrice: roundPln(band.median), p25: roundPln(band.p25), p75: roundPln(band.p75), samples: band.eligibleCount,
+        ready: band.eligibleCount >= RESEARCH_READY_SAMPLES, basis: 'probable-sale band', updatedAt, typicalSource: 'probable-sale-band' as const, observationHours,
+      };
+    }
+    const prices = (this.stmt(`SELECT ml.last_price_pln FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id
+      WHERE ml.market_watch_id = ? AND ml.status = 'active' AND ml.last_price_pln > 0
+        AND (ml.version_id = mw.active_version_id OR (mw.active_version_id IS NULL AND ml.version_id IS NULL))`).all(row.id) as Array<{ last_price_pln: number }>)
+      .map((item) => Number(item.last_price_pln));
+    const priced = prices.length >= MIN_BAND_SAMPLES;
+    return {
+      variant: null,
+      typicalPrice: priced ? roundPln(median(prices)) : null,
+      p25: priced ? roundPln(percentile(prices, 0.25)) : null,
+      p75: priced ? roundPln(percentile(prices, 0.75)) : null,
+      samples: prices.length,
+      ready: false,
+      basis: 'asking prices of active research listings',
+      updatedAt,
+      typicalSource: priced ? 'research-asking' as const : null,
+      observationHours,
+    };
+  }
+
+  /**
    * Cross-watch analytics for the Analytics page. Deal metrics come from
    * daily-deduped `observations` (asking price vs learned baseline); triage
    * and AI-quality sections are operational signals that are not watch-scoped,
@@ -3687,10 +3839,15 @@ export class ScoutService {
     return { price: Number(row.last_price_pln), lastSeenAt: String(row.last_seen_at), endedAt: String(row.ended_at), endedReason: row.ended_reason };
   }
 
+  /** Probable-sale band of one research series over the standard window. */
+  private referenceBand(marketWatchId: string): SaleBand {
+    const samples = this.endedSaleBandRows(marketWatchId).map((item) => this.toBandSample(item));
+    return computeSaleBand(samples, SALE_BAND_WINDOW_DAYS, nowIso());
+  }
+
   /** Probable-sale median of a reference research series, or null while the band is too thin. */
   private referenceBandMedian(marketWatchId: string): number | null {
-    const samples = this.endedSaleBandRows(marketWatchId).map((item) => this.toBandSample(item));
-    const band = computeSaleBand(samples, SALE_BAND_WINDOW_DAYS, nowIso());
+    const band = this.referenceBand(marketWatchId);
     return band.eligibleCount >= MIN_BAND_SAMPLES && band.median !== null ? band.median : null;
   }
 
@@ -5226,7 +5383,7 @@ export class ScoutService {
    */
   private watchBaselines(row: WatchRow): WatchBaselines {
     const groups = parseVariantGroups(row.variant_groups_json);
-    const rows = this.stmt(`SELECT o.price_pln, x.variant_key, x.first
+    const rows = this.stmt(`SELECT o.price_pln, o.observed_at, x.variant_key, x.first
       FROM (
         SELECT COALESCE(wl.variant_key, ?) AS variant_key,
           (SELECT o2.id FROM observations o2 INDEXED BY observations_watch_listing
@@ -5249,7 +5406,7 @@ export class ScoutService {
       row.id,
       row.ai_relevance === false || row.ai_relevance === 0 ? 0 : 1,
       row.shipping_only ? 1 : 0,
-    ) as Array<{ price_pln: number; variant_key: string; first: string | null }>;
+    ) as Array<{ price_pln: number; observed_at: string; variant_key: string; first: string | null }>;
     const buckets = new Map<string, WatchVariantBucket>();
     const bucketFor = (key: string) => {
       let bucket = buckets.get(key);
@@ -5269,6 +5426,7 @@ export class ScoutService {
       const bucket = bucketFor(key);
       // Rows arrive newest-first; 400 preserves the per-model ceiling the
       // watch-wide query used to apply globally.
+      bucket.latestObservedAt ??= item.observed_at;
       if (bucket.prices.length < 400) bucket.prices.push(price);
     }
     for (const [key, first] of firstByVariant) bucketFor(key).firstObservedAt = first;
@@ -5924,53 +6082,6 @@ export type ListingFilters = {
    */
   relaxTerms?: boolean;
 };
-
-/** Query filler that carries no product signal on its own (Polish + English). */
-const QUERY_STOPWORDS = new Set([
-  'do', 'na', 'w', 'we', 'z', 'ze', 'i', 'oraz', 'dla', 'od', 'po', 'za', 'o', 'a', 'u',
-  'the', 'for', 'with', 'and', 'to', 'of', 'in', 'on', 'at', 'by',
-]);
-
-/**
- * Implicit query tokens. Single-character digits are kept (so "iphone 5" still
- * constrains the model) while single letters and stopwords are dropped — but
- * only while at least one meaningful token survives, so a query that is all
- * stopwords still filters on what the user typed.
- */
-function queryTokens(query: string) {
-  const tokens = normalizeFilterText(query).split(/\s+/).filter(Boolean);
-  const meaningful = tokens.filter((term) => (term.length > 1 || /\d/.test(term)) && !QUERY_STOPWORDS.has(term));
-  return meaningful.length ? meaningful : tokens;
-}
-
-function parseIncludedExcluded(query: string, includedRaw: string, excludedRaw: string) {
-  const explicitTerms = Boolean(includedRaw.trim());
-  const included = explicitTerms
-    ? includedRaw.split(',').map(normalizeFilterText).filter(Boolean)
-    : queryTokens(query);
-  const excluded = excludedRaw.split(',').map(normalizeFilterText).filter(Boolean);
-  return { included, excluded, explicitTerms };
-}
-
-/**
- * One term against one normalized title. Plain substring matching is preserved,
- * but alphanumeric model tokens ("128gb", "rtx3080", "s23ultra") also match the
- * title with its spaces removed, so "128 GB" and "128gb" describe the same
- * offer. The digit requirement keeps the glued form from colliding across word
- * boundaries on ordinary words ("onpro" inside "iphone13pro"). Pure numeric
- * terms must land on a whole token so "5" cannot match "15".
- */
-function termMatches(titleSpaced: string, titleGlued: string, term: string) {
-  if (!term) return false;
-  // Pure numeric terms must land on a digit run boundaried by letters or the
-  // token start, so "5" cannot match "15" but does match "5g" and "rtx3080".
-  if (/^\d+$/.test(term)) {
-    return titleSpaced.split(' ').some((token) => token.split(/[a-z]+/).includes(term));
-  }
-  if (titleSpaced.includes(term)) return true;
-  const compact = term.replace(/ /g, '');
-  return /\d/.test(compact) && compact.length >= 3 && titleGlued.includes(compact);
-}
 
 const CONDITION_ALIASES: Record<string, string[]> = {
   'like new': ['like new', 'jak nowy', 'jak nowa', 'idealny', 'idealna'],
