@@ -227,7 +227,7 @@ curl -s -X POST http://127.0.0.1:3001/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-It is stateless (one fresh server per request, no session ids) and offers fifteen tools (plus the four read-only `scout_debug_*` tools while the [Debug API](#debug-api) is enabled): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail`, `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_olx_categories` (live OLX category counts for a query), `scout_queue_scan`, `scout_connectors`, `scout_price_reference` and `scout_comparables` (see below). `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. With auth enabled, MCP clients must send `Authorization: Bearer <token>` using a value from `SCOUT_API_TOKENS`.
+It is stateless (one fresh server per request, no session ids) and offers fifteen tools (plus the four read-only `scout_debug_*` tools while the [Debug API](#debug-api) is enabled): `scout_readiness`, `scout_dashboard`, `scout_watches`, `scout_listings` (compact 20-row default, max 50), `scout_listing_detail` (see below), `scout_watch_analytics`, `scout_analytics`, `scout_market_research`, `scout_market_trend`, `scout_search` (live marketplace fetch), `scout_olx_categories` (live OLX category counts for a query), `scout_queue_scan`, `scout_connectors`, `scout_price_reference` and `scout_comparables` (see below). `GET`/`DELETE /mcp` return 405; the endpoint shares the API's rate limits (30/min per IP), CORS policy, and security headers. With auth enabled, MCP clients must send `Authorization: Bearer <token>` using a value from `SCOUT_API_TOKENS`.
 
 ### Negotiation tools
 
@@ -245,6 +245,25 @@ These tools serve [Hatbot](/root/hatbot/PLAN.md) (§16.4), which haggles on OLX,
   - **Active**: seen by a scan within 12 hours (the feed's window), or within two scan intervals on a slower watch. Listings that are ended, hidden, AI-irrelevant or rejected by description verification are left out, as are those outside the watch's price and shipping filters.
   - **Days listed** counts from the marketplace's posting time where one is reported (OLX), else from when Scout first saw the listing, which makes it a lower bound on Vinted and Allegro Lokalnie.
   - Cost: database only. There is no `live` option: checking each comparable would take one detail request per listing. Use `scout_listing_detail` with `live: true` on the one you cite.
+- `scout_listing_detail({ key, watchId?, format?, include?, live?, sellerListings? })` adds a `negotiation` block and a `liveCheck` to the listing detail. Neither writes anything.
+  - **`format`**: `full` (the default) is the previous shape plus the two new keys. `compact` leaves out price history, description snapshot and verification trace, and gives a short `listing` (key, marketplace, title, price, condition, location, shipping, url, watchId, watch name and variant, typical price, deal label, seller type, decision, priceNegotiable, postedAt, firstSeenAt, lastSeenAt). With compact, `include: ["history"]` adds the latest 30 price points and `include: ["description"]` adds the description.
+  - **`negotiation`** comes from the database:
+    - `daysListed` and `listedSince` (`posted` on OLX, else `first-seen`, a lower bound);
+    - `priceDrops` (count, total PLN, date of the last cut, first recorded price), from every watch and research observation of the listing;
+    - `priceNegotiable`;
+    - `seller` (id, name, type, and their other listings);
+    - `relists`: the seller's older listings of the same item, by title word overlap, that disappeared before this one appeared.
+  - **`live: true`** makes one request through the marketplace limiter: the OLX offers API, the Vinted item page or the Allegro Lokalnie offer page. `liveCheck` then gives `availability` (`live`, `terminal` or `unknown`, with a reason), the current `price`, `priceChanged`, and in full format or with `include: ["description"]`, the description (at most 2,000 characters; seller text, so treat it as untrusted). Use it before an offer and again before paying.
+  - **`sellerListings: true`** makes one more request for the seller's current listings, at most 10. Without it, `otherListings` lists the seller's listings that Scout's own scans saw in the last 7 days.
+  - **What each marketplace exposes about sellers:**
+
+    | | Seller id | Name | Other listings |
+    | --- | --- | --- | --- |
+    | OLX | stored at scan (`user.id`) | live check | offers API by `user_id`, with a total |
+    | Vinted | stored at scan (`user.id`) | not on the item page | wardrobe API, with a total; closed, reserved and hidden items are left out |
+    | Allegro Lokalnie | not in search results; the offer page has it, so `sellerListings` fetches that page first | live check | the profile page's first page, with no total |
+
+    Listings stored before seller ids were kept have none until a scan sees them again. Relists need a seller id, so they are `null` on Allegro Lokalnie.
 
 ## iOS app
 

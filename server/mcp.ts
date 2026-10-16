@@ -95,14 +95,18 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
   });
 
   server.registerTool('scout_listing_detail', {
-    description: 'Full detail for one listing: scoring, price history, triage action, description snapshot, and verification trace.',
+    description: 'Detail for one listing: scoring, triage action and a negotiation block (days listed, price drops, negotiable flag, seller and their other listings, relists). format full (default) adds price history, description snapshot and verification trace; compact leaves them out unless included. live: true makes one request to check the listing is still up at its price; sellerListings: true makes one for the seller\'s current listings. Nothing is written.',
     inputSchema: {
-      key: z.string().min(3).max(500).describe('Global marketplace listing key.'),
+      key: z.string().min(3).max(500).describe('<Marketplace>:<listingId>'),
       watchId: z.string().min(1).max(160).optional(),
+      format: z.enum(['full', 'compact']).optional().describe('compact drops history, description and verification trace (default full).'),
+      include: z.array(z.enum(['history', 'description'])).min(1).max(2).optional().describe('compact only: add the latest 30 price points and/or the description.'),
+      live: z.boolean().optional().describe('Fetch the listing now: availability, current price and description. One marketplace request.'),
+      sellerListings: z.boolean().optional().describe('Fetch the seller\'s current listings from the marketplace. One request, plus the listing page when Scout has no seller id (Allegro Lokalnie).'),
     },
-    annotations: { readOnlyHint: true },
-  }, async ({ key, watchId }) => {
-    try { return text(service.listingDetail(key, watchId ?? null)); } catch (error) { return toolError(error); }
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  }, async ({ key, ...options }) => {
+    try { return text(await service.listingDetailForAgent(key, options)); } catch (error) { return toolError(error); }
   });
 
   server.registerTool('scout_price_reference', {

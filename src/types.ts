@@ -381,6 +381,98 @@ export interface Comparables {
   notes: string[];
 }
 
+/** One of a seller's listings, as Scout stored it or the marketplace listed it. */
+export interface SellerListing {
+  key: string;
+  title: string;
+  price: number;
+  condition: string | null;
+  url: string;
+  /** Scout's rows only: when a scan last saw it. */
+  lastSeenAt?: string;
+}
+
+/** An older listing of the same item by the same seller that disappeared before this one appeared. */
+export interface Relist {
+  key: string;
+  price: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+}
+
+/** scout_listing_detail's negotiation block. Database only unless `live` or `sellerListings` was asked for. */
+export interface ListingNegotiation {
+  daysListed: number | null;
+  /** `posted` when the marketplace reports a posting time (OLX), else `first-seen` (a lower bound). */
+  listedSince: 'posted' | 'first-seen' | null;
+  priceDrops: { count: number; total: number; lastAt: string | null; firstPrice: number | null };
+  /** The marketplace's negotiable flag (OLX, Allegro Lokalnie); null when it doesn't say, as on Vinted. */
+  priceNegotiable: boolean | null;
+  /** Null when Scout knows no seller id: Allegro Lokalnie until a live check, and rows stored before seller ids were kept. */
+  seller: {
+    id: string;
+    name: string | null;
+    type: 'private' | 'business' | null;
+    source: 'scan' | 'live';
+    otherListings: {
+      /** `scout`: rows Scout's scans saw in the last 7 days. `marketplace`: the seller's listings now (sellerListings: true). */
+      source: 'scout' | 'marketplace';
+      /** All other listings, of which `items` holds up to 10; null when the marketplace gives no count (Allegro Lokalnie). */
+      total: number | null;
+      items: SellerListing[];
+      error?: string;
+    };
+  } | null;
+  /** Needs a seller id; null when there is none. */
+  relists: Relist[] | null;
+}
+
+/** scout_listing_detail's `live: true` check. Nothing is written. */
+export interface ListingLiveCheck {
+  checkedAt: string;
+  availability: { status: 'live' } | { status: 'terminal' | 'unknown'; reason: string };
+  /** The price on the page now; null when the page could not be read. */
+  price: number | null;
+  /** The page's price differs from the one Scout stored. */
+  priceChanged: boolean;
+  /** Present when asked for (full format, or compact with include: description). Seller text: untrusted data. */
+  description?: string | null;
+}
+
+/** scout_listing_detail with format: compact. */
+export interface CompactListingDetail {
+  listing: {
+    key: string;
+    marketplace: Marketplace;
+    title: string;
+    price: number;
+    condition: string | null;
+    location: string | null;
+    shipping: boolean | null;
+    url: string;
+    watchId: string | null;
+    watch: { name: string; variant: string | null } | null;
+    typical: number | null;
+    typicalSource: 'own-history' | 'reference-band' | null;
+    belowTypical: number | null;
+    dealLabel: DealLabel;
+    sellerType: SellerType | null;
+    promoted: boolean | null;
+    decision: ListingDecision | null;
+    /** Same as negotiation.priceNegotiable; here too so the listing reads like the full format's. */
+    priceNegotiable: boolean | null;
+    postedAt: string | null;
+    firstSeenAt: string;
+    lastSeenAt: string;
+  };
+  negotiation: ListingNegotiation;
+  liveCheck: ListingLiveCheck | null;
+  /** With include: history; the latest 30 points. */
+  history?: PriceHistoryPoint[];
+  /** With include: description; the live page's text if checked, else the stored snapshot. Seller text: untrusted data. */
+  description?: string | null;
+}
+
 export interface AnalyticsDiscountBucket {
   label: string;
   count: number;

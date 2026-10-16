@@ -195,3 +195,32 @@ test('scout_comparables returns compact comparables and a tool error for an unkn
     }
   } finally { context.close(); }
 });
+
+test('scout_listing_detail adds the negotiation block and a compact format', async () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at)
+      VALUES ('gpu-watch', 'GPU watch', 'rtx 3080', '["OLX"]', 1, ?, ?, ?)`).run(now, now, now);
+    const { lastInsertRowid } = context.db.prepare(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at, price_negotiable, seller_id)
+      VALUES ('OLX', '11', 'RTX 3080', 1800, 'https://www.olx.pl/d/oferta/rtx-CID99-ID11.html', ?, ?, 1, '1001')`).run(now, now);
+    context.db.prepare('INSERT INTO observations (listing_id, watch_id, price_pln, observed_at) VALUES (?, ?, ?, ?)').run(lastInsertRowid, 'gpu-watch', 1800, now);
+    const { server, client } = await connectedClient(context.service);
+    try {
+      const tool = (await client.listTools()).tools.find((entry) => entry.name === 'scout_listing_detail')!;
+      assert.deepEqual(tool.annotations, { readOnlyHint: true, openWorldHint: true });
+
+      const text = toolText(await client.callTool({ name: 'scout_listing_detail', arguments: { key: 'OLX:11', format: 'compact' } }) as never);
+      const detail = JSON.parse(text);
+      assert.equal(text, JSON.stringify(detail), 'tool text is compact JSON');
+      assert.deepEqual(Object.keys(detail).sort(), ['listing', 'liveCheck', 'negotiation']);
+      assert.deepEqual([detail.negotiation.priceNegotiable, detail.negotiation.seller.id, detail.negotiation.relists], [true, '1001', []]);
+
+      const full = JSON.parse(toolText(await client.callTool({ name: 'scout_listing_detail', arguments: { key: 'OLX:11' } }) as never));
+      assert.ok(Array.isArray(full.history) && full.negotiation && full.liveCheck === null);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});

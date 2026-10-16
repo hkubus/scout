@@ -169,7 +169,7 @@ test('prices round to the nearest 9,99 and marketplace condition labels map to S
   const labels: Array<[string | null, string | null]> = [
     ['Nowe', 'new'], ['Nowy', 'new'], ['Nowy bez metki', 'new'], ['Nowy z metką', 'new-with-tags'],
     ['Bardzo dobry', 'like-new'], ['Używany - jak nowy', 'like-new'], ['Używane', 'good'], ['Dobry', 'good'],
-    ['Uszkodzone', 'damaged'], ['Zadowalający', 'damaged'], ['Used', 'good'], ['', null], [null, null], ['Inne', null],
+    ['Uszkodzone', 'damaged'], ['Zadowalający', 'damaged'], ['Nie w pełni sprawny', 'damaged'], ['Używany, w pełni sprawny', 'good'], ['Used', 'good'], ['', null], [null, null], ['Inne', null],
   ];
   for (const [label, condition] of labels) assert.equal(listingConditionFromLabel(label), condition, String(label));
 });

@@ -934,8 +934,8 @@ test('reads Vinted promotion and business flags per item from the catalog page a
   const item = (id: number, promoted: boolean, business: boolean) => `{\\"id\\":${id},\\"productItem\\":{\\"id\\":${id},\\"title\\":\\"RTX\\",\\"isPromoted\\":${promoted},\\"user\\":{\\"id\\":9,\\"photo\\":null,\\"isBusiness\\":${business}},\\"photos\\":[{\\"url\\":\\"x\\"}]}}`;
   const script = `<script>self.__next_f.push([1,"{\\"items\\":{\\"items\\":[${item(11, false, true)},${item(12, true, false)}]}}"])</script>`;
   const signals = parseVintedPageSignals(script);
-  assert.deepEqual(signals.get('11'), { promoted: false, sellerType: 'business' });
-  assert.deepEqual(signals.get('12'), { promoted: true, sellerType: 'private' });
+  assert.deepEqual(signals.get('11'), { promoted: false, sellerType: 'business', sellerId: '9' });
+  assert.deepEqual(signals.get('12'), { promoted: true, sellerType: 'private', sellerId: '9' });
   const card = (id: number) => `<a data-testid="product-item-id-${id}--overlay-link" href="/items/${id}-rtx" title="RTX 3070, Stan: Dobry, 1 200,00 zł, 1 262,70 zł"></a>`;
   const cards = parseVintedCards(`${script}${card(11)}${card(12)}${card(13)}`);
   assert.deepEqual(cards.map((listing) => [listing.listingId, listing.sellerType, listing.promoted]), [['11', 'business', false], ['12', 'private', true], ['13', null, null]]);
