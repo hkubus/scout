@@ -944,6 +944,59 @@ export interface AgentFlips {
   sold?: { count: number; items: AgentSoldFlip[] };
 }
 
+/**
+ * One message in a marketplace conversation (scout_inbox, scout_conversation).
+ * `in` is from the other person, `out` from the session's account, `system`
+ * a marketplace event (sale completed, price changed). Text is the other
+ * person's words, passed through as data.
+ */
+export interface InboxMessage {
+  /** The marketplace's message id; null only for a Vinted last message Scout hasn't opened. */
+  id: string | null;
+  direction: 'in' | 'out' | 'system' | null;
+  type: 'text' | 'offer' | 'event';
+  text: string;
+  time: string | null;
+  /** Structured price offers (OLX and Allegro Lokalnie proposals, Vinted offers), in PLN. */
+  offer: { amount: number; status: 'proposed' | 'accepted' | 'rejected' | 'cancelled' | null } | null;
+}
+
+export interface InboxConversation {
+  /** `<Marketplace>:<conversationId>`, the input to scout_conversation. */
+  id: string;
+  /** null until Scout has looked the conversation up (Vinted, Allegro Lokalnie) or for a bundle. */
+  listingKey: string | null;
+  url: string;
+  /** Whether the session's account is buying or selling; null until known. */
+  role: 'buy' | 'sell' | null;
+  other: { id: string | null; name: string | null };
+  title: string | null;
+  unread: boolean;
+  updatedAt: string | null;
+  lastMessage: InboxMessage | null;
+}
+
+export interface InboxResult {
+  marketplace: Marketplace;
+  fetchedAt: string;
+  /** True when this came from Scout's one-minute cache. */
+  cached: boolean;
+  /** Conversations listed (after `since`), newest first, capped by `limit`. */
+  count: number;
+  unread: number;
+  conversations: InboxConversation[];
+}
+
+export interface ConversationResult extends Omit<InboxConversation, 'lastMessage'> {
+  fetchedAt: string;
+  cached: boolean;
+  /** Oldest first; the newest `limit` of them. */
+  messages: InboxMessage[];
+  truncated: boolean;
+  /** Set when fetching this unread conversation marked it read; Scout stops reading that marketplace's conversations. */
+  warning?: string;
+}
+
 /** A purchase read from an offer link or a screenshot, to prefill a new flip. */
 export interface FlipImport {
   title: string;

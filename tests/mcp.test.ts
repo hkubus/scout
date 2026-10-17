@@ -276,3 +276,23 @@ test('scout_flips returns the ledger compactly and rejects an unknown status', a
     }
   } finally { context.close(); }
 });
+
+test('scout_inbox and scout_conversation are read-only and report a missing session in the tool error shape', async () => {
+  const context = fixture();
+  try {
+    const { server, client } = await connectedClient(context.service);
+    try {
+      const tools = (await client.listTools()).tools.filter((entry) => entry.name === 'scout_inbox' || entry.name === 'scout_conversation');
+      assert.deepEqual(tools.map((tool) => [tool.name, tool.annotations]), [['scout_inbox', { readOnlyHint: true, openWorldHint: true }], ['scout_conversation', { readOnlyHint: true, openWorldHint: true }]]);
+      const inbox = await client.callTool({ name: 'scout_inbox', arguments: { marketplace: 'Vinted', limit: 5 } }) as { isError?: boolean; content: Array<{ type: string; text?: string }> };
+      assert.equal(inbox.isError, true);
+      assert.match(JSON.parse(toolText(inbox)).error, /^No Vinted session is stored/);
+      const conversation = await client.callTool({ name: 'scout_conversation', arguments: { id: 'eBay:123' } }) as { isError?: boolean; content: Array<{ type: string; text?: string }> };
+      assert.equal(conversation.isError, true);
+      assert.deepEqual(JSON.parse(toolText(conversation)), { error: 'Invalid conversation id; expected <Marketplace>:<conversationId> from scout_inbox' });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});

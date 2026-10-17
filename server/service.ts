@@ -13,6 +13,7 @@ import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVa
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyChecksWithJev, classifyWatchVariantWithJev, summarizeCheckResults, checkIssue, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
 import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, readPurchaseScreenshotWithVision, resolveVisionModel, verifyListingDescriptionWithVision, visionToVerification } from './vision';
 import { MAX_FLIP_PHOTO_BYTES, flipFromRow, sniffImageMime, toWebp } from './flips';
+import { InboxError, MarketplaceInbox, isSessionRenewalRequest } from './inbox';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { Limiter, mapPool } from './limiter';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, percentile, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
@@ -24,7 +25,7 @@ import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assi
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
-import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes, AgentFlip, AgentFlips } from '../src/types';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes, AgentFlip, AgentFlips, ConversationResult, InboxResult } from '../src/types';
 import { estimatedNetAtTypical, flipCost, flipNet, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, suggestedListingPrice, type FeePresets } from '../src/profit';
 
 type Database = any;
@@ -180,6 +181,7 @@ const COMPARABLES_LIMIT = 10;
 const COMPARABLES_MEDIAN_MIN = 3;
 /** Comparable titles are cut to this length; Hatbot pays per token. */
 const COMPARABLE_TITLE_CHARS = 100;
+const INBOX_READ_GUARD_KEY = 'inbox_read_guard';
 /** scout_listing_detail lists at most this many of a seller's other listings. */
 const SELLER_LISTINGS_LIMIT = 10;
 /** Scout's own rows count as a seller's current listings when seen this recently. */
@@ -274,8 +276,14 @@ export interface ScoutServiceDependencies {
   verifyListingDescriptionWithVision?: typeof verifyListingDescriptionWithVision;
   readPurchaseScreenshot?: typeof readPurchaseScreenshotWithVision;
   fetchListingDetailHtml?: (url: string, marketplace: Marketplace) => Promise<string>;
+  /** The inbox tools' HTTP client (tests stand in for the marketplaces). */
+  inboxFetch?: (url: string, init: RequestInit) => Promise<Response>;
   publicExposureWarning?: boolean;
   authEnabled?: boolean;
+}
+
+function inboxServiceError(error: unknown) {
+  return error instanceof InboxError ? new ServiceError(error.message, error.status) : error;
 }
 
 export function marketStatusAfterMiss(currentMissingScans: number, threshold = 3) {
@@ -693,6 +701,7 @@ export class ScoutService {
   private readonly visionVerification: typeof verifyListingDescriptionWithVision;
   private readonly readPurchaseScreenshot: typeof readPurchaseScreenshotWithVision;
   private readonly detailHtml: (url: string, marketplace: Marketplace) => Promise<string>;
+  private readonly inbox: MarketplaceInbox;
   private readonly publicExposureWarning: boolean;
   private readonly authEnabled: boolean;
   private readonly schedulerOwner = `scheduler-${process.pid}-${randomBytes(8).toString('hex')}`;
@@ -720,6 +729,22 @@ export class ScoutService {
     this.detailHtml = dependencies.fetchListingDetailHtml ?? ((url, marketplace) => this.fetchPublicPage(url, marketplace));
     this.publicExposureWarning = dependencies.publicExposureWarning ?? false;
     this.authEnabled = dependencies.authEnabled ?? false;
+    const inboxFetch = dependencies.inboxFetch ?? ((url: string, init: RequestInit) => fetch(url, init));
+    this.inbox = new MarketplaceInbox({
+      fetch: inboxFetch,
+      userAgent: MARKETPLACE_API_USER_AGENT,
+      session: (marketplace) => {
+        const state = this.readMarketplaceSession(marketplace);
+        return state ? { state, version: String(this.marketplaceSessionRow(marketplace)?.storage_state_encrypted ?? '') } : null;
+      },
+      saveSession: (marketplace, version, state) => this.saveRenewedMarketplaceSession(marketplace, version, state),
+      sessionFailed: (marketplace, message) => this.setMarketplaceSessionError(marketplace, message),
+      sessionUsed: (marketplace) => this.touchMarketplaceSession(marketplace),
+      request: (marketplace, task) => this.marketplaceRequest(marketplace, task),
+      readGuard: (marketplace) => this.inboxReadGuards()[marketplace] ?? null,
+      tripGuard: (marketplace, reason) => this.setSetting(INBOX_READ_GUARD_KEY, JSON.stringify({ ...this.inboxReadGuards(), [marketplace]: reason })),
+      log: (message) => this.log('info', 'diagnostics', message),
+    });
   }
 
   private transaction<T>(callback: () => T, retries = 3): T {
@@ -2292,6 +2317,7 @@ export class ScoutService {
       ON CONFLICT(marketplace) DO UPDATE SET label = excluded.label, storage_state_encrypted = excluded.storage_state_encrypted, updated_at = excluded.updated_at, last_used_at = NULL, last_error = NULL`)
       .run(marketplace, safeLabel, encryptSecret(JSON.stringify(state)), timestamp, timestamp);
     this.marketplaceSessionCache.delete(marketplace);
+    this.resetInbox(marketplace);
     return this.settings();
   }
 
@@ -2299,7 +2325,46 @@ export class ScoutService {
     const result = this.stmt('DELETE FROM marketplace_sessions WHERE marketplace = ?').run(marketplace);
     if (!result.changes) throw new ServiceError('Marketplace session not found', 404);
     this.marketplaceSessionCache.delete(marketplace);
+    this.resetInbox(marketplace);
     return this.settings();
+  }
+
+  /**
+   * Writes back a session the inbox renewed (its refresh token rotates), unless
+   * it was re-imported or removed meanwhile. Returns the new ciphertext, or null.
+   */
+  private saveRenewedMarketplaceSession(marketplace: Marketplace, version: string, state: MarketplaceStorageState) {
+    const ciphertext = encryptSecret(JSON.stringify(state));
+    const result = this.stmt('UPDATE marketplace_sessions SET storage_state_encrypted = ?, updated_at = ? WHERE marketplace = ? AND storage_state_encrypted = ?')
+      .run(ciphertext, nowIso(), marketplace, version) as { changes?: number };
+    if (!result.changes) return null;
+    this.marketplaceSessionCache.set(marketplace, { ciphertext, state });
+    return ciphertext;
+  }
+
+  /** Marketplaces whose conversations scout_conversation stopped reading because opening one marked it read. */
+  private inboxReadGuards(): Partial<Record<Marketplace, string>> {
+    return parseJson<Partial<Record<Marketplace, string>>>(this.getSetting(INBOX_READ_GUARD_KEY), {});
+  }
+
+  /** A re-imported or removed session starts the inbox afresh, read guard included. */
+  private resetInbox(marketplace: Marketplace) {
+    this.inbox.forget(marketplace);
+    const guards = this.inboxReadGuards();
+    if (guards[marketplace]) {
+      delete guards[marketplace];
+      this.setSetting(INBOX_READ_GUARD_KEY, JSON.stringify(guards));
+    }
+  }
+
+  /** scout_inbox: the newest conversations through the stored session. */
+  async inboxForAgent(input: { marketplace: Marketplace; since?: string; limit?: number }): Promise<InboxResult> {
+    try { return await this.inbox.inbox(input.marketplace, input); } catch (error) { throw inboxServiceError(error); }
+  }
+
+  /** scout_conversation: one conversation's messages through the stored session. */
+  async conversationForAgent(input: { id: string; limit?: number }): Promise<ConversationResult> {
+    try { return await this.inbox.conversation(input.id, input); } catch (error) { throw inboxServiceError(error); }
   }
 
   private watchFromRow(
@@ -5498,8 +5563,11 @@ export class ScoutService {
   private async requestPublicPage(url: string, marketplace: Marketplace): Promise<string> {
     const validation = validateSearchUrl(url, marketplace);
     if (!validation.valid) throw new Error(validation.reason);
-    const authenticatedState = this.readMarketplaceSession(marketplace);
-    if (authenticatedState) {
+    const storedState = this.readMarketplaceSession(marketplace);
+    if (storedState) {
+      // Renew a short-lived token first, so the page's own scripts never
+      // rotate the stored refresh token inside a throwaway browser context.
+      const authenticatedState = await this.inbox.freshSession(marketplace).then((session) => session.state, () => storedState);
       try {
         const html = await this.renderPublicPage(validation.url, marketplace, authenticatedState);
         this.touchMarketplaceSession(marketplace);
@@ -5647,6 +5715,9 @@ export class ScoutService {
         const bare = hostname.replace(/^\[|\]$/g, '');
         const reachable = bare && isSafeNetworkHost(bare) && (bare.includes('.') || bare.includes(':'));
         if (!reachable) return route.abort('blockedbyclient');
+        // Token renewal belongs to Scout (inbox.ts): a renewal here would
+        // rotate the stored session's refresh token and throw the new one away.
+        if (storageState && isSessionRenewalRequest(route.request().method(), route.request().url())) return route.abort('blockedbyclient');
         // Only the HTML is read: marketplace CDN photos get a 1x1 GIF instead of
         // a download. Other hosts' images (challenge platforms) still load.
         if (route.request().resourceType() === 'image' && isMarketplaceImageUrl(route.request().url())) {
