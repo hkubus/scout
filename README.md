@@ -263,6 +263,8 @@ To create a Playwright storage-state file on a machine with a visible Chromium i
 npm run marketplace:login -- --marketplace "OLX"
 ```
 
+The command opens an ordinary Chromium window with a temporary profile and no automation or remote-debugging switches, so the marketplace sees a normal browser. Log in, then close the window or press Enter in the terminal. Scout then reads the closed profile offline with Playwright, keeps only the marketplace's own cookies and localStorage, and deletes the temporary profile.
+
 After logging in, import the generated JSON from Settings → Marketplace accounts. Session state is encrypted with `SCOUT_SECRET`, restricted to the selected marketplace domain, and never returned by the API. Allegro Lokalnie imports may also contain the related `allegro.pl` account-auth origin used by its sign-in flow. Sessions can expire and must then be re-imported. Do not paste raw `Cookie` headers or commit storage-state files.
 
 ## Safety boundaries
