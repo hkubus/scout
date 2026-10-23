@@ -247,6 +247,19 @@ public struct ScoutClient: Sendable {
         return decoded.photo
     }
 
+    /// Marks a flip "Ready to list" on `channels` (or re-marks it, which
+    /// retries failed and declined ones). The server says what's missing.
+    public func markReadyToList(flipId: Int, channels: [FlipChannel]) async throws -> Flip {
+        let response: FlipResponse = try await send("PUT", "/api/flips/\(flipId)/ready", body: ReadyToListBody(channels: channels))
+        return response.flip
+    }
+
+    /// Takes a flip out of Hatbot's list; listed channels keep their link.
+    public func cancelReadyToList(flipId: Int) async throws -> Flip {
+        let response: FlipResponse = try await send("DELETE", "/api/flips/\(flipId)/ready", body: EmptyBody())
+        return response.flip
+    }
+
     public func deleteFlipPhoto(id: Int) async throws {
         let _: OkResponse = try await send("DELETE", "/api/flip-photos/\(id)", body: EmptyBody())
     }

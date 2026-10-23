@@ -643,7 +643,7 @@ export interface DashboardData {
   lastScanTime: string;
 }
 
-export type { FeePreset, FeePresets, FlipChannel, FlipListing, ListingCondition } from './profit';
+export type { FeePreset, FeePresets, FlipChannel, FlipDelivery, FlipListing, FlipListingChannel, ListingChannel, ListingCondition, ParcelSize } from './profit';
 
 export interface Flip {
   id: number;
@@ -672,6 +672,15 @@ export interface Flip {
   listing: import('./profit').FlipListing | null;
   /** Listing photos in posting order; bytes come from `/api/flip-photos/:id`. */
   photos: FlipPhoto[];
+  /** Marked "Ready to list": Hatbot posts it on the `ready` channels. */
+  readyToList: boolean;
+  /** Each picked marketplace and how posting went; `listed` ones stay after a cancel. */
+  listingChannels: import('./profit').FlipListingChannel[];
+  /**
+   * The draft's revision: moves only when what gets posted changes, never
+   * when a channel's status is recorded. Null until the draft is first saved.
+   */
+  listingRevisedAt: string | null;
 }
 
 export interface FlipPhoto {

@@ -17,7 +17,7 @@ import { compressApiResponse } from './compression';
 import { apiTokenCredentialId, bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
 import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
 import { FlipStore, MAX_FLIP_PHOTO_BYTES, MAX_FLIP_PHOTOS } from './flips';
-import { FLIP_CHANNELS, LISTING_CONDITIONS } from '../src/profit';
+import { FLIP_CHANNELS, LISTING_CHANNELS, LISTING_CONDITIONS, PARCEL_SIZES } from '../src/profit';
 import { dashboardTopParam, NO_LOCATION_FILTER, normalizeSourceIntervals, olxCategoryToJson, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 import { parseVariantGroups } from './variants';
@@ -691,9 +691,24 @@ app.put('/api/flips/:id/listing', async (request, reply) => {
     category: z.string().trim().max(80).optional(),
     prices: z.object(Object.fromEntries(FLIP_CHANNELS.map((channel) => [channel, flipAmount.positive().optional()])) as Record<(typeof FLIP_CHANNELS)[number], z.ZodOptional<z.ZodNumber>>).strict(),
     basePrice: flipAmount.positive().nullable(),
+    // Left out by older clients: the stored delivery is kept.
+    delivery: z.object({ shipping: z.boolean(), pickup: z.boolean(), parcelSize: z.enum(PARCEL_SIZES).nullable() }).strict().optional(),
   }).strict().nullable().safeParse(request.body);
   if (!listing.success) return reply.code(400).send({ error: 'Invalid listing draft', details: listing.error.flatten() });
   return { flip: flips.setListing(params.data.id, listing.data) };
+});
+// "Ready to list": Hatbot posts the draft on these channels (see docs/hatbot-listing-plan.md).
+app.put('/api/flips/:id/ready', async (request, reply) => {
+  const params = flipIdParams.safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid flip id is required' });
+  const parsed = z.object({ channels: z.array(z.enum(LISTING_CHANNELS)).max(LISTING_CHANNELS.length) }).strict().safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'Pick the marketplaces to list it on', details: parsed.error.flatten() });
+  return { flip: flips.markReady(params.data.id, [...new Set(parsed.data.channels)]) };
+});
+app.delete('/api/flips/:id/ready', async (request, reply) => {
+  const params = flipIdParams.safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid flip id is required' });
+  return { flip: flips.cancelReady(params.data.id) };
 });
 app.post('/api/flips/:id/listing-draft', async (request, reply) => {
   const params = flipIdParams.safeParse(request.params);
@@ -1075,7 +1090,7 @@ app.post('/mcp', async (request, reply) => {
     return;
   }
   const [{ createScoutMcpServer }, { StreamableHTTPServerTransport }] = modules;
-  const mcpServer = createScoutMcpServer(service, debug);
+  const mcpServer = createScoutMcpServer(service, debug, flips);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   reply.raw.on('close', () => {
     transport.close().catch(() => {});

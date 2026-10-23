@@ -958,6 +958,44 @@ final class FlipTests: XCTestCase {
         XCTAssertEqual(data.feePresets[.allegroLokalnie].percent, 4.9)
     }
 
+    func testDecodesReadyToListAndSaysWhatADraftIsMissing() throws {
+        let json = #"{"id":4,"title":"RTX 3070","listingKey":null,"watchId":null,"buyChannel":"OLX","boughtOn":"2026-10-01","buyPrice":900,"buyCosts":0,"listedOn":["OLX"],"soldOn":null,"saleChannel":null,"salePrice":null,"saleFee":null,"saleCosts":null,"delisted":[],"note":"","createdAt":"now","updatedAt":"now","listing":{"title":"RTX","description":"ok","condition":"good","category":"Karty graficzne","prices":{"OLX":1199},"basePrice":1149,"delivery":{"shipping":true,"pickup":false,"parcelSize":"medium"}},"photos":[],"readyToList":true,"listingChannels":[{"channel":"OLX","status":"listed","url":"https://www.olx.pl/d/oferta/x","error":null,"updatedAt":"now"},{"channel":"Vinted","status":"queued-later","url":null,"error":"x","updatedAt":"now"}],"listingRevisedAt":"2026-10-24T10:00:00.000Z"}"#
+        let flip: Flip = try ScoutClient.decode(Data(json.utf8))
+        XCTAssertEqual(flip.readyToList, true)
+        XCTAssertEqual(flip.listingChannels?.map(\.status), [.listed, ListingStatus(rawValue: "queued-later")], "a status a newer server adds still decodes")
+        XCTAssertEqual(flip.listingChannels?.first?.status.label, "Listed")
+        XCTAssertEqual(flip.listing?.delivery?.parcelSize, "medium")
+        XCTAssertEqual(flip.listing?.price(on: .vinted), 1149, "the base price stands in")
+        XCTAssertEqual(ReadyToList.gaps(listing: flip.listing, photoCount: 0, channels: [.olx, .vinted]), ["at least one photo"])
+        XCTAssertEqual(
+            ReadyToList.gaps(listing: nil, photoCount: 0, channels: [.olx, .vinted]),
+            ["a title", "a description", "the condition", "a price for OLX and Vinted", "shipping or pickup for OLX", "the parcel size for Vinted", "at least one photo"]
+        )
+        XCTAssertEqual(ReadyToList.message(["a description", "a price for Vinted", "at least one photo"]), "Before it can be listed, add a description, a price for Vinted and at least one photo.")
+        let older: Flip = try ScoutClient.decode(Data(json.replacingOccurrences(of: #","readyToList""#, with: #","ignored""#).utf8))
+        XCTAssertNil(older.readyToList, "older servers send no ready state")
+        let body = try JSONSerialization.jsonObject(with: JSONEncoder().encode(ReadyToListBody(channels: [.olx, .vinted]))) as? [String: [String]]
+        XCTAssertEqual(body, ["channels": ["OLX", "Vinted"]])
+    }
+
+    func testReadyToListFlowInDemo() async throws {
+        let client = ScoutClient(baseURL: DemoTransport.baseURL, transport: DemoTransport())
+        do {
+            _ = try await client.markReadyToList(flipId: 4, channels: [.olx, .vinted])
+            XCTFail("a draft without photos can't be listed")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "Before it can be listed, add at least one photo.")
+        }
+        _ = try await client.uploadFlipPhoto(flipId: 4, jpeg: Data([0xFF, 0xD8, 0xFF, 0xE0, 1, 2]))
+        let ready = try await client.markReadyToList(flipId: 4, channels: [.vinted, .olx])
+        XCTAssertEqual(ready.readyToList, true)
+        XCTAssertEqual(ready.listingChannels?.map(\.channel), [.olx, .vinted])
+        XCTAssertEqual(ready.listingChannels?.map(\.status), [.ready, .ready])
+        let cancelled = try await client.cancelReadyToList(flipId: 4)
+        XCTAssertEqual(cancelled.readyToList, false)
+        XCTAssertEqual(cancelled.listingChannels, [])
+    }
+
     func testLedgerFlowInDemo() async throws {
         let client = ScoutClient(baseURL: DemoTransport.baseURL, transport: DemoTransport())
         let start = try await client.flips()
