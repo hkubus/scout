@@ -476,3 +476,26 @@ test('works the same with sign-in off, and still honours Disconnect', { timeout:
     await scout.stop();
   }
 });
+
+test('behind a proxy, the metadata and the /mcp challenge say SCOUT_PUBLIC_ORIGIN, whatever Host and scheme reach Scout', { timeout: 180_000 }, async () => {
+  const scout = await startScout({ SCOUT_PASSWORD: PASSWORD, SCOUT_PUBLIC_ORIGIN: 'https://scout.example' });
+  try {
+    const { origin } = scout;
+    const proxied = { 'x-forwarded-for': '203.0.113.7' };
+    const metadata = await (await fetch(`${origin}/.well-known/oauth-authorization-server`, { headers: proxied })).json() as Record<string, string>;
+    assert.equal(metadata.issuer, 'https://scout.example');
+    assert.equal(metadata.authorization_endpoint, 'https://scout.example/oauth/authorize');
+    assert.equal(metadata.token_endpoint, 'https://scout.example/oauth/token');
+    assert.equal(metadata.registration_endpoint, 'https://scout.example/oauth/register');
+    const resource = await (await fetch(`${origin}/.well-known/oauth-protected-resource`, { headers: proxied })).json();
+    assert.deepEqual(resource, { resource: 'https://scout.example/mcp', authorization_servers: ['https://scout.example'] });
+    const refused = await fetch(`${origin}/mcp`, { method: 'POST', headers: { ...proxied, 'content-type': 'application/json' }, body: '{}' });
+    assert.equal(refused.status, 401);
+    assert.equal(refused.headers.get('www-authenticate'), 'Bearer resource_metadata="https://scout.example/.well-known/oauth-protected-resource"');
+    // Reached directly, it's still the address that was used.
+    const direct = await (await fetch(`${origin}/.well-known/oauth-authorization-server`)).json() as Record<string, string>;
+    assert.equal(direct.issuer, origin);
+  } finally {
+    await scout.stop();
+  }
+});

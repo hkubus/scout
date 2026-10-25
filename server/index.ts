@@ -86,6 +86,11 @@ const allowedHostNames = [
   ...(process.env.SCOUT_ALLOWED_HOSTS ?? '').split(',').map((name) => name.trim()).filter(Boolean),
 ];
 const forwardedHeaders = ['x-forwarded-for', 'forwarded', 'x-forwarded-host', 'x-real-ip', 'cf-connecting-ip'] as const;
+// Where apps reach Scout, for the OAuth metadata: through the proxy, SCOUT_PUBLIC_ORIGIN whatever
+// Host and scheme it passes on; directly, the address they used.
+const appOrigin = (request: FastifyRequest) => (publicOrigins[0] && forwardedHeaders.some((name) => request.headers[name] !== undefined)
+  ? publicOrigins[0]
+  : `${request.protocol}://${request.host}`);
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -167,7 +172,7 @@ function resolveAuth(request: FastifyRequest, route: string): FastifyRequest['sc
 
 function refuseUnauthenticated(request: FastifyRequest, reply: FastifyReply, route: string) {
   // /mcp's challenge sends MCP clients to the OAuth metadata (MCP authorization spec).
-  reply.header('WWW-Authenticate', route === '/mcp' ? mcpChallenge(`${request.protocol}://${request.host}`) : 'Bearer realm="scout"');
+  reply.header('WWW-Authenticate', route === '/mcp' ? mcpChallenge(appOrigin(request)) : 'Bearer realm="scout"');
   return reply.code(401).send({ error: 'Authentication required' });
 }
 
@@ -1173,6 +1178,7 @@ await registerOAuthRoutes(app, {
   store: connectedApps,
   sendPage: (reply) => (existsSync(distPath) ? reply.sendFile('index.html') : reply.code(404).send({ error: 'Not found' })),
   canConsent: (request) => request.scoutAuth === 'session' || request.scoutAuth === 'disabled',
+  origin: appOrigin,
 });
 
 const scheduler = setInterval(() => {

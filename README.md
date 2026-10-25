@@ -237,7 +237,7 @@ An MCP client such as [Hatbot](docs/hatbot-listing-plan.md#connecting-hatbot) ca
 
 | Endpoint | Does |
 | --- | --- |
-| `GET /.well-known/oauth-authorization-server` | Metadata for the origin the request came in on, so it works at whatever address you typed. |
+| `GET /.well-known/oauth-authorization-server` | Metadata for the origin the request came in on, so it works at whatever address you typed. Through a reverse proxy (a request with forwarded headers), it is `SCOUT_PUBLIC_ORIGIN` when that is set. |
 | `GET /.well-known/oauth-protected-resource` | `{resource: "<origin>/mcp", authorization_servers: ["<origin>"]}`; a 401 from `/mcp` points at it with `WWW-Authenticate: Bearer resource_metadata="…"`. |
 | `POST /oauth/register` | Dynamic registration (JSON, public clients only, `redirect_uris` must be http(s) without a fragment); 10/min per IP. At most 50 apps; ones that hold no token are dropped after a day. |
 | `GET /oauth/authorize` | The dashboard's "Let … in?" page. A `redirect_uri` not registered for that `client_id` shows an error and redirects nowhere. Allow (a same-origin form post from a signed-in session) 302s back with a one-time code bound to the client, `redirect_uri` and `code_challenge` for 5 minutes; Cancel with `error=access_denied`. |
