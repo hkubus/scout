@@ -86,6 +86,11 @@ const allowedHostNames = [
   ...(process.env.SCOUT_ALLOWED_HOSTS ?? '').split(',').map((name) => name.trim()).filter(Boolean),
 ];
 const forwardedHeaders = ['x-forwarded-for', 'forwarded', 'x-forwarded-host', 'x-real-ip', 'cf-connecting-ip'] as const;
+// Where apps reach Scout, for the OAuth metadata: through the proxy, SCOUT_PUBLIC_ORIGIN whatever
+// Host and scheme it passes on; directly, the address they used.
+const appOrigin = (request: FastifyRequest) => (publicOrigins[0] && forwardedHeaders.some((name) => request.headers[name] !== undefined)
+  ? publicOrigins[0]
+  : `${request.protocol}://${request.host}`);
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -117,12 +122,14 @@ app.addHook('onRequest', async (request, reply) => {
   const route = request.routeOptions.url;
   if (!isProtectedRoute(route) && !isOAuthRoute(route)) return;
 
-  const expensive = route === '/mcp' || /\/search$|\/categories$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/listing-draft$|\/flips\/import\/(?:url|screenshot)$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route);
+  // A connected app (Hatbot) gets its own bucket, so it neither eats nor runs out of the dashboard's.
+  const connectedApp = route === '/mcp' && isConnectedAppToken(bearerToken(request.headers.authorization) ?? '');
+  const expensive = !connectedApp && (route === '/mcp' || /\/search$|\/categories$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/listing-draft$|\/flips\/import\/(?:url|screenshot)$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route));
   // Registration is public, so it gets the tightest bucket of its own.
-  const limit = route === '/oauth/register' ? 10 : route === '/oauth/token' || route === CONSENT_PATH ? 30 : expensive ? 30 : 240;
+  const limit = route === '/oauth/register' ? 10 : route === '/oauth/token' || route === CONSENT_PATH ? 30 : expensive ? 30 : connectedApp ? 120 : 240;
   // Snapshot images use the general limit so a screen of saved photos loads.
   // Key on the route template, not the raw URL, so ids cannot mint new buckets.
-  const bucket = rateLimiter.consume(`${rateLimitKey(request.ip)}:${expensive ? 'expensive' : `${request.method} ${route}`}`, limit);
+  const bucket = rateLimiter.consume(`${rateLimitKey(request.ip)}:${expensive ? 'expensive' : connectedApp ? 'app' : `${request.method} ${route}`}`, limit);
   reply.header('X-RateLimit-Limit', String(limit));
   reply.header('X-RateLimit-Remaining', String(bucket.remaining));
   if (!bucket.allowed) {
@@ -167,7 +174,7 @@ function resolveAuth(request: FastifyRequest, route: string): FastifyRequest['sc
 
 function refuseUnauthenticated(request: FastifyRequest, reply: FastifyReply, route: string) {
   // /mcp's challenge sends MCP clients to the OAuth metadata (MCP authorization spec).
-  reply.header('WWW-Authenticate', route === '/mcp' ? mcpChallenge(`${request.protocol}://${request.host}`) : 'Bearer realm="scout"');
+  reply.header('WWW-Authenticate', route === '/mcp' ? mcpChallenge(appOrigin(request)) : 'Bearer realm="scout"');
   return reply.code(401).send({ error: 'Authentication required' });
 }
 
@@ -1108,7 +1115,21 @@ app.get('/events', async (request, reply) => {
 // got through OAuth (server/oauth.ts).
 // The MCP SDK (~40 MB RSS) loads on the first /mcp request, not at startup.
 let mcpModules: Promise<[typeof import('./mcp'), typeof import('@modelcontextprotocol/sdk/server/streamableHttp.js')]> | undefined;
+// Live marketplace fetches keep the 30/min cap the dashboard's searches have, even for a connected app.
+const LIVE_MCP_TOOLS = new Set(['scout_search', 'scout_olx_categories', 'scout_queue_scan']);
+const callsLiveTool = (body: unknown) => (Array.isArray(body) ? body : [body]).some((message) => {
+  const call = message as { method?: unknown; params?: { name?: unknown } } | null;
+  return call?.method === 'tools/call' && LIVE_MCP_TOOLS.has(String(call.params?.name));
+});
+
 app.post('/mcp', async (request, reply) => {
+  if (request.scoutAuth === 'app' && callsLiveTool(request.body)) {
+    const bucket = rateLimiter.consume(`${rateLimitKey(request.ip)}:expensive`, 30);
+    if (!bucket.allowed) {
+      reply.header('Retry-After', String(bucket.retryAfterSeconds));
+      return reply.code(429).send({ error: 'Too many requests. Try again later.' });
+    }
+  }
   reply.hijack();
   let modules: Awaited<NonNullable<typeof mcpModules>>;
   try {
@@ -1173,6 +1194,7 @@ await registerOAuthRoutes(app, {
   store: connectedApps,
   sendPage: (reply) => (existsSync(distPath) ? reply.sendFile('index.html') : reply.code(404).send({ error: 'Not found' })),
   canConsent: (request) => request.scoutAuth === 'session' || request.scoutAuth === 'disabled',
+  origin: appOrigin,
 });
 
 const scheduler = setInterval(() => {

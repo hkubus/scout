@@ -228,6 +228,8 @@ export type OAuthRouteOptions = {
   sendPage: (reply: FastifyReply) => unknown;
   /** Whether this request may press Allow: a signed-in session, or any request while auth is off. */
   canConsent: (request: FastifyRequest) => boolean;
+  /** Where apps reach Scout; by default the origin the request came in on. */
+  origin?: (request: FastifyRequest) => string;
 };
 
 /**
@@ -235,9 +237,9 @@ export type OAuthRouteOptions = {
  * caller's onRequest hooks decide who reaches what: the /api routes need the
  * dashboard's sign-in and the Allow POST a same-origin session.
  */
-export async function registerOAuthRoutes(app: FastifyInstance, { store, sendPage, canConsent }: OAuthRouteOptions) {
+export async function registerOAuthRoutes(app: FastifyInstance, { store, sendPage, canConsent, origin: originOf = requestOrigin }: OAuthRouteOptions) {
   app.get('/.well-known/oauth-authorization-server', async (request) => {
-    const origin = requestOrigin(request);
+    const origin = originOf(request);
     return {
       issuer: origin,
       authorization_endpoint: `${origin}${CONSENT_PATH}`,
@@ -251,7 +253,7 @@ export async function registerOAuthRoutes(app: FastifyInstance, { store, sendPag
   });
 
   app.get('/.well-known/oauth-protected-resource', async (request) => {
-    const origin = requestOrigin(request);
+    const origin = originOf(request);
     return { resource: `${origin}/mcp`, authorization_servers: [origin] };
   });
 
