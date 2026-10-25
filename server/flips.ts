@@ -1,4 +1,9 @@
-import { DEFAULT_FEE_PRESETS, FLIP_CHANNELS, LISTING_CONDITIONS, isFlipChannel, normalizeFeePresets, saleFee, type FeePresets, type FlipChannel, type FlipListing, type ListingCondition } from '../src/profit';
+import { createHash } from 'node:crypto';
+import {
+  DEFAULT_FEE_PRESETS, FLIP_CHANNELS, LISTING_CHANNELS, LISTING_CHANNEL_STATUSES, LISTING_CONDITIONS, NO_DELIVERY, PARCEL_SIZES,
+  isFlipChannel, isListingChannel, listingPrice, normalizeFeePresets, readyToListGaps, readyToListMessage, saleFee,
+  type FeePresets, type FlipChannel, type FlipDelivery, type FlipListing, type FlipListingChannel, type ListingChannel, type ListingChannelStatus, type ListingCondition, type ParcelSize,
+} from '../src/profit';
 import sharp from 'sharp';
 import type { Flip, FlipPhoto, FlipsData } from '../src/types';
 import { FEE_PRESETS_KEY, ServiceError } from './service';
@@ -8,6 +13,11 @@ export const MAX_FLIP_PHOTOS = 20;
 export const MAX_FLIP_PHOTO_BYTES = 10 * 1024 * 1024;
 /** Long edge of a stored photo; the marketplaces show no more than this. */
 export const MAX_FLIP_PHOTO_EDGE = 2000;
+/** A photo sent to Hatbot stays under about 2 MB once base64-encoded. */
+export const MAX_POSTING_PHOTO_BYTES = 1_500_000;
+/** Where each marketplace's own listings live. */
+export const LISTING_HOSTS: Record<ListingChannel, string> = { OLX: 'olx.pl', 'Allegro Lokalnie': 'allegrolokalnie.pl', Vinted: 'vinted.pl' };
+const MAX_LISTING_ERROR_CHARS = 500;
 
 // One image at a time and no decoded-image cache: the server is small.
 sharp.concurrency(1);
@@ -27,6 +37,41 @@ export function sniffImageMime(data: Uint8Array): 'image/jpeg' | 'image/png' | '
  * metadata (GPS position included) is dropped. A WebP that is already small
  * enough is kept as it is, so it is never compressed twice.
  */
+/**
+ * A stored photo as a JPEG for posting, at most 2000 px on the long side,
+ * stepping the quality down until it fits `MAX_POSTING_PHOTO_BYTES`.
+ */
+export async function toPostingJpeg(data: Uint8Array): Promise<Buffer> {
+  try {
+    let jpeg = Buffer.alloc(0);
+    for (const quality of [85, 75, 65, 55]) {
+      jpeg = await sharp(data, { failOn: 'error', limitInputPixels: 100_000_000 })
+        .rotate()
+        .resize({ width: MAX_FLIP_PHOTO_EDGE, height: MAX_FLIP_PHOTO_EDGE, fit: 'inside', withoutEnlargement: true })
+        .flatten({ background: '#ffffff' })
+        .jpeg({ quality, mozjpeg: true })
+        .toBuffer();
+      if (jpeg.byteLength <= MAX_POSTING_PHOTO_BYTES) break;
+    }
+    return jpeg;
+  } catch {
+    throw new ServiceError('The photo could not be read as an image', 415);
+  }
+}
+
+/**
+ * The URL of a new listing, checked to be on that marketplace's own host
+ * (`www.olx.pl` and `m.olx.pl` count as olx.pl).
+ */
+export function listingUrlOn(channel: ListingChannel, raw: string | null | undefined): string {
+  const host = LISTING_HOSTS[channel];
+  let url: URL;
+  try { url = new URL(String(raw ?? '').trim()); } catch { throw new ServiceError(`Recording ${channel} as listed needs the new listing's URL on ${host}`, 400); }
+  const onHost = url.hostname === host || url.hostname.endsWith(`.${host}`);
+  if (url.protocol !== 'https:' || url.username || url.password || !onHost) throw new ServiceError(`${url.href} is not an https:// address on ${host}`, 400);
+  return url.href;
+}
+
 export async function toWebp(data: Uint8Array): Promise<Buffer> {
   try {
     const image = sharp(data, { failOn: 'error', limitInputPixels: 100_000_000 });
@@ -56,6 +101,7 @@ function listingFromJson(value: unknown): FlipListing | null {
     }
   }
   const condition = LISTING_CONDITIONS.includes(raw.condition as ListingCondition) ? raw.condition as ListingCondition : null;
+  const delivery = (raw.delivery && typeof raw.delivery === 'object' ? raw.delivery : {}) as Record<string, unknown>;
   return {
     title: typeof raw.title === 'string' ? raw.title : '',
     description: typeof raw.description === 'string' ? raw.description : '',
@@ -63,7 +109,44 @@ function listingFromJson(value: unknown): FlipListing | null {
     ...(typeof raw.category === 'string' && raw.category.trim() ? { category: raw.category.trim().slice(0, 80) } : {}),
     prices,
     basePrice: typeof raw.basePrice === 'number' && Number.isFinite(raw.basePrice) && raw.basePrice > 0 ? raw.basePrice : null,
+    delivery: {
+      shipping: delivery.shipping === true,
+      pickup: delivery.pickup === true,
+      parcelSize: PARCEL_SIZES.includes(delivery.parcelSize as ParcelSize) ? delivery.parcelSize as ParcelSize : null,
+    },
   };
+}
+
+function listingChannelsFromJson(value: unknown): FlipListingChannel[] {
+  let parsed: unknown = [];
+  try { parsed = JSON.parse(String(value ?? '[]')); } catch { parsed = []; }
+  if (!Array.isArray(parsed)) return [];
+  const byChannel = new Map<ListingChannel, FlipListingChannel>();
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object' || !isListingChannel(item.channel) || !LISTING_CHANNEL_STATUSES.includes(item.status)) continue;
+    byChannel.set(item.channel, {
+      channel: item.channel,
+      status: item.status,
+      url: typeof item.url === 'string' && item.url ? item.url : null,
+      error: typeof item.error === 'string' && item.error ? item.error : null,
+      updatedAt: String(item.updatedAt ?? ''),
+    });
+  }
+  return LISTING_CHANNELS.flatMap((channel) => byChannel.get(channel) ?? []);
+}
+
+/** What `scout_flip` hands Hatbot to post. */
+export interface FlipToPost {
+  id: number;
+  updatedAt: string;
+  title: string;
+  description: string;
+  condition: ListingCondition;
+  category: string | null;
+  delivery: FlipDelivery;
+  prices: Partial<Record<ListingChannel, number>>;
+  currency: 'PLN';
+  photos: Array<{ id: number; mime: 'image/jpeg' }>;
 }
 
 export interface FlipInput {
@@ -118,6 +201,9 @@ function flipFromRow(row: Record<string, any>, photos: FlipPhoto[] = []): Flip {
     updatedAt: String(row.updated_at),
     listing: listingFromJson(row.listing_json),
     photos,
+    readyToList: Boolean(row.listing_ready_at),
+    listingChannels: listingChannelsFromJson(row.listing_channels_json),
+    listingRevisedAt: row.listing_revised_at ?? null,
   };
 }
 
@@ -169,11 +255,170 @@ export class FlipStore {
     return flipFromRow(row, this.photosByFlip(id).get(id) ?? []);
   }
 
+  /** A draft without `delivery` keeps the stored one, so older clients don't wipe it. */
   setListing(id: number, listing: FlipListing | null): Flip {
-    this.get(id);
-    this.db.prepare('UPDATE flips SET listing_json = ?, updated_at = ? WHERE id = ?').run(listing ? JSON.stringify(listing) : null, new Date().toISOString(), id);
+    const current = this.get(id);
+    const next = listing ? { ...listing, delivery: listing.delivery ?? current.listing?.delivery ?? { ...NO_DELIVERY } } : null;
+    this.assertStillComplete(current, next, current.photos.length);
+    this.db.prepare('UPDATE flips SET listing_json = ?, updated_at = ? WHERE id = ?').run(next ? JSON.stringify(next) : null, new Date().toISOString(), id);
+    this.revise(id);
     this.onChange({ id });
     return this.get(id);
+  }
+
+  /**
+   * A flip marked ready keeps a complete draft, so Hatbot never sees one
+   * with a gap: an edit that would leave one is refused.
+   */
+  private assertStillComplete(flip: Flip, listing: FlipListing | null, photoCount: number) {
+    if (!flip.readyToList) return;
+    const gaps = readyToListGaps(listing, photoCount, flip.listingChannels.map((item) => item.channel));
+    if (gaps.length) throw new ServiceError(`This flip is ready to list, so its draft must keep ${gaps.join(', ')}. Cancel “Ready to list” first to change that.`, 400);
+  }
+
+  /** Everything that gets posted, hashed: text, delivery, prices, photos, channels. */
+  private fingerprint(flip: Flip) {
+    const channels = flip.listingChannels.map((item) => item.channel);
+    const listing = flip.listing;
+    return createHash('sha256').update(JSON.stringify({
+      ready: flip.readyToList,
+      channels,
+      title: listing?.title ?? null,
+      description: listing?.description ?? null,
+      condition: listing?.condition ?? null,
+      category: listing?.category ?? null,
+      delivery: listing?.delivery ?? null,
+      prices: channels.map((channel) => listingPrice(listing, channel)),
+      photos: flip.photos.map((photo) => photo.id),
+    })).digest('hex');
+  }
+
+  /**
+   * Move the draft's revision when what gets posted changed (or `force`).
+   * Hatbot asks the owner again on every new revision, so recording a
+   * channel's status never calls this. Each revision is later than the last.
+   */
+  private revise(id: number, force = false) {
+    const flip = this.get(id);
+    const row = this.db.prepare('SELECT listing_fingerprint, listing_revised_at FROM flips WHERE id = ?').get(id) as { listing_fingerprint: string | null; listing_revised_at: string | null };
+    const fingerprint = this.fingerprint(flip);
+    if (!force && row.listing_fingerprint === fingerprint) return;
+    const previous = row.listing_revised_at ? Date.parse(row.listing_revised_at) : 0;
+    const revisedAt = new Date(Math.max(Date.now(), previous + 1)).toISOString();
+    this.db.prepare('UPDATE flips SET listing_fingerprint = ?, listing_revised_at = ? WHERE id = ?').run(fingerprint, revisedAt, id);
+  }
+
+  /**
+   * Mark a flip "Ready to list" on `picked`, or re-mark it. Channels already
+   * listed stay picked; failed and declined ones go back to ready, which is
+   * how the owner retries.
+   */
+  markReady(id: number, picked: ListingChannel[]): Flip {
+    const flip = this.get(id);
+    if (flip.soldOn) throw new ServiceError('This flip is already sold', 400);
+    if (!picked.length) throw new ServiceError('Pick at least one marketplace to list it on', 400);
+    const previous = new Map(flip.listingChannels.map((item) => [item.channel, item]));
+    const channels = LISTING_CHANNELS.filter((channel) => picked.includes(channel) || previous.get(channel)?.status === 'listed');
+    const gaps = readyToListGaps(flip.listing, flip.photos.length, channels);
+    if (gaps.length) throw new ServiceError(readyToListMessage(gaps), 400);
+    const now = new Date().toISOString();
+    let retried = false;
+    const next = channels.map((channel): FlipListingChannel => {
+      const current = previous.get(channel);
+      if (current?.status === 'listed' || (current?.status === 'ready' && flip.readyToList)) return current;
+      if (current) retried = true;
+      return { channel, status: 'ready', url: null, error: null, updatedAt: now };
+    });
+    this.db.prepare('UPDATE flips SET listing_ready_at = COALESCE(listing_ready_at, ?), listing_channels_json = ?, updated_at = ? WHERE id = ?').run(now, JSON.stringify(next), now, id);
+    this.revise(id, !flip.readyToList || retried);
+    this.onChange({ id });
+    return this.get(id);
+  }
+
+  /** Take a flip out of `scout_flips_to_list`; listed channels keep their URL. */
+  cancelReady(id: number): Flip {
+    this.get(id);
+    this.clearReady(id);
+    this.onChange({ id });
+    return this.get(id);
+  }
+
+  private clearReady(id: number) {
+    const flip = this.get(id);
+    if (!flip.readyToList) return;
+    const listed = flip.listingChannels.filter((item) => item.status === 'listed');
+    this.db.prepare('UPDATE flips SET listing_ready_at = NULL, listing_channels_json = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(listed), new Date().toISOString(), id);
+    this.revise(id);
+  }
+
+  /**
+   * Hatbot's report for one channel. `listed` is always kept, even after a
+   * cancel, because the listing is live; `failed` and `declined` only change
+   * a picked channel that isn't listed. Repeating a report changes nothing,
+   * and the draft's revision never moves.
+   */
+  recordListing(flipId: number, channel: string, status: Exclude<ListingChannelStatus, 'ready'>, url?: string | null, error?: string | null) {
+    if (!isListingChannel(channel)) throw new ServiceError(`Unknown channel "${channel}": use OLX, Allegro Lokalnie or Vinted`, 400);
+    const flip = this.get(flipId);
+    const current = flip.listingChannels.find((item) => item.channel === channel);
+    let record: FlipListingChannel;
+    let listedOn = flip.listedOn;
+    if (status === 'listed') {
+      const href = listingUrlOn(channel, url);
+      if (current?.status === 'listed' && current.url === href && listedOn.includes(channel)) return;
+      record = { channel, status, url: href, error: null, updatedAt: new Date().toISOString() };
+      if (!listedOn.includes(channel)) listedOn = [...listedOn, channel];
+    } else {
+      if (!current || current.status === 'listed') return;
+      const text = String(error ?? '').trim().slice(0, MAX_LISTING_ERROR_CHARS) || null;
+      if (current.status === status && current.error === text) return;
+      record = { channel, status, url: null, error: text, updatedAt: new Date().toISOString() };
+    }
+    const channels = LISTING_CHANNELS.flatMap((item) => (item === channel ? [record] : flip.listingChannels.filter((other) => other.channel === item)));
+    this.db.prepare('UPDATE flips SET listing_channels_json = ?, listed_on_json = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(channels), JSON.stringify(listedOn), new Date().toISOString(), flipId);
+    this.onChange({ id: flipId });
+  }
+
+  /** Flips marked ready, each with its draft revision and picked channels. */
+  readyToList() {
+    const rows = this.db.prepare('SELECT id, listing_revised_at, listing_channels_json FROM flips WHERE listing_ready_at IS NOT NULL ORDER BY listing_ready_at, id').all() as Array<Record<string, any>>;
+    return rows.map((row) => ({
+      id: Number(row.id),
+      updatedAt: String(row.listing_revised_at),
+      channels: listingChannelsFromJson(row.listing_channels_json).map(({ channel, status, url, error }) => ({ channel, status, ...(url ? { url } : {}), ...(error ? { error } : {}) })),
+    }));
+  }
+
+  /** The draft of a flip marked ready, as Hatbot posts it. */
+  toPost(id: number): FlipToPost {
+    const flip = this.get(id);
+    if (!flip.readyToList || !flip.listing?.condition) throw new ServiceError(`Flip ${id} is not marked ready to list`, 404);
+    const listing = flip.listing;
+    const prices: Partial<Record<ListingChannel, number>> = {};
+    for (const { channel } of flip.listingChannels) {
+      const price = listingPrice(listing, channel);
+      if (price) prices[channel] = price;
+    }
+    return {
+      id: flip.id,
+      updatedAt: String(flip.listingRevisedAt),
+      title: listing.title,
+      description: listing.description,
+      condition: listing.condition!,
+      category: listing.category ?? null,
+      delivery: listing.delivery ?? { ...NO_DELIVERY },
+      prices,
+      currency: 'PLN',
+      photos: flip.photos.map((photo) => ({ id: photo.id, mime: 'image/jpeg' as const })),
+    };
+  }
+
+  /** One photo of a flip marked ready, re-encoded as JPEG for posting. */
+  async photoToPost(photoId: number) {
+    const row = this.db.prepare('SELECT p.data, f.listing_ready_at FROM flip_photos p JOIN flips f ON f.id = p.flip_id WHERE p.id = ?').get(photoId) as { data: Uint8Array; listing_ready_at: string | null } | undefined;
+    if (!row?.listing_ready_at) throw new ServiceError(`Photo ${photoId} is not on a flip marked ready to list`, 404);
+    const jpeg = await toPostingJpeg(row.data);
+    return { id: photoId, mime: 'image/jpeg' as const, base64: jpeg.toString('base64') };
   }
 
   async addPhoto(flipId: number, data: Uint8Array): Promise<FlipPhoto> {
@@ -187,6 +432,7 @@ export class FlipStore {
     this.assertPhotoRoom(flipId);
     const position = Number((this.db.prepare('SELECT COALESCE(MAX(position), -1) + 1 AS next FROM flip_photos WHERE flip_id = ?').get(flipId) as { next: number }).next);
     const result = this.db.prepare('INSERT INTO flip_photos (flip_id, position, mime, data, byte_size, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(flipId, position, 'image/webp', webp, webp.byteLength, new Date().toISOString());
+    this.revise(flipId);
     this.onChange({ id: flipId });
     return { id: Number(result.lastInsertRowid), mime: 'image/webp', byteSize: webp.byteLength };
   }
@@ -223,8 +469,11 @@ export class FlipStore {
   deletePhoto(photoId: number) {
     const row = this.db.prepare('SELECT flip_id FROM flip_photos WHERE id = ?').get(photoId) as { flip_id: number } | undefined;
     if (!row) throw new ServiceError('Photo not found', 404);
+    const flip = this.get(Number(row.flip_id));
+    this.assertStillComplete(flip, flip.listing, flip.photos.length - 1);
     this.db.prepare('DELETE FROM flip_photos WHERE id = ?').run(photoId);
-    this.onChange({ id: Number(row.flip_id) });
+    this.revise(flip.id);
+    this.onChange({ id: flip.id });
   }
 
   /** Reorders a flip's photos; `ids` must be exactly its photos. */
@@ -235,6 +484,7 @@ export class FlipStore {
     }
     const update = this.db.prepare('UPDATE flip_photos SET position = ? WHERE id = ?');
     ids.forEach((id, position) => update.run(position, id));
+    this.revise(flipId);
     this.onChange({ id: flipId });
     return this.get(flipId);
   }
@@ -287,6 +537,8 @@ export class FlipStore {
       next.title, next.listingKey, next.watchId, next.buyChannel, next.boughtOn, next.buyPrice, next.buyCosts, JSON.stringify(next.listedOn),
       next.soldOn, next.saleChannel, next.salePrice, next.saleFee, next.saleCosts, JSON.stringify(next.delisted), next.note, new Date().toISOString(), id,
     );
+    // Sold: nothing left to post.
+    if (next.soldOn) this.clearReady(id);
     this.onChange({ id });
     return this.get(id);
   }

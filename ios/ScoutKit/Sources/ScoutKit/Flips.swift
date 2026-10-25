@@ -113,6 +113,13 @@ public struct Flip: Codable, Hashable, Sendable, Identifiable {
     public var listing: FlipListing?
     /// Listing photos in posting order. Missing on older servers.
     public var photos: [FlipPhoto]?
+    /// Marked "Ready to list": Hatbot posts it on the `ready` channels.
+    /// Missing on older servers.
+    public var readyToList: Bool?
+    /// Each picked marketplace and how posting went; listed ones stay after a cancel.
+    public var listingChannels: [FlipListingChannel]?
+    /// The draft's revision, which Hatbot asks again on.
+    public var listingRevisedAt: String?
 
     public var isSold: Bool { soldOn != nil && salePrice != nil }
     public var cost: Double { Profit.cost(buyPrice: buyPrice, buyCosts: buyCosts) }
@@ -131,10 +138,106 @@ public struct Flip: Codable, Hashable, Sendable, Identifiable {
 public struct FlipListing: Codable, Hashable, Sendable {
     public var title: String
     public var description: String
-    /// `new`, `like-new`, `good`, or `damaged`.
+    /// `new-with-tags`, `new`, `like-new`, `good`, or `damaged`.
     public var condition: String?
+    public var category: String?
     public var prices: [String: Double]
     public var basePrice: Double?
+    /// Missing on older servers.
+    public var delivery: FlipDelivery?
+
+    public init(title: String, description: String, condition: String?, category: String? = nil, prices: [String: Double], basePrice: Double?, delivery: FlipDelivery? = nil) {
+        self.title = title
+        self.description = description
+        self.condition = condition
+        self.category = category
+        self.prices = prices
+        self.basePrice = basePrice
+        self.delivery = delivery
+    }
+
+    /// The asking price a channel is posted at: its own, else the base price.
+    public func price(on channel: FlipChannel) -> Double? {
+        prices[channel.rawValue] ?? basePrice
+    }
+}
+
+public struct FlipDelivery: Codable, Hashable, Sendable {
+    public var shipping: Bool
+    public var pickup: Bool
+    /// `small`, `medium` or `large`; Vinted asks for it.
+    public var parcelSize: String?
+
+    public init(shipping: Bool = false, pickup: Bool = false, parcelSize: String? = nil) {
+        self.shipping = shipping
+        self.pickup = pickup
+        self.parcelSize = parcelSize
+    }
+}
+
+/// How posting a flip on one marketplace went. Open like `FlipChannel`.
+public struct ListingStatus: RawRepresentable, Codable, Hashable, Sendable {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+
+    public static let ready = ListingStatus(rawValue: "ready")
+    public static let listed = ListingStatus(rawValue: "listed")
+    public static let failed = ListingStatus(rawValue: "failed")
+    public static let declined = ListingStatus(rawValue: "declined")
+
+    public var label: String {
+        switch self {
+        case .ready: "Waiting for Hatbot"
+        case .listed: "Listed"
+        case .failed: "Failed"
+        case .declined: "Declined in Hatbot"
+        default: rawValue.capitalized
+        }
+    }
+}
+
+public struct FlipListingChannel: Codable, Hashable, Sendable, Identifiable {
+    public var channel: FlipChannel
+    public var status: ListingStatus
+    /// The live listing, once listed.
+    public var url: String?
+    public var error: String?
+    public var updatedAt: String
+    public var id: String { channel.rawValue }
+}
+
+/// Body of `PUT /api/flips/:id/ready`.
+struct ReadyToListBody: Encodable {
+    var channels: [FlipChannel]
+}
+
+/// "Ready to list", mirroring `readyToListGaps` in `src/profit.ts`.
+public enum ReadyToList {
+    /// What a draft still needs before it can be posted on `channels`, in
+    /// plain words; empty when it's complete.
+    public static func gaps(listing: FlipListing?, photoCount: Int, channels: [FlipChannel]) -> [String] {
+        var gaps: [String] = []
+        let blank = { (text: String?) in (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        if blank(listing?.title) { gaps.append("a title") }
+        if blank(listing?.description) { gaps.append("a description") }
+        if listing?.condition == nil { gaps.append("the condition") }
+        let unpriced = channels.filter { (listing?.price(on: $0) ?? 0) <= 0 }
+        if !unpriced.isEmpty { gaps.append("a price for \(joined(unpriced.map(\.rawValue)))") }
+        let delivery = listing?.delivery ?? FlipDelivery()
+        let undelivered = channels.filter { $0 != .vinted && !delivery.shipping && !delivery.pickup }
+        if !undelivered.isEmpty { gaps.append("shipping or pickup for \(joined(undelivered.map(\.rawValue)))") }
+        if channels.contains(.vinted) && delivery.parcelSize == nil { gaps.append("the parcel size for Vinted") }
+        if photoCount < 1 { gaps.append("at least one photo") }
+        return gaps
+    }
+
+    public static func message(_ gaps: [String]) -> String {
+        "Before it can be listed, add \(joined(gaps))."
+    }
+
+    static func joined(_ items: [String]) -> String {
+        items.count < 2 ? items.joined() : items.dropLast().joined(separator: ", ") + " and " + items[items.count - 1]
+    }
 }
 
 public struct FlipPhoto: Codable, Hashable, Sendable, Identifiable {

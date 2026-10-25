@@ -1,4 +1,4 @@
-import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, FeePresets, Flip, FlipImport, FlipListing, FlipPhoto, ListingCondition, FlipsData, NotificationPriority, NotificationRecord, OlxCategoryOption, PriceHistoryPoint, ResaleListingDraft, SearchFilters, SettingsData, VariantSuggestions, VerificationComparison, Watch, WatchAnalytics, Connector } from './types';
+import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, FeePresets, Flip, FlipImport, FlipListing, FlipPhoto, ListingChannel, ListingCondition, ConnectedApp, FlipsData, NotificationPriority, NotificationRecord, OlxCategoryOption, PriceHistoryPoint, ResaleListingDraft, SearchFilters, SettingsData, VariantSuggestions, VerificationComparison, Watch, WatchAnalytics, Connector } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -84,6 +84,10 @@ export const api = {
   login: (password: string) => request<{ ok: true }>('/api/auth/login', json('POST', { password })),
   logout: () => request<{ ok: true }>('/api/auth/logout', { method: 'POST' }),
   logoutAll: () => request<{ ok: true }>('/api/auth/logout-all', { method: 'POST' }),
+  /** What the "Let … in?" page shows, for the OAuth request in `search` (the page's query string). */
+  oauthAuthorization: (search: string) => request<{ clientName: string; redirectOrigin: string }>(`/api/oauth/authorize${search}`),
+  connectedApps: () => request<{ apps: ConnectedApp[] }>('/api/connected-apps'),
+  disconnectApp: (id: number) => request<{ ok: true }>(`/api/connected-apps/${id}`, { method: 'DELETE' }),
   dashboard: (signal?: AbortSignal) => request<DashboardData>('/api/dashboard', { signal }),
   connectors: (signal?: AbortSignal) => request<{ connectors: Connector[] }>('/api/connectors', { signal }),
   listings: (options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string; sort?: 'newest' | 'strongest' | 'price'; decision?: ListingDecision | 'none'; visibility?: 'visible' | 'hidden' | 'all'; minStrength?: number; aiFiltered?: 'exclude' | 'include' | 'only' } = {}, signal?: AbortSignal) => {
@@ -117,6 +121,8 @@ export const api = {
   updateFlip: (id: number, patch: Partial<Omit<Flip, 'id' | 'createdAt' | 'updatedAt'>>) => request<{ flip: Flip }>(`/api/flips/${id}`, json('PATCH', patch)),
   deleteFlip: (id: number) => request<{ ok: true }>(`/api/flips/${id}`, json('DELETE')),
   saveFlipListing: (id: number, listing: FlipListing | null) => request<{ flip: Flip }>(`/api/flips/${id}/listing`, json('PUT', listing)),
+  markReadyToList: (id: number, channels: ListingChannel[]) => request<{ flip: Flip }>(`/api/flips/${id}/ready`, json('PUT', { channels })),
+  cancelReadyToList: (id: number) => request<{ flip: Flip }>(`/api/flips/${id}/ready`, json('DELETE')),
   /** Notes are used only for flips not bought through Scout, which have no original to draft from. */
   draftFlipListing: (id: number, notes: { title?: string; description?: string; condition?: ListingCondition | null } = {}) => request<{ draft: ResaleListingDraft; photosAdded: number; flip: Flip }>(`/api/flips/${id}/listing-draft`, json('POST', notes)),
   uploadFlipPhoto: (id: number, photo: Blob) => request<{ photo: FlipPhoto }>(`/api/flips/${id}/photos`, { method: 'POST', headers: { 'content-type': photo.type }, body: photo }, 60_000),

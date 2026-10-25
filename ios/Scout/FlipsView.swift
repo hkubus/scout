@@ -197,6 +197,15 @@ struct FlipsView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                    if !flip.isSold, flip.readyToList == true, let records = flip.listingChannels {
+                        Label {
+                            Text(verbatim: records.map { "\($0.channel.rawValue) \($0.status.label.lowercased())" }.joined(separator: " · "))
+                        } icon: {
+                            Image(systemName: records.contains { $0.status == .failed } ? "exclamationmark.triangle.fill" : "paperplane")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(records.contains { $0.status == .failed } ? Color.dealOrange : Color.scoutBlue)
+                    }
                 }
                 Spacer(minLength: 6)
                 if let net = flip.net {
@@ -379,13 +388,15 @@ struct FlipEditorRequest: Identifiable {
     /// `nil` creates a new flip.
     var flipID: Int?
     var photos: [FlipPhoto] = []
+    /// The flip being edited, for its listing draft and "Ready to list" state.
+    var flip: Flip?
 
     static func create(_ draft: FlipDraft = FlipDraft()) -> FlipEditorRequest {
         FlipEditorRequest(draft: draft, flipID: nil)
     }
 
     static func edit(_ flip: Flip) -> FlipEditorRequest {
-        FlipEditorRequest(draft: FlipDraft(flip: flip), flipID: flip.id, photos: flip.photos ?? [])
+        FlipEditorRequest(draft: FlipDraft(flip: flip), flipID: flip.id, photos: flip.photos ?? [], flip: flip)
     }
 }
 
@@ -436,6 +447,10 @@ struct FlipEditorView: View {
     @State private var photos: [FlipPhoto]
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var uploading = false
+    /// The flip as the server last returned it, for "Ready to list".
+    @State private var listed: Flip?
+    @State private var readyChannels: [FlipChannel]
+    @State private var readying = false
 
     private static let maxPhotos = 20
 
@@ -446,6 +461,11 @@ struct FlipEditorView: View {
         _buyPrice = State(initialValue: amountText(request.draft.buyPrice))
         _buyCosts = State(initialValue: amountText(request.draft.buyCosts))
         _photos = State(initialValue: request.photos)
+        _listed = State(initialValue: request.flip)
+        let channels = request.flip?.listingChannels ?? []
+        _readyChannels = State(initialValue: request.flip?.readyToList == true
+            ? channels.map(\.channel)
+            : FlipChannel.platforms.filter { channel in channels.contains { $0.channel == channel && $0.status == .listed } || request.flip?.listing?.prices[channel.rawValue] != nil })
     }
 
     var body: some View {
@@ -487,6 +507,9 @@ struct FlipEditorView: View {
                 }
                 if request.flipID != nil {
                     photosSection
+                }
+                if let listed, !listed.isSold, listed.readyToList != nil {
+                    readySection(listed)
                 }
                 if let error {
                     Section {
@@ -551,7 +574,94 @@ struct FlipEditorView: View {
         } header: {
             Text(verbatim: "Listing photos · \(photos.count) of \(Self.maxPhotos)")
         } footer: {
-            Text("Saved to Scout right away; the browser extension attaches them on OLX, Allegro Lokalnie and Vinted. The first one is the cover. Long-press a photo to delete it. Listing text and prices are edited on the web Flips page.")
+            Text("Saved to Scout right away; the browser extension and Hatbot attach them on OLX, Allegro Lokalnie and Vinted. The first one is the cover. Long-press a photo to delete it. Listing text, prices and delivery are edited on the web Flips page.")
+        }
+    }
+
+    /// "Ready to list": Hatbot asks once in its chat, then posts the listing
+    /// on the picked marketplaces and sends each link back.
+    @ViewBuilder
+    private func readySection(_ flip: Flip) -> some View {
+        let records = flip.listingChannels ?? []
+        let isReady = flip.readyToList == true
+        let gaps = ReadyToList.gaps(listing: flip.listing, photoCount: photos.count, channels: readyChannels)
+        let retrying = records.contains { ($0.status == .failed || $0.status == .declined) && readyChannels.contains($0.channel) }
+        Section {
+            ForEach(FlipChannel.platforms) { channel in
+                let record = records.first { $0.channel == channel }
+                Toggle(isOn: readyBinding(channel)) {
+                    Text(verbatim: channel.rawValue)
+                    if let record {
+                        Text(verbatim: record.error.map { "\(record.status.label): \($0)" } ?? record.status.label)
+                            .foregroundStyle(record.status == .failed ? Color.red : Color.secondary)
+                    }
+                }
+                .disabled(readying || record?.status == .listed)
+                if let link = record?.url, let url = URL(string: link) {
+                    Link(destination: url) {
+                        Label("Open the \(channel.rawValue) listing", systemImage: "arrow.up.right.square")
+                    }
+                }
+            }
+            Button {
+                markReady()
+            } label: {
+                HStack {
+                    Label(isReady ? (retrying ? "Retry" : "Update") : "Ready to list", systemImage: "paperplane")
+                    Spacer()
+                    if readying { ProgressView() }
+                }
+            }
+            .disabled(readying || readyChannels.isEmpty || !gaps.isEmpty)
+            if isReady {
+                Button("Cancel listing", role: .destructive, action: cancelReady)
+                    .disabled(readying)
+            }
+        } header: {
+            Text(isReady ? "Ready to list" : "List with Hatbot")
+        } footer: {
+            if !readyChannels.isEmpty, !gaps.isEmpty {
+                Text(verbatim: ReadyToList.message(gaps) + " Write the listing text and prices on the web Flips page.")
+            } else {
+                Text("Hatbot asks you once in its chat, then Haggler posts the listing on each marketplace and sends the link back here. Editing the listing makes it ask again; Retry sends failed and declined marketplaces again.")
+            }
+        }
+    }
+
+    private func readyBinding(_ channel: FlipChannel) -> Binding<Bool> {
+        Binding(
+            get: { readyChannels.contains(channel) },
+            set: { enabled in
+                readyChannels.removeAll { $0 == channel }
+                if enabled { readyChannels = FlipChannel.platforms.filter { $0 == channel || readyChannels.contains($0) } }
+            }
+        )
+    }
+
+    private func markReady() {
+        updateReady { client, id in try await client.markReadyToList(flipId: id, channels: readyChannels) }
+    }
+
+    private func cancelReady() {
+        updateReady { client, id in try await client.cancelReadyToList(flipId: id) }
+    }
+
+    private func updateReady(_ action: @escaping (ScoutClient, Int) async throws -> Flip) {
+        guard let client = model.client, let flipID = request.flipID else { return }
+        readying = true
+        error = nil
+        Task { @MainActor in
+            defer { readying = false }
+            do {
+                var saved = try await action(client, flipID)
+                saved.photos = saved.photos ?? photos
+                withAnimation { listed = saved }
+                readyChannels = (saved.listingChannels ?? []).map(\.channel)
+                model.play(.success)
+                onSaved(saved)
+            } catch {
+                self.error = error.localizedDescription
+            }
         }
     }
 

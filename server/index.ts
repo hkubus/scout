@@ -1,4 +1,4 @@
-import Fastify, { type FastifyRequest } from 'fastify';
+import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
 import { execFile } from 'node:child_process';
@@ -15,9 +15,10 @@ import { backupDatabase, openDatabase, seedDatabase, startWalCheckpointer } from
 import { buildDiscordEmbed } from './notifications';
 import { compressApiResponse } from './compression';
 import { apiTokenCredentialId, bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
+import { CONSENT_PATH, isConnectedAppToken, isOAuthRoute, mcpChallenge, OAuthStore, registerOAuthRoutes } from './oauth';
 import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
 import { FlipStore, MAX_FLIP_PHOTO_BYTES, MAX_FLIP_PHOTOS } from './flips';
-import { FLIP_CHANNELS, LISTING_CONDITIONS } from '../src/profit';
+import { FLIP_CHANNELS, LISTING_CHANNELS, LISTING_CONDITIONS, PARCEL_SIZES } from '../src/profit';
 import { dashboardTopParam, NO_LOCATION_FILTER, normalizeSourceIntervals, olxCategoryToJson, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 import { parseVariantGroups } from './variants';
@@ -88,7 +89,8 @@ const forwardedHeaders = ['x-forwarded-for', 'forwarded', 'x-forwarded-host', 'x
 
 declare module 'fastify' {
   interface FastifyRequest {
-    scoutAuth: 'disabled' | 'session' | 'token' | 'none';
+    /** `app` is a connected app's OAuth token, which only /mcp accepts. */
+    scoutAuth: 'disabled' | 'session' | 'token' | 'app' | 'none';
   }
 }
 
@@ -113,10 +115,11 @@ app.addHook('onRequest', async (request, reply) => {
       : 'Received X-Forwarded-For from a peer SCOUT_TRUST_PROXY does not trust: every client shares that address for rate limits. Under Docker Compose use SCOUT_TRUST_PROXY=uniquelocal');
   }
   const route = request.routeOptions.url;
-  if (!isProtectedRoute(route)) return;
+  if (!isProtectedRoute(route) && !isOAuthRoute(route)) return;
 
   const expensive = route === '/mcp' || /\/search$|\/categories$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/listing-draft$|\/flips\/import\/(?:url|screenshot)$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route);
-  const limit = expensive ? 30 : 240;
+  // Registration is public, so it gets the tightest bucket of its own.
+  const limit = route === '/oauth/register' ? 10 : route === '/oauth/token' || route === CONSENT_PATH ? 30 : expensive ? 30 : 240;
   // Snapshot images use the general limit so a screen of saved photos loads.
   // Key on the route template, not the raw URL, so ids cannot mint new buckets.
   const bucket = rateLimiter.consume(`${rateLimitKey(request.ip)}:${expensive ? 'expensive' : `${request.method} ${route}`}`, limit);
@@ -142,17 +145,30 @@ const checkpointer = startWalCheckpointer(db, { onError: (message) => app.log.wa
 if (process.env.SCOUT_SEED_DEMO === 'true') seedDatabase(db, { watches: seedWatches, listings: seedListings });
 const sessions = new SessionStore(db, [auth.credentialId, ...auth.tokenCredentialIds]);
 if (auth.enabled) sessions.purgeExpired();
+const connectedApps = new OAuthStore(db);
+connectedApps.purgeClients();
 
 // Health/readiness stay public for container probes (details only when
 // authenticated); the auth endpoints must be reachable before login.
 const publicApiPaths = new Set(['/api/health', '/api/ready', '/api/auth/session', '/api/auth/login', '/api/auth/logout']);
 const safeMethods = new Set(['GET', 'HEAD', 'OPTIONS']);
 
-function resolveAuth(request: FastifyRequest): FastifyRequest['scoutAuth'] {
-  const token = bearerToken(request.headers.authorization);
-  if (token !== null) return matchesApiToken(auth, token) ? 'token' : 'none';
+const sessionAuth = (request: FastifyRequest) => {
   const cookie = parseCookies(request.headers.cookie).get(SESSION_COOKIE);
   return cookie && sessions.validate(cookie) ? 'session' : 'none';
+};
+
+function resolveAuth(request: FastifyRequest, route: string): FastifyRequest['scoutAuth'] {
+  const token = bearerToken(request.headers.authorization);
+  if (token !== null && isConnectedAppToken(token)) return route === '/mcp' && connectedApps.verify(token) ? 'app' : 'none';
+  if (token !== null) return matchesApiToken(auth, token) ? 'token' : 'none';
+  return sessionAuth(request);
+}
+
+function refuseUnauthenticated(request: FastifyRequest, reply: FastifyReply, route: string) {
+  // /mcp's challenge sends MCP clients to the OAuth metadata (MCP authorization spec).
+  reply.header('WWW-Authenticate', route === '/mcp' ? mcpChallenge(`${request.protocol}://${request.host}`) : 'Bearer realm="scout"');
+  return reply.code(401).send({ error: 'Authentication required' });
 }
 
 app.addHook('onRequest', async (request, reply) => {
@@ -162,7 +178,7 @@ app.addHook('onRequest', async (request, reply) => {
   const route = request.routeOptions.url;
   if (!auth.enabled) {
     request.scoutAuth = 'disabled';
-    if (!isProtectedRoute(route)) return;
+    if (!isProtectedRoute(route) && !isOAuthRoute(route)) return;
     // Unauthenticated mode is only for direct loopback/LAN access. A request
     // relayed by a reverse proxy means Scout is being published without a
     // password, so refuse it unless SCOUT_AUTH=off accepted that explicitly.
@@ -177,15 +193,29 @@ app.addHook('onRequest', async (request, reply) => {
     if (!safeMethods.has(request.method) && isCrossSiteBrowserRequest(request.headers, `${request.protocol}://${request.host}`)) {
       return reply.code(403).send({ error: 'Cross-origin request rejected' });
     }
+    // Nothing else needs credentials, but a connected app's token is honoured
+    // as one: it works on /mcp only, and stops the moment it is disconnected.
+    const token = isProtectedRoute(route) ? bearerToken(request.headers.authorization) : null;
+    if (token !== null && isConnectedAppToken(token)) {
+      if (route !== '/mcp' || !connectedApps.verify(token)) return refuseUnauthenticated(request, reply, route);
+      request.scoutAuth = 'app';
+    }
+    return;
+  }
+  if (isOAuthRoute(route)) {
+    // The rest of the OAuth endpoints are public: an app registers and trades
+    // its code before it has a token. Pressing Allow takes the dashboard's
+    // signed-in session from Scout's own page.
+    if (route !== CONSENT_PATH || request.method !== 'POST') return;
+    request.scoutAuth = sessionAuth(request);
+    if (request.scoutAuth === 'none') return reply.code(401).type('text/plain').send('Sign in to Scout first, then connect the app again.');
+    if (!sameOrigin(request)) return reply.code(403).send({ error: 'Cross-origin request rejected' });
     return;
   }
   if (!isProtectedRoute(route)) return;
-  request.scoutAuth = resolveAuth(request);
+  request.scoutAuth = resolveAuth(request, route);
   if (publicApiPaths.has(route)) return;
-  if (request.scoutAuth === 'none') {
-    reply.header('WWW-Authenticate', 'Bearer realm="scout"');
-    return reply.code(401).send({ error: 'Authentication required' });
-  }
+  if (request.scoutAuth === 'none') return refuseUnauthenticated(request, reply, route);
   if (request.scoutAuth === 'session' && !safeMethods.has(request.method) && !sameOrigin(request)) {
     return reply.code(403).send({ error: 'Cross-origin request rejected' });
   }
@@ -691,9 +721,24 @@ app.put('/api/flips/:id/listing', async (request, reply) => {
     category: z.string().trim().max(80).optional(),
     prices: z.object(Object.fromEntries(FLIP_CHANNELS.map((channel) => [channel, flipAmount.positive().optional()])) as Record<(typeof FLIP_CHANNELS)[number], z.ZodOptional<z.ZodNumber>>).strict(),
     basePrice: flipAmount.positive().nullable(),
+    // Left out by older clients: the stored delivery is kept.
+    delivery: z.object({ shipping: z.boolean(), pickup: z.boolean(), parcelSize: z.enum(PARCEL_SIZES).nullable() }).strict().optional(),
   }).strict().nullable().safeParse(request.body);
   if (!listing.success) return reply.code(400).send({ error: 'Invalid listing draft', details: listing.error.flatten() });
   return { flip: flips.setListing(params.data.id, listing.data) };
+});
+// "Ready to list": Hatbot posts the draft on these channels (see docs/hatbot-listing-plan.md).
+app.put('/api/flips/:id/ready', async (request, reply) => {
+  const params = flipIdParams.safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid flip id is required' });
+  const parsed = z.object({ channels: z.array(z.enum(LISTING_CHANNELS)).max(LISTING_CHANNELS.length) }).strict().safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'Pick the marketplaces to list it on', details: parsed.error.flatten() });
+  return { flip: flips.markReady(params.data.id, [...new Set(parsed.data.channels)]) };
+});
+app.delete('/api/flips/:id/ready', async (request, reply) => {
+  const params = flipIdParams.safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'A valid flip id is required' });
+  return { flip: flips.cancelReady(params.data.id) };
 });
 app.post('/api/flips/:id/listing-draft', async (request, reply) => {
   const params = flipIdParams.safeParse(request.params);
@@ -1059,7 +1104,8 @@ app.get('/events', async (request, reply) => {
 // MCP clients connect over HTTP instead of stdio. Stateless per-request
 // servers keep every request independent: no session ids, no resumability,
 // any replica can serve any call. When auth is enabled, clients send an
-// `Authorization: Bearer` token from SCOUT_API_TOKENS.
+// `Authorization: Bearer` token from SCOUT_API_TOKENS or one a connected app
+// got through OAuth (server/oauth.ts).
 // The MCP SDK (~40 MB RSS) loads on the first /mcp request, not at startup.
 let mcpModules: Promise<[typeof import('./mcp'), typeof import('@modelcontextprotocol/sdk/server/streamableHttp.js')]> | undefined;
 app.post('/mcp', async (request, reply) => {
@@ -1075,7 +1121,8 @@ app.post('/mcp', async (request, reply) => {
     return;
   }
   const [{ createScoutMcpServer }, { StreamableHTTPServerTransport }] = modules;
-  const mcpServer = createScoutMcpServer(service, debug);
+  // Connected apps never get the scout_debug_* tools, even with the Debug API on.
+  const mcpServer = createScoutMcpServer(service, request.scoutAuth === 'app' ? null : debug, flips);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   reply.raw.on('close', () => {
     transport.close().catch(() => {});
@@ -1114,11 +1161,19 @@ if (existsSync(distPath)) {
     },
   });
   app.setNotFoundHandler((request, reply) => {
-    if (request.url.startsWith('/api') || request.url === '/events' || request.url === '/mcp') return reply.code(404).send({ error: 'Not found' });
+    if (request.url.startsWith('/api') || request.url === '/events' || request.url === '/mcp' || request.url.startsWith('/.well-known/') || request.url.startsWith('/oauth/')) return reply.code(404).send({ error: 'Not found' });
     if (request.method !== 'GET' && request.method !== 'HEAD') return reply.code(404).send({ error: 'Not found' });
     return reply.sendFile('index.html');
   });
 }
+
+// Connected apps (OAuth for MCP clients such as Hatbot). The "Let … in?" page
+// is the dashboard shell, which signs the operator in first when needed.
+await registerOAuthRoutes(app, {
+  store: connectedApps,
+  sendPage: (reply) => (existsSync(distPath) ? reply.sendFile('index.html') : reply.code(404).send({ error: 'Not found' })),
+  canConsent: (request) => request.scoutAuth === 'session' || request.scoutAuth === 'disabled',
+});
 
 const scheduler = setInterval(() => {
   service.schedulerTick();

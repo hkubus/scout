@@ -247,6 +247,19 @@ public struct ScoutClient: Sendable {
         return decoded.photo
     }
 
+    /// Marks a flip "Ready to list" on `channels` (or re-marks it, which
+    /// retries failed and declined ones). The server says what's missing.
+    public func markReadyToList(flipId: Int, channels: [FlipChannel]) async throws -> Flip {
+        let response: FlipResponse = try await send("PUT", "/api/flips/\(flipId)/ready", body: ReadyToListBody(channels: channels))
+        return response.flip
+    }
+
+    /// Takes a flip out of Hatbot's list; listed channels keep their link.
+    public func cancelReadyToList(flipId: Int) async throws -> Flip {
+        let response: FlipResponse = try await send("DELETE", "/api/flips/\(flipId)/ready", body: EmptyBody())
+        return response.flip
+    }
+
     public func deleteFlipPhoto(id: Int) async throws {
         let _: OkResponse = try await send("DELETE", "/api/flip-photos/\(id)", body: EmptyBody())
     }
@@ -353,6 +366,17 @@ public struct ScoutClient: Sendable {
         try await send("PATCH", "/api/settings", body: ["ntfy": ["openInApp": enabled]])
     }
 
+    /// Apps let in over OAuth; an older server without them answers with an error.
+    public func connectedApps() async throws -> [ConnectedApp] {
+        let response: ConnectedAppsResponse = try await get("/api/connected-apps")
+        return response.apps
+    }
+
+    /// Revokes the app's token: it stops reaching Scout on its next request.
+    public func disconnectApp(id: Int) async throws {
+        let _: OkResponse = try await send("DELETE", "/api/connected-apps/\(id)", body: EmptyBody())
+    }
+
     public func connectors() async throws -> [Connector] {
         let response: ConnectorsResponse = try await get("/api/connectors")
         return response.connectors
@@ -438,6 +462,7 @@ private struct PointsResponse: Decodable { var points: [PriceHistoryPoint] }
 private struct SnapshotResponse: Decodable { var snapshot: MarketListingSnapshot? }
 private struct EmptyBody: Encodable {}
 private struct ConnectorsResponse: Decodable { var connectors: [Connector] }
+private struct ConnectedAppsResponse: Decodable { var apps: [ConnectedApp] }
 private struct ListingActionResponse: Decodable { var action: ListingAction }
 private struct ScanBody: Encodable { var watchId: String? }
 private struct OlxCategoriesResponse: Decodable { var categories: [OlxCategoryOption] }

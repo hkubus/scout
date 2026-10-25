@@ -219,6 +219,72 @@ export interface FlipListing {
   prices: Partial<Record<FlipChannel, number>>;
   /** What the operator wants to receive before fees; drives the suggestions. */
   basePrice: number | null;
+  /** How the buyer gets it. Older drafts have none; the server fills in `NO_DELIVERY`. */
+  delivery?: FlipDelivery;
+}
+
+/** The marketplaces a flip can be posted on; "Other" is a ledger channel only. */
+export const LISTING_CHANNELS = ["OLX", "Allegro Lokalnie", "Vinted"] as const;
+export type ListingChannel = (typeof LISTING_CHANNELS)[number];
+
+export function isListingChannel(value: unknown): value is ListingChannel {
+  return typeof value === "string" && (LISTING_CHANNELS as readonly string[]).includes(value);
+}
+
+/** Vinted's parcel sizes: small fits a shoebox, large a moving box. */
+export const PARCEL_SIZES = ["small", "medium", "large"] as const;
+export type ParcelSize = (typeof PARCEL_SIZES)[number];
+
+export interface FlipDelivery {
+  shipping: boolean;
+  pickup: boolean;
+  /** Vinted asks for it; OLX and Allegro Lokalnie don't. */
+  parcelSize: ParcelSize | null;
+}
+
+export const NO_DELIVERY: FlipDelivery = { shipping: false, pickup: false, parcelSize: null };
+
+export const LISTING_CHANNEL_STATUSES = ["ready", "listed", "failed", "declined"] as const;
+export type ListingChannelStatus = (typeof LISTING_CHANNEL_STATUSES)[number];
+
+/** One marketplace a flip is to be posted on, and how that went. */
+export interface FlipListingChannel {
+  channel: ListingChannel;
+  status: ListingChannelStatus;
+  /** The live listing, once `listed`. */
+  url: string | null;
+  error: string | null;
+  updatedAt: string;
+}
+
+/** The asking price a channel is posted at: its own, else the base price. */
+export function listingPrice(listing: FlipListing | null, channel: ListingChannel) {
+  return listing?.prices[channel] ?? listing?.basePrice ?? null;
+}
+
+const joinAnd = (items: string[]) => (items.length < 2 ? items.join("") : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`);
+
+/**
+ * What a draft still needs before it can be posted on `channels`, in plain
+ * words ("a description", "a price for Vinted"); empty when it's complete.
+ */
+export function readyToListGaps(listing: FlipListing | null, photoCount: number, channels: readonly ListingChannel[]): string[] {
+  const gaps: string[] = [];
+  if (!listing?.title.trim()) gaps.push("a title");
+  if (!listing?.description.trim()) gaps.push("a description");
+  if (!listing?.condition) gaps.push("the condition");
+  const unpriced = channels.filter((channel) => !listingPrice(listing, channel));
+  if (unpriced.length) gaps.push(`a price for ${joinAnd(unpriced)}`);
+  const delivery = listing?.delivery ?? NO_DELIVERY;
+  const undelivered = channels.filter((channel) => channel !== "Vinted" && !delivery.shipping && !delivery.pickup);
+  if (undelivered.length) gaps.push(`shipping or pickup for ${joinAnd(undelivered)}`);
+  if (channels.includes("Vinted") && !delivery.parcelSize) gaps.push("the parcel size for Vinted");
+  if (photoCount < 1) gaps.push("at least one photo");
+  return gaps;
+}
+
+export function readyToListMessage(gaps: string[]) {
+  return `Before it can be listed, add ${joinAnd(gaps)}.`;
 }
 
 /**
