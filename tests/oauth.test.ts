@@ -385,10 +385,10 @@ async function mcpTools(origin: string, token: string) {
   }
 }
 
-const mcpPost = (origin: string, token: string) => fetch(`${origin}/mcp`, {
+const mcpPost = (origin: string, token: string, call: { method: string; params: unknown } = { method: 'tools/list', params: {} }) => fetch(`${origin}/mcp`, {
   method: 'POST',
   headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
-  body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+  body: JSON.stringify({ jsonrpc: '2.0', id: 1, ...call }),
 });
 
 test('end to end: register, Allow, token, then tools/list on /mcp without the debug tools', { timeout: 180_000 }, async () => {
@@ -442,6 +442,11 @@ test('a connected-app token works on /mcp only, and a disconnected one not at al
     assert.equal((await mcpPost(origin, token)).status, 200);
     // Its own rate limit, past the 30/min the dashboard's MCP and search share: a flip's photos fit.
     for (let call = 0; call < 40; call += 1) assert.equal((await mcpPost(origin, token)).status, 200);
+    // Live marketplace tools keep the shared 30/min cap; the rest carry on.
+    const scan = { method: 'tools/call', params: { name: 'scout_queue_scan', arguments: { watchId: 'no-such-watch' } } };
+    for (let call = 0; call < 30; call += 1) assert.equal((await mcpPost(origin, token, scan)).status, 200);
+    assert.equal((await mcpPost(origin, token, scan)).status, 429);
+    assert.equal((await mcpPost(origin, token)).status, 200);
 
     // Disconnect revokes it at once.
     const { apps } = await (await fetch(`${origin}/api/connected-apps`, { headers: { cookie } })).json() as { apps: Array<{ id: number }> };

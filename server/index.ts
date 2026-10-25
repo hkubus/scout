@@ -1115,7 +1115,21 @@ app.get('/events', async (request, reply) => {
 // got through OAuth (server/oauth.ts).
 // The MCP SDK (~40 MB RSS) loads on the first /mcp request, not at startup.
 let mcpModules: Promise<[typeof import('./mcp'), typeof import('@modelcontextprotocol/sdk/server/streamableHttp.js')]> | undefined;
+// Live marketplace fetches keep the 30/min cap the dashboard's searches have, even for a connected app.
+const LIVE_MCP_TOOLS = new Set(['scout_search', 'scout_olx_categories', 'scout_queue_scan']);
+const callsLiveTool = (body: unknown) => (Array.isArray(body) ? body : [body]).some((message) => {
+  const call = message as { method?: unknown; params?: { name?: unknown } } | null;
+  return call?.method === 'tools/call' && LIVE_MCP_TOOLS.has(String(call.params?.name));
+});
+
 app.post('/mcp', async (request, reply) => {
+  if (request.scoutAuth === 'app' && callsLiveTool(request.body)) {
+    const bucket = rateLimiter.consume(`${rateLimitKey(request.ip)}:expensive`, 30);
+    if (!bucket.allowed) {
+      reply.header('Retry-After', String(bucket.retryAfterSeconds));
+      return reply.code(429).send({ error: 'Too many requests. Try again later.' });
+    }
+  }
   reply.hijack();
   let modules: Awaited<NonNullable<typeof mcpModules>>;
   try {
