@@ -440,6 +440,8 @@ test('a connected-app token works on /mcp only, and a disconnected one not at al
     assert.equal((await fetch(`${origin}/events`, { headers: { authorization: `Bearer ${token}` } })).status, 401);
     assert.equal((await fetch(`${origin}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json', origin }, body: JSON.stringify({ password: token }) })).status, 401);
     assert.equal((await mcpPost(origin, token)).status, 200);
+    // Its own rate limit, past the 30/min the dashboard's MCP and search share: a flip's photos fit.
+    for (let call = 0; call < 40; call += 1) assert.equal((await mcpPost(origin, token)).status, 200);
 
     // Disconnect revokes it at once.
     const { apps } = await (await fetch(`${origin}/api/connected-apps`, { headers: { cookie } })).json() as { apps: Array<{ id: number }> };

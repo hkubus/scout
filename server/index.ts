@@ -122,12 +122,14 @@ app.addHook('onRequest', async (request, reply) => {
   const route = request.routeOptions.url;
   if (!isProtectedRoute(route) && !isOAuthRoute(route)) return;
 
-  const expensive = route === '/mcp' || /\/search$|\/categories$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/listing-draft$|\/flips\/import\/(?:url|screenshot)$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route);
+  // A connected app (Hatbot) gets its own bucket, so it neither eats nor runs out of the dashboard's.
+  const connectedApp = route === '/mcp' && isConnectedAppToken(bearerToken(request.headers.authorization) ?? '');
+  const expensive = !connectedApp && (route === '/mcp' || /\/search$|\/categories$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/listing-draft$|\/flips\/import\/(?:url|screenshot)$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route));
   // Registration is public, so it gets the tightest bucket of its own.
-  const limit = route === '/oauth/register' ? 10 : route === '/oauth/token' || route === CONSENT_PATH ? 30 : expensive ? 30 : 240;
+  const limit = route === '/oauth/register' ? 10 : route === '/oauth/token' || route === CONSENT_PATH ? 30 : expensive ? 30 : connectedApp ? 120 : 240;
   // Snapshot images use the general limit so a screen of saved photos loads.
   // Key on the route template, not the raw URL, so ids cannot mint new buckets.
-  const bucket = rateLimiter.consume(`${rateLimitKey(request.ip)}:${expensive ? 'expensive' : `${request.method} ${route}`}`, limit);
+  const bucket = rateLimiter.consume(`${rateLimitKey(request.ip)}:${expensive ? 'expensive' : connectedApp ? 'app' : `${request.method} ${route}`}`, limit);
   reply.header('X-RateLimit-Limit', String(limit));
   reply.header('X-RateLimit-Remaining', String(bucket.remaining));
   if (!bucket.allowed) {
