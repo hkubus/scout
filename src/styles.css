@@ -916,6 +916,12 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .login-card { width: min(380px, 100%); display: grid; gap: 4px; padding: 28px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
 .login-card .primary-button { margin-top: 20px; }
 .login-error { margin: 12px 0 0; color: var(--orange); font-size: 13px; }
+.consent-title { margin: 16px 0 4px; color: var(--text); font-size: 20px; line-height: 1.25; overflow-wrap: anywhere; }
+.consent-note { margin: 8px 0 0; color: var(--muted); font-size: 14px; line-height: 1.45; overflow-wrap: anywhere; }
+.consent-note strong { color: var(--text); }
+.consent-loading { display: flex; align-items: center; gap: 8px; }
+.consent-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px; }
+.login-card .consent-actions .primary-button { margin-top: 0; }
 
 /* Flips ledger */
 .flips-panel { margin-top: 16px; padding: 16px 20px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow); }

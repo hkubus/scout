@@ -157,3 +157,22 @@ test('the private flip ledger is hidden from tables, read-only SQL and snapshots
     assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM flips').get() as { count: number }).count, 1, 'the live ledger is untouched');
   } finally { context.close(); }
 });
+
+test('connected apps are hidden like the flip ledger', async () => {
+  const context = fixture();
+  try {
+    context.db.prepare("INSERT INTO oauth_clients (id, name, redirect_uris_json, created_at) VALUES ('c1', 'Hatbot', '[]', 'now')").run();
+    context.db.prepare("INSERT INTO connected_app_tokens (token_hash, client_id, client_name, created_at) VALUES ('digest', 'c1', 'Hatbot', 'now')").run();
+    const names = context.debug.schema().tables.map((table: { name: string }) => table.name);
+    for (const table of ['oauth_clients', 'oauth_codes', 'connected_app_tokens']) {
+      assert.equal(names.includes(table), false, table);
+      await assert.rejects(context.debug.query(`SELECT * FROM ${table}`), (error: unknown) => error instanceof ServiceError && error.status === 403, table);
+    }
+    const snapshot = context.debug.snapshot();
+    const copy = new DatabaseSync(snapshot.path, { readOnly: true });
+    try {
+      assert.equal((copy.prepare('SELECT COUNT(*) AS count FROM connected_app_tokens').get() as { count: number }).count, 0);
+    } finally { copy.close(); }
+    snapshot.cleanup();
+  } finally { context.close(); }
+});

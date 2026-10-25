@@ -725,3 +725,6 @@ export interface FlipImport {
   /** Things the operator should check before saving. */
   warnings: string[];
 }
+
+/** An app let in over OAuth (Settings → Connected apps); its token works on /mcp only. */
+export type ConnectedApp = { id: number; name: string; connectedAt: string; lastUsedAt: string | null };

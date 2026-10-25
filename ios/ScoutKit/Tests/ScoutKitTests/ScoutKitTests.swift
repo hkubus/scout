@@ -996,6 +996,24 @@ final class FlipTests: XCTestCase {
         XCTAssertEqual(cancelled.listingChannels, [])
     }
 
+    func testConnectedAppsInDemo() async throws {
+        let client = ScoutClient(baseURL: DemoTransport.baseURL, transport: DemoTransport())
+        let apps = try await client.connectedApps()
+        XCTAssertEqual(apps.map(\.name), ["Hatbot"])
+        XCTAssertNotNil(ScoutDate.parse(apps.first?.lastUsedAt))
+        try await client.disconnectApp(id: apps[0].id)
+        let after = try await client.connectedApps()
+        XCTAssertEqual(after, [])
+        do {
+            try await client.disconnectApp(id: apps[0].id)
+            XCTFail("an app can be disconnected once")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "That app is not connected")
+        }
+        let decoded: ConnectedApp = try ScoutClient.decode(Data(#"{"id":7,"name":"Hatbot","connectedAt":"2026-10-25T09:00:00.000Z","lastUsedAt":null}"#.utf8))
+        XCTAssertNil(decoded.lastUsedAt, "an app that never called Scout yet")
+    }
+
     func testLedgerFlowInDemo() async throws {
         let client = ScoutClient(baseURL: DemoTransport.baseURL, transport: DemoTransport())
         let start = try await client.flips()

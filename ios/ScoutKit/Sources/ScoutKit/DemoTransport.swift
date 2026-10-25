@@ -18,6 +18,7 @@ public actor DemoTransport: HTTPTransport {
     private var flips: [Flip]
     private var feePresets = FeePresets.defaults
     private var nextPhotoID = 100
+    private var connectedApps: [ConnectedApp]
     private let encoder = JSONEncoder()
 
     public init(now: Date = Date()) {
@@ -26,6 +27,8 @@ public actor DemoTransport: HTTPTransport {
         marketWatches = DemoMarket.watches(now: now)
         marketListings = DemoMarket.listings(dashboard: dashboard, now: now)
         flips = Self.demoFlips(now: now)
+        let formatter = ISO8601DateFormatter()
+        connectedApps = [ConnectedApp(id: 1, name: "Hatbot", connectedAt: formatter.string(from: now.addingTimeInterval(-6 * 86_400)), lastUsedAt: formatter.string(from: now.addingTimeInterval(-240)))]
     }
 
     /// A few flips around today so the ledger, quarter total, and sales record have content.
@@ -128,7 +131,7 @@ public actor DemoTransport: HTTPTransport {
         let segments = components.path.split(separator: "/").map(String.init)
         let method = request.httpMethod ?? "GET"
         // `/api/<collection>/<id>/...` routes are matched with the id replaced by `:id`.
-        let collections: Set<String> = ["watches", "market-watches", "market-listings", "flips", "flip-photos"]
+        let collections: Set<String> = ["watches", "market-watches", "market-listings", "flips", "flip-photos", "connected-apps"]
         let watchID = segments.count >= 3 && segments[0] == "api" && collections.contains(segments[1]) ? segments[2] : nil
         let route = method + " /" + segments.enumerated().map { $0.offset == 2 && watchID != nil ? ":id" : $0.element }.joined(separator: "/")
         try await Task.sleep(nanoseconds: 150_000_000)
@@ -306,6 +309,14 @@ public actor DemoTransport: HTTPTransport {
             return try respond(["ok": true])
         case "DELETE /api/flip-photos/:id":
             for index in flips.indices { flips[index].photos?.removeAll { String($0.id) == watchID } }
+            return try respond(["ok": true])
+        case "GET /api/connected-apps":
+            return try respond(["apps": connectedApps])
+        case "DELETE /api/connected-apps/:id":
+            guard connectedApps.contains(where: { String($0.id) == watchID }) else {
+                return try respond(["error": "That app is not connected"], status: 404)
+            }
+            connectedApps.removeAll { String($0.id) == watchID }
             return try respond(["ok": true])
         case "PUT /api/flips/:id/ready", "DELETE /api/flips/:id/ready":
             guard let index = flips.firstIndex(where: { String($0.id) == watchID }) else {

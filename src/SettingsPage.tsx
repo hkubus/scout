@@ -6,6 +6,7 @@ import {
   Database,
   LoaderCircle,
   LogOut,
+  Unplug,
   Moon,
   Send,
   Settings2,
@@ -15,7 +16,8 @@ import {
   Trash2,
 } from "lucide-react";
 import { api } from "./api";
-import type { Marketplace, NotificationPriority, SettingsData, Theme } from "./types";
+import { formatDate, mediumDateShortTime } from "./format";
+import type { ConnectedApp, Marketplace, NotificationPriority, SettingsData, Theme } from "./types";
 import { PageHeader } from "./ui";
 
 type Toast = { type: "success" | "error" | "info" };
@@ -24,6 +26,62 @@ const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
 
 /** A settings card: a one-line title, an optional status, and its fields. */
+/** Apps let in over OAuth from their own settings (e.g. Hatbot); Disconnect revokes the token at once. */
+function ConnectedAppsSection({ onToast }: { onToast: (message: string, type?: "success" | "error" | "info") => void }) {
+  const [apps, setApps] = useState<ConnectedApp[] | null>(null);
+  const [busy, setBusy] = useState<number | null>(null);
+  const load = useCallback(async () => {
+    try {
+      setApps((await api.connectedApps()).apps);
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+    }
+  }, [onToast]);
+  useEffect(() => {
+    void load();
+  }, [load]);
+  const disconnect = async (app: ConnectedApp) => {
+    if (!window.confirm(`Disconnect ${app.name}? It stops reaching Scout at once and has to be connected again from its own settings.`)) return;
+    setBusy(app.id);
+    try {
+      await api.disconnectApp(app.id);
+      onToast(`${app.name} is disconnected.`, "success");
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+    } finally {
+      setBusy(null);
+      void load();
+    }
+  };
+  return (
+    <Section title="Connected apps" wide>
+      {apps === null ? (
+        <p className="settings-inline-note">Loading…</p>
+      ) : apps.length === 0 ? (
+        <p className="settings-inline-note">No apps are connected. An app such as Hatbot connects from its own settings: you type Scout's address there and press Allow here.</p>
+      ) : (
+        <div className="session-status-list">
+          {apps.map((app) => (
+            <div className="session-status-row" key={app.id}>
+              <i className={app.lastUsedAt ? "session-dot session-dot--connected" : "session-dot"} />
+              <div>
+                <strong>{app.name}</strong>
+                <span>
+                  Connected {formatDate(mediumDateShortTime, app.connectedAt)} · {app.lastUsedAt ? `last used ${formatDate(mediumDateShortTime, app.lastUsedAt)}` : "not used yet"}
+                </span>
+              </div>
+              <button className="link-button danger-link" disabled={busy === app.id} onClick={() => void disconnect(app)}>
+                {busy === app.id ? <LoaderCircle size={13} className="spin" /> : <Unplug size={13} />}Disconnect
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      <p className="settings-inline-note">They can see your watches, listings and flips and record where flips went up, through Scout's MCP server only.</p>
+    </Section>
+  );
+}
+
 function Section({ title, status, wide = false, children }: { title: string; status?: { on: boolean; label: string }; wide?: boolean; children: ReactNode }) {
   return (
     <section className={`settings-section${wide ? " settings-section--wide" : ""}`}>
@@ -526,6 +584,7 @@ export default function SettingsPage({
             </div>
           </div>
         </Section>
+        <ConnectedAppsSection onToast={onToast} />
       </div>
       {settings?.publicExposureWarning ? (
         <div className="form-error settings-warning" role="alert">

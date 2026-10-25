@@ -8,6 +8,12 @@ export default defineConfig(({ isSsrBuild }) => ({
     proxy: {
       '/api': process.env.SCOUT_API_PROXY ?? 'http://127.0.0.1:3001',
       '/events': process.env.SCOUT_API_PROXY ?? 'http://127.0.0.1:3001',
+      '/.well-known': process.env.SCOUT_API_PROXY ?? 'http://127.0.0.1:3001',
+      // The "Let … in?" page is the SPA; its Allow/Cancel post and the rest go to the API.
+      '/oauth': {
+        target: process.env.SCOUT_API_PROXY ?? 'http://127.0.0.1:3001',
+        bypass: (request) => (request.method === 'GET' && request.url?.startsWith('/oauth/authorize') ? '/index.html' : undefined),
+      },
     },
   },
   preview: {

@@ -311,6 +311,22 @@ public struct WatchAnalytics: Codable, Hashable, Sendable {
     public var sources: [WatchAnalyticsSource]
 }
 
+/// An app let in over OAuth from its own settings (e.g. Hatbot). Its token
+/// works on Scout's MCP server only; disconnecting revokes it at once.
+public struct ConnectedApp: Codable, Hashable, Sendable, Identifiable {
+    public var id: Int
+    public var name: String
+    public var connectedAt: String
+    public var lastUsedAt: String?
+
+    public init(id: Int, name: String, connectedAt: String, lastUsedAt: String? = nil) {
+        self.id = id
+        self.name = name
+        self.connectedAt = connectedAt
+        self.lastUsedAt = lastUsedAt
+    }
+}
+
 public struct Connector: Codable, Hashable, Sendable {
     public var name: String
     /// `marketplace`, `discord`, or `ntfy`.

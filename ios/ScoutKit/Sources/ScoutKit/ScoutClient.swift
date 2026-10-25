@@ -366,6 +366,17 @@ public struct ScoutClient: Sendable {
         try await send("PATCH", "/api/settings", body: ["ntfy": ["openInApp": enabled]])
     }
 
+    /// Apps let in over OAuth; an older server without them answers with an error.
+    public func connectedApps() async throws -> [ConnectedApp] {
+        let response: ConnectedAppsResponse = try await get("/api/connected-apps")
+        return response.apps
+    }
+
+    /// Revokes the app's token: it stops reaching Scout on its next request.
+    public func disconnectApp(id: Int) async throws {
+        let _: OkResponse = try await send("DELETE", "/api/connected-apps/\(id)", body: EmptyBody())
+    }
+
     public func connectors() async throws -> [Connector] {
         let response: ConnectorsResponse = try await get("/api/connectors")
         return response.connectors
@@ -451,6 +462,7 @@ private struct PointsResponse: Decodable { var points: [PriceHistoryPoint] }
 private struct SnapshotResponse: Decodable { var snapshot: MarketListingSnapshot? }
 private struct EmptyBody: Encodable {}
 private struct ConnectorsResponse: Decodable { var connectors: [Connector] }
+private struct ConnectedAppsResponse: Decodable { var apps: [ConnectedApp] }
 private struct ListingActionResponse: Decodable { var action: ListingAction }
 private struct ScanBody: Encodable { var watchId: String? }
 private struct OlxCategoriesResponse: Decodable { var categories: [OlxCategoryOption] }
