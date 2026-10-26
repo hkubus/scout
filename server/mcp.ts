@@ -35,6 +35,7 @@ export const SCOUT_MCP_TOOL_NAMES = [
   'scout_olx_categories',
   'scout_queue_scan',
   'scout_connectors',
+  'scout_session_status',
 ] as const;
 
 /**
@@ -218,6 +219,13 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
     annotations: { readOnlyHint: true },
   }, async () => {
     try { return text({ connectors: service.getConnectors() }); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_session_status', {
+    description: 'Whether each stored marketplace account session is still signed in: {marketplace, signedIn (true, false, or null when not checked or undecided), checkedAt, detail}. Scout checks every few hours by opening the account page; this reads the last result and never returns the session.',
+    annotations: { readOnlyHint: true },
+  }, async () => {
+    try { return text({ sessions: service.marketplaceSessionStatus() }); } catch (error) { return toolError(error); }
   });
 }
 

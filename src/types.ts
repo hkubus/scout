@@ -634,6 +634,20 @@ export interface MarketplaceSession {
   detail: string;
   /** Connected apps (Hatbot) may fetch this session over MCP for their own browser. */
   sharedWithApps: boolean;
+  /** Scans, detail checks and AI verification render with this session; off keeps them anonymous. */
+  useForChecks: boolean;
+  /** Last signed-in check: null when not checked yet or the account page told neither way. */
+  signedIn: boolean | null;
+  checkedAt: string | null;
+  checkDetail: string | null;
+}
+
+export interface MarketplaceSessionCheck {
+  marketplace: Marketplace;
+  signedIn: boolean | null;
+  checkedAt: string;
+  detail: string;
+  sessions: MarketplaceSession[];
 }
 
 export interface DashboardData {

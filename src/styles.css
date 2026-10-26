@@ -453,8 +453,15 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .session-status-row strong { overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .session-status-row span { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
 .session-status-row .link-button { margin-left: auto; flex: 0 0 auto; font-size: 11px; }
-.session-share { margin-left: auto; display: flex; flex: 0 0 auto; align-items: center; gap: 5px; color: var(--muted); font-size: 11px; white-space: nowrap; }
-.session-status-row .session-share + .link-button { margin-left: 4px; }
+.session-share, .session-use { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; white-space: nowrap; cursor: pointer; }
+.session-share input, .session-use input { width: 14px; height: 14px; margin: 0; accent-color: var(--blue); }
+.session-status-row > .session-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px 12px; margin-left: auto; flex: 0 1 auto; }
+.session-actions .link-button { margin-left: 0; }
+@media (max-width: 700px) {
+  .session-status-row { flex-wrap: wrap; }
+  .session-status-row > div:not(.session-actions) { flex: 1 1 0; }
+  .session-status-row > .session-actions { flex-basis: 100%; justify-content: flex-start; padding-left: 18px; }
+}
 .session-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: var(--soft); }
 .session-dot--connected { background: var(--green); box-shadow: 0 0 0 3px rgba(58, 171, 97, .12); }
 .file-button { position: relative; cursor: pointer; }

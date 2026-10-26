@@ -124,7 +124,7 @@ app.addHook('onRequest', async (request, reply) => {
 
   // A connected app (Hatbot) gets its own bucket, so it neither eats nor runs out of the dashboard's.
   const connectedApp = route === '/mcp' && isConnectedAppToken(bearerToken(request.headers.authorization) ?? '');
-  const expensive = !connectedApp && (route === '/mcp' || /\/search$|\/categories$|\/scan$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/listing-draft$|\/flips\/import\/(?:url|screenshot)$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route));
+  const expensive = !connectedApp && (route === '/mcp' || /\/search$|\/categories$|\/scan$|\/check$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/listing-draft$|\/flips\/import\/(?:url|screenshot)$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route));
   // Registration is public, so it gets the tightest bucket of its own.
   const limit = route === '/oauth/register' ? 10 : route === '/oauth/token' || route === CONSENT_PATH ? 30 : expensive ? 30 : connectedApp ? 120 : 240;
   // Snapshot images use the general limit so a screen of saved photos loads.
@@ -469,9 +469,20 @@ app.put('/api/marketplace-sessions/:marketplace', async (request, reply) => {
 app.patch('/api/marketplace-sessions/:marketplace', async (request, reply) => {
   const params = z.object({ marketplace: marketplaceParam }).safeParse(request.params);
   if (!params.success) return reply.code(400).send({ error: 'Unsupported marketplace' });
-  const body = z.object({ sharedWithApps: z.boolean() }).strict().safeParse(request.body);
-  if (!body.success) return reply.code(400).send({ error: 'sharedWithApps must be true or false' });
-  return service.shareMarketplaceSession(params.data.marketplace, body.data.sharedWithApps);
+  // A partial update of the session's switches; the stored session itself only changes through PUT.
+  const body = z.object({ sharedWithApps: z.boolean().optional(), useForChecks: z.boolean().optional() }).strict().safeParse(request.body);
+  if (!body.success || (body.data.sharedWithApps === undefined && body.data.useForChecks === undefined)) return reply.code(400).send({ error: 'sharedWithApps or useForChecks must be true or false' });
+  if (body.data.sharedWithApps !== undefined) service.shareMarketplaceSession(params.data.marketplace, body.data.sharedWithApps);
+  if (body.data.useForChecks !== undefined) service.setMarketplaceSessionUse(params.data.marketplace, body.data.useForChecks);
+  return service.settings();
+});
+
+// Renders the marketplace's account page with the stored session (one page load, nothing sent to the account).
+app.post('/api/marketplace-sessions/:marketplace/check', async (request, reply) => {
+  const params = z.object({ marketplace: marketplaceParam }).safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'Unsupported marketplace' });
+  const result = await service.checkMarketplaceSession(params.data.marketplace);
+  return { ...result, sessions: service.marketplaceSessions() };
 });
 
 app.delete('/api/marketplace-sessions/:marketplace', async (request) => {

@@ -144,6 +144,23 @@ test('the listing tools are offered alongside the others when flips are availabl
   } finally { context.close(); }
 });
 
+test('scout_session_status reports each stored session without its cookies', async () => {
+  const context = fixture();
+  try {
+    context.service.saveMarketplaceSession('OLX', 'Personal', { cookies: [{ name: 'session', value: 'private-token', domain: '.olx.pl', path: '/' }], origins: [] });
+    const { server, client } = await connectedClient(context.service);
+    try {
+      const result = await client.callTool({ name: 'scout_session_status', arguments: {} }) as { content: Array<{ type: string; text?: string }> };
+      const text = toolText(result);
+      assert.doesNotMatch(text, /private-token|cookies/);
+      assert.deepEqual(JSON.parse(text), { sessions: [{ marketplace: 'OLX', signedIn: null, checkedAt: null, detail: 'Not checked yet' }] });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});
+
 // Hatbot's MCP plugin (apps/brain/src/plugins/mcp/index.ts, moneyKind) makes
 // a tool whose name or description reads as a payment or a purchase always
 // ask the owner. A copy of its patterns, so the listing tools never trip them.
