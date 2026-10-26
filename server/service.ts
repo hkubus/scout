@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { Readable } from 'node:stream';
 // @ts-ignore node:sqlite is present in the supported Node 22+ runtime.
@@ -223,6 +223,36 @@ function jevCheckConcurrency() {
   const configured = Number.parseInt(process.env.SCOUT_JEV_CONCURRENCY ?? '', 10);
   if (!Number.isFinite(configured) || configured < 1) return DEFAULT_JEV_CHECK_CONCURRENCY;
   return Math.min(configured, MAX_JEV_CHECK_CONCURRENCY);
+}
+
+/** A new deal watch, with every default already filled in. */
+export interface NewWatch {
+  id?: string;
+  name: string;
+  query: string;
+  terms: string;
+  excluded: string;
+  sources: Marketplace[];
+  condition: string;
+  /** Minutes; Settings' default interval when left out. */
+  interval?: number;
+  sourceIntervals: Record<string, number>;
+  exactUrls: string[];
+  sensitivity: number;
+  shippingOnly: boolean;
+  typoVariants: boolean;
+  aiRelevance: boolean;
+  variantGroups: VariantGroup[];
+  variantGroupsAuto: boolean;
+  referenceMarketWatchId: string | null;
+  minPrice: number | null;
+  maxPrice: number | null;
+  olxCategory: OlxCategory | null;
+  sellerType: SellerType | null;
+  ignorePromoted: boolean;
+  targetPrice: number | null;
+  minSaving: number | null;
+  verificationChecks: VerificationCheck[];
 }
 
 export class ServiceError extends Error {
@@ -2706,6 +2736,30 @@ export class ScoutService {
   /** One watch (archived included) with the same stats as allWatches(). */
   watchById(id: string): Watch | undefined {
     return this.watches(true, id)[0];
+  }
+
+  createWatch(value: NewWatch): Watch {
+    for (const url of value.exactUrls) {
+      const valid = validateSearchUrl(url);
+      if (!valid.valid || !value.sources.includes(valid.marketplace)) throw new ServiceError(valid.valid ? 'Exact URL source is not selected' : valid.reason);
+    }
+    if (value.referenceMarketWatchId && !this.db.prepare('SELECT 1 FROM market_watches WHERE id = ?').get(value.referenceMarketWatchId)) {
+      throw new ServiceError('Reference research watch not found');
+    }
+    const id = value.id ?? `watch-${randomUUID()}`;
+    const now = nowIso();
+    const interval = value.interval ?? Number(this.getSetting('default_interval') ?? 5);
+    const sourceIntervals = normalizeSourceIntervals(value.sources, value.sourceIntervals);
+    try {
+      this.db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, source_intervals_json, sensitivity, shipping_only, typo_variants, ai_relevance, variant_groups_json, variant_groups_auto, reference_market_watch_id, min_price_pln, max_price_pln, olx_category_json, seller_type, ignore_promoted, target_price_pln, min_saving_pln, verification_checks_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, NO_LOCATION_FILTER, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), interval, JSON.stringify(sourceIntervals), value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, JSON.stringify(value.variantGroups), value.variantGroupsAuto && !value.variantGroups.length ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, olxCategoryToJson(value.olxCategory), value.sellerType, value.ignorePromoted ? 1 : 0, value.targetPrice, value.minSaving || null, JSON.stringify(value.verificationChecks), 1, now, now, now);
+    } catch (error) {
+      if (error instanceof Error && /UNIQUE|PRIMARY KEY|constraint/i.test(error.message)) {
+        throw new ServiceError('A watch with this id already exists', 409);
+      }
+      throw error;
+    }
+    this.emit('watch', { id, name: value.name });
+    return this.watchById(id)!;
   }
 
   /**

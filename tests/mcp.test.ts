@@ -127,6 +127,33 @@ test('scout_listings defaults to a compact page and scout_queue_scan surfaces se
   } finally { context.close(); }
 });
 
+test('scout_watch_create makes a watch Scout scans, and refuses a price range upside down', async () => {
+  const context = fixture();
+  try {
+    const { server, client } = await connectedClient(context.service);
+    try {
+      const created = JSON.parse(toolText(await client.callTool({ name: 'scout_watch_create', arguments: {
+        name: 'Steam Deck OLED', query: 'steam deck oled', sources: ['OLX', 'Vinted'], terms: 'oled', maxPrice: 2200, targetPrice: 1700,
+        verificationChecks: [{ text: 'Not cracked', mode: 'require' }],
+      } }) as never));
+      const [watch] = context.service.getWatches();
+      assert.equal(watch.id, created.watch.id);
+      assert.equal(watch.enabled, true);
+      assert.deepEqual(watch.sources, ['OLX', 'Vinted']);
+      assert.equal(watch.maxPrice, 2200);
+      assert.equal(watch.targetPrice, 1700);
+      assert.equal(watch.interval, 5);
+
+      const upsideDown = await client.callTool({ name: 'scout_watch_create', arguments: { name: 'x', query: 'x', sources: ['OLX'], minPrice: 500, maxPrice: 100 } }) as never as { isError?: boolean };
+      assert.equal(upsideDown.isError, true);
+      assert.equal(context.service.getWatches().length, 1);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});
+
 test('the listing tools are offered alongside the others when flips are available', async () => {
   const context = fixture();
   try {

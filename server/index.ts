@@ -19,7 +19,7 @@ import { CONSENT_PATH, isConnectedAppToken, isOAuthRoute, mcpChallenge, OAuthSto
 import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
 import { FlipStore, MAX_FLIP_PHOTO_BYTES, MAX_FLIP_PHOTOS } from './flips';
 import { FLIP_CHANNELS, LISTING_CHANNELS, LISTING_CONDITIONS, PARCEL_SIZES } from '../src/profit';
-import { dashboardTopParam, NO_LOCATION_FILTER, normalizeSourceIntervals, olxCategoryToJson, ScoutService, ServiceError } from './service';
+import { dashboardTopParam, normalizeSourceIntervals, olxCategoryToJson, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 import { parseVariantGroups } from './variants';
 import { VERIFICATION_CHECKS_MAX, VERIFICATION_CHECK_MAX_CHARS } from './ai';
@@ -544,28 +544,7 @@ const watchInput = z.object({
 app.post('/api/watches', async (request, reply) => {
   const parsed = watchInput.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid watch', details: parsed.error.flatten() });
-  const value = parsed.data;
-  for (const url of value.exactUrls) {
-    const valid = validateSearchUrl(url);
-    if (!valid.valid || !value.sources.includes(valid.marketplace)) return reply.code(400).send({ error: valid.valid ? 'Exact URL source is not selected' : valid.reason });
-  }
-  if (value.referenceMarketWatchId && !db.prepare('SELECT 1 FROM market_watches WHERE id = ?').get(value.referenceMarketWatchId)) {
-    return reply.code(400).send({ error: 'Reference research watch not found' });
-  }
-  const id = value.id ?? `watch-${randomUUID()}`;
-  const now = nowIso();
-  const sourceIntervals = normalizeSourceIntervals(value.sources, value.sourceIntervals);
-  try {
-    db.prepare('INSERT INTO watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, exact_urls_json, interval_minutes, source_intervals_json, sensitivity, shipping_only, typo_variants, ai_relevance, variant_groups_json, variant_groups_auto, reference_market_watch_id, min_price_pln, max_price_pln, olx_category_json, seller_type, ignore_promoted, target_price_pln, min_saving_pln, verification_checks_json, enabled, next_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, value.name, value.query, value.terms, value.excluded, NO_LOCATION_FILTER, value.condition, JSON.stringify(value.sources), JSON.stringify(value.exactUrls), value.interval, JSON.stringify(sourceIntervals), value.sensitivity, value.shippingOnly ? 1 : 0, value.typoVariants ? 1 : 0, value.aiRelevance ? 1 : 0, JSON.stringify(value.variantGroups), value.variantGroupsAuto && !value.variantGroups.length ? 1 : 0, value.referenceMarketWatchId, value.minPrice, value.maxPrice, olxCategoryToJson(value.olxCategory), value.sellerType, value.ignorePromoted ? 1 : 0, value.targetPrice, value.minSaving || null, JSON.stringify(value.verificationChecks), 1, now, now, now);
-  } catch (error) {
-    if (error instanceof Error && /UNIQUE|PRIMARY KEY|constraint/i.test(error.message)) {
-      return reply.code(409).send({ error: 'A watch with this id already exists' });
-    }
-    throw error;
-  }
-  emit('watch', { id, name: value.name });
-  const created = service.watchById(id);
-  return reply.code(201).send({ watch: created });
+  return reply.code(201).send({ watch: service.createWatch(parsed.data) });
 });
 
 app.patch('/api/watches/:id', async (request, reply) => {
