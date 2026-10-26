@@ -632,6 +632,8 @@ export interface MarketplaceSession {
   updatedAt: string | null;
   lastUsedAt: string | null;
   detail: string;
+  /** Connected apps (Hatbot) may fetch this session over MCP for their own browser. */
+  sharedWithApps: boolean;
 }
 
 export interface DashboardData {

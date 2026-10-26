@@ -9,20 +9,20 @@ import sharp from 'sharp';
 import { openDatabase } from '../server/db';
 import { FlipStore, sniffImageMime } from '../server/flips';
 import { ScoutService } from '../server/service';
-import { MCP_DASHBOARD_LISTINGS, SCOUT_MCP_LISTING_TOOL_NAMES, SCOUT_MCP_TOOL_NAMES, createScoutMcpServer } from '../server/mcp';
+import { MCP_DASHBOARD_LISTINGS, SCOUT_MCP_LISTING_TOOL_NAMES, SCOUT_MCP_SESSION_TOOL_NAMES, SCOUT_MCP_TOOL_NAMES, createScoutMcpServer } from '../server/mcp';
 
 if (process.env.SCOUT_JEV_MODE === undefined) process.env.SCOUT_JEV_MODE = 'legacy';
 
-function fixture() {
+function fixture(authEnabled = false) {
   const directory = mkdtempSync(join(tmpdir(), 'scout-mcp-'));
   const db = openDatabase(join(directory, 'scout.sqlite'));
-  const service = new ScoutService(db, () => {}, {});
+  const service = new ScoutService(db, () => {}, { authEnabled });
   const flips = new FlipStore(db);
   return { db, service, flips, close: () => { db.close(); rmSync(directory, { recursive: true, force: true }); } };
 }
 
-async function connectedClient(service: ScoutService, flips: FlipStore | null = null) {
-  const server = createScoutMcpServer(service, null, flips);
+async function connectedClient(service: ScoutService, flips: FlipStore | null = null, sessions = false) {
+  const server = createScoutMcpServer(service, null, flips, sessions);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'scout-mcp-test', version: '1.0.0' });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -155,10 +155,11 @@ const HANDOFF_WORDS = /\b(pay\w*|checkout|transfer\w*|refund\w*|money|funds|char
 test('the listing tools use no money or selling words in their names and descriptions', async () => {
   const context = fixture();
   try {
-    const { server, client } = await connectedClient(context.service, context.flips);
+    const { server, client } = await connectedClient(context.service, context.flips, true);
     try {
       const { tools } = await client.listTools();
-      for (const tool of tools.filter((item) => (SCOUT_MCP_LISTING_TOOL_NAMES as readonly string[]).includes(item.name))) {
+      assert.ok(SCOUT_MCP_SESSION_TOOL_NAMES.every((name) => tools.some((tool) => tool.name === name)));
+      for (const tool of tools.filter((item) => ([...SCOUT_MCP_LISTING_TOOL_NAMES, ...SCOUT_MCP_SESSION_TOOL_NAMES] as readonly string[]).includes(item.name))) {
         const words = tool.name.replace(/[_.-]+/g, ' ');
         const parameters = Object.values((tool.inputSchema.properties ?? {}) as Record<string, { description?: string }>).map((property) => property.description ?? '').join(' ');
         for (const text of [`${words} ${tool.description}`, parameters]) {
@@ -233,5 +234,66 @@ test('Hatbot reads a ready flip, its draft and photos, and records each channel'
       await client.close();
       await server.close();
     }
+  } finally { context.close(); }
+});
+
+const olxState = (value: string) => ({ cookies: [{ name: 'access_token', value, domain: '.olx.pl', path: '/', httpOnly: true, secure: true }], origins: [] });
+
+test('connected apps get only the marketplace sessions the owner shared', async () => {
+  const context = fixture(true);
+  try {
+    context.service.saveMarketplaceSession('OLX', 'Haggler', olxState('first'));
+    context.service.saveMarketplaceSession('Vinted', '', { cookies: [{ name: 'v', value: 'x', domain: 'www.vinted.pl', path: '/' }], origins: [] });
+    const { server, client } = await connectedClient(context.service, null, true);
+    try {
+      const list = async () => JSON.parse(toolText(await client.callTool({ name: 'scout_shared_sessions', arguments: {} }) as never)).sessions;
+      assert.deepEqual(await list(), []);
+      const refused = await client.callTool({ name: 'scout_shared_session', arguments: { marketplace: 'OLX' } }) as never as { isError?: boolean; content: Array<{ type: string; text?: string }> };
+      assert.equal(refused.isError, true);
+      assert.doesNotMatch(toolText(refused), /first/);
+
+      context.service.shareMarketplaceSession('OLX', true);
+      const [shared] = await list();
+      assert.deepEqual(Object.keys(shared).sort(), ['label', 'marketplace', 'revision']);
+      assert.equal(shared.marketplace, 'OLX');
+      const session = JSON.parse(toolText(await client.callTool({ name: 'scout_shared_session', arguments: { marketplace: 'OLX' } }) as never));
+      assert.equal(session.revision, shared.revision);
+      assert.equal(session.storageState.cookies[0].value, 'first');
+
+      context.service.shareMarketplaceSession('OLX', false);
+      context.service.shareMarketplaceSession('OLX', true);
+      assert.equal((await list())[0].revision, shared.revision, 'the revision holds until the session is imported again');
+      context.service.saveMarketplaceSession('OLX', 'Haggler', olxState('second'));
+      assert.notEqual((await list())[0].revision, shared.revision);
+      assert.equal(context.service.marketplaceSessions().find((item) => item.marketplace === 'OLX')?.sharedWithApps, true, 're-importing keeps the choice');
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});
+
+test('the session tools are only offered to connected apps', async () => {
+  const context = fixture();
+  try {
+    const { server, client } = await connectedClient(context.service, context.flips);
+    try {
+      const { tools } = await client.listTools();
+      assert.ok(!tools.some((tool) => (SCOUT_MCP_SESSION_TOOL_NAMES as readonly string[]).includes(tool.name)));
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});
+
+test('without sign-in, nothing is shared: anyone on the network could connect an app', async () => {
+  const context = fixture();
+  try {
+    context.service.saveMarketplaceSession('OLX', '', olxState('first'));
+    assert.throws(() => context.service.shareMarketplaceSession('OLX', true), /sign-in/);
+    context.db.prepare('UPDATE marketplace_sessions SET shared_with_apps = 1').run();
+    assert.deepEqual(context.service.sharedMarketplaceSessions(), []);
+    assert.throws(() => context.service.sharedMarketplaceSession('OLX'), /isn't shared/);
   } finally { context.close(); }
 });

@@ -353,6 +353,17 @@ export default function SettingsPage({
       setSavingSession(false);
     }
   };
+  const shareMarketplaceSession = async (marketplace: Marketplace, shared: boolean) => {
+    setSavingSession(true);
+    try {
+      setSettings(await api.shareMarketplaceSession(marketplace, shared));
+      onToast(shared ? `Connected apps can now use the ${marketplace} session.` : `The ${marketplace} session is no longer shared.`);
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+    } finally {
+      setSavingSession(false);
+    }
+  };
   const removeMarketplaceSession = async (marketplace: Marketplace) => {
     if (!window.confirm(`Remove the saved ${marketplace} session?`)) return;
     setSavingSession(true);
@@ -618,9 +629,15 @@ export default function SettingsPage({
                     <span>{session.detail}</span>
                   </div>
                   {session.createdAt ? (
-                    <button className="link-button danger-link" disabled={savingSession} onClick={() => void removeMarketplaceSession(session.marketplace)}>
-                      Remove
-                    </button>
+                    <>
+                      <label className="session-share" title={settings?.authEnabled ? "Connected apps such as Hatbot can sign their own browser in with this session" : "Needs Scout's sign-in: without it anyone on your network could connect an app"}>
+                        <input type="checkbox" checked={session.sharedWithApps} disabled={savingSession || (!settings?.authEnabled && !session.sharedWithApps)} onChange={(event) => void shareMarketplaceSession(session.marketplace, event.target.checked)} />
+                        Share with connected apps
+                      </label>
+                      <button className="link-button danger-link" disabled={savingSession} onClick={() => void removeMarketplaceSession(session.marketplace)}>
+                        Remove
+                      </button>
+                    </>
                   ) : null}
                 </div>
               ))}
