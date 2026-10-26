@@ -357,7 +357,7 @@ export default function SettingsPage({
     setSavingSession(true);
     try {
       setSettings(await api.shareMarketplaceSession(marketplace, shared));
-      onToast(shared ? `Hatbot can now use the ${marketplace} session.` : `The ${marketplace} session is no longer shared.`);
+      onToast(shared ? `Connected apps can now use the ${marketplace} session.` : `The ${marketplace} session is no longer shared.`);
     } catch (error) {
       onToast(errorMessage(error), "error");
     } finally {
@@ -630,9 +630,9 @@ export default function SettingsPage({
                   </div>
                   {session.createdAt ? (
                     <>
-                      <label className="session-share" title="Hatbot, once connected under Connected apps, signs its own browser in with this session">
-                        <input type="checkbox" checked={session.sharedWithApps} disabled={savingSession} onChange={(event) => void shareMarketplaceSession(session.marketplace, event.target.checked)} />
-                        Share with Hatbot
+                      <label className="session-share" title={settings?.authEnabled ? "Connected apps such as Hatbot can sign their own browser in with this session" : "Needs Scout's sign-in: without it anyone on your network could connect an app"}>
+                        <input type="checkbox" checked={session.sharedWithApps} disabled={savingSession || (!settings?.authEnabled && !session.sharedWithApps)} onChange={(event) => void shareMarketplaceSession(session.marketplace, event.target.checked)} />
+                        Share with connected apps
                       </label>
                       <button className="link-button danger-link" disabled={savingSession} onClick={() => void removeMarketplaceSession(session.marketplace)}>
                         Remove

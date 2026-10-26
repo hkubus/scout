@@ -516,6 +516,9 @@ test('stores marketplace sessions encrypted and rejects cross-marketplace state'
   try {
     assert.deepEqual(parseMarketplaceStorageState(state, 'OLX'), state);
     assert.throws(() => parseMarketplaceStorageState({ cookies: [{ name: 'session', value: 'x', domain: '.vinted.pl', path: '/' }] }, 'OLX'), /outside OLX/);
+    for (const domain of ['evil.example/.olx.pl', 'evil.example?.olx.pl', 'evil.example#.olx.pl', 'evil.example\\.olx.pl', 'olx.pl.']) {
+      assert.throws(() => parseMarketplaceStorageState({ cookies: [{ name: 'session', value: 'x', domain, path: '/' }] }, 'OLX'), /outside OLX/, domain);
+    }
     assert.throws(() => parseMarketplaceStorageState({ cookies: [{ name: 'session', value: 'x', domain: '.olx.pl', path: '/' }], origins: [{ origin: 'http://www.olx.pl' }] }, 'OLX'), /approved OLX HTTPS origin/);
     const settings = context.service.saveMarketplaceSession('OLX', 'Personal', state);
     const saved = settings.marketplaceSessions.find((session) => session.marketplace === 'OLX')!;

@@ -2256,6 +2256,7 @@ export class ScoutService {
   }
 
   shareMarketplaceSession(marketplace: Marketplace, shared: boolean) {
+    if (shared && !this.authEnabled) throw new ServiceError('Turn on Scout\'s sign-in first: without it, anyone on your network could connect an app and take the session.');
     const result = this.stmt('UPDATE marketplace_sessions SET shared_with_apps = ? WHERE marketplace = ?').run(shared ? 1 : 0, marketplace);
     if (!result.changes) throw new ServiceError('Marketplace session not found', 404);
     return this.settings();
@@ -2271,8 +2272,11 @@ export class ScoutService {
     };
   }
 
+  // Without sign-in anyone who reaches Scout can connect an app, so nothing is shared then, even
+  // sessions shared before sign-in was turned off.
   /** The sessions the operator shared with connected apps, without their cookies. */
   sharedMarketplaceSessions() {
+    if (!this.authEnabled) return [];
     return (this.stmt('SELECT * FROM marketplace_sessions WHERE shared_with_apps = 1 ORDER BY marketplace').all() as Array<Record<string, any>>)
       .map((row) => this.sharedSessionInfo(row));
   }
@@ -2280,7 +2284,7 @@ export class ScoutService {
   /** One shared session with its Playwright storage state, for a connected app's own browser. */
   sharedMarketplaceSession(marketplace: Marketplace) {
     const row = this.marketplaceSessionRow(marketplace);
-    if (!row || !row.shared_with_apps) throw new ServiceError(`The ${marketplace} session isn't shared with connected apps`, 404);
+    if (!row || !row.shared_with_apps || !this.authEnabled) throw new ServiceError(`The ${marketplace} session isn't shared with connected apps`, 404);
     const storageState = this.readMarketplaceSession(marketplace);
     if (!storageState) throw new ServiceError(`The ${marketplace} session isn't shared with connected apps`, 404);
     return { ...this.sharedSessionInfo(row), storageState };

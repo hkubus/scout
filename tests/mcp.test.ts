@@ -13,10 +13,10 @@ import { MCP_DASHBOARD_LISTINGS, SCOUT_MCP_LISTING_TOOL_NAMES, SCOUT_MCP_SESSION
 
 if (process.env.SCOUT_JEV_MODE === undefined) process.env.SCOUT_JEV_MODE = 'legacy';
 
-function fixture() {
+function fixture(authEnabled = false) {
   const directory = mkdtempSync(join(tmpdir(), 'scout-mcp-'));
   const db = openDatabase(join(directory, 'scout.sqlite'));
-  const service = new ScoutService(db, () => {}, {});
+  const service = new ScoutService(db, () => {}, { authEnabled });
   const flips = new FlipStore(db);
   return { db, service, flips, close: () => { db.close(); rmSync(directory, { recursive: true, force: true }); } };
 }
@@ -240,7 +240,7 @@ test('Hatbot reads a ready flip, its draft and photos, and records each channel'
 const olxState = (value: string) => ({ cookies: [{ name: 'access_token', value, domain: '.olx.pl', path: '/', httpOnly: true, secure: true }], origins: [] });
 
 test('connected apps get only the marketplace sessions the owner shared', async () => {
-  const context = fixture();
+  const context = fixture(true);
   try {
     context.service.saveMarketplaceSession('OLX', 'Haggler', olxState('first'));
     context.service.saveMarketplaceSession('Vinted', '', { cookies: [{ name: 'v', value: 'x', domain: 'www.vinted.pl', path: '/' }], origins: [] });
@@ -284,5 +284,16 @@ test('the session tools are only offered to connected apps', async () => {
       await client.close();
       await server.close();
     }
+  } finally { context.close(); }
+});
+
+test('without sign-in, nothing is shared: anyone on the network could connect an app', async () => {
+  const context = fixture();
+  try {
+    context.service.saveMarketplaceSession('OLX', '', olxState('first'));
+    assert.throws(() => context.service.shareMarketplaceSession('OLX', true), /sign-in/);
+    context.db.prepare('UPDATE marketplace_sessions SET shared_with_apps = 1').run();
+    assert.deepEqual(context.service.sharedMarketplaceSessions(), []);
+    assert.throws(() => context.service.sharedMarketplaceSession('OLX'), /isn't shared/);
   } finally { context.close(); }
 });

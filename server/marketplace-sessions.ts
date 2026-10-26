@@ -65,7 +65,8 @@ export function parseMarketplaceStorageState(input: unknown, marketplace: Market
     const cookieValue = text(value.value, `Cookie ${index + 1} value`, 32_768);
     const domain = text(value.domain, `Cookie ${index + 1} domain`, 255).trim();
     const normalizedDomain = domain.replace(/^\.+/, '').toLowerCase();
-    if (!normalizedDomain || !isApprovedMarketplaceSessionHost(marketplace, normalizedDomain)) fail(`Cookie ${index + 1} belongs outside ${marketplace}`);
+    // Only a bare hostname: a browser reads "evil.example/.olx.pl" as evil.example.
+    if (!/^\.?[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(domain) || !isApprovedMarketplaceSessionHost(marketplace, normalizedDomain)) fail(`Cookie ${index + 1} belongs outside ${marketplace}`);
     const path = text(value.path, `Cookie ${index + 1} path`, 2_048);
     if (!path.startsWith('/')) fail(`Cookie ${index + 1} path must start with /`);
     if (value.expires !== undefined && (typeof value.expires !== 'number' || !Number.isFinite(value.expires))) fail(`Cookie ${index + 1} expires must be a finite number`);
