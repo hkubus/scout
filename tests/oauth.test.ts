@@ -414,6 +414,8 @@ test('end to end: register, Allow, token, then tools/list on /mcp without the de
     assert.ok(tools.includes('scout_flips_to_list') && tools.includes('scout_watches') && tools.includes('scout_listing_detail'));
     assert.equal(tools.filter((name) => name.startsWith('scout_debug_')).length, 0, 'connected apps never get the debug tools');
     assert.ok((await mcpTools(origin, STATIC_TOKEN)).some((name) => name.startsWith('scout_debug_')), 'an API token still does');
+    assert.ok(tools.includes('scout_shared_session'), 'connected apps get the shared sessions');
+    assert.ok(!(await mcpTools(origin, STATIC_TOKEN)).includes('scout_shared_session'), 'an API token never does');
 
     const apps = await (await fetch(`${origin}/api/connected-apps`, { headers: { cookie } })).json() as { apps: Array<{ name: string; lastUsedAt: string | null }> };
     assert.equal(apps.apps.length, 1);

@@ -2240,7 +2240,7 @@ export class ScoutService {
   marketplaceSessions() {
     return marketplaces.map((marketplace) => {
       const row = this.marketplaceSessionRow(marketplace);
-      if (!row) return { marketplace, label: '', connected: false, createdAt: null, updatedAt: null, lastUsedAt: null, detail: 'No authenticated session' };
+      if (!row) return { marketplace, label: '', connected: false, createdAt: null, updatedAt: null, lastUsedAt: null, detail: 'No authenticated session', sharedWithApps: false };
       const lastError = typeof row.last_error === 'string' ? row.last_error : null;
       return {
         marketplace,
@@ -2250,8 +2250,40 @@ export class ScoutService {
         updatedAt: row.updated_at ?? null,
         lastUsedAt: row.last_used_at ?? null,
         detail: lastError ?? 'Authenticated browser session ready',
+        sharedWithApps: Boolean(row.shared_with_apps),
       };
     });
+  }
+
+  shareMarketplaceSession(marketplace: Marketplace, shared: boolean) {
+    const result = this.stmt('UPDATE marketplace_sessions SET shared_with_apps = ? WHERE marketplace = ?').run(shared ? 1 : 0, marketplace);
+    if (!result.changes) throw new ServiceError('Marketplace session not found', 404);
+    return this.settings();
+  }
+
+  // revision moves only when the session is imported again, so a connected app
+  // copies a session once per import instead of on every poll.
+  private sharedSessionInfo(row: Record<string, any>) {
+    return {
+      marketplace: row.marketplace as Marketplace,
+      label: String(row.label ?? ''),
+      revision: createHash('sha256').update(String(row.storage_state_encrypted)).digest('hex').slice(0, 16),
+    };
+  }
+
+  /** The sessions the operator shared with connected apps, without their cookies. */
+  sharedMarketplaceSessions() {
+    return (this.stmt('SELECT * FROM marketplace_sessions WHERE shared_with_apps = 1 ORDER BY marketplace').all() as Array<Record<string, any>>)
+      .map((row) => this.sharedSessionInfo(row));
+  }
+
+  /** One shared session with its Playwright storage state, for a connected app's own browser. */
+  sharedMarketplaceSession(marketplace: Marketplace) {
+    const row = this.marketplaceSessionRow(marketplace);
+    if (!row || !row.shared_with_apps) throw new ServiceError(`The ${marketplace} session isn't shared with connected apps`, 404);
+    const storageState = this.readMarketplaceSession(marketplace);
+    if (!storageState) throw new ServiceError(`The ${marketplace} session isn't shared with connected apps`, 404);
+    return { ...this.sharedSessionInfo(row), storageState };
   }
 
   saveMarketplaceSession(marketplace: Marketplace, label: string | undefined, input: unknown) {

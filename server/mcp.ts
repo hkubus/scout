@@ -50,6 +50,16 @@ export const SCOUT_MCP_LISTING_TOOL_NAMES = [
   'scout_flip_listed',
 ] as const;
 
+/**
+ * The marketplace sessions the operator shared with connected apps, so
+ * Hatbot's own browser can use those logins. Only connected apps get them,
+ * never SCOUT_API_TOKENS clients.
+ */
+export const SCOUT_MCP_SESSION_TOOL_NAMES = [
+  'scout_shared_sessions',
+  'scout_shared_session',
+] as const;
+
 export const SCOUT_MCP_DEBUG_TOOL_NAMES = [
   'scout_debug_schema',
   'scout_debug_table',
@@ -255,6 +265,24 @@ export function registerScoutListingMcpTools(server: McpServer, flips: FlipStore
   });
 }
 
+/** Marketplace sessions shared with connected apps (Settings → Marketplace accounts). */
+export function registerScoutSessionMcpTools(server: McpServer, service: ScoutService) {
+  server.registerTool('scout_shared_sessions', {
+    description: 'The marketplace browser sessions the owner shared with connected apps in Scout, each {marketplace, label, revision}, without cookies. revision changes only when the owner imports the session again.',
+    annotations: { readOnlyHint: true },
+  }, async () => {
+    try { return text({ sessions: service.sharedMarketplaceSessions() }); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_shared_session', {
+    description: 'One shared marketplace browser session: {marketplace, label, revision, storageState}, where storageState is Playwright storage state (cookies and localStorage) for that marketplace\'s sites only. It signs a browser in, so keep it out of logs and model context.',
+    inputSchema: { marketplace: marketplace.describe('A marketplace from scout_shared_sessions.') },
+    annotations: { readOnlyHint: true },
+  }, async ({ marketplace: name }) => {
+    try { return text(service.sharedMarketplaceSession(name)); } catch (error) { return toolError(error); }
+  });
+}
+
 /**
  * Read-only database introspection for development: schema, raw table rows,
  * arbitrary read-only SQL, and runtime state. Mirrors /api/debug/*.
@@ -302,13 +330,14 @@ export function registerScoutDebugMcpTools(server: McpServer, debug: ScoutDebug)
 }
 
 /** Build a fresh per-request MCP server bound to the given service. */
-export function createScoutMcpServer(service: ScoutService, debug: ScoutDebug | null = null, flips: FlipStore | null = null) {
+export function createScoutMcpServer(service: ScoutService, debug: ScoutDebug | null = null, flips: FlipStore | null = null, sessions = false) {
   const server = new McpServer(
     { name: 'scout-deal-monitor', version: process.env.SCOUT_VERSION ?? '1.0.0' },
     { capabilities: { tools: {} } },
   );
   registerScoutMcpTools(server, service);
   if (flips) registerScoutListingMcpTools(server, flips);
+  if (sessions) registerScoutSessionMcpTools(server, service);
   if (debug) registerScoutDebugMcpTools(server, debug);
   return server;
 }

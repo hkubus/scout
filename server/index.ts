@@ -466,6 +466,14 @@ app.put('/api/marketplace-sessions/:marketplace', async (request, reply) => {
   return reply.code(201).send(service.saveMarketplaceSession(params.data.marketplace, body.data.label, body.data.storageState));
 });
 
+app.patch('/api/marketplace-sessions/:marketplace', async (request, reply) => {
+  const params = z.object({ marketplace: marketplaceParam }).safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'Unsupported marketplace' });
+  const body = z.object({ sharedWithApps: z.boolean() }).strict().safeParse(request.body);
+  if (!body.success) return reply.code(400).send({ error: 'sharedWithApps must be true or false' });
+  return service.shareMarketplaceSession(params.data.marketplace, body.data.sharedWithApps);
+});
+
 app.delete('/api/marketplace-sessions/:marketplace', async (request) => {
   const params = z.object({ marketplace: marketplaceParam }).safeParse(request.params);
   if (!params.success) throw new ServiceError('Unsupported marketplace', 400);
@@ -1143,7 +1151,9 @@ app.post('/mcp', async (request, reply) => {
   }
   const [{ createScoutMcpServer }, { StreamableHTTPServerTransport }] = modules;
   // Connected apps never get the scout_debug_* tools, even with the Debug API on.
-  const mcpServer = createScoutMcpServer(service, request.scoutAuth === 'app' ? null : debug, flips);
+  // Only they get the shared marketplace sessions.
+  const connectedApp = request.scoutAuth === 'app';
+  const mcpServer = createScoutMcpServer(service, connectedApp ? null : debug, flips, connectedApp);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   reply.raw.on('close', () => {
     transport.close().catch(() => {});
