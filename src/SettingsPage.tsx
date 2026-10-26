@@ -17,7 +17,7 @@ import {
 } from "lucide-react";
 import { api } from "./api";
 import { formatDate, mediumDateShortTime } from "./format";
-import type { ConnectedApp, Marketplace, NotificationPriority, SettingsData, Theme } from "./types";
+import type { ConnectedApp, Marketplace, MarketplaceSession, NotificationPriority, SettingsData, Theme } from "./types";
 import { PageHeader } from "./ui";
 
 type Toast = { type: "success" | "error" | "info" };
@@ -82,6 +82,11 @@ function ConnectedAppsSection({ onToast }: { onToast: (message: string, type?: "
   );
 }
 
+function sessionCheckLine(session: MarketplaceSession) {
+  if (!session.checkedAt) return "Not checked yet";
+  return `Checked ${formatDate(mediumDateShortTime, session.checkedAt)}: ${session.checkDetail ?? ""}`;
+}
+
 function Section({ title, status, wide = false, children }: { title: string; status?: { on: boolean; label: string }; wide?: boolean; children: ReactNode }) {
   return (
     <section className={`settings-section${wide ? " settings-section--wide" : ""}`}>
@@ -129,6 +134,7 @@ export default function SettingsPage({
   const [storageStateInput, setStorageStateInput] = useState("");
   const [storageStateFile, setStorageStateFile] = useState("");
   const [savingSession, setSavingSession] = useState(false);
+  const [checkingSession, setCheckingSession] = useState<Marketplace | null>(null);
   const [recoveryBusy, setRecoveryBusy] = useState(false);
   const [resettingAi, setResettingAi] = useState(false);
   const [updating, setUpdating] = useState(false);
@@ -362,6 +368,29 @@ export default function SettingsPage({
       onToast(errorMessage(error), "error");
     } finally {
       setSavingSession(false);
+    }
+  };
+  const setMarketplaceSessionUse = async (marketplace: Marketplace, useForChecks: boolean) => {
+    setSavingSession(true);
+    try {
+      setSettings(await api.setMarketplaceSessionUse(marketplace, useForChecks));
+      onToast(useForChecks ? `Scans on ${marketplace} use the signed-in session.` : `Scans on ${marketplace} run anonymously.`);
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+    } finally {
+      setSavingSession(false);
+    }
+  };
+  const checkMarketplaceSession = async (marketplace: Marketplace) => {
+    setCheckingSession(marketplace);
+    try {
+      const result = await api.checkMarketplaceSession(marketplace);
+      setSettings((current) => current ? { ...current, marketplaceSessions: result.sessions } : current);
+      onToast(result.signedIn === true ? `${marketplace} session is signed in.` : result.signedIn === false ? `${marketplace} session is signed out; log in again and re-import it.` : `${marketplace}: ${result.detail}`, result.signedIn === false ? "error" : undefined);
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+    } finally {
+      setCheckingSession(null);
     }
   };
   const removeMarketplaceSession = async (marketplace: Marketplace) => {
@@ -627,17 +656,25 @@ export default function SettingsPage({
                   <div>
                     <strong>{session.marketplace}{session.label ? ` · ${session.label}` : ""}</strong>
                     <span>{session.detail}</span>
+                    {session.createdAt ? <span title={sessionCheckLine(session)}>{sessionCheckLine(session)}</span> : null}
                   </div>
                   {session.createdAt ? (
-                    <>
+                    <div className="session-actions">
+                      <label className="session-use" title="Scans, detail checks and AI verification on this marketplace open pages signed in with this session. Off: they run anonymously and the session stays stored.">
+                        <input type="checkbox" role="switch" checked={session.useForChecks} disabled={savingSession} onChange={(event) => void setMarketplaceSessionUse(session.marketplace, event.target.checked)} />
+                        Use for scans
+                      </label>
                       <label className="session-share" title={settings?.authEnabled ? "Connected apps such as Hatbot can sign their own browser in with this session" : "Needs Scout's sign-in: without it anyone on your network could connect an app"}>
                         <input type="checkbox" checked={session.sharedWithApps} disabled={savingSession || (!settings?.authEnabled && !session.sharedWithApps)} onChange={(event) => void shareMarketplaceSession(session.marketplace, event.target.checked)} />
                         Share with connected apps
                       </label>
+                      <button className="link-button" disabled={checkingSession !== null} title="Open the account page with this session to see whether it is still signed in" onClick={() => void checkMarketplaceSession(session.marketplace)}>
+                        {checkingSession === session.marketplace ? "Checking…" : "Check"}
+                      </button>
                       <button className="link-button danger-link" disabled={savingSession} onClick={() => void removeMarketplaceSession(session.marketplace)}>
                         Remove
                       </button>
-                    </>
+                    </div>
                   ) : null}
                 </div>
               ))}

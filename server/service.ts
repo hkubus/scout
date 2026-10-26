@@ -5,10 +5,10 @@ import { Readable } from 'node:stream';
 import { DatabaseSync } from 'node:sqlite';
 import { connect as connectHttp2, type SecureClientSessionOptions } from 'node:http2';
 import { brotliDecompressSync, gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
-import type { Browser, BrowserContext } from 'playwright-core';
+import type { Browser, BrowserContext, Page } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseOfferPage, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, type SellerType, parseOlxCategoryFacets, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult, olxDetailHint } from './marketplaces';
-import { MarketplaceSessionValidationError, parseMarketplaceStorageState, type MarketplaceStorageState } from './marketplace-sessions';
+import { MarketplaceSessionValidationError, SESSION_CHECK_URLS, classifySessionCheck, parseMarketplaceStorageState, type MarketplaceStorageState, type SessionCheckOutcome } from './marketplace-sessions';
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, writeResaleListingWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseVerificationChecks, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type VerificationCheck } from './ai';
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyChecksWithJev, classifyWatchVariantWithJev, summarizeCheckResults, checkIssue, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
 import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, readPurchaseScreenshotWithVision, resolveVisionModel, verifyListingDescriptionWithVision, visionToVerification } from './vision';
@@ -189,6 +189,8 @@ function loadPlaywright() {
 const BROWSER_RENDER_CONCURRENCY = 2;
 /** A locally launched Chromium is shared across renders and closed this long after the last one. */
 const BROWSER_IDLE_CLOSE_MS = 20_000;
+/** How often the scheduler renders each stored session's account page to see whether it is still signed in. */
+const SESSION_CHECK_INTERVAL_MS = 6 * 60 * 60_000;
 // A wedged Chromium must not hold up shutdown (and the database close after it).
 const BROWSER_CLOSE_TIMEOUT_MS = 5_000;
 /**
@@ -2217,9 +2219,14 @@ export class ScoutService {
   // written or removed.
   private marketplaceSessionCache = new Map<Marketplace, { ciphertext: string; state: MarketplaceStorageState }>();
 
-  private readMarketplaceSession(marketplace: Marketplace): MarketplaceStorageState | null {
+  /**
+   * forChecks: for scans, detail checks and verification, which skip a session
+   * the operator turned off for them or the last check found signed out (its
+   * pages are anonymous anyway, only slower through Chromium).
+   */
+  private readMarketplaceSession(marketplace: Marketplace, options: { forChecks?: boolean } = {}): MarketplaceStorageState | null {
     const row = this.marketplaceSessionRow(marketplace);
-    if (!row) return null;
+    if (!row || (options.forChecks && (!Number(row.use_for_checks) || (row.signed_in !== null && Number(row.signed_in) === 0)))) return null;
     const ciphertext = String(row.storage_state_encrypted);
     const cached = this.marketplaceSessionCache.get(marketplace);
     if (cached && cached.ciphertext === ciphertext) return cached.state;
@@ -2240,26 +2247,56 @@ export class ScoutService {
   marketplaceSessions() {
     return marketplaces.map((marketplace) => {
       const row = this.marketplaceSessionRow(marketplace);
-      if (!row) return { marketplace, label: '', connected: false, createdAt: null, updatedAt: null, lastUsedAt: null, detail: 'No authenticated session', sharedWithApps: false };
+      if (!row) return { marketplace, label: '', connected: false, createdAt: null, updatedAt: null, lastUsedAt: null, detail: 'No authenticated session', sharedWithApps: false, useForChecks: true, signedIn: null, checkedAt: null, checkDetail: null };
       const lastError = typeof row.last_error === 'string' ? row.last_error : null;
+      const useForChecks = Boolean(Number(row.use_for_checks));
+      const signedIn = row.signed_in === null || row.signed_in === undefined ? null : Boolean(Number(row.signed_in));
       return {
         marketplace,
         label: String(row.label ?? ''),
-        connected: !lastError,
+        // Signed out stays disconnected until a re-import or a passing check, whatever scans do meanwhile.
+        connected: !lastError && signedIn !== false,
         createdAt: row.created_at ?? null,
         updatedAt: row.updated_at ?? null,
         lastUsedAt: row.last_used_at ?? null,
-        detail: lastError ?? 'Authenticated browser session ready',
+        detail: signedIn === false
+          ? `Signed out; scans run anonymously until you log in again and re-import it`
+          : lastError ?? (useForChecks ? 'Authenticated browser session ready' : 'Stored; scans run anonymously'),
         sharedWithApps: Boolean(row.shared_with_apps),
+        useForChecks,
+        signedIn,
+        checkedAt: row.checked_at ?? null,
+        checkDetail: row.check_detail ?? null,
       };
     });
   }
 
   shareMarketplaceSession(marketplace: Marketplace, shared: boolean) {
-    if (shared && !this.authEnabled) throw new ServiceError('Turn on Scout\'s sign-in first: without it, anyone on your network could connect an app and take the session.');
-    const result = this.stmt('UPDATE marketplace_sessions SET shared_with_apps = ? WHERE marketplace = ?').run(shared ? 1 : 0, marketplace);
+    return this.setMarketplaceSessionSwitches(marketplace, { sharedWithApps: shared });
+  }
+
+  setMarketplaceSessionUse(marketplace: Marketplace, useForChecks: boolean) {
+    return this.setMarketplaceSessionSwitches(marketplace, { useForChecks });
+  }
+
+  /** The session's switches in one update; an omitted switch keeps its value. */
+  setMarketplaceSessionSwitches(marketplace: Marketplace, switches: { sharedWithApps?: boolean; useForChecks?: boolean }) {
+    if (switches.sharedWithApps && !this.authEnabled) throw new ServiceError('Turn on Scout\'s sign-in first: without it, anyone on your network could connect an app and take the session.');
+    const flag = (value: boolean | undefined) => value === undefined ? null : Number(value);
+    const result = this.stmt('UPDATE marketplace_sessions SET shared_with_apps = COALESCE(?, shared_with_apps), use_for_checks = COALESCE(?, use_for_checks) WHERE marketplace = ?')
+      .run(flag(switches.sharedWithApps), flag(switches.useForChecks), marketplace);
     if (!result.changes) throw new ServiceError('Marketplace session not found', 404);
     return this.settings();
+  }
+
+  /** The last signed-in check of every stored session; never the session itself. */
+  marketplaceSessionStatus() {
+    return this.marketplaceSessions().filter((session) => session.createdAt).map((session) => ({
+      marketplace: session.marketplace,
+      signedIn: session.signedIn,
+      checkedAt: session.checkedAt,
+      detail: session.checkDetail ?? (session.connected ? 'Not checked yet' : session.detail),
+    }));
   }
 
   // revision moves only when the session is imported again, so a connected app
@@ -2290,6 +2327,87 @@ export class ScoutService {
     return { ...this.sharedSessionInfo(row), storageState };
   }
 
+  private sessionChecksInFlight = new Map<Marketplace, Promise<SessionCheckOutcome & { marketplace: Marketplace; checkedAt: string }>>();
+
+  /**
+   * Render the marketplace's account page with the stored session and record
+   * whether it is still signed in. Signed out marks the session disconnected,
+   * and scans skip it, until it is re-imported or a later check passes; a
+   * page that tells neither way only records when and what it saw.
+   */
+  checkMarketplaceSession(marketplace: Marketplace) {
+    const pending = this.sessionChecksInFlight.get(marketplace);
+    if (pending) return pending;
+    const row = this.marketplaceSessionRow(marketplace);
+    if (!row) return Promise.reject(new ServiceError('Marketplace session not found', 404));
+    const ciphertext = String(row.storage_state_encrypted);
+    const check = (async () => {
+      let outcome: SessionCheckOutcome;
+      try {
+        const state = this.readMarketplaceSession(marketplace);
+        outcome = state
+          ? await this.marketplaceRequest(marketplace, () => this.browserLimiter.run(() => this.probeMarketplaceSession(marketplace, state)))
+          : { signedIn: null, detail: 'No stored session' };
+      } catch (error) {
+        outcome = { signedIn: null, detail: `Check failed: ${error instanceof Error ? error.message : String(error)}` };
+      }
+      const checkedAt = nowIso();
+      const detail = outcome.detail.slice(0, 500);
+      // Signed out lives in signed_in (connected reads it), so a later scan's
+      // touch cannot clear it; signed in also clears a stale render error, and
+      // an undecided check keeps the last definite answer.
+      // Matching the ciphertext keeps a check that raced a re-import off the new session.
+      this.stmt(`UPDATE marketplace_sessions SET signed_in = COALESCE(?, signed_in), checked_at = ?, check_detail = ?,
+        last_error = CASE WHEN ? THEN NULL ELSE last_error END
+        WHERE marketplace = ? AND storage_state_encrypted = ?`)
+        .run(outcome.signedIn === null ? null : Number(outcome.signedIn), checkedAt, detail, Number(outcome.signedIn === true), marketplace, ciphertext);
+      if (outcome.signedIn === false) this.log('error', 'diagnostics', `${marketplace} session is signed out; log in again and re-import it in Settings → Marketplace accounts`);
+      else if (outcome.signedIn === null) this.log('info', 'diagnostics', `${marketplace} session check: ${detail}`);
+      return { marketplace, signedIn: outcome.signedIn, checkedAt, detail };
+    })().finally(() => this.sessionChecksInFlight.delete(marketplace));
+    this.sessionChecksInFlight.set(marketplace, check);
+    return check;
+  }
+
+  /**
+   * Scheduled: check each session that scans use or connected apps get at
+   * most every SESSION_CHECK_INTERVAL_MS, one at a time; a new import is
+   * checked on the next tick. A session nothing uses is left alone.
+   */
+  private async processSessionChecks() {
+    if (this.sessionChecksInFlight.size) return;
+    const cutoff = new Date(Date.now() - SESSION_CHECK_INTERVAL_MS).toISOString();
+    const due = this.stmt(`SELECT marketplace FROM marketplace_sessions
+      WHERE (use_for_checks = 1 OR shared_with_apps = 1) AND (checked_at IS NULL OR checked_at <= ?) ORDER BY checked_at`).all(cutoff) as Array<{ marketplace: Marketplace }>;
+    for (const { marketplace } of due) {
+      if (marketplaces.includes(marketplace)) await this.checkMarketplaceSession(marketplace);
+    }
+  }
+
+  /**
+   * The account page in a browser with the session. Signed out, OLX leaves
+   * for login.olx.pl from page script after the load, so a page still on the
+   * account path gets up to 12 s to leave it; a sign-in page gets a few more
+   * in case it was only a single-sign-on hop on the way back to the account,
+   * and a challenge on the account page itself one reload, as renders do.
+   */
+  private probeMarketplaceSession(marketplace: Marketplace, state: MarketplaceStorageState) {
+    return this.withMarketplacePage(state, async (page) => {
+      let response = await page.goto(SESSION_CHECK_URLS[marketplace], { waitUntil: 'domcontentloaded', timeout: 25_000 });
+      await page.waitForURL((url) => classifySessionCheck(marketplace, url.toString(), 200).signedIn !== true, { timeout: 12_000, waitUntil: 'commit' }).catch(() => { /* still on the account page */ });
+      let outcome = classifySessionCheck(marketplace, page.url(), response?.status() ?? null);
+      if (outcome.signedIn === false) {
+        await page.waitForTimeout(3_000);
+        outcome = classifySessionCheck(marketplace, page.url(), response?.status() ?? null);
+      } else if (outcome.signedIn === null && (response?.status() === 403 || response?.status() === 429)) {
+        response = await page.reload({ waitUntil: 'domcontentloaded', timeout: 25_000 });
+        await page.waitForTimeout(4_000);
+        outcome = classifySessionCheck(marketplace, page.url(), response?.status() ?? null);
+      }
+      return outcome;
+    });
+  }
+
   saveMarketplaceSession(marketplace: Marketplace, label: string | undefined, input: unknown) {
     let state: MarketplaceStorageState;
     try {
@@ -2302,7 +2420,7 @@ export class ScoutService {
     const safeLabel = (label ?? '').trim().slice(0, 80);
     this.stmt(`INSERT INTO marketplace_sessions (marketplace, label, storage_state_encrypted, created_at, updated_at, last_used_at, last_error)
       VALUES (?, ?, ?, ?, ?, NULL, NULL)
-      ON CONFLICT(marketplace) DO UPDATE SET label = excluded.label, storage_state_encrypted = excluded.storage_state_encrypted, updated_at = excluded.updated_at, last_used_at = NULL, last_error = NULL`)
+      ON CONFLICT(marketplace) DO UPDATE SET label = excluded.label, storage_state_encrypted = excluded.storage_state_encrypted, updated_at = excluded.updated_at, last_used_at = NULL, last_error = NULL, signed_in = NULL, checked_at = NULL, check_detail = NULL`)
       .run(marketplace, safeLabel, encryptSecret(JSON.stringify(state)), timestamp, timestamp);
     this.marketplaceSessionCache.delete(marketplace);
     return this.settings();
@@ -4562,6 +4680,7 @@ export class ScoutService {
     }
     this.background('Notification retries', this.processNotificationRetries());
     this.background('Daily digest', this.processDailyDigest());
+    this.background('Marketplace session checks', this.processSessionChecks());
     const rows = this.stmt('SELECT * FROM watches WHERE enabled = 1 AND next_scan_at <= ?').all(nowIso()) as WatchRow[];
     for (const row of rows) this.background(`Scan ${row.name}`, this.runWatch(row));
     const marketRows = this.stmt('SELECT * FROM market_watches WHERE enabled = 1 AND next_scan_at <= ?').all(nowIso()) as WatchRow[];
@@ -4951,7 +5070,7 @@ export class ScoutService {
   private async requestPublicPage(url: string, marketplace: Marketplace): Promise<string> {
     const validation = validateSearchUrl(url, marketplace);
     if (!validation.valid) throw new Error(validation.reason);
-    const authenticatedState = this.readMarketplaceSession(marketplace);
+    const authenticatedState = this.readMarketplaceSession(marketplace, { forChecks: true });
     if (authenticatedState) {
       try {
         const html = await this.renderPublicPage(validation.url, marketplace, authenticatedState);
@@ -5069,7 +5188,36 @@ export class ScoutService {
     }
   }
 
-  private async renderInBrowser(url: string, marketplace: Marketplace, storageState?: MarketplaceStorageState): Promise<string> {
+  private renderInBrowser(url: string, marketplace: Marketplace, storageState?: MarketplaceStorageState): Promise<string> {
+    return this.withMarketplacePage(storageState, async (page) => {
+      // Vinted-only warm-up: the homepage sets the anonymous session cookies
+      // (access_token_web, __cf_bm) and lets JS challenges settle before the
+      // target navigation goes out cold. Other marketplaces keep the direct
+      // navigation to avoid extra latency and challenge surface.
+      if (marketplace === 'Vinted') {
+        try {
+          const root = new URL(url).origin + '/';
+          if (root !== url) await page.goto(root, { waitUntil: 'domcontentloaded', timeout: 15_000 });
+        } catch { /* warm-up is opportunistic; the target navigation still runs */ }
+      }
+      let response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 });
+      await page.waitForTimeout(800);
+      if (response && (response.status() === 403 || response.status() === 429)) {
+        // Cloudflare Turnstile / DataDome challenges can auto-resolve given
+        // a moment in a real browser; one reload beats an instant failure.
+        await page.waitForTimeout(3_000);
+        response = await page.reload({ waitUntil: 'domcontentloaded', timeout: 25_000 });
+        await page.waitForTimeout(800);
+      }
+      const finalValidation = validateSearchUrl(page.url(), marketplace);
+      if (!finalValidation.valid) throw new Error('Marketplace redirected off the approved domain');
+      if (response && !response.ok()) throw new Error(`Chromium page returned ${response.status()} for ${marketplace} (anonymous browser blocked; import a session in Settings or retry from a residential IP)`);
+      return page.content();
+    });
+  }
+
+  /** One page in its own browser context (with the storage state, if given), closed afterwards. */
+  private async withMarketplacePage<T>(storageState: MarketplaceStorageState | undefined, use: (page: Page) => Promise<T>): Promise<T> {
     let browser: Browser | undefined;
     let context: BrowserContext | undefined;
     let sharedLocal = false;
@@ -5110,29 +5258,7 @@ export class ScoutService {
       await context.routeWebSocket(/.*/, (socket) => { socket.close(); });
       const page = await context.newPage();
       try {
-        // Vinted-only warm-up: the homepage sets the anonymous session cookies
-        // (access_token_web, __cf_bm) and lets JS challenges settle before the
-        // target navigation goes out cold. Other marketplaces keep the direct
-        // navigation to avoid extra latency and challenge surface.
-        if (marketplace === 'Vinted') {
-          try {
-            const root = new URL(url).origin + '/';
-            if (root !== url) await page.goto(root, { waitUntil: 'domcontentloaded', timeout: 15_000 });
-          } catch { /* warm-up is opportunistic; the target navigation still runs */ }
-        }
-        let response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 });
-        await page.waitForTimeout(800);
-        if (response && (response.status() === 403 || response.status() === 429)) {
-          // Cloudflare Turnstile / DataDome challenges can auto-resolve given
-          // a moment in a real browser; one reload beats an instant failure.
-          await page.waitForTimeout(3_000);
-          response = await page.reload({ waitUntil: 'domcontentloaded', timeout: 25_000 });
-          await page.waitForTimeout(800);
-        }
-        const finalValidation = validateSearchUrl(page.url(), marketplace);
-        if (!finalValidation.valid) throw new Error('Marketplace redirected off the approved domain');
-        if (response && !response.ok()) throw new Error(`Chromium page returned ${response.status()} for ${marketplace} (anonymous browser blocked; import a session in Settings or retry from a residential IP)`);
-        return await page.content();
+        return await use(page);
       } finally { await page.close(); }
     } finally {
       try {
