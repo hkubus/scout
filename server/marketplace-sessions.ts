@@ -139,6 +139,8 @@ export function classifySessionCheck(marketplace: Marketplace, finalUrl: string,
   const under = (prefixes: string[]) => prefixes.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
   const where = `${host}${url.pathname}`;
   if (page.signInHosts.includes(host) || (isApprovedMarketplaceSessionHost(marketplace, host) && under(page.signInPaths))) {
+    // For Lokalnie this also covers a lapsed Lokalnie login with the Allegro one still valid: Scout's
+    // browser does not complete Allegro's single sign-on (DataDome stops it), so its pages are anonymous.
     return { signedIn: false, detail: `Signed out: the account page went to sign-in (${where})` };
   }
   if (!isApprovedMarketplaceSessionHost(marketplace, host)) return { signedIn: null, detail: `The account page ended off ${marketplace} (${host})` };

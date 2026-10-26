@@ -636,7 +636,7 @@ export interface MarketplaceSession {
   sharedWithApps: boolean;
   /** Scans, detail checks and AI verification render with this session; off keeps them anonymous. */
   useForChecks: boolean;
-  /** Last signed-in check: null when not checked yet or the account page told neither way. */
+  /** The last definite signed-in check: null until one told either way. checkDetail is the latest attempt. */
   signedIn: boolean | null;
   checkedAt: string | null;
   checkDetail: string | null;

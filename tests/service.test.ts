@@ -576,6 +576,12 @@ test('a session turned off for checks keeps scans anonymous while it stays store
     assert.deepEqual(fetched, ['https://www.olx.pl/d/oferta/b']);
     assert.equal(renders.length, 1);
 
+    context.service.setMarketplaceSessionUse('OLX', true);
+    context.db.prepare('UPDATE marketplace_sessions SET signed_in = 0 WHERE marketplace = ?').run('OLX');
+    assert.equal(await service.requestPublicPage('https://www.olx.pl/d/oferta/c', 'OLX'), '<html>anonymous</html>', 'a session the check found signed out is skipped too');
+    assert.equal(renders.length, 1);
+
+    context.service.setMarketplaceSessionUse('OLX', false);
     context.service.saveMarketplaceSession('OLX', 'Personal', olxSessionState);
     assert.equal(context.service.settings().marketplaceSessions.find((session) => session.marketplace === 'OLX')?.useForChecks, false, 're-importing keeps the choice');
     assert.throws(() => context.service.setMarketplaceSessionUse('Vinted', true), /not found/);
@@ -627,13 +633,18 @@ test('a session check records signed in, signed out and undecided', async () => 
     assert.equal(session().connected, false, 'signed out shows as disconnected');
     assert.equal(session().signedIn, false);
     assert.equal(session().checkedAt, out.checkedAt);
-    assert.match(session().detail, /signed out/);
+    assert.match(session().detail, /Signed out/);
     assert.match(context.service.logs()[0].message, /OLX session is signed out/);
+    service.touchMarketplaceSession('OLX');
+    assert.equal(session().connected, false, 'a later scan does not clear signed out');
 
     outcomes.push({ signedIn: null, detail: 'The account page answered 403; could not tell whether the session is signed in' });
-    await context.service.checkMarketplaceSession('OLX');
-    assert.equal(session().signedIn, null);
-    assert.equal(session().connected, false, 'an undecided check leaves the last error alone');
+    const undecided = await context.service.checkMarketplaceSession('OLX');
+    assert.equal(undecided.signedIn, null);
+    assert.equal(session().signedIn, false, 'an undecided check keeps the last definite answer');
+    assert.equal(session().checkedAt, undecided.checkedAt);
+    assert.match(String(session().checkDetail), /answered 403/);
+    assert.equal(session().connected, false);
 
     outcomes.push(new Error('Chromium is not available; configure SCOUT_BROWSER_WS'));
     const failed = await context.service.checkMarketplaceSession('OLX');
@@ -685,6 +696,12 @@ test('the scheduler checks each stored session once per interval', async () => {
     context.db.prepare('UPDATE marketplace_sessions SET checked_at = ? WHERE marketplace = ?').run(new Date(Date.now() - 7 * 60 * 60_000).toISOString(), 'Vinted');
     await service.processSessionChecks();
     assert.deepEqual(probed.slice(2), ['Vinted']);
+    context.service.saveMarketplaceSession('Allegro Lokalnie', '', { cookies: [{ name: 'session', value: 'a', domain: '.allegrolokalnie.pl', path: '/' }], origins: [] });
+    context.service.setMarketplaceSessionUse('Allegro Lokalnie', false);
+    await service.processSessionChecks();
+    assert.equal(probed.length, 3, 'a session neither scans nor connected apps use is left alone');
+    await context.service.checkMarketplaceSession('Allegro Lokalnie');
+    assert.equal(probed.at(-1), 'Allegro Lokalnie', 'Check still works on it');
   } finally { context.close(); }
 });
 

@@ -222,7 +222,7 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
   });
 
   server.registerTool('scout_session_status', {
-    description: 'Whether each stored marketplace account session is still signed in: {marketplace, signedIn (true, false, or null when not checked or undecided), checkedAt, detail}. Scout checks every few hours by opening the account page; this reads the last result and never returns the session.',
+    description: 'Whether each stored marketplace account session is still signed in: {marketplace, signedIn, checkedAt, detail}: signedIn is the last definite answer (null until a check could tell), checkedAt and detail describe the latest check. Scout checks every few hours by opening the account page; this reads the last result and never returns the session.',
     annotations: { readOnlyHint: true },
   }, async () => {
     try { return text({ sessions: service.marketplaceSessionStatus() }); } catch (error) { return toolError(error); }

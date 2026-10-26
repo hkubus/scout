@@ -84,8 +84,7 @@ function ConnectedAppsSection({ onToast }: { onToast: (message: string, type?: "
 
 function sessionCheckLine(session: MarketplaceSession) {
   if (!session.checkedAt) return "Not checked yet";
-  const state = session.signedIn === true ? "signed in" : session.signedIn === false ? "signed out" : "could not tell";
-  return `Checked ${formatDate(mediumDateShortTime, session.checkedAt)}: ${state}`;
+  return `Checked ${formatDate(mediumDateShortTime, session.checkedAt)}: ${session.checkDetail ?? ""}`;
 }
 
 function Section({ title, status, wide = false, children }: { title: string; status?: { on: boolean; label: string }; wide?: boolean; children: ReactNode }) {
@@ -657,7 +656,7 @@ export default function SettingsPage({
                   <div>
                     <strong>{session.marketplace}{session.label ? ` · ${session.label}` : ""}</strong>
                     <span>{session.detail}</span>
-                    {session.createdAt ? <span title={session.checkDetail ?? undefined}>{sessionCheckLine(session)}</span> : null}
+                    {session.createdAt ? <span title={sessionCheckLine(session)}>{sessionCheckLine(session)}</span> : null}
                   </div>
                   {session.createdAt ? (
                     <div className="session-actions">

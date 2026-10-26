@@ -2219,10 +2219,14 @@ export class ScoutService {
   // written or removed.
   private marketplaceSessionCache = new Map<Marketplace, { ciphertext: string; state: MarketplaceStorageState }>();
 
-  /** forChecks: for scans, detail checks and verification, which skip a session the operator turned off for them. */
+  /**
+   * forChecks: for scans, detail checks and verification, which skip a session
+   * the operator turned off for them or the last check found signed out (its
+   * pages are anonymous anyway, only slower through Chromium).
+   */
   private readMarketplaceSession(marketplace: Marketplace, options: { forChecks?: boolean } = {}): MarketplaceStorageState | null {
     const row = this.marketplaceSessionRow(marketplace);
-    if (!row || (options.forChecks && !Number(row.use_for_checks))) return null;
+    if (!row || (options.forChecks && (!Number(row.use_for_checks) || (row.signed_in !== null && Number(row.signed_in) === 0)))) return null;
     const ciphertext = String(row.storage_state_encrypted);
     const cached = this.marketplaceSessionCache.get(marketplace);
     if (cached && cached.ciphertext === ciphertext) return cached.state;
@@ -2246,17 +2250,21 @@ export class ScoutService {
       if (!row) return { marketplace, label: '', connected: false, createdAt: null, updatedAt: null, lastUsedAt: null, detail: 'No authenticated session', sharedWithApps: false, useForChecks: true, signedIn: null, checkedAt: null, checkDetail: null };
       const lastError = typeof row.last_error === 'string' ? row.last_error : null;
       const useForChecks = Boolean(Number(row.use_for_checks));
+      const signedIn = row.signed_in === null || row.signed_in === undefined ? null : Boolean(Number(row.signed_in));
       return {
         marketplace,
         label: String(row.label ?? ''),
-        connected: !lastError,
+        // Signed out stays disconnected until a re-import or a passing check, whatever scans do meanwhile.
+        connected: !lastError && signedIn !== false,
         createdAt: row.created_at ?? null,
         updatedAt: row.updated_at ?? null,
         lastUsedAt: row.last_used_at ?? null,
-        detail: lastError ?? (useForChecks ? 'Authenticated browser session ready' : 'Stored; scans run anonymously'),
+        detail: signedIn === false
+          ? `Signed out; scans run anonymously until you log in again and re-import it`
+          : lastError ?? (useForChecks ? 'Authenticated browser session ready' : 'Stored; scans run anonymously'),
         sharedWithApps: Boolean(row.shared_with_apps),
         useForChecks,
-        signedIn: row.signed_in === null || row.signed_in === undefined ? null : Boolean(Number(row.signed_in)),
+        signedIn,
         checkedAt: row.checked_at ?? null,
         checkDetail: row.check_detail ?? null,
       };
@@ -2264,8 +2272,19 @@ export class ScoutService {
   }
 
   shareMarketplaceSession(marketplace: Marketplace, shared: boolean) {
-    if (shared && !this.authEnabled) throw new ServiceError('Turn on Scout\'s sign-in first: without it, anyone on your network could connect an app and take the session.');
-    const result = this.stmt('UPDATE marketplace_sessions SET shared_with_apps = ? WHERE marketplace = ?').run(shared ? 1 : 0, marketplace);
+    return this.setMarketplaceSessionSwitches(marketplace, { sharedWithApps: shared });
+  }
+
+  setMarketplaceSessionUse(marketplace: Marketplace, useForChecks: boolean) {
+    return this.setMarketplaceSessionSwitches(marketplace, { useForChecks });
+  }
+
+  /** The session's switches in one update; an omitted switch keeps its value. */
+  setMarketplaceSessionSwitches(marketplace: Marketplace, switches: { sharedWithApps?: boolean; useForChecks?: boolean }) {
+    if (switches.sharedWithApps && !this.authEnabled) throw new ServiceError('Turn on Scout\'s sign-in first: without it, anyone on your network could connect an app and take the session.');
+    const flag = (value: boolean | undefined) => value === undefined ? null : Number(value);
+    const result = this.stmt('UPDATE marketplace_sessions SET shared_with_apps = COALESCE(?, shared_with_apps), use_for_checks = COALESCE(?, use_for_checks) WHERE marketplace = ?')
+      .run(flag(switches.sharedWithApps), flag(switches.useForChecks), marketplace);
     if (!result.changes) throw new ServiceError('Marketplace session not found', 404);
     return this.settings();
   }
@@ -2278,12 +2297,6 @@ export class ScoutService {
       checkedAt: session.checkedAt,
       detail: session.checkDetail ?? (session.connected ? 'Not checked yet' : session.detail),
     }));
-  }
-
-  setMarketplaceSessionUse(marketplace: Marketplace, useForChecks: boolean) {
-    const result = this.stmt('UPDATE marketplace_sessions SET use_for_checks = ?, updated_at = ? WHERE marketplace = ?').run(useForChecks ? 1 : 0, nowIso(), marketplace);
-    if (!result.changes) throw new ServiceError('Marketplace session not found', 404);
-    return this.settings();
   }
 
   // revision moves only when the session is imported again, so a connected app
@@ -2318,9 +2331,9 @@ export class ScoutService {
 
   /**
    * Render the marketplace's account page with the stored session and record
-   * whether it is still signed in. Signed out marks the session disconnected
-   * (last_error) until it is re-imported or a later check passes; a page that
-   * tells neither way is recorded without touching last_error.
+   * whether it is still signed in. Signed out marks the session disconnected,
+   * and scans skip it, until it is re-imported or a later check passes; a
+   * page that tells neither way only records when and what it saw.
    */
   checkMarketplaceSession(marketplace: Marketplace) {
     const pending = this.sessionChecksInFlight.get(marketplace);
@@ -2332,17 +2345,22 @@ export class ScoutService {
       let outcome: SessionCheckOutcome;
       try {
         const state = this.readMarketplaceSession(marketplace);
-        outcome = state ? await this.browserLimiter.run(() => this.probeMarketplaceSession(marketplace, state)) : { signedIn: null, detail: 'No stored session' };
+        outcome = state
+          ? await this.marketplaceRequest(marketplace, () => this.browserLimiter.run(() => this.probeMarketplaceSession(marketplace, state)))
+          : { signedIn: null, detail: 'No stored session' };
       } catch (error) {
         outcome = { signedIn: null, detail: `Check failed: ${error instanceof Error ? error.message : String(error)}` };
       }
       const checkedAt = nowIso();
       const detail = outcome.detail.slice(0, 500);
+      // Signed out lives in signed_in (connected reads it), so a later scan's
+      // touch cannot clear it; signed in also clears a stale render error, and
+      // an undecided check keeps the last definite answer.
       // Matching the ciphertext keeps a check that raced a re-import off the new session.
-      this.stmt(`UPDATE marketplace_sessions SET signed_in = ?, checked_at = ?, check_detail = ?,
-        last_error = CASE ? WHEN 0 THEN ? WHEN 1 THEN NULL ELSE last_error END
+      this.stmt(`UPDATE marketplace_sessions SET signed_in = COALESCE(?, signed_in), checked_at = ?, check_detail = ?,
+        last_error = CASE WHEN ? THEN NULL ELSE last_error END
         WHERE marketplace = ? AND storage_state_encrypted = ?`)
-        .run(outcome.signedIn === null ? null : Number(outcome.signedIn), checkedAt, detail, outcome.signedIn === null ? -1 : Number(outcome.signedIn), `${marketplace} session is signed out; log in again and re-import it`, marketplace, ciphertext);
+        .run(outcome.signedIn === null ? null : Number(outcome.signedIn), checkedAt, detail, Number(outcome.signedIn === true), marketplace, ciphertext);
       if (outcome.signedIn === false) this.log('error', 'diagnostics', `${marketplace} session is signed out; log in again and re-import it in Settings → Marketplace accounts`);
       else if (outcome.signedIn === null) this.log('info', 'diagnostics', `${marketplace} session check: ${detail}`);
       return { marketplace, signedIn: outcome.signedIn, checkedAt, detail };
@@ -2351,11 +2369,16 @@ export class ScoutService {
     return check;
   }
 
-  /** Scheduled: check each stored session at most every SESSION_CHECK_INTERVAL_MS, one at a time; a new import is checked on the next tick. */
+  /**
+   * Scheduled: check each session that scans use or connected apps get at
+   * most every SESSION_CHECK_INTERVAL_MS, one at a time; a new import is
+   * checked on the next tick. A session nothing uses is left alone.
+   */
   private async processSessionChecks() {
     if (this.sessionChecksInFlight.size) return;
     const cutoff = new Date(Date.now() - SESSION_CHECK_INTERVAL_MS).toISOString();
-    const due = this.stmt('SELECT marketplace FROM marketplace_sessions WHERE checked_at IS NULL OR checked_at <= ? ORDER BY checked_at').all(cutoff) as Array<{ marketplace: Marketplace }>;
+    const due = this.stmt(`SELECT marketplace FROM marketplace_sessions
+      WHERE (use_for_checks = 1 OR shared_with_apps = 1) AND (checked_at IS NULL OR checked_at <= ?) ORDER BY checked_at`).all(cutoff) as Array<{ marketplace: Marketplace }>;
     for (const { marketplace } of due) {
       if (marketplaces.includes(marketplace)) await this.checkMarketplaceSession(marketplace);
     }
@@ -2363,15 +2386,15 @@ export class ScoutService {
 
   /**
    * The account page in a browser with the session. Signed out, OLX leaves
-   * for login.olx.pl from page script after the load, so the page gets a few
-   * seconds; a sign-in page gets a few more in case it was only a
-   * single-sign-on hop on the way back to the account, and a challenge on
-   * the account page itself one reload, as renders do.
+   * for login.olx.pl from page script after the load, so a page still on the
+   * account path gets up to 12 s to leave it; a sign-in page gets a few more
+   * in case it was only a single-sign-on hop on the way back to the account,
+   * and a challenge on the account page itself one reload, as renders do.
    */
   private probeMarketplaceSession(marketplace: Marketplace, state: MarketplaceStorageState) {
     return this.withMarketplacePage(state, async (page) => {
       let response = await page.goto(SESSION_CHECK_URLS[marketplace], { waitUntil: 'domcontentloaded', timeout: 25_000 });
-      await page.waitForTimeout(4_000);
+      await page.waitForURL((url) => classifySessionCheck(marketplace, url.toString(), 200).signedIn !== true, { timeout: 12_000, waitUntil: 'commit' }).catch(() => { /* still on the account page */ });
       let outcome = classifySessionCheck(marketplace, page.url(), response?.status() ?? null);
       if (outcome.signedIn === false) {
         await page.waitForTimeout(3_000);

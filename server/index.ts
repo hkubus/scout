@@ -472,9 +472,7 @@ app.patch('/api/marketplace-sessions/:marketplace', async (request, reply) => {
   // A partial update of the session's switches; the stored session itself only changes through PUT.
   const body = z.object({ sharedWithApps: z.boolean().optional(), useForChecks: z.boolean().optional() }).strict().safeParse(request.body);
   if (!body.success || (body.data.sharedWithApps === undefined && body.data.useForChecks === undefined)) return reply.code(400).send({ error: 'sharedWithApps or useForChecks must be true or false' });
-  if (body.data.sharedWithApps !== undefined) service.shareMarketplaceSession(params.data.marketplace, body.data.sharedWithApps);
-  if (body.data.useForChecks !== undefined) service.setMarketplaceSessionUse(params.data.marketplace, body.data.useForChecks);
-  return service.settings();
+  return service.setMarketplaceSessionSwitches(params.data.marketplace, body.data);
 });
 
 // Renders the marketplace's account page with the stored session (one page load, nothing sent to the account).
