@@ -4,6 +4,7 @@ import type { ScoutDebug } from './debug';
 import type { FlipStore } from './flips';
 import type { ScoutService } from './service';
 import { ServiceError } from './service';
+import { VERIFICATION_CHECKS_MAX, VERIFICATION_CHECK_MAX_CHARS } from './ai';
 
 export const MCP_DASHBOARD_LISTINGS = 20;
 
@@ -34,6 +35,7 @@ export const SCOUT_MCP_TOOL_NAMES = [
   'scout_search',
   'scout_olx_categories',
   'scout_queue_scan',
+  'scout_watch_create',
   'scout_connectors',
   'scout_price_reference',
   'scout_comparables',
@@ -41,6 +43,7 @@ export const SCOUT_MCP_TOOL_NAMES = [
   'scout_flips',
   'scout_inbox',
   'scout_conversation',
+  'scout_session_status',
 ] as const;
 
 /**
@@ -54,6 +57,16 @@ export const SCOUT_MCP_LISTING_TOOL_NAMES = [
   'scout_flip',
   'scout_flip_photo',
   'scout_flip_listed',
+] as const;
+
+/**
+ * The marketplace sessions the operator shared with connected apps, so
+ * Hatbot's own browser can use those logins. Only connected apps get them,
+ * never SCOUT_API_TOKENS clients.
+ */
+export const SCOUT_MCP_SESSION_TOOL_NAMES = [
+  'scout_shared_sessions',
+  'scout_shared_session',
 ] as const;
 
 export const SCOUT_MCP_DEBUG_TOOL_NAMES = [
@@ -296,11 +309,48 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
     try { return text(service.queueScan(watchId)); } catch (error) { return toolError(error); }
   });
 
+  server.registerTool('scout_watch_create', {
+    description: 'Create a deal watch: Scout searches for it on its usual interval from then on, learns its typical price, and alerts on strong deals and on listings at or under targetPrice. Check scout_watches first so you don\'t make the same one twice.',
+    inputSchema: {
+      name: z.string().trim().min(1).max(120),
+      query: z.string().trim().min(1).max(240).describe('What to search for, as you would type it on the marketplace.'),
+      sources: z.array(marketplace).min(1).max(3).refine((sources) => new Set(sources).size === sources.length, { message: 'Marketplace sources must be unique' }),
+      terms: z.string().trim().max(240).optional().default('').describe('Comma-separated words every title must contain.'),
+      excluded: z.string().trim().max(240).optional().default('').describe('Comma-separated words that drop a listing.'),
+      minPrice: z.number().nonnegative().optional().describe('PLN.'),
+      maxPrice: z.number().positive().optional().describe('PLN.'),
+      targetPrice: z.number().positive().max(1_000_000).optional().describe('PLN: alert on any listing at or under it, even while Scout is still learning the typical price.'),
+      shippingOnly: z.boolean().optional().default(false).describe('Only listings that ship.'),
+      olxCategory: z.object({ id: z.number().int().positive().max(1_000_000_000), label: z.string().trim().min(1).max(120), path: z.string().trim().max(240).regex(/^(?:[a-z0-9-]+(?:\/[a-z0-9-]+)*)?$/) }).optional().describe('An OLX category from scout_olx_categories, to keep OLX results in it.'),
+      verificationChecks: z.array(z.object({ text: z.string().trim().min(1).max(VERIFICATION_CHECK_MAX_CHARS), mode: z.enum(['require', 'exclude']) })).max(VERIFICATION_CHECKS_MAX).optional().default([]).describe('Checks a listing\'s description and photos must pass (require) or fail (exclude).'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+  }, async (input) => {
+    if (input.minPrice !== undefined && input.maxPrice !== undefined && input.minPrice > input.maxPrice) return toolError(new ServiceError('Minimum price cannot exceed maximum price'));
+    try {
+      return text({ watch: service.createWatch({
+        name: input.name, query: input.query, sources: input.sources, terms: input.terms, excluded: input.excluded,
+        condition: 'Any', sourceIntervals: {}, exactUrls: [], sensitivity: 1, shippingOnly: input.shippingOnly,
+        typoVariants: false, aiRelevance: true, variantGroups: [], variantGroupsAuto: true, referenceMarketWatchId: null,
+        minPrice: input.minPrice ?? null, maxPrice: input.maxPrice ?? null, olxCategory: input.olxCategory ?? null,
+        sellerType: null, ignorePromoted: false, targetPrice: input.targetPrice ?? null, minSaving: null,
+        verificationChecks: input.verificationChecks,
+      }) });
+    } catch (error) { return toolError(error); }
+  });
+
   server.registerTool('scout_connectors', {
     description: 'Marketplace and notification connector health: status, latency, and last success per connector.',
     annotations: { readOnlyHint: true },
   }, async () => {
     try { return text({ connectors: service.getConnectors() }); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_session_status', {
+    description: 'Whether each stored marketplace account session is still signed in: {marketplace, signedIn, checkedAt, detail}: signedIn is the last definite answer (null until a check could tell), checkedAt and detail describe the latest check. Scout checks every few hours by opening the account page; this reads the last result and never returns the session.',
+    annotations: { readOnlyHint: true },
+  }, async () => {
+    try { return text({ sessions: service.marketplaceSessionStatus() }); } catch (error) { return toolError(error); }
   });
 }
 
@@ -345,6 +395,24 @@ export function registerScoutListingMcpTools(server: McpServer, flips: FlipStore
       flips.recordListing(flipId, channel, status, url, problem);
       return text({ ok: true });
     } catch (error) { return toolError(error); }
+  });
+}
+
+/** Marketplace sessions shared with connected apps (Settings → Marketplace accounts). */
+export function registerScoutSessionMcpTools(server: McpServer, service: ScoutService) {
+  server.registerTool('scout_shared_sessions', {
+    description: 'The marketplace browser sessions the owner shared with connected apps in Scout, each {marketplace, label, revision}, without cookies. revision changes only when the owner imports the session again.',
+    annotations: { readOnlyHint: true },
+  }, async () => {
+    try { return text({ sessions: service.sharedMarketplaceSessions() }); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_shared_session', {
+    description: 'One shared marketplace browser session: {marketplace, label, revision, storageState}, where storageState is Playwright storage state (cookies and localStorage) for that marketplace\'s sites only. It signs a browser in, so keep it out of logs and model context.',
+    inputSchema: { marketplace: marketplace.describe('A marketplace from scout_shared_sessions.') },
+    annotations: { readOnlyHint: true },
+  }, async ({ marketplace: name }) => {
+    try { return text(service.sharedMarketplaceSession(name)); } catch (error) { return toolError(error); }
   });
 }
 
@@ -395,13 +463,14 @@ export function registerScoutDebugMcpTools(server: McpServer, debug: ScoutDebug)
 }
 
 /** Build a fresh per-request MCP server bound to the given service. */
-export function createScoutMcpServer(service: ScoutService, debug: ScoutDebug | null = null, flips: FlipStore | null = null) {
+export function createScoutMcpServer(service: ScoutService, debug: ScoutDebug | null = null, flips: FlipStore | null = null, sessions = false) {
   const server = new McpServer(
     { name: 'scout-deal-monitor', version: process.env.SCOUT_VERSION ?? '1.0.0' },
     { capabilities: { tools: {} } },
   );
   registerScoutMcpTools(server, service);
   if (flips) registerScoutListingMcpTools(server, flips);
+  if (sessions) registerScoutSessionMcpTools(server, service);
   if (debug) registerScoutDebugMcpTools(server, debug);
   return server;
 }

@@ -1,4 +1,4 @@
-import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, FeePresets, Flip, FlipImport, FlipListing, FlipPhoto, ListingChannel, ListingCondition, ConnectedApp, FlipsData, NotificationPriority, NotificationRecord, OlxCategoryOption, PriceHistoryPoint, ResaleListingDraft, SearchFilters, SettingsData, VariantSuggestions, VerificationComparison, Watch, WatchAnalytics, Connector } from './types';
+import type { AnalyticsData, ConnectorRun, DashboardData, ListingAction, ListingDetail, ListingDecision, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketWatch, MarketWatchInput, MarketWatchTrend, Marketplace, MarketplaceSessionCheck, FeePresets, Flip, FlipImport, FlipListing, FlipPhoto, ListingChannel, ListingCondition, ConnectedApp, FlipsData, NotificationPriority, NotificationRecord, OlxCategoryOption, PriceHistoryPoint, ResaleListingDraft, SearchFilters, SettingsData, VariantSuggestions, VerificationComparison, Watch, WatchAnalytics, Connector } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -162,6 +162,9 @@ export const api = {
   settings: () => request<SettingsData>('/api/settings'),
   saveSettings: (settings: { interval: number; nightInterval?: number; webhook?: string; clearWebhook?: boolean; discordMinimumPriority?: NotificationPriority; dailyDigest?: { enabled?: boolean; time?: string; discord?: boolean; ntfy?: boolean }; clearNtfy?: boolean; ntfy?: { serverUrl?: string; topic?: string; token?: string; minimumPriority?: NotificationPriority; openInApp?: boolean }; ai?: { apiKey?: string; clearApiKey?: boolean; model?: string } }) => request<SettingsData>('/api/settings', json('PATCH', settings)),
   saveMarketplaceSession: (marketplace: Marketplace, label: string, storageState: unknown) => request<SettingsData>(`/api/marketplace-sessions/${encodeURIComponent(marketplace)}`, json('PUT', { label, storageState })),
+  shareMarketplaceSession: (marketplace: Marketplace, sharedWithApps: boolean) => request<SettingsData>(`/api/marketplace-sessions/${encodeURIComponent(marketplace)}`, json('PATCH', { sharedWithApps })),
+  setMarketplaceSessionUse: (marketplace: Marketplace, useForChecks: boolean) => request<SettingsData>(`/api/marketplace-sessions/${encodeURIComponent(marketplace)}`, json('PATCH', { useForChecks })),
+  checkMarketplaceSession: (marketplace: Marketplace) => request<MarketplaceSessionCheck>(`/api/marketplace-sessions/${encodeURIComponent(marketplace)}/check`, json('POST')),
   deleteMarketplaceSession: (marketplace: Marketplace) => request<SettingsData>(`/api/marketplace-sessions/${encodeURIComponent(marketplace)}`, json('DELETE')),
   testWebhook: () => request<{ delivered: boolean }>('/api/settings/webhook/test', { method: 'POST' }),
   testNtfy: () => request<{ delivered: boolean }>('/api/settings/ntfy/test', { method: 'POST' }),

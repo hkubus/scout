@@ -65,7 +65,8 @@ export function parseMarketplaceStorageState(input: unknown, marketplace: Market
     const cookieValue = text(value.value, `Cookie ${index + 1} value`, 32_768);
     const domain = text(value.domain, `Cookie ${index + 1} domain`, 255).trim();
     const normalizedDomain = domain.replace(/^\.+/, '').toLowerCase();
-    if (!normalizedDomain || !isApprovedMarketplaceSessionHost(marketplace, normalizedDomain)) fail(`Cookie ${index + 1} belongs outside ${marketplace}`);
+    // Only a bare hostname: a browser reads "evil.example/.olx.pl" as evil.example.
+    if (!/^\.?[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(domain) || !isApprovedMarketplaceSessionHost(marketplace, normalizedDomain)) fail(`Cookie ${index + 1} belongs outside ${marketplace}`);
     const path = text(value.path, `Cookie ${index + 1} path`, 2_048);
     if (!path.startsWith('/')) fail(`Cookie ${index + 1} path must start with /`);
     if (value.expires !== undefined && (typeof value.expires !== 'number' || !Number.isFinite(value.expires))) fail(`Cookie ${index + 1} expires must be a finite number`);
@@ -101,4 +102,49 @@ export function parseMarketplaceStorageState(input: unknown, marketplace: Market
   if (!cookies.length && !origins.some((origin) => (origin.localStorage?.length ?? 0) > 0)) fail('Storage state does not contain any cookies or localStorage entries');
   if (Buffer.byteLength(JSON.stringify(state), 'utf8') > MAX_STORAGE_STATE_BYTES) fail(`Storage state is larger than ${MAX_STORAGE_STATE_BYTES} bytes`);
   return state;
+}
+
+/**
+ * A page only a signed-in user sees on each marketplace. Signed out, each one
+ * sends the browser to its sign-in page (seen 2026-10-26 without a session):
+ * OLX's /myaccount/ redirects in page script to login.olx.pl, Vinted's
+ * /settings/profile answers 307 to /member/register/select_type, and
+ * Lokalnie's /konto/… answers 302 to Allegro's OAuth authorize page.
+ */
+export const SESSION_CHECK_URLS: Record<Marketplace, string> = {
+  OLX: 'https://www.olx.pl/myaccount/',
+  'Allegro Lokalnie': 'https://allegrolokalnie.pl/konto/oferty/obserwowane',
+  Vinted: 'https://www.vinted.pl/settings/profile',
+};
+
+const sessionCheckPages: Record<Marketplace, { accountPaths: string[]; signInHosts: string[]; signInPaths: string[] }> = {
+  OLX: { accountPaths: ['/myaccount', '/mojolx'], signInHosts: ['login.olx.pl'], signInPaths: [] },
+  'Allegro Lokalnie': { accountPaths: ['/konto'], signInHosts: ['allegro.pl', 'www.allegro.pl'], signInPaths: ['/logowanie', '/auth'] },
+  Vinted: { accountPaths: ['/settings'], signInHosts: [], signInPaths: ['/member/register', '/member/signup', '/member/login', '/auth'] },
+};
+
+export interface SessionCheckOutcome {
+  /** null when the page neither showed the account nor sent the browser to sign in. */
+  signedIn: boolean | null;
+  detail: string;
+}
+
+/** Decide from where the account page ended up (and its HTTP status) whether the stored session is signed in. */
+export function classifySessionCheck(marketplace: Marketplace, finalUrl: string, status: number | null): SessionCheckOutcome {
+  let url: URL;
+  try { url = new URL(finalUrl); } catch { return { signedIn: null, detail: 'The account page ended on an unreadable address' }; }
+  const page = sessionCheckPages[marketplace];
+  const host = url.hostname.toLowerCase().replace(/\.$/, '');
+  const path = url.pathname.toLowerCase();
+  const under = (prefixes: string[]) => prefixes.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
+  const where = `${host}${url.pathname}`;
+  if (page.signInHosts.includes(host) || (isApprovedMarketplaceSessionHost(marketplace, host) && under(page.signInPaths))) {
+    // For Lokalnie this also covers a lapsed Lokalnie login with the Allegro one still valid: Scout's
+    // browser does not complete Allegro's single sign-on (DataDome stops it), so its pages are anonymous.
+    return { signedIn: false, detail: `Signed out: the account page went to sign-in (${where})` };
+  }
+  if (!isApprovedMarketplaceSessionHost(marketplace, host)) return { signedIn: null, detail: `The account page ended off ${marketplace} (${host})` };
+  if (status !== null && (status < 200 || status >= 400)) return { signedIn: null, detail: `The account page answered ${status}; could not tell whether the session is signed in` };
+  if (under(page.accountPaths)) return { signedIn: true, detail: 'Signed in: the account page opened' };
+  return { signedIn: null, detail: `The account page ended on ${where}; could not tell whether the session is signed in` };
 }

@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase } from '../server/db';
-import { parseMarketplaceStorageState } from '../server/marketplace-sessions';
+import { SESSION_CHECK_URLS, classifySessionCheck, parseMarketplaceStorageState } from '../server/marketplace-sessions';
 import { DeepSeekError } from '../server/ai';
 import { listingDescriptionVerificationInputHash, listingRelevanceInputHash } from '../server/ai';
 import { VisionError } from '../server/vision';
@@ -516,6 +516,9 @@ test('stores marketplace sessions encrypted and rejects cross-marketplace state'
   try {
     assert.deepEqual(parseMarketplaceStorageState(state, 'OLX'), state);
     assert.throws(() => parseMarketplaceStorageState({ cookies: [{ name: 'session', value: 'x', domain: '.vinted.pl', path: '/' }] }, 'OLX'), /outside OLX/);
+    for (const domain of ['evil.example/.olx.pl', 'evil.example?.olx.pl', 'evil.example#.olx.pl', 'evil.example\\.olx.pl', 'olx.pl.']) {
+      assert.throws(() => parseMarketplaceStorageState({ cookies: [{ name: 'session', value: 'x', domain, path: '/' }] }, 'OLX'), /outside OLX/, domain);
+    }
     assert.throws(() => parseMarketplaceStorageState({ cookies: [{ name: 'session', value: 'x', domain: '.olx.pl', path: '/' }], origins: [{ origin: 'http://www.olx.pl' }] }, 'OLX'), /approved OLX HTTPS origin/);
     const settings = context.service.saveMarketplaceSession('OLX', 'Personal', state);
     const saved = settings.marketplaceSessions.find((session) => session.marketplace === 'OLX')!;
@@ -543,6 +546,162 @@ test('accepts Allegro account auth state while keeping unrelated session domains
     assert.throws(() => parseMarketplaceStorageState({ cookies: [{ name: 'session', value: 'x', domain: '.allegro.example', path: '/' }] }, 'Allegro Lokalnie'), /outside Allegro Lokalnie/);
     context.service.saveMarketplaceSession('Allegro Lokalnie', 'Personal', state);
     assert.equal(context.service.settings().marketplaceSessions.find((session) => session.marketplace === 'Allegro Lokalnie')?.connected, true);
+  } finally { context.close(); }
+});
+
+const olxSessionState = {
+  cookies: [{ name: 'session', value: 'private-token', domain: '.olx.pl', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' as const }],
+  origins: [],
+};
+
+test('a session turned off for checks keeps scans anonymous while it stays stored', async () => {
+  const context = fixture();
+  const originalFetch = globalThis.fetch;
+  const renders: Array<{ url: string; withSession: boolean }> = [];
+  const service = context.service as any;
+  service.renderPublicPage = async (url: string, _marketplace: string, state?: unknown) => { renders.push({ url, withSession: Boolean(state) }); return '<html>rendered</html>'; };
+  const fetched: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL) => { fetched.push(String(input)); return new Response('<html>anonymous</html>', { status: 200 }); }) as typeof fetch;
+  try {
+    const saved = context.service.saveMarketplaceSession('OLX', 'Personal', olxSessionState).marketplaceSessions.find((session) => session.marketplace === 'OLX')!;
+    assert.equal(saved.useForChecks, true, 'a stored session is used by default, as before');
+    assert.equal(await service.requestPublicPage('https://www.olx.pl/d/oferta/a', 'OLX'), '<html>rendered</html>');
+    assert.deepEqual(renders, [{ url: 'https://www.olx.pl/d/oferta/a', withSession: true }]);
+
+    const off = context.service.setMarketplaceSessionUse('OLX', false).marketplaceSessions.find((session) => session.marketplace === 'OLX')!;
+    assert.equal(off.useForChecks, false);
+    assert.equal(off.connected, true);
+    assert.match(off.detail, /anonymously/);
+    assert.equal(await service.requestPublicPage('https://www.olx.pl/d/oferta/b', 'OLX'), '<html>anonymous</html>');
+    assert.deepEqual(fetched, ['https://www.olx.pl/d/oferta/b']);
+    assert.equal(renders.length, 1);
+
+    context.service.setMarketplaceSessionUse('OLX', true);
+    context.db.prepare('UPDATE marketplace_sessions SET signed_in = 0 WHERE marketplace = ?').run('OLX');
+    assert.equal(await service.requestPublicPage('https://www.olx.pl/d/oferta/c', 'OLX'), '<html>anonymous</html>', 'a session the check found signed out is skipped too');
+    assert.equal(renders.length, 1);
+
+    context.service.setMarketplaceSessionUse('OLX', false);
+    context.service.saveMarketplaceSession('OLX', 'Personal', olxSessionState);
+    assert.equal(context.service.settings().marketplaceSessions.find((session) => session.marketplace === 'OLX')?.useForChecks, false, 're-importing keeps the choice');
+    assert.throws(() => context.service.setMarketplaceSessionUse('Vinted', true), /not found/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    context.close();
+  }
+});
+
+test('classifies the account page by where it ended up', () => {
+  // Signed-out destinations seen live on 2026-10-26.
+  assert.equal(classifySessionCheck('OLX', 'https://login.olx.pl/?client_id=x&redirect_uri=https%3A%2F%2Fwww.olx.pl%2Fd%2Fcallback%2F', 200).signedIn, false);
+  assert.equal(classifySessionCheck('Vinted', 'https://www.vinted.pl/member/register/select_type?ref_url=%2Fsettings%2Fprofile', 200).signedIn, false);
+  assert.equal(classifySessionCheck('Vinted', 'https://www.vinted.pl/member/signup/select_type?ref_url=%2Fsettings%2Fprofile', 200).signedIn, false);
+  assert.equal(classifySessionCheck('Allegro Lokalnie', 'https://allegro.pl/auth/oauth/authorize?client_id=lokalnie_prod2', 403).signedIn, false, 'DataDome on allegro.pl does not hide the redirect');
+  // Staying on the account page is signed in.
+  for (const marketplace of ['OLX', 'Allegro Lokalnie', 'Vinted'] as const) {
+    assert.equal(classifySessionCheck(marketplace, SESSION_CHECK_URLS[marketplace], 200).signedIn, true, marketplace);
+    assert.equal(classifySessionCheck(marketplace, SESSION_CHECK_URLS[marketplace], 403).signedIn, null, `${marketplace} behind a challenge tells neither way`);
+  }
+  assert.equal(classifySessionCheck('OLX', 'https://www.olx.pl/myaccount/ads/', 200).signedIn, true);
+  assert.equal(classifySessionCheck('OLX', 'https://www.olx.pl/', 200).signedIn, null, 'the home page is neither');
+  assert.equal(classifySessionCheck('OLX', 'https://www.olx.pl/myaccountant/', 200).signedIn, null, 'paths match whole segments');
+  assert.equal(classifySessionCheck('Vinted', 'https://example.com/settings/profile', 200).signedIn, null, 'off the marketplace is neither');
+  assert.equal(classifySessionCheck('Vinted', 'not a url', 200).signedIn, null);
+});
+
+test('a session check records signed in, signed out and undecided', async () => {
+  const context = fixture();
+  const service = context.service as any;
+  const outcomes: Array<{ signedIn: boolean | null; detail: string } | Error> = [];
+  const probed: string[] = [];
+  service.probeMarketplaceSession = async (marketplace: string, state: { cookies: unknown[] }) => {
+    probed.push(marketplace);
+    assert.equal(state.cookies.length, 1);
+    const next = outcomes.shift()!;
+    if (next instanceof Error) throw next;
+    return next;
+  };
+  const session = () => context.service.settings().marketplaceSessions.find((item) => item.marketplace === 'OLX')!;
+  try {
+    await assert.rejects(context.service.checkMarketplaceSession('OLX'), /not found/);
+    context.service.saveMarketplaceSession('OLX', 'Personal', olxSessionState);
+    assert.deepEqual(context.service.marketplaceSessionStatus(), [{ marketplace: 'OLX', signedIn: null, checkedAt: null, detail: 'Not checked yet' }]);
+
+    outcomes.push({ signedIn: false, detail: 'Signed out: the account page went to sign-in (login.olx.pl/)' });
+    const out = await context.service.checkMarketplaceSession('OLX');
+    assert.equal(out.signedIn, false);
+    assert.equal(session().connected, false, 'signed out shows as disconnected');
+    assert.equal(session().signedIn, false);
+    assert.equal(session().checkedAt, out.checkedAt);
+    assert.match(session().detail, /Signed out/);
+    assert.match(context.service.logs()[0].message, /OLX session is signed out/);
+    service.touchMarketplaceSession('OLX');
+    assert.equal(session().connected, false, 'a later scan does not clear signed out');
+
+    outcomes.push({ signedIn: null, detail: 'The account page answered 403; could not tell whether the session is signed in' });
+    const undecided = await context.service.checkMarketplaceSession('OLX');
+    assert.equal(undecided.signedIn, null);
+    assert.equal(session().signedIn, false, 'an undecided check keeps the last definite answer');
+    assert.equal(session().checkedAt, undecided.checkedAt);
+    assert.match(String(session().checkDetail), /answered 403/);
+    assert.equal(session().connected, false);
+
+    outcomes.push(new Error('Chromium is not available; configure SCOUT_BROWSER_WS'));
+    const failed = await context.service.checkMarketplaceSession('OLX');
+    assert.equal(failed.signedIn, null);
+    assert.match(failed.detail, /Check failed: Chromium is not available/);
+
+    outcomes.push({ signedIn: true, detail: 'Signed in: the account page opened' });
+    await context.service.checkMarketplaceSession('OLX');
+    assert.equal(session().connected, true, 'signed in clears the error');
+    const [status] = context.service.marketplaceSessionStatus();
+    assert.deepEqual(Object.keys(status).sort(), ['checkedAt', 'detail', 'marketplace', 'signedIn']);
+    assert.equal(status.signedIn, true);
+    assert.doesNotMatch(JSON.stringify(context.service.settings()), /private-token/);
+
+    // Concurrent requests share one browser check.
+    outcomes.push({ signedIn: true, detail: 'Signed in: the account page opened' });
+    const [first, second] = await Promise.all([context.service.checkMarketplaceSession('OLX'), context.service.checkMarketplaceSession('OLX')]);
+    assert.equal(first, second);
+    assert.equal(probed.length, 5);
+
+    // A check that finishes after a re-import does not land on the new session.
+    let release!: (value: { signedIn: boolean; detail: string }) => void;
+    service.probeMarketplaceSession = () => new Promise((resolve) => { release = resolve; });
+    const racing = context.service.checkMarketplaceSession('OLX');
+    await new Promise((resolve) => setImmediate(resolve));
+    context.service.saveMarketplaceSession('OLX', 'Personal', { ...olxSessionState, cookies: [{ ...olxSessionState.cookies[0], value: 'new-token' }] });
+    release({ signedIn: false, detail: 'Signed out' });
+    await racing;
+    assert.equal(session().signedIn, null);
+    assert.equal(session().checkedAt, null);
+    assert.equal(session().connected, true);
+  } finally { context.close(); }
+});
+
+test('the scheduler checks each stored session once per interval', async () => {
+  const context = fixture();
+  const service = context.service as any;
+  const probed: string[] = [];
+  service.probeMarketplaceSession = async (marketplace: string) => { probed.push(marketplace); return { signedIn: true, detail: 'Signed in: the account page opened' }; };
+  try {
+    await service.processSessionChecks();
+    assert.deepEqual(probed, [], 'nothing stored, nothing checked');
+    context.service.saveMarketplaceSession('OLX', '', olxSessionState);
+    context.service.saveMarketplaceSession('Vinted', '', { cookies: [{ name: 'session', value: 'v', domain: '.vinted.pl', path: '/' }], origins: [] });
+    await service.processSessionChecks();
+    assert.deepEqual(probed.sort(), ['OLX', 'Vinted'], 'a new import is checked on the next tick');
+    await service.processSessionChecks();
+    assert.equal(probed.length, 2, 'a fresh result is not checked again');
+    context.db.prepare('UPDATE marketplace_sessions SET checked_at = ? WHERE marketplace = ?').run(new Date(Date.now() - 7 * 60 * 60_000).toISOString(), 'Vinted');
+    await service.processSessionChecks();
+    assert.deepEqual(probed.slice(2), ['Vinted']);
+    context.service.saveMarketplaceSession('Allegro Lokalnie', '', { cookies: [{ name: 'session', value: 'a', domain: '.allegrolokalnie.pl', path: '/' }], origins: [] });
+    context.service.setMarketplaceSessionUse('Allegro Lokalnie', false);
+    await service.processSessionChecks();
+    assert.equal(probed.length, 3, 'a session neither scans nor connected apps use is left alone');
+    await context.service.checkMarketplaceSession('Allegro Lokalnie');
+    assert.equal(probed.at(-1), 'Allegro Lokalnie', 'Check still works on it');
   } finally { context.close(); }
 });
 
@@ -1915,7 +2074,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals', '030_perf_indexes', '031_flips', '032_flip_listings', '033_verification_checks', '033_watch_alert_targets', '034_flip_ready_to_list', '034_listing_seller', '035_connected_apps', '035_negotiation_outcomes']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals', '030_perf_indexes', '031_flips', '032_flip_listings', '033_verification_checks', '033_watch_alert_targets', '034_flip_ready_to_list', '034_listing_seller', '035_connected_apps', '035_negotiation_outcomes', '036_shared_sessions', '037_marketplace_session_checks']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -2405,7 +2564,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 40);
+    assert.equal(after.migrations.count, 42);
   } finally { context.close(); }
 });
 

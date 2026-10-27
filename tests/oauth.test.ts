@@ -385,10 +385,10 @@ async function mcpTools(origin: string, token: string) {
   }
 }
 
-const mcpPost = (origin: string, token: string) => fetch(`${origin}/mcp`, {
+const mcpPost = (origin: string, token: string, call: { method: string; params: unknown } = { method: 'tools/list', params: {} }) => fetch(`${origin}/mcp`, {
   method: 'POST',
   headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
-  body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+  body: JSON.stringify({ jsonrpc: '2.0', id: 1, ...call }),
 });
 
 test('end to end: register, Allow, token, then tools/list on /mcp without the debug tools', { timeout: 180_000 }, async () => {
@@ -414,6 +414,8 @@ test('end to end: register, Allow, token, then tools/list on /mcp without the de
     assert.ok(tools.includes('scout_flips_to_list') && tools.includes('scout_watches') && tools.includes('scout_listing_detail'));
     assert.equal(tools.filter((name) => name.startsWith('scout_debug_')).length, 0, 'connected apps never get the debug tools');
     assert.ok((await mcpTools(origin, STATIC_TOKEN)).some((name) => name.startsWith('scout_debug_')), 'an API token still does');
+    assert.ok(tools.includes('scout_shared_session'), 'connected apps get the shared sessions');
+    assert.ok(!(await mcpTools(origin, STATIC_TOKEN)).includes('scout_shared_session'), 'an API token never does');
 
     const apps = await (await fetch(`${origin}/api/connected-apps`, { headers: { cookie } })).json() as { apps: Array<{ name: string; lastUsedAt: string | null }> };
     assert.equal(apps.apps.length, 1);
@@ -439,6 +441,13 @@ test('a connected-app token works on /mcp only, and a disconnected one not at al
     assert.equal((await fetch(`${origin}/api/connected-apps`, { headers: { authorization: `Bearer ${token}` } })).status, 401, "it can't disconnect apps either");
     assert.equal((await fetch(`${origin}/events`, { headers: { authorization: `Bearer ${token}` } })).status, 401);
     assert.equal((await fetch(`${origin}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json', origin }, body: JSON.stringify({ password: token }) })).status, 401);
+    assert.equal((await mcpPost(origin, token)).status, 200);
+    // Its own rate limit, past the 30/min the dashboard's MCP and search share: a flip's photos fit.
+    for (let call = 0; call < 40; call += 1) assert.equal((await mcpPost(origin, token)).status, 200);
+    // Live marketplace tools keep the shared 30/min cap; the rest carry on.
+    const scan = { method: 'tools/call', params: { name: 'scout_queue_scan', arguments: { watchId: 'no-such-watch' } } };
+    for (let call = 0; call < 30; call += 1) assert.equal((await mcpPost(origin, token, scan)).status, 200);
+    assert.equal((await mcpPost(origin, token, scan)).status, 429);
     assert.equal((await mcpPost(origin, token)).status, 200);
 
     // Disconnect revokes it at once.
@@ -472,6 +481,29 @@ test('works the same with sign-in off, and still honours Disconnect', { timeout:
     assert.equal(rebound, 403);
     const crossSite = await fetch(`${origin}/oauth/authorize`, { method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/x-www-form-urlencoded', origin: 'https://evil.example' }, body: 'decision=allow' });
     assert.equal(crossSite.status, 403);
+  } finally {
+    await scout.stop();
+  }
+});
+
+test('behind a proxy, the metadata and the /mcp challenge say SCOUT_PUBLIC_ORIGIN, whatever Host and scheme reach Scout', { timeout: 180_000 }, async () => {
+  const scout = await startScout({ SCOUT_PASSWORD: PASSWORD, SCOUT_PUBLIC_ORIGIN: 'https://scout.example' });
+  try {
+    const { origin } = scout;
+    const proxied = { 'x-forwarded-for': '203.0.113.7' };
+    const metadata = await (await fetch(`${origin}/.well-known/oauth-authorization-server`, { headers: proxied })).json() as Record<string, string>;
+    assert.equal(metadata.issuer, 'https://scout.example');
+    assert.equal(metadata.authorization_endpoint, 'https://scout.example/oauth/authorize');
+    assert.equal(metadata.token_endpoint, 'https://scout.example/oauth/token');
+    assert.equal(metadata.registration_endpoint, 'https://scout.example/oauth/register');
+    const resource = await (await fetch(`${origin}/.well-known/oauth-protected-resource`, { headers: proxied })).json();
+    assert.deepEqual(resource, { resource: 'https://scout.example/mcp', authorization_servers: ['https://scout.example'] });
+    const refused = await fetch(`${origin}/mcp`, { method: 'POST', headers: { ...proxied, 'content-type': 'application/json' }, body: '{}' });
+    assert.equal(refused.status, 401);
+    assert.equal(refused.headers.get('www-authenticate'), 'Bearer resource_metadata="https://scout.example/.well-known/oauth-protected-resource"');
+    // Reached directly, it's still the address that was used.
+    const direct = await (await fetch(`${origin}/.well-known/oauth-authorization-server`)).json() as Record<string, string>;
+    assert.equal(direct.issuer, origin);
   } finally {
     await scout.stop();
   }
