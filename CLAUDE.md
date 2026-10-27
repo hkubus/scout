@@ -13,11 +13,13 @@ Research watches use immutable criteria versions, bounded detail checks, price r
 Run the following from this directory:
 
 ```bash
-npm run typecheck
-npm test
-npm run build
+npm run typecheck   # ~4 s
+npm test            # ~5 s, 350 tests
+npm run build       # ~7 s
 npm audit --omit=dev
 ```
+
+While iterating, run `npm run typecheck` and only the affected test files (`node --import tsx --test tests/flips.test.ts`); run the full `npm test` and `npm run build` once before finishing. `npm audit` hits the network, so run it only when dependencies change. Run each step as its own command rather than chaining them with `&&`: one long chain can hit the 10-minute command timeout and lose every result. If a step takes much longer than the times above, the host is loaded by other agents, not stuck; do not add sleeps or retries around it.
 
 For a controlled local smoke test, use a temporary `SCOUT_DB_PATH`, loopback binding, a temporary `SCOUT_SECRET`, and a temporary `SCOUT_PASSWORD`/`SCOUT_API_TOKENS`; never restart the user's persistent process or delete its database without explicit direction. Docker Compose requires `SCOUT_SECRET`, and its readiness check waits for the Browserless health check.
 

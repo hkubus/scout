@@ -1,6 +1,6 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase } from '../server/db';
@@ -16,9 +16,25 @@ import { OTHER_VARIANT_KEY } from '../server/variants';
 // legacy behavior. Live-path tests below opt in explicitly via liveJevEnv().
 if (process.env.SCOUT_JEV_MODE === undefined) process.env.SCOUT_JEV_MODE = 'legacy';
 
+// Migrating a fresh database takes ~80 ms, nearly all of each test's run
+// time, so migrate once per file and give every fixture its own copy.
+const templateDirectory = mkdtempSync(join(tmpdir(), 'scout-service-template-'));
+after(() => rmSync(templateDirectory, { recursive: true, force: true }));
+let template: string | undefined;
+function migratedDatabase(path: string) {
+  if (!template) {
+    template = join(templateDirectory, 'scout.sqlite');
+    // Closing the only connection checkpoints and removes the WAL, so the
+    // main file alone is a complete copy.
+    openDatabase(template).close();
+  }
+  copyFileSync(template, path);
+  return openDatabase(path);
+}
+
 function fixture(dependencies: ScoutServiceDependencies = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'scout-service-'));
-  const db = openDatabase(join(directory, 'scout.sqlite'));
+  const db = migratedDatabase(join(directory, 'scout.sqlite'));
   // Automatic variant groups would otherwise call OpenRouter whenever a test
   // configures a key; tests that care inject their own suggester.
   const service = new ScoutService(db, () => {}, { suggestVariantGroups: async () => [], ...dependencies });

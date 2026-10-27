@@ -37,17 +37,20 @@ test('the worker checkpointer backfills the WAL off the main connection and lets
       await sleep(5);
     }
     // Once idle, the worker backfills every frame. The main connection never
-    // checkpoints here (its auto-checkpoint is 10,000 frames), so the backfill
-    // is the worker's. Poll for it rather than sleeping a fixed time, which
-    // was flaky on a loaded host.
+    // checkpoints here: its auto-checkpoint is 10,000 frames and the 2,000
+    // commits write about 4,000 in total, so any backfill is the worker's. On
+    // an idle host the worker keeps up during the writes and the WAL resets
+    // several times, so the frame count is only what landed since the last
+    // reset; do not expect it to hold every write. Poll for the backfill
+    // rather than sleeping a fixed time, which was flaky on a loaded host.
     const file = join(directory, 'scout.sqlite');
     const deadline = Date.now() + 10_000;
     let index = walIndex(file);
-    while ((index.frames < 4_000 || index.backfilled < index.frames) && Date.now() < deadline) {
+    while ((index.frames === 0 || index.backfilled < index.frames) && Date.now() < deadline) {
       await sleep(20);
       index = walIndex(file);
     }
-    assert.ok(index.frames >= 4_000, `WAL held the writes (${index.frames} frames)`);
+    assert.ok(index.frames > 0, 'the WAL holds the latest writes');
     assert.equal(index.backfilled, index.frames, 'the worker backfilled the whole WAL');
     // Stop the worker before the next write and the probe: its 20 ms
     // background checkpoint would otherwise race them (the probe reported
