@@ -6,7 +6,7 @@
  * heuristics, never confirmed sale prices.
  */
 
-import { dealStrength, median } from './scoring';
+import { dealStrength, median, percentile } from './scoring';
 import type {
   AnalyticsDiscountBucket,
   AnalyticsMarketplaceDeals,
@@ -37,16 +37,6 @@ export function discountPercentFor(row: Pick<AnalyticsObservation, 'price' | 'ty
   return row.typical !== null && Number.isFinite(row.typical) && row.typical > 0
     ? ((row.typical - row.price) / row.typical) * 100
     : null;
-}
-
-function percentile(values: number[], fraction: number): number | null {
-  const sorted = values.filter(Number.isFinite).slice().sort((left, right) => left - right);
-  if (!sorted.length) return null;
-  const position = (sorted.length - 1) * fraction;
-  const lower = Math.floor(position);
-  const upper = Math.ceil(position);
-  if (lower === upper) return sorted[lower];
-  return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
 }
 
 function discounts(rows: AnalyticsObservation[]): number[] {

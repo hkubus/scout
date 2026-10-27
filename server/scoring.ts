@@ -27,6 +27,17 @@ export function median(values: number[]) {
   return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
+/** Linear-interpolation percentile (numpy's default); null without finite values. */
+export function percentile(values: number[], fraction: number): number | null {
+  const sorted = values.filter(Number.isFinite).slice().sort((left, right) => left - right);
+  if (!sorted.length) return null;
+  const position = (sorted.length - 1) * fraction;
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) return sorted[lower];
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
+}
+
 /**
  * Within-variant price noise measured across the whole watch: each price is
  * expressed as a ratio to its own variant's median and the ratios are pooled.

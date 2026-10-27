@@ -96,7 +96,7 @@ const channels = (value: unknown): FlipChannel[] => {
 };
 const num = (value: unknown) => (value === null || value === undefined ? null : Number(value));
 
-function flipFromRow(row: Record<string, any>, photos: FlipPhoto[] = []): Flip {
+export function flipFromRow(row: Record<string, any>, photos: FlipPhoto[] = []): Flip {
   return {
     id: Number(row.id),
     title: String(row.title),

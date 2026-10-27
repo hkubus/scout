@@ -138,20 +138,24 @@ test('debug MCP tools are registered only when a debug instance is provided', as
   } finally { context.close(); }
 });
 
-test('the private flip ledger is hidden from tables, read-only SQL and snapshots', async () => {
+test('the private flip ledger and negotiation outcomes are hidden from tables, read-only SQL and snapshots', async () => {
   const context = fixture();
   try {
     context.db.prepare("INSERT INTO flips (title, buy_channel, bought_on, buy_price_pln, created_at, updated_at) VALUES ('RTX 3070', 'OLX', '2026-09-01', 1200, 'now', 'now')").run();
+    context.db.prepare("INSERT INTO negotiation_outcomes (negotiation_id, marketplace, listing_id, role, outcome, asking_price_pln, final_price_pln, decided_on, created_at, updated_at) VALUES ('n1', 'OLX', '1', 'buy', 'agreed', 1000, 850, '2026-10-16', 'now', 'now')").run();
+    assert.equal(context.debug.schema().tables.some((table: { name: string }) => table.name === 'negotiation_outcomes'), false);
+    assert.throws(() => context.debug.tableRows('negotiation_outcomes'), (error: unknown) => error instanceof ServiceError && error.status === 404);
     assert.equal(context.debug.schema().tables.some((table: { name: string }) => table.name === 'flips'), false);
     assert.throws(() => context.debug.tableRows('flips'), (error: unknown) => error instanceof ServiceError && error.status === 404);
     assert.equal(context.debug.schema().tables.some((table: { name: string }) => table.name === 'flip_photos'), false);
-    for (const sql of ['SELECT * FROM flips', 'select title from "FLIPS"', 'WITH x AS (SELECT buy_price_pln FROM flips) SELECT * FROM x', 'SELECT data FROM flip_photos']) {
+    for (const sql of ['SELECT * FROM flips', 'select title from "FLIPS"', 'WITH x AS (SELECT buy_price_pln FROM flips) SELECT * FROM x', 'SELECT data FROM flip_photos', 'SELECT final_price_pln FROM negotiation_outcomes']) {
       await assert.rejects(context.debug.query(sql), (error: unknown) => error instanceof ServiceError && error.status === 403, sql);
     }
     const snapshot = context.debug.snapshot();
     const copy = new DatabaseSync(snapshot.path, { readOnly: true });
     try {
       assert.equal((copy.prepare('SELECT COUNT(*) AS count FROM flips').get() as { count: number }).count, 0);
+      assert.equal((copy.prepare('SELECT COUNT(*) AS count FROM negotiation_outcomes').get() as { count: number }).count, 0);
     } finally { copy.close(); }
     snapshot.cleanup();
     assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM flips').get() as { count: number }).count, 1, 'the live ledger is untouched');

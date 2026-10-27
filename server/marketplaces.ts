@@ -25,9 +25,21 @@ export interface NormalizedListing {
   promoted?: boolean | null;
   /** From the marketplace's own business-account flag; null when unknown. */
   sellerType?: SellerType | null;
+  /**
+   * The seller's account id where the search payload carries it: OLX
+   * `user.id` and Vinted `user.id`. Allegro Lokalnie search cards carry none.
+   */
+  sellerId?: string | null;
 }
 
 export type SellerType = 'private' | 'business';
+
+/** A seller as a detail page shows it. Names are display names, never logins or emails. */
+export interface ListingSeller {
+  id: string;
+  name: string | null;
+  type: SellerType | null;
+}
 
 export type ListingAvailability =
   | { status: 'live' }
@@ -37,6 +49,9 @@ export type ListingAvailability =
 export interface ListingDetailResult {
   availability: ListingAvailability;
   listing?: NormalizedListing;
+  /** The seller's own text, when the detail response carries it. */
+  description?: string | null;
+  seller?: ListingSeller | null;
 }
 
 export type MarketplaceSearchPageStatus = 'results' | 'empty';
@@ -254,7 +269,14 @@ export function normalizeListing(input: Omit<Partial<NormalizedListing>, 'market
     refreshedAt: validTimestamp(input.refreshedAt),
     promoted: typeof input.promoted === 'boolean' ? input.promoted : null,
     sellerType: input.sellerType === 'private' || input.sellerType === 'business' ? input.sellerType : null,
+    sellerId: normalizeSellerId(input.sellerId),
   };
+}
+
+/** Marketplace account ids are numeric (OLX, Vinted) or `Client:<n>` (Allegro Lokalnie). */
+export function normalizeSellerId(value: unknown): string | null {
+  const text = typeof value === 'number' && Number.isSafeInteger(value) ? String(value) : typeof value === 'string' ? value.trim() : '';
+  return /^[A-Za-z0-9:_-]{1,64}$/.test(text) ? text : null;
 }
 
 function validTimestamp(value: unknown) {
@@ -428,6 +450,85 @@ function vintedCardPriceIndex(label: string) {
   return last >= 2 && VINTED_LABEL_PRICE.test(segments[last - 1]) ? last - 1 : last;
 }
 
+/** OLX offer JSON (search or detail): `user.id`, `user.name`, and the offer's business flag. */
+export function parseOlxOfferSeller(offer: unknown): ListingSeller | null {
+  if (!isRecord(offer) || !isRecord(offer.user)) return null;
+  const id = normalizeSellerId(offer.user.id);
+  if (!id) return null;
+  const name = typeof offer.user.name === 'string' && offer.user.name.trim() ? offer.user.name.trim().slice(0, 80) : null;
+  return { id, name, type: typeof offer.business === 'boolean' ? (offer.business ? 'business' : 'private') : null };
+}
+
+/** Vinted's item page embeds `"sellerId":<n>` and links the seller's `/member/<n>` page. */
+export function parseVintedItemSeller(html: string): ListingSeller | null {
+  const text = html.includes('\\"') ? html.replace(/\\"/g, '"') : html;
+  const id = normalizeSellerId(text.match(/"sellerId":(\d+)/)?.[1] ?? text.match(/\/member\/(\d+)/)?.[1]);
+  return id ? { id, name: null, type: null } : null;
+}
+
+/**
+ * Allegro Lokalnie's offer page embeds (HTML-escaped) `"seller":{"id":"<uuid>",
+ * "name":"Jakub (Client:33405696)","type":"individual",…}` and links the
+ * profile at `/uzytkownik/Client%3A33405696`; the Client id addresses the profile.
+ */
+export function parseAllegroOfferSeller(html: string): ListingSeller | null {
+  const text = html.replace(/&quot;/g, '"');
+  const seller = text.match(/"seller":\{"id":"[^"]*","name":"([^"]*)","type":"([^"]*)"/);
+  const fromName = seller?.[1].match(/\((Client:\d+)\)\s*$/)?.[1];
+  const fromLink = text.match(/\/uzytkownik\/(Client%3A\d+)/i)?.[1];
+  const id = normalizeSellerId(fromName ?? (fromLink ? decodeURIComponent(fromLink) : undefined));
+  if (!id) return null;
+  const name = seller?.[1].replace(/\s*\(Client:\d+\)\s*$/, '').trim().slice(0, 80) || null;
+  const type = seller?.[2] === 'individual' ? 'private' : seller?.[2] === 'business' || seller?.[2] === 'company' ? 'business' : null;
+  return { id, name, type };
+}
+
+/** One page of a seller's listings: what the marketplace shows, and its total where it reports one. */
+export interface SellerListingsPage {
+  listings: NormalizedListing[];
+  total: number | null;
+}
+
+export function olxSellerListingsUrl(sellerId: string, limit: number) {
+  return `https://www.olx.pl/api/v1/offers/?offset=0&limit=${Math.max(1, Math.floor(limit))}&user_id=${encodeURIComponent(sellerId)}`;
+}
+
+export function vintedWardrobeUrl(sellerId: string, perPage: number) {
+  return `https://www.vinted.pl/api/v2/wardrobe/${encodeURIComponent(sellerId)}/items?page=1&per_page=${Math.max(1, Math.floor(perPage))}`;
+}
+
+export function allegroSellerProfileUrl(sellerId: string) {
+  return `https://allegrolokalnie.pl/uzytkownik/${encodeURIComponent(sellerId)}`;
+}
+
+/** The OLX offers API filtered by `user_id`; `metadata.total_elements` counts all of them. */
+export function parseOlxSellerListings(json: unknown): SellerListingsPage {
+  const listings = [...parseOlxOffersApi(json)];
+  const metadata = isRecord(json) && isRecord(json.metadata) ? json.metadata : undefined;
+  const total = typeof metadata?.total_elements === 'number' ? metadata.total_elements : null;
+  return { listings, total };
+}
+
+/** Vinted's wardrobe API; closed, hidden, draft and reserved items are not for sale. */
+export function parseVintedWardrobe(json: unknown): SellerListingsPage {
+  if (!isRecord(json) || !Array.isArray(json.items)) throw new Error('Vinted wardrobe response did not contain items');
+  const listings: NormalizedListing[] = [];
+  for (const item of json.items) {
+    if (!isRecord(item) || item.is_closed === true || item.is_hidden === true || item.is_draft === true || item.is_reserved === true) continue;
+    try {
+      const listing = parseVintedCatalogItem(item);
+      if (listing) listings.push(listing);
+    } catch { /* malformed items are skipped */ }
+  }
+  const pagination = isRecord(json.pagination) ? json.pagination : undefined;
+  return { listings, total: typeof pagination?.total_entries === 'number' ? pagination.total_entries : null };
+}
+
+/** Allegro Lokalnie's profile page lists the seller's offers as search cards, with no total. */
+export function parseAllegroSellerProfile(html: string): SellerListingsPage {
+  return { listings: [...parseSearchPage(html, 'Allegro Lokalnie')], total: null };
+}
+
 /**
  * Vinted's catalog page embeds each card's data as (escaped) JSON:
  * `"productItem":{"id":…,"isPromoted":false,…,"user":{…,"isBusiness":false}}`.
@@ -435,7 +536,7 @@ function vintedCardPriceIndex(label: string) {
  */
 export function parseVintedPageSignals(html: string) {
   const text = html.includes('\\"productItem\\"') ? html.replace(/\\"/g, '"') : html;
-  const signals = new Map<string, { promoted: boolean | null; sellerType: SellerType | null }>();
+  const signals = new Map<string, { promoted: boolean | null; sellerType: SellerType | null; sellerId: string | null }>();
   const starts = [...text.matchAll(/"productItem":\{"id":(\d+)/g)];
   starts.forEach((match, index) => {
     const end = starts[index + 1]?.index ?? Math.min(text.length, (match.index ?? 0) + 20_000);
@@ -445,6 +546,7 @@ export function parseVintedPageSignals(html: string) {
     signals.set(match[1], {
       promoted: promoted === undefined ? null : promoted === 'true',
       sellerType: business === undefined ? null : business === 'true' ? 'business' : 'private',
+      sellerId: chunk.match(/"user":\{"id":(\d+)/)?.[1] ?? null,
     });
   });
   return signals;
@@ -471,7 +573,7 @@ export function parseVintedCards(html: string) {
     const condition = label.match(/,\s*Stan:\s*([^,]+)/i)?.[1]?.trim();
     try {
       const signal = signals.get(listingId);
-      listings.push(normalizeListing({ marketplace: 'Vinted', listingId, title, price, url: new URL(href, 'https://www.vinted.pl').toString(), imageUrl: imageTag ? attribute(imageTag, 'src') : undefined, condition, priceNegotiable: parsePriceNegotiabilityFromMarkup(`${tag} ${label}`), promoted: signal?.promoted, sellerType: signal?.sellerType }));
+      listings.push(normalizeListing({ marketplace: 'Vinted', listingId, title, price, url: new URL(href, 'https://www.vinted.pl').toString(), imageUrl: imageTag ? attribute(imageTag, 'src') : undefined, condition, priceNegotiable: parsePriceNegotiabilityFromMarkup(`${tag} ${label}`), promoted: signal?.promoted, sellerType: signal?.sellerType, sellerId: signal?.sellerId }));
     } catch { /* malformed or off-domain cards are ignored */ }
   }
   return listings;
@@ -483,8 +585,12 @@ function visiblePageText(html: string) {
 
 function isBlockedMarkup(html: string) {
   const text = visiblePageText(html).toLowerCase();
+  // Cloudflare injects a passive bot-detection beacon
+  // (/cdn-cgi/challenge-platform/scripts/jsd/main.js) into ordinary pages,
+  // Vinted item pages included; a real challenge loads challenge-platform/h/…
+  // and sets cf-chl- tokens.
   return /captcha|cloudflare|access denied|verify you are human|robot check|przejdz weryfikacje|zbyt wiele zapytan|too many requests|challenge page/.test(text)
-    || /(?:g-recaptcha|h-captcha|cf-chl-|challenge-platform)/i.test(html);
+    || /(?:g-recaptcha|h-captcha|cf-chl-|challenge-platform\/(?!scripts\/jsd\/))/i.test(html);
 }
 
 function hasExplicitEmptyState(html: string, marketplace: Marketplace) {
@@ -870,7 +976,13 @@ export function createPublicAdapter(marketplace: Marketplace, fetcher: (url: str
         onPath?.('public-detail-page');
         const listings = parseStructuredListings(html, marketplace);
         const availability = parseListingAvailability(html, marketplace);
-        return { availability, listing: listings[0] };
+        if (availability.status !== 'live') return { availability, listing: listings[0] };
+        return {
+          availability,
+          listing: listings[0],
+          description: parseListingDescription(html, marketplace),
+          seller: marketplace === 'Allegro Lokalnie' ? parseAllegroOfferSeller(html) : marketplace === 'Vinted' ? parseVintedItemSeller(html) : null,
+        };
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Detail page verification failed';
         if (/\b(?:404|410)\b/.test(message)) return { availability: { status: 'terminal', reason: message.slice(0, 240) } };
@@ -1128,12 +1240,14 @@ function parseOlxOffer(offer: unknown): NormalizedListing | null {
   const promotionFlags = promotion ? [promotion.top_ad, promotion.highlighted, promotion.urgent].filter((flag): flag is boolean => typeof flag === 'boolean') : [];
   const promoted = promotionFlags.length ? promotionFlags.some(Boolean) : null;
   const sellerType = typeof offer.business === 'boolean' ? (offer.business ? 'business' : 'private') : null;
+  const user = isRecord(offer.user) ? offer.user : undefined;
   const listing = normalizeListing({
     marketplace: 'OLX', listingId, title, price, url, imageUrl, condition, location, shippingAvailable, priceNegotiable,
     postedAt: typeof offer.created_time === 'string' ? offer.created_time : null,
     refreshedAt: typeof offer.last_refresh_time === 'string' ? offer.last_refresh_time : null,
     promoted,
     sellerType,
+    sellerId: normalizeSellerId(user?.id),
   });
   const imageUrls: string[] = [];
   for (const photo of photos) {
@@ -1234,7 +1348,9 @@ export function createOlxJsonAdapter(marketplace: Marketplace, fetcher: (url: st
       const availability = parseOlxListingAvailabilityApi(response.json, response.status);
       let listing: NormalizedListing | undefined;
       if (availability.status === 'live' && isRecord(response.json) && isRecord(response.json.data)) {
-        try { listing = parseOlxOffer(response.json.data) ?? undefined; } catch { listing = undefined; }
+        const data = response.json.data;
+        try { listing = parseOlxOffer(data) ?? undefined; } catch { listing = undefined; }
+        return { availability, listing, description: listingDescriptionText(data.description, 'OLX'), seller: parseOlxOfferSeller(data) };
       }
       return { availability, listing };
     },
@@ -1444,6 +1560,7 @@ function parseVintedCatalogItem(item: unknown): NormalizedListing | null {
     marketplace: 'Vinted', listingId, title, price, url, imageUrl, condition, priceNegotiable: null,
     promoted: typeof item.promoted === 'boolean' ? item.promoted : null,
     sellerType: business === undefined ? null : business ? 'business' : 'private',
+    sellerId: normalizeSellerId(user?.id ?? item.user_id),
   });
 }
 
@@ -1568,6 +1685,7 @@ export function createVintedJsonAdapter(
       let listing: NormalizedListing | undefined;
       if (availability.status === 'live') {
         try { listing = parseStructuredListings(page.body, marketplace)[0]; } catch { listing = undefined; }
+        return { availability, listing, description: parseListingDescription(page.body, marketplace), seller: parseVintedItemSeller(page.body) };
       }
       return { availability, listing };
     },

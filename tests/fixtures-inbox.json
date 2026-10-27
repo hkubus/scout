@@ -1,0 +1,166 @@
+{
+  "_comment": "Synthetic inbox responses in the shapes OLX, Vinted and Allegro Lokalnie returned on 2026-10-17. Every id, name, text and price is made up; fields Scout ignores are trimmed.",
+  "olx": {
+    "unread": {
+      "data": [
+        {
+          "id": "0a1b2c3d-0000-4000-8000-000000000001",
+          "user_id": 100,
+          "user_uuid": "0a1b2c3d-0000-4000-8000-0000000000aa",
+          "read_only": false,
+          "respondent": { "id": 200, "uuid": "0a1b2c3d-0000-4000-8000-0000000000bb", "blocked": false, "name": "Sprzedawca A", "type": "seller" },
+          "archived": false,
+          "ad": { "id": 900000001, "title": "Karta graficzna RTX 3070 8GB", "category": { "id": "1", "type": "electronics" } },
+          "is_observed": false,
+          "messages": [
+            { "id": "0a1b2c3d-0000-4000-8000-00000000a001", "user_id": 100, "created_at": "2026-10-10T10:00:00.000000Z", "read_at": "2026-10-10T10:05:00.000000Z", "text": "Dzień dobry, czy karta jest sprawna?", "attachments": [], "sent_from_mobile": false },
+            { "id": "0a1b2c3d-0000-4000-8000-00000000a002", "user_id": 100, "created_at": "2026-10-10T10:01:00.000000Z", "read_at": null, "text": "Zaproponowano 1 300 zł", "attachments": [], "sent_from_mobile": false, "type": "custom:price_negotiation_widget_buyer_proposed", "extras": { "negotiationId": "n-1", "ad": { "adId": 900000001, "basePrice": { "cents": 150000, "currency": "PLN" } }, "sentBy": "BUYER", "proposal": { "price": { "cents": 130000, "currency": "PLN" }, "id": "p-1", "by": "BUYER" } } },
+            { "id": "0a1b2c3d-0000-4000-8000-00000000a004", "user_id": 200, "created_at": "2026-10-10T12:30:00.000000Z", "read_at": null, "text": "Mogę zejść do 1400, odbiór w Krakowie.", "attachments": [], "sent_from_mobile": true },
+            { "id": "0a1b2c3d-0000-4000-8000-00000000a003", "user_id": 200, "created_at": "2026-10-10T12:29:00.000000Z", "read_at": null, "text": "Zaproponowano 1 400 zł", "attachments": [], "sent_from_mobile": true, "type": "custom:price_negotiation_widget_seller_proposed", "extras": { "negotiationId": "n-1", "ad": { "adId": 900000001, "basePrice": { "cents": 150000, "currency": "PLN" } }, "sentBy": "SELLER", "proposal": { "price": { "cents": 140000, "currency": "PLN" }, "id": "p-2", "by": "SELLER" } } }
+          ],
+          "unread_count": 1,
+          "has_attachment": false
+        }
+      ],
+      "metadata": { "total_elements": 1 },
+      "links": {}
+    },
+    "read": {
+      "data": [
+        {
+          "id": "0a1b2c3d-0000-4000-8000-000000000002",
+          "user_id": 100,
+          "respondent": { "id": 201, "name": "Kupujący B", "type": "buyer" },
+          "ad": { "id": 900000002, "title": "iPhone 13 128GB" },
+          "messages": [
+            { "id": "0a1b2c3d-0000-4000-8000-00000000b001", "user_id": 201, "created_at": "2026-10-09T08:00:00.000000Z", "read_at": null, "text": "Zaproponowano 1 900 zł", "type": "custom:price_negotiation_widget_buyer_proposed", "extras": { "proposal": { "price": { "cents": 190000, "currency": "PLN" }, "by": "BUYER" } } },
+            { "id": "0a1b2c3d-0000-4000-8000-00000000b002", "user_id": 100, "created_at": "2026-10-09T09:00:00.000000Z", "read_at": null, "text": "Oferta zaakceptowana", "type": "custom:price_negotiation_widget_seller_accepted", "extras": { "proposal": { "price": { "cents": 190000, "currency": "PLN" }, "by": "BUYER" } } },
+            { "id": "0a1b2c3d-0000-4000-8000-00000000b003", "user_id": 100, "created_at": "2026-10-09T09:00:01.000000Z", "read_at": null, "text": "Kupujący może teraz kupić przedmiot w zaakceptowanej cenie.", "type": "system", "extras": { "text": "" } }
+          ],
+          "unread_count": 0
+        },
+        {
+          "id": "0a1b2c3d-0000-4000-8000-000000000001",
+          "user_id": 100,
+          "respondent": { "id": 200, "name": "Sprzedawca A", "type": "seller" },
+          "ad": { "id": 900000001, "title": "Karta graficzna RTX 3070 8GB" },
+          "messages": [],
+          "unread_count": 0
+        }
+      ],
+      "metadata": { "total_elements": 2 },
+      "links": {}
+    },
+    "older": {
+      "data": [
+        {
+          "id": "0a1b2c3d-0000-4000-8000-000000000003",
+          "user_id": 100,
+          "respondent": { "id": 202, "name": "Sprzedawca C", "type": "seller" },
+          "ad": { "id": 900000003, "title": "Steam Deck 512GB" },
+          "messages": [
+            { "id": "0a1b2c3d-0000-4000-8000-00000000c001", "user_id": 202, "created_at": "2026-09-01T08:00:00.000000Z", "read_at": null, "text": "Sprzedane, przepraszam." }
+          ],
+          "unread_count": 0
+        }
+      ],
+      "metadata": { "total_elements": 41 }
+    }
+  },
+  "vinted": {
+    "inbox": {
+      "conversations": [
+        { "id": 7001, "item_count": 1, "description": "Mogę zejść do 900 zł", "unread": true, "updated_at": "2026-10-12T11:00:00+02:00", "opposite_user": { "id": 501, "login": "sprzedawca_d", "photo": null, "badge": null } },
+        { "id": 7002, "item_count": 1, "description": "Dziękuję, wysłane.", "unread": false, "updated_at": "2026-10-11T09:00:00+02:00", "opposite_user": { "id": 502, "login": "kupujaca_e" } },
+        { "id": 7003, "item_count": 2, "description": "Biorę oba", "unread": false, "updated_at": "2026-10-01T09:00:00+02:00", "opposite_user": { "id": 503, "login": "kupujacy_f" } }
+      ],
+      "pagination": { "page": 1, "per_page": 20, "total_entries": 3, "total_pages": 1, "current_page": 1 },
+      "code": 0
+    },
+    "conversations": {
+      "7001": {
+        "conversation": {
+          "id": 7001,
+          "read_by_current_user": false,
+          "subtitle": "Nintendo Switch OLED",
+          "messages": [
+            { "id": 9101, "entity_type": "offer_request_message", "entity": { "offer_request_id": 9101, "transaction_id": 81, "user_id": 400, "status": 30, "status_title": "Odrzucone", "body": "800,00 zł", "price": { "amount": "800.0", "currency_code": "PLN" }, "original_price": { "amount": "1000.0", "currency_code": "PLN" }, "currency": "PLN", "current": false }, "created_at_ts": "2026-10-12T09:00:00+02:00" },
+            { "entity_type": "offer_message", "entity": { "user_id": 501, "price": { "amount": "900.0", "currency_code": "PLN" }, "price_label": "900,00 zł", "currency": "PLN", "current": true }, "id": 9102, "created_at_ts": "2026-10-12T10:59:00+02:00" },
+            { "entity_type": "message", "entity": { "body": "Mogę zejść do 900 zł", "photos": [], "user_id": 501, "id": 9103, "is_hidden": false }, "created_at_ts": "2026-10-12T11:00:00+02:00" },
+            { "entity_type": "status_message", "entity": { "title": "Sprzedający zaproponował nową cenę", "template": { "style": "secondary" }, "interpolation_values": {} }, "created_at_ts": "2026-10-12T10:59:30+02:00", "event_type": "offer" }
+          ],
+          "transaction": { "id": 81, "status": 10, "buyer_id": 400, "seller_id": 501, "current_user_side": "buyer", "item_count": 1, "item_id": 4001, "item_ids": [4001], "item_title": "Nintendo Switch OLED" },
+          "opposite_user": { "id": 501, "login": "sprzedawca_d" }
+        },
+        "code": 0
+      },
+      "7002": {
+        "conversation": {
+          "id": 7002,
+          "read_by_current_user": true,
+          "messages": [
+            { "entity_type": "message", "entity": { "body": "Dziękuję, wysłane.", "user_id": 400, "id": 9201 }, "created_at_ts": "2026-10-11T09:00:00+02:00" }
+          ],
+          "transaction": { "id": 82, "current_user_side": "seller", "item_count": 1, "item_ids": [4002], "item_title": "Kurtka zimowa M" },
+          "opposite_user": { "id": 502, "login": "kupujaca_e" }
+        },
+        "code": 0
+      },
+      "7003": {
+        "conversation": {
+          "id": 7003,
+          "read_by_current_user": true,
+          "messages": [
+            { "entity_type": "message", "entity": { "body": "Biorę oba", "user_id": 503, "id": 9301 }, "created_at_ts": "2026-10-01T09:00:00+02:00" }
+          ],
+          "transaction": { "id": 83, "current_user_side": "seller", "item_count": 2, "item_ids": [4003, 4004], "item_title": "Zestaw" },
+          "opposite_user": { "id": 503, "login": "kupujacy_f" }
+        },
+        "code": 0
+      }
+    }
+  },
+  "allegroLokalnie": {
+    "inbox": {
+      "entries": [
+        {
+          "id": "5e6f7a8b-0000-4000-8000-000000000001",
+          "last_message": { "id": "5e6f7a8b-0000-4000-8000-00000000d003", "type": "negotiations_price_proposed", "inserted_at": "2026-10-13T15:00:00.000000Z", "content": { "buyer_login": "kupujacy-g", "buyer_name": "G", "proposed_price_cents": 31500, "seller_login": "ja", "seller_name": "Ja" }, "conversation_id": "5e6f7a8b-0000-4000-8000-000000000001", "author_id": "5e6f7a8b-0000-4000-8000-0000000000cc", "verification_status": null },
+          "pinned": false,
+          "subject": { "id": "5e6f7a8b-0000-4000-8000-0000000000e1", "type": "buying_intent", "price_cents": 34900, "participant_id": "5e6f7a8b-0000-4000-8000-0000000000cc", "participant_type": "User", "items_count": 1, "participant_name": "Kupujący G", "first_item_title": "Aparat Fujifilm X100", "is_seller": true },
+          "is_unseen": true
+        },
+        {
+          "id": "5e6f7a8b-0000-4000-8000-000000000002",
+          "last_message": { "id": "5e6f7a8b-0000-4000-8000-00000000e001", "type": "text", "inserted_at": "2026-10-12T10:00:00.000000Z", "content": { "body": "Dziękuję za zakup" }, "author_id": "5e6f7a8b-0000-4000-8000-0000000000dd" },
+          "subject": { "id": "5e6f7a8b-0000-4000-8000-0000000000e2", "type": "transaction", "price_cents": 9000, "participant_id": "5e6f7a8b-0000-4000-8000-0000000000dd", "participant_name": "Sprzedawca H", "first_item_title": "Słuchawki Sony WH-1000XM4", "is_seller": false },
+          "is_unseen": false
+        },
+        {
+          "id": "5e6f7a8b-0000-4000-8000-000000000003",
+          "last_message": null,
+          "subject": { "id": "5e6f7a8b-0000-4000-8000-0000000000e3", "type": "buying_intent", "participant_id": "5e6f7a8b-0000-4000-8000-0000000000ee", "participant_name": "Kupujący I", "first_item_title": "Rower górski", "is_seller": true },
+          "is_unseen": false
+        }
+      ],
+      "page_size": 20,
+      "page_number": 1,
+      "total_entries": 3,
+      "total_pages": 1
+    },
+    "messages": {
+      "5e6f7a8b-0000-4000-8000-000000000001": {
+        "messages": [
+          { "id": "5e6f7a8b-0000-4000-8000-00000000d001", "type": "text", "inserted_at": "2026-10-13T14:00:00.000000Z", "content": { "body": "Czy aparat ma rysy?" }, "author_id": "5e6f7a8b-0000-4000-8000-0000000000cc", "read_at": null },
+          { "id": "5e6f7a8b-0000-4000-8000-00000000d002", "type": "negotiations_price_changed", "inserted_at": "2026-10-13T14:30:00.000000Z", "content": { "offer_previous_price_cents": 36900, "offer_price_cents": 34900, "offer_title": "Aparat Fujifilm X100" }, "author_id": "5e6f7a8b-0000-4000-8000-0000000000ff", "read_at": null },
+          { "id": "5e6f7a8b-0000-4000-8000-00000000d003", "type": "negotiations_price_proposed", "inserted_at": "2026-10-13T15:00:00.000000Z", "content": { "proposed_price_cents": 31500 }, "author_id": "5e6f7a8b-0000-4000-8000-0000000000cc", "read_at": null }
+        ]
+      }
+    },
+    "subjects": {
+      "5e6f7a8b-0000-4000-8000-0000000000e1": { "data": { "reservation": null }, "item": { "id": "5e6f7a8b-0000-4000-8000-00000000f001", "slug": "https://allegrolokalnie.pl/oferta/aparat-fujifilm-x100", "title": "Aparat Fujifilm X100", "price_cents": 34900, "is_current_user_seller": true }, "write_allowed": true },
+      "5e6f7a8b-0000-4000-8000-0000000000e2": { "items": [{ "id": "5e6f7a8b-0000-4000-8000-00000000f002", "title": "Słuchawki Sony WH-1000XM4", "quantity": 1, "unit_price_cents": 9000 }], "subject": { "id": "5e6f7a8b-0000-4000-8000-0000000000e2", "price_cents": 9000 }, "write_allowed": true },
+      "5e6f7a8b-0000-4000-8000-0000000000e3": { "item": { "id": "5e6f7a8b-0000-4000-8000-00000000f003", "title": "Rower górski" } }
+    }
+  }
+}

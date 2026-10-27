@@ -189,7 +189,7 @@ export function listingConditionFromLabel(label: string | null | undefined): Lis
   if (!text) return null;
   if (/bez metki/.test(text)) return "new";
   if (/\bz metk|with tags|z etykiet/.test(text)) return "new-with-tags";
-  if (/uszkodz|na czesci|zadowalaj|damaged|for parts|broken/.test(text)) return "damaged";
+  if (/uszkodz|na czesci|zadowalaj|nie w pelni sprawn|niesprawn|damaged|for parts|broken|not fully functional/.test(text)) return "damaged";
   if (/^now[eya]\b|^new\b|brand new/.test(text)) return "new";
   if (/bardzo dobr|jak nowy|like new|very good|idealn/.test(text)) return "like-new";
   if (/uzywan|dobry|used|good|refurb|odnowion/.test(text)) return "good";

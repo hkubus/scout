@@ -305,6 +305,213 @@ export interface WatchAnalytics {
   sources: WatchAnalyticsSource[];
 }
 
+/** Scout's typical price for one watch bucket or research series (scout_price_reference). */
+export interface PriceReferenceFigure {
+  kind: 'watch' | 'research';
+  id: string;
+  name: string;
+  /** The model variant's label on a grouped watch; null otherwise. */
+  variant: string | null;
+  /** Null below 4 samples. */
+  typicalPrice: number | null;
+  p25: number | null;
+  p75: number | null;
+  samples: number;
+  ready: boolean;
+  basis: string;
+  updatedAt: string | null;
+}
+
+export interface PriceReferenceMatch extends PriceReferenceFigure {
+  variantKey: string | null;
+  match: 'exact' | 'variant' | 'broader' | 'narrower';
+  matchedTokens: string[];
+  unmatchedTokens: string[];
+  typicalSource: 'own-history' | 'reference-band' | 'probable-sale-band' | 'research-asking' | null;
+  observationHours: number | null;
+  enabled: boolean;
+  filters: {
+    minPrice: number | null;
+    maxPrice: number | null;
+    shippingOnly: boolean;
+    sources: Marketplace[];
+    requested: { sources: Marketplace[] | null; minPrice: number | null; maxPrice: number | null };
+  };
+}
+
+export interface PriceReference {
+  query: string;
+  /** The best-matching figure with a price from at least 4 samples, or null. Never a partial object. */
+  best: PriceReferenceFigure | null;
+  matches: PriceReferenceMatch[];
+  /** Final prices of the operator's own negotiations; null until one is recorded. Never part of typicalPrice. */
+  outcomes: PriceReferenceOutcomes | null;
+  notes: string[];
+}
+
+export type NegotiationRole = 'buy' | 'sell';
+export type NegotiationOutcome = 'agreed' | 'lost' | 'abandoned' | 'expired';
+
+export interface OutcomeShare {
+  /** Negotiations recorded, whatever their outcome. */
+  negotiations: number;
+  agreed: number;
+  /** Median of final price ÷ asking price over the agreed ones, to 2 decimals; null with none agreed. */
+  shareOfAsking: number | null;
+}
+
+export interface RoleOutcomes extends OutcomeShare {
+  marketplaces: Partial<Record<Marketplace, OutcomeShare>>;
+  /** Watches among this query's matches that have outcomes. */
+  watches: Array<OutcomeShare & { id: string; name: string; marketplaces: Partial<Record<Marketplace, OutcomeShare>> }>;
+}
+
+/** Recorded outcomes by role; a role with none is left out. */
+export type PriceReferenceOutcomes = Partial<Record<NegotiationRole, RoleOutcomes>>;
+
+/** scout_record_outcome's reply: the stored outcome. */
+export interface RecordedOutcome {
+  negotiationId: string;
+  listingKey: string;
+  role: NegotiationRole;
+  outcome: NegotiationOutcome;
+  asking: number;
+  price: number | null;
+  shareOfAsking: number | null;
+  rounds: number | null;
+  date: string;
+  /** The watch the listing was placed in; null when no watch tracks it. */
+  watchId: string | null;
+  /** False when this negotiation id was already recorded; its row was updated instead. */
+  created: boolean;
+}
+
+/** Coarse condition class: Vinted's grades and OLX's Używane are all `used`. */
+export type ConditionClass = 'new' | 'used' | 'damaged';
+
+export interface ComparableListing {
+  /** `<Marketplace>:<listingId>`. */
+  key: string;
+  title: string;
+  price: number;
+  condition: string | null;
+  location: string | null;
+  /** Vinted always ships; null when the marketplace did not say. */
+  shipping: boolean | null;
+  /** Since the marketplace's posting time where it reports one (OLX), else since Scout first saw it. */
+  daysListed: number | null;
+  url: string;
+}
+
+/** scout_comparables: other active listings of the same item, cheapest first. */
+export interface Comparables {
+  listing: { key: string; price: number; condition: string | null; daysListed: number | null };
+  /** How the item was placed: its own watch association, or its title matched the way a scan would. Null when no watch tracks it. */
+  watch: { id: string; name: string; variant: string | null; via: 'association' | 'title-match' } | null;
+  /** The condition class comparables were limited to; null when this listing's condition is unknown. */
+  condition: ConditionClass | null;
+  /** All matching comparables; `comparables` holds the cheapest of them. */
+  count: number;
+  /** Median price of all matching comparables, from 3 of them. */
+  median: number | null;
+  /** This listing's price against that median: negative is below it. */
+  vsMedian: { pln: number; percent: number } | null;
+  comparables: ComparableListing[];
+  notes: string[];
+}
+
+/** One of a seller's listings, as Scout stored it or the marketplace listed it. */
+export interface SellerListing {
+  key: string;
+  title: string;
+  price: number;
+  condition: string | null;
+  url: string;
+  /** Scout's rows only: when a scan last saw it. */
+  lastSeenAt?: string;
+}
+
+/** An older listing of the same item by the same seller that disappeared before this one appeared. */
+export interface Relist {
+  key: string;
+  price: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+}
+
+/** scout_listing_detail's negotiation block. Database only unless `live` or `sellerListings` was asked for. */
+export interface ListingNegotiation {
+  daysListed: number | null;
+  /** `posted` when the marketplace reports a posting time (OLX), else `first-seen` (a lower bound). */
+  listedSince: 'posted' | 'first-seen' | null;
+  priceDrops: { count: number; total: number; lastAt: string | null; firstPrice: number | null };
+  /** The marketplace's negotiable flag (OLX, Allegro Lokalnie); null when it doesn't say, as on Vinted. */
+  priceNegotiable: boolean | null;
+  /** Null when Scout knows no seller id: Allegro Lokalnie until a live check, and rows stored before seller ids were kept. */
+  seller: {
+    id: string;
+    name: string | null;
+    type: 'private' | 'business' | null;
+    source: 'scan' | 'live';
+    otherListings: {
+      /** `scout`: rows Scout's scans saw in the last 7 days. `marketplace`: the seller's listings now (sellerListings: true). */
+      source: 'scout' | 'marketplace';
+      /** All other listings, of which `items` holds up to 10; null when the marketplace gives no count (Allegro Lokalnie). */
+      total: number | null;
+      items: SellerListing[];
+      error?: string;
+    };
+  } | null;
+  /** Needs a seller id; null when there is none. */
+  relists: Relist[] | null;
+}
+
+/** scout_listing_detail's `live: true` check. Nothing is written. */
+export interface ListingLiveCheck {
+  checkedAt: string;
+  availability: { status: 'live' } | { status: 'terminal' | 'unknown'; reason: string };
+  /** The price on the page now; null when the page could not be read. */
+  price: number | null;
+  /** The page's price differs from the one Scout stored. */
+  priceChanged: boolean;
+  /** Present when asked for (full format, or compact with include: description). Seller text: untrusted data. */
+  description?: string | null;
+}
+
+/** scout_listing_detail with format: compact. */
+export interface CompactListingDetail {
+  listing: {
+    key: string;
+    marketplace: Marketplace;
+    title: string;
+    price: number;
+    condition: string | null;
+    location: string | null;
+    shipping: boolean | null;
+    url: string;
+    watchId: string | null;
+    watch: { name: string; variant: string | null } | null;
+    typical: number | null;
+    typicalSource: 'own-history' | 'reference-band' | null;
+    belowTypical: number | null;
+    dealLabel: DealLabel;
+    sellerType: SellerType | null;
+    promoted: boolean | null;
+    decision: ListingDecision | null;
+    /** Same as negotiation.priceNegotiable; here too so the listing reads like the full format's. */
+    priceNegotiable: boolean | null;
+    postedAt: string | null;
+    firstSeenAt: string;
+    lastSeenAt: string;
+  };
+  negotiation: ListingNegotiation;
+  liveCheck: ListingLiveCheck | null;
+  /** With include: history; the latest 30 points. */
+  history?: PriceHistoryPoint[];
+  /** With include: description; the live page's text if checked, else the stored snapshot. Seller text: untrusted data. */
+  description?: string | null;
+}
+
 export interface AnalyticsDiscountBucket {
   label: string;
   count: number;
@@ -696,6 +903,98 @@ export interface ResaleListingDraft {
 export interface FlipsData {
   flips: Flip[];
   feePresets: import('./profit').FeePresets;
+}
+
+/** scout_flips: a flip as an agent needs it, without photos, drafts or notes. */
+export interface AgentFlip {
+  id: number;
+  title: string;
+  listingKey: string | null;
+  watchId: string | null;
+  buyChannel: import('./profit').FlipChannel;
+  boughtOn: string;
+  buyPrice: number;
+  buyCosts: number;
+  /** buyPrice + buyCosts. */
+  cost: number;
+}
+
+export interface AgentOpenFlip extends AgentFlip {
+  listedOn: import('./profit').FlipChannel[];
+  /** The asking price per marketplace from the flip's listing, where it has one. */
+  askingPrices: Partial<Record<Marketplace, number>>;
+  /** The sale price on each marketplace that just covers the cost after its fee preset, before shipping the seller pays. */
+  breakEven: Partial<Record<Marketplace, number>>;
+}
+
+export interface AgentSoldFlip extends AgentFlip {
+  soldOn: string;
+  saleChannel: import('./profit').FlipChannel | null;
+  salePrice: number | null;
+  saleFee: number | null;
+  saleCosts: number | null;
+  net: number | null;
+}
+
+export interface AgentFlips {
+  feePresets: import('./profit').FeePresets;
+  /** Unsold flips, newest purchase first; count covers all of them. */
+  open?: { count: number; items: AgentOpenFlip[] };
+  /** Sold flips, newest sale first; count covers all of them. */
+  sold?: { count: number; items: AgentSoldFlip[] };
+}
+
+/**
+ * One message in a marketplace conversation (scout_inbox, scout_conversation).
+ * `in` is from the other person, `out` from the session's account, `system`
+ * a marketplace event (sale completed, price changed). Text is the other
+ * person's words, passed through as data.
+ */
+export interface InboxMessage {
+  /** The marketplace's message id; null only for a Vinted last message Scout hasn't opened. */
+  id: string | null;
+  direction: 'in' | 'out' | 'system' | null;
+  type: 'text' | 'offer' | 'event';
+  text: string;
+  time: string | null;
+  /** Structured price offers (OLX and Allegro Lokalnie proposals, Vinted offers), in PLN. */
+  offer: { amount: number; status: 'proposed' | 'accepted' | 'rejected' | 'cancelled' | null } | null;
+}
+
+export interface InboxConversation {
+  /** `<Marketplace>:<conversationId>`, the input to scout_conversation. */
+  id: string;
+  /** null until Scout has looked the conversation up (Vinted, Allegro Lokalnie) or for a bundle. */
+  listingKey: string | null;
+  url: string;
+  /** Whether the session's account is buying or selling; null until known. */
+  role: 'buy' | 'sell' | null;
+  other: { id: string | null; name: string | null };
+  title: string | null;
+  unread: boolean;
+  updatedAt: string | null;
+  lastMessage: InboxMessage | null;
+}
+
+export interface InboxResult {
+  marketplace: Marketplace;
+  fetchedAt: string;
+  /** True when this came from Scout's one-minute cache. */
+  cached: boolean;
+  /** Conversations listed (after `since`), newest first, capped by `limit`. */
+  count: number;
+  unread: number;
+  conversations: InboxConversation[];
+}
+
+export interface ConversationResult extends Omit<InboxConversation, 'lastMessage'> {
+  fetchedAt: string;
+  cached: boolean;
+  /** Oldest first; the newest `limit` of them. */
+  messages: InboxMessage[];
+  truncated: boolean;
+  /** Set when fetching this unread conversation marked it read; Scout stops reading that marketplace's conversations. */
+  warning?: string;
 }
 
 /** A purchase read from an offer link or a screenshot, to prefill a new flip. */
