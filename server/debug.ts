@@ -69,16 +69,17 @@ function stripLeadingComments(sql: string) {
   }
 }
 
+const quoteIdent = (name: string) => `"${name.replace(/"/g, '""')}"`;
+
 /**
  * The operator's private bookkeeping (the flip ledger and the outcomes of
- * their negotiations) is not debugging data: it is left out of the table
- * list, refused in read-only SQL, and emptied in snapshots. Export it through
- * the authenticated /api/export instead.
+ * their negotiations) and the apps let in over OAuth are not debugging data:
+ * they are left out of the table list, refused in read-only SQL, and emptied
+ * in snapshots. Export the ledger through the authenticated /api/export
+ * instead.
  */
-const PRIVATE_TABLES = ['flips', 'flip_photos', 'negotiation_outcomes'];
+const PRIVATE_TABLES = ['flips', 'flip_photos', 'negotiation_outcomes', 'oauth_clients', 'oauth_codes', 'connected_app_tokens'];
 const PRIVATE_TABLE_PATTERN = new RegExp(`\\b(?:${PRIVATE_TABLES.join('|')})\\b`, 'i');
-
-const quoteIdent = (name: string) => `"${name.replace(/"/g, '""')}"`;
 
 // Runs in a child process: opens its own read-only connection, blanks the
 // encrypted marketplace session column via the authorizer (where supported),
@@ -247,7 +248,7 @@ export class ScoutDebug {
     const statementText = stripLeadingComments(sql);
     if (!READ_STATEMENT.test(statementText)) throw new ServiceError('Only SELECT, WITH, VALUES, EXPLAIN, and PRAGMA statements are allowed', 400);
     // Belt and braces with the child's authorizer, which older Node builds lack.
-    if (PRIVATE_TABLE_PATTERN.test(statementText)) throw new ServiceError('The flip ledger and negotiation outcomes are private and not available through the debug API', 403);
+    if (PRIVATE_TABLE_PATTERN.test(statementText)) throw new ServiceError('The flip ledger, negotiation outcomes and connected apps are private and not available through the debug API', 403);
     const limit = Math.min(Math.max(1, Math.trunc(maxRows)), QUERY_MAX_ROWS);
     const started = performance.now();
     const result = await runQueryChild({ path: this.databasePath, sql: statementText, params, maxRows: limit }, this.queryTimeoutMs);

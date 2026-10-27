@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { ScoutDebug } from './debug';
+import type { FlipStore } from './flips';
 import type { ScoutService } from './service';
 import { ServiceError } from './service';
 
@@ -40,6 +41,19 @@ export const SCOUT_MCP_TOOL_NAMES = [
   'scout_flips',
   'scout_inbox',
   'scout_conversation',
+] as const;
+
+/**
+ * Hatbot's listing tools (docs/hatbot-listing-plan.md). Hatbot's MCP plugin
+ * reads tool names and descriptions for money words and would make any tool
+ * it suspects ask the owner every time, so these never use them; the test
+ * runs the plugin's patterns over them.
+ */
+export const SCOUT_MCP_LISTING_TOOL_NAMES = [
+  'scout_flips_to_list',
+  'scout_flip',
+  'scout_flip_photo',
+  'scout_flip_listed',
 ] as const;
 
 export const SCOUT_MCP_DEBUG_TOOL_NAMES = [
@@ -290,6 +304,50 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
   });
 }
 
+/** The flips the owner marked "Ready to list", for Hatbot to post. */
+export function registerScoutListingMcpTools(server: McpServer, flips: FlipStore) {
+  server.registerTool('scout_flips_to_list', {
+    description: 'Flips the owner marked "Ready to list" in Scout, each with its draft revision (updatedAt) and every picked marketplace with its status: ready (to be posted), listed (with url), failed (with error) or declined. updatedAt moves only when what gets posted changes, never when a status is recorded. Database only.',
+    annotations: { readOnlyHint: true },
+  }, async () => {
+    try { return text({ flips: flips.readyToList() }); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_flip', {
+    description: 'The listing draft of one flip marked ready to list: title, description, condition (new-with-tags, new, like-new, good or damaged), category hint, delivery (shipping, pickup, Vinted parcel size), the price in PLN for each picked marketplace, and its photos, cover first. Get each photo with scout_flip_photo.',
+    inputSchema: { id: z.number().int().positive().describe('Flip id from scout_flips_to_list.') },
+    annotations: { readOnlyHint: true },
+  }, async ({ id }) => {
+    try { return text(flips.toPost(id)); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_flip_photo', {
+    description: 'One photo of a flip marked ready to list, as JSON text {id, mime, base64}: a JPEG at most 2000 px on the long side, under about 2 MB.',
+    inputSchema: { id: z.number().int().positive().describe('Photo id from scout_flip.') },
+    annotations: { readOnlyHint: true },
+  }, async ({ id }) => {
+    // Text, not image content: Hatbot's MCP client drops image content.
+    try { return text(await flips.photoToPost(id)); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_flip_listed', {
+    description: 'Record how posting a flip on one marketplace went: listed with the new listing\'s url (on olx.pl, allegrolokalnie.pl or vinted.pl), failed with a one-sentence error, or declined when the owner said no. Repeating a report changes nothing, and it never moves the draft\'s updatedAt.',
+    inputSchema: {
+      flipId: z.number().int().positive(),
+      channel: z.string().trim().min(1).max(80).describe('OLX, Allegro Lokalnie or Vinted.'),
+      status: z.enum(['listed', 'failed', 'declined']),
+      url: z.string().trim().max(2000).optional().describe('The new listing\'s address; required when listed.'),
+      error: z.string().max(2000).optional().describe('What went wrong, in one plain sentence.'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  }, async ({ flipId, channel, status, url, error: problem }) => {
+    try {
+      flips.recordListing(flipId, channel, status, url, problem);
+      return text({ ok: true });
+    } catch (error) { return toolError(error); }
+  });
+}
+
 /**
  * Read-only database introspection for development: schema, raw table rows,
  * arbitrary read-only SQL, and runtime state. Mirrors /api/debug/*.
@@ -337,12 +395,13 @@ export function registerScoutDebugMcpTools(server: McpServer, debug: ScoutDebug)
 }
 
 /** Build a fresh per-request MCP server bound to the given service. */
-export function createScoutMcpServer(service: ScoutService, debug: ScoutDebug | null = null) {
+export function createScoutMcpServer(service: ScoutService, debug: ScoutDebug | null = null, flips: FlipStore | null = null) {
   const server = new McpServer(
     { name: 'scout-deal-monitor', version: process.env.SCOUT_VERSION ?? '1.0.0' },
     { capabilities: { tools: {} } },
   );
   registerScoutMcpTools(server, service);
+  if (flips) registerScoutListingMcpTools(server, flips);
   if (debug) registerScoutDebugMcpTools(server, debug);
   return server;
 }

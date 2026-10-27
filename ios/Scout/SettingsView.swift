@@ -7,6 +7,10 @@ struct SettingsView: View {
     @State private var readiness: Readiness?
     @State private var connectors: [Connector] = []
     @State private var serverSettings: ServerSettings?
+    /// nil until loaded, or from a server without connected apps.
+    @State private var connectedApps: [ConnectedApp]?
+    @State private var appToDisconnect: ConnectedApp?
+    @State private var disconnectError: String?
     @State private var updatingNotifications = false
     @State private var newAPIToken = ""
     @State private var savingAPIToken = false
@@ -87,6 +91,8 @@ struct SettingsView: View {
 
             apiTokenSection
 
+            connectedAppsSection
+
             Section {
                 // The gallery is a screenshot surface; the system widget picker previews widgets for everyone else.
                 if model.isDemo {
@@ -124,6 +130,7 @@ struct SettingsView: View {
             self.readiness = readiness
             self.connectors = connectors
             serverSettings = try? await client.settings()
+            connectedApps = try? await client.connectedApps()
             error = nil
             // A cancelled or failed settings fetch leaves the server settings
             // section missing, so don't mark the load done: the next
@@ -132,6 +139,63 @@ struct SettingsView: View {
         } catch {
             if !error.isCancellation { self.error = error.localizedDescription }
             return false
+        }
+    }
+
+    /// Apps let in over OAuth from their own settings, such as Hatbot.
+    @ViewBuilder
+    private var connectedAppsSection: some View {
+        if let connectedApps {
+            Section {
+                if connectedApps.isEmpty {
+                    Text("No apps are connected.")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(connectedApps) { app in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(app.name)
+                            Text("Connected \(Format.relative(iso: app.connectedAt)) · \(app.lastUsedAt == nil ? "not used yet" : "last used \(Format.relative(iso: app.lastUsedAt))")")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Disconnect", role: .destructive) { appToDisconnect = app }
+                            .buttonStyle(.borderless)
+                    }
+                }
+            } header: {
+                Text("Connected apps")
+            } footer: {
+                if let disconnectError {
+                    Text(disconnectError).foregroundStyle(.red)
+                } else {
+                    Text("Apps such as Hatbot connect from their own settings. They can see your watches, listings and flips, and record where flips went up.")
+                }
+            }
+            .confirmationDialog(
+                "Disconnect \(appToDisconnect?.name ?? "this app")?",
+                isPresented: Binding(get: { appToDisconnect != nil }, set: { if !$0 { appToDisconnect = nil } }),
+                titleVisibility: .visible,
+                presenting: appToDisconnect
+            ) { app in
+                Button("Disconnect", role: .destructive) { disconnect(app) }
+            } message: { _ in
+                Text("It stops reaching Scout at once and has to be connected again from its own settings.")
+            }
+        }
+    }
+
+    private func disconnect(_ app: ConnectedApp) {
+        guard let client = model.client else { return }
+        disconnectError = nil
+        Task { @MainActor in
+            do {
+                try await client.disconnectApp(id: app.id)
+                connectedApps?.removeAll { $0.id == app.id }
+            } catch {
+                if !error.isCancellation { disconnectError = error.localizedDescription }
+            }
         }
     }
 

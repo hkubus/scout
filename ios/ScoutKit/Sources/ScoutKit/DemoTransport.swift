@@ -18,6 +18,7 @@ public actor DemoTransport: HTTPTransport {
     private var flips: [Flip]
     private var feePresets = FeePresets.defaults
     private var nextPhotoID = 100
+    private var connectedApps: [ConnectedApp]
     private let encoder = JSONEncoder()
 
     public init(now: Date = Date()) {
@@ -26,6 +27,8 @@ public actor DemoTransport: HTTPTransport {
         marketWatches = DemoMarket.watches(now: now)
         marketListings = DemoMarket.listings(dashboard: dashboard, now: now)
         flips = Self.demoFlips(now: now)
+        let formatter = ISO8601DateFormatter()
+        connectedApps = [ConnectedApp(id: 1, name: "Hatbot", connectedAt: formatter.string(from: now.addingTimeInterval(-6 * 86_400)), lastUsedAt: formatter.string(from: now.addingTimeInterval(-240)))]
     }
 
     /// A few flips around today so the ledger, quarter total, and sales record have content.
@@ -39,8 +42,14 @@ public actor DemoTransport: HTTPTransport {
                 saleCosts: sold?.costs, delisted: sold?.delisted ?? [], note: "", createdAt: stamp, updatedAt: stamp
             )
         }
+        var gpu = flip(4, "Gigabyte RTX 3070 Eagle OC 8GB", bought: -2, from: .vinted, price: 1_150, costs: 16.99, listed: [.olx, .allegroLokalnie], sold: nil)
+        gpu.listing = FlipListing(
+            title: "Gigabyte RTX 3070 Eagle OC 8GB", description: "Sprawna, bez kopania. Pudełko w zestawie.", condition: "like-new",
+            category: "Karty graficzne", prices: ["OLX": 1_449.99, "Allegro Lokalnie": 1_529.99, "Vinted": 1_449.99], basePrice: 1_450,
+            delivery: FlipDelivery(shipping: true, pickup: true, parcelSize: "medium")
+        )
         return [
-            flip(4, "Gigabyte RTX 3070 Eagle OC 8GB", bought: -2, from: .vinted, price: 1_150, costs: 16.99, listed: [.olx, .allegroLokalnie], sold: nil),
+            gpu,
             flip(3, "Ryzen 5 5600X box", bought: -9, from: .olx, price: 290, costs: 12, listed: [.olx, .allegroLokalnie, .vinted], sold: (day: -1, on: .allegroLokalnie, price: 420, fee: 20.58, costs: 0, delisted: [.olx])),
             flip(2, "Steam Deck OLED 512GB", bought: -20, from: .olx, price: 1_899, costs: 0, listed: [.olx], sold: (day: -12, on: .olx, price: 2_350, fee: 0, costs: 0, delisted: [])),
             flip(1, "Sony WH-1000XM5", bought: -30, from: .allegroLokalnie, price: 749, costs: 14.99, listed: [.vinted], sold: (day: -24, on: .vinted, price: 980, fee: 0, costs: 0, delisted: [])),
@@ -122,7 +131,7 @@ public actor DemoTransport: HTTPTransport {
         let segments = components.path.split(separator: "/").map(String.init)
         let method = request.httpMethod ?? "GET"
         // `/api/<collection>/<id>/...` routes are matched with the id replaced by `:id`.
-        let collections: Set<String> = ["watches", "market-watches", "market-listings", "flips", "flip-photos"]
+        let collections: Set<String> = ["watches", "market-watches", "market-listings", "flips", "flip-photos", "connected-apps"]
         let watchID = segments.count >= 3 && segments[0] == "api" && collections.contains(segments[1]) ? segments[2] : nil
         let route = method + " /" + segments.enumerated().map { $0.offset == 2 && watchID != nil ? ":id" : $0.element }.joined(separator: "/")
         try await Task.sleep(nanoseconds: 150_000_000)
@@ -301,6 +310,38 @@ public actor DemoTransport: HTTPTransport {
         case "DELETE /api/flip-photos/:id":
             for index in flips.indices { flips[index].photos?.removeAll { String($0.id) == watchID } }
             return try respond(["ok": true])
+        case "GET /api/connected-apps":
+            return try respond(["apps": connectedApps])
+        case "DELETE /api/connected-apps/:id":
+            guard connectedApps.contains(where: { String($0.id) == watchID }) else {
+                return try respond(["error": "That app is not connected"], status: 404)
+            }
+            connectedApps.removeAll { String($0.id) == watchID }
+            return try respond(["ok": true])
+        case "PUT /api/flips/:id/ready", "DELETE /api/flips/:id/ready":
+            guard let index = flips.firstIndex(where: { String($0.id) == watchID }) else {
+                return try respond(["error": "Flip not found"], status: 404)
+            }
+            var flip = flips[index]
+            let listed = (flip.listingChannels ?? []).filter { $0.status == .listed }
+            if method == "DELETE" {
+                flip.readyToList = false
+                flip.listingChannels = listed
+            } else {
+                let body = try JSONDecoder().decode([String: [FlipChannel]].self, from: request.httpBody ?? Data())
+                let picked = FlipChannel.platforms.filter { (body["channels"] ?? []).contains($0) || listed.map(\.channel).contains($0) }
+                guard !picked.isEmpty else { return try respond(["error": "Pick at least one marketplace to list it on"], status: 400) }
+                let gaps = ReadyToList.gaps(listing: flip.listing, photoCount: flip.photos?.count ?? 0, channels: picked)
+                guard gaps.isEmpty else { return try respond(["error": ReadyToList.message(gaps)], status: 400) }
+                let stamp = ISO8601DateFormatter().string(from: Date())
+                flip.readyToList = true
+                flip.listingChannels = picked.map { channel in
+                    listed.first { $0.channel == channel } ?? FlipListingChannel(channel: channel, status: .ready, updatedAt: stamp)
+                }
+                flip.listingRevisedAt = stamp
+            }
+            flips[index] = flip
+            return try respond(["flip": flip])
         case "POST /api/flips/:id/photos":
             guard let index = flips.firstIndex(where: { String($0.id) == watchID }) else {
                 return try respond(["error": "Flip not found"], status: 404)

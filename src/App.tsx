@@ -142,11 +142,13 @@ function viewFromLocation(): View {
   return navSections.some((section) => section.views.some((item) => item.id === raw)) ? raw : "overview";
 }
 
+/** Scout's "Let … in?" page for an app connecting over OAuth (server/oauth.ts), shown instead of the dashboard. */
+const consentPage = window.location.pathname === "/oauth/authorize";
 const initialView = viewFromLocation();
 /** Whether the first view renders the dashboard (see planFlush). */
-const initialViewNeedsDashboard = planFlush(initialView, new Set(allLiveResources), false, false).dashboard;
+const initialViewNeedsDashboard = !consentPage && planFlush(initialView, new Set(allLiveResources), false, false).dashboard;
 // A deep-linked route's chunk loads alongside the session check, so it mounts without suspending.
-preloadView(initialView);
+if (!consentPage) preloadView(initialView);
 
 // Boot requests start with the module, in parallel: the session check and,
 // when the first view shows it, the dashboard. ScoutApp's first refresh takes
@@ -214,6 +216,7 @@ function App() {
   }, []);
   if (auth === "checking") return null;
   if (auth === "login") return <LoginScreen passwordLogin={session?.passwordLogin ?? true} tokenLogin={session?.tokenLogin ?? false} />;
+  if (consentPage) return <ConsentScreen />;
   const logout = session?.authEnabled && (session.passwordLogin || session.tokenLogin)
     ? () => { void api.logout().finally(() => window.location.reload()); }
     : null;
@@ -271,6 +274,57 @@ function LoginScreen({ passwordLogin, tokenLogin }: { passwordLogin: boolean; to
           <p className="login-error" role="alert">
             Sign-in is not configured. Set SCOUT_PASSWORD_HASH or SCOUT_API_TOKENS on the server.
           </p>
+        )}
+      </form>
+    </main>
+  );
+}
+
+/**
+ * Lets an app in over OAuth. Allow and Cancel are a plain same-origin form
+ * post: Scout answers with a 302 back to the app (the page's CSP allows the
+ * app's origin as a form target), so no code ever passes through script.
+ */
+function ConsentScreen() {
+  useTheme();
+  const params = useMemo(() => new URLSearchParams(window.location.search), []);
+  const [request, setRequest] = useState<{ clientName: string; redirectOrigin: string } | { error: string } | null>(null);
+  useEffect(() => {
+    let active = true;
+    api.oauthAuthorization(window.location.search)
+      .then((value) => { if (active) setRequest(value); })
+      .catch((reason) => { if (active) setRequest({ error: errorMessage(reason) }); });
+    return () => { active = false; };
+  }, []);
+  const fields = ["response_type", "client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method"];
+  return (
+    <main className="login-shell">
+      <form className="login-card consent-card" method="post" action="/oauth/authorize">
+        <div className="brand-row">
+          <div className="brand-mark" aria-hidden="true">
+            <Search size={24} strokeWidth={2.7} />
+            <span />
+          </div>
+          <span className="brand-name">Scout</span>
+        </div>
+        {request === null ? (
+          <p className="consent-note consent-loading"><LoaderCircle size={16} className="spin" /> Checking the app…</p>
+        ) : "error" in request ? (
+          <>
+            <h1 className="consent-title">Can't connect this app</h1>
+            <p className="login-error" role="alert">{request.error}</p>
+          </>
+        ) : (
+          <>
+            <h1 className="consent-title">Let {request.clientName} in?</h1>
+            <p className="consent-note">It can see your watches, listings and flips, and record where flips went up.</p>
+            <p className="consent-note">You'll go back to <strong>{request.redirectOrigin}</strong>.</p>
+            {fields.map((name) => params.has(name) ? <input key={name} type="hidden" name={name} value={params.get(name) ?? ""} /> : null)}
+            <div className="consent-actions">
+              <button className="outline-button" type="submit" name="decision" value="deny">Cancel</button>
+              <button className="primary-button" type="submit" name="decision" value="allow" autoFocus>Allow</button>
+            </div>
+          </>
         )}
       </form>
     </main>

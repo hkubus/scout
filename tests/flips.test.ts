@@ -1,14 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase } from '../server/db';
 import sharp from 'sharp';
-import { FlipStore, MAX_FLIP_PHOTO_EDGE, MAX_FLIP_PHOTOS, sniffImageMime, toWebp } from '../server/flips';
+import { FlipStore, MAX_FLIP_PHOTO_EDGE, MAX_FLIP_PHOTOS, MAX_POSTING_PHOTO_BYTES, listingUrlOn, sniffImageMime, toPostingJpeg, toWebp } from '../server/flips';
 import { ServiceError } from '../server/service';
 import type { PurchaseScreenshotReading } from '../server/vision';
-import { DEFAULT_FEE_PRESETS, estimatedNetAtTypical, listingConditionFromLabel, roundToNines, suggestedListingPrice, estimateFlipNet, flipNet, normalizeFeePresets, quarterOf, saleFee, salesRecord, salesRecordCsv } from '../src/profit';
+import { DEFAULT_FEE_PRESETS, NO_DELIVERY, readyToListGaps, readyToListMessage, estimatedNetAtTypical, listingConditionFromLabel, roundToNines, suggestedListingPrice, estimateFlipNet, flipNet, normalizeFeePresets, quarterOf, saleFee, salesRecord, salesRecordCsv } from '../src/profit';
 
 function fixture() {
   const directory = mkdtempSync(join(tmpdir(), 'scout-flips-'));
@@ -102,7 +103,7 @@ test('listing drafts and photos are stored per flip as WebP, checked by their by
     assert.equal(flip.listing, null);
     assert.deepEqual(flip.photos, []);
     const listing = { title: 'Gigabyte RTX 3070 Eagle OC 8GB', description: 'Sprawna, bez kopania.', condition: 'good' as const, prices: { OLX: 1450, 'Allegro Lokalnie': 1525 }, basePrice: 1450 };
-    assert.deepEqual(context.store.setListing(flip.id, listing).listing, listing);
+    assert.deepEqual(context.store.setListing(flip.id, listing).listing, { ...listing, delivery: NO_DELIVERY }, 'a draft without delivery details gets none');
 
     const first = await context.store.addPhoto(flip.id, JPEG);
     const second = await context.store.addPhoto(flip.id, PNG);
@@ -374,4 +375,186 @@ test('estimates the net of reselling at the typical after the seller fee', () =>
   assert.equal(estimatedNetAtTypical(1100, 1000, { percent: 0, fixed: 5 }), -105);
   assert.equal(estimatedNetAtTypical(700, null, { percent: 0, fixed: 0 }), null);
   assert.equal(estimatedNetAtTypical(700, 0, { percent: 0, fixed: 0 }), null);
+});
+
+const readyDraft = {
+  title: 'Gigabyte RTX 3070 Gaming OC',
+  description: 'Sprawna, bez kopania. Pudełko w zestawie.',
+  condition: 'like-new' as const,
+  category: 'Karty graficzne',
+  prices: { OLX: 1199, Vinted: 1149 },
+  basePrice: 1150,
+  delivery: { shipping: true, pickup: true, parcelSize: 'medium' as const },
+};
+
+test('marking a flip ready to list says plainly what its draft is missing', async () => {
+  assert.deepEqual(readyToListGaps(null, 0, ['OLX', 'Vinted']), ['a title', 'a description', 'the condition', 'a price for OLX and Vinted', 'shipping or pickup for OLX', 'the parcel size for Vinted', 'at least one photo']);
+  assert.deepEqual(readyToListGaps({ ...readyDraft, prices: {}, basePrice: 900 }, 1, ['OLX', 'Allegro Lokalnie', 'Vinted']), [], 'the base price stands in for a channel without one');
+  assert.deepEqual(readyToListGaps({ ...readyDraft, delivery: { shipping: false, pickup: false, parcelSize: null } }, 1, ['Vinted']), ['the parcel size for Vinted'], 'Vinted only ships');
+  assert.equal(readyToListMessage(['a description', 'a price for Vinted', 'at least one photo']), 'Before it can be listed, add a description, a price for Vinted and at least one photo.');
+
+  const context = fixture();
+  try {
+    const flip = context.store.create({ title: 'RTX 3070', buyChannel: 'OLX', boughtOn: '2026-10-01', buyPrice: 900 });
+    assert.deepEqual([flip.readyToList, flip.listingChannels, flip.listingRevisedAt], [false, [], null]);
+    assert.throws(() => context.store.markReady(flip.id, ['OLX']), /^Error: Before it can be listed, add a title, a description, the condition, a price for OLX, shipping or pickup for OLX and at least one photo\.$/);
+    context.store.setListing(flip.id, { ...readyDraft, description: ' ', prices: { OLX: 1199 }, basePrice: null });
+    assert.throws(() => context.store.markReady(flip.id, ['OLX', 'Vinted']), /add a description, a price for Vinted and at least one photo\./);
+    assert.throws(() => context.store.markReady(flip.id, []), /Pick at least one marketplace/);
+    assert.equal(context.store.readyToList().length, 0);
+    assert.equal(context.store.get(flip.id).readyToList, false, 'a refused mark changes nothing');
+  } finally { context.close(); }
+});
+
+test('a ready flip lists its channels, records outcomes, and adds listed ones to listedOn', async () => {
+  const context = fixture();
+  try {
+    const flip = context.store.create({ title: 'RTX 3070', buyChannel: 'OLX', boughtOn: '2026-10-01', buyPrice: 900, listedOn: ['Other'] });
+    context.store.setListing(flip.id, readyDraft);
+    const photo = await context.store.addPhoto(flip.id, await image(40, 30).jpeg().toBuffer());
+    const ready = context.store.markReady(flip.id, ['Vinted', 'OLX', 'Vinted']);
+    assert.equal(ready.readyToList, true);
+    assert.deepEqual(ready.listingChannels.map(({ channel, status, url, error }) => ({ channel, status, url, error })), [
+      { channel: 'OLX', status: 'ready', url: null, error: null },
+      { channel: 'Vinted', status: 'ready', url: null, error: null },
+    ], 'one record per channel, in a fixed sequence');
+    assert.deepEqual(context.store.readyToList(), [{ id: flip.id, updatedAt: ready.listingRevisedAt, channels: [{ channel: 'OLX', status: 'ready' }, { channel: 'Vinted', status: 'ready' }] }]);
+
+    assert.deepEqual(context.store.toPost(flip.id), {
+      id: flip.id, updatedAt: ready.listingRevisedAt, title: readyDraft.title, description: readyDraft.description, condition: 'like-new', category: 'Karty graficzne',
+      delivery: readyDraft.delivery, prices: { OLX: 1199, Vinted: 1149 }, currency: 'PLN', photos: [{ id: photo.id, mime: 'image/jpeg' }],
+    });
+
+    // A URL off the channel's own host, or no URL, is refused.
+    for (const url of [undefined, 'not a url', 'https://olx.pl.evil.example/d/oferta/x', 'http://www.olx.pl/d/oferta/x', 'https://www.vinted.pl/items/1', 'https://user@www.olx.pl/d/oferta/x']) {
+      assert.throws(() => context.store.recordListing(flip.id, 'OLX', 'listed', url), (error: unknown) => error instanceof ServiceError && error.status === 400, String(url));
+    }
+    assert.throws(() => context.store.recordListing(flip.id, 'Other', 'failed', null, 'x'), /Unknown channel "Other"/);
+    assert.throws(() => context.store.recordListing(9999, 'OLX', 'failed'), (error: unknown) => error instanceof ServiceError && error.status === 404);
+    assert.equal(listingUrlOn('OLX', 'https://m.olx.pl/d/oferta/rtx-CID99-ID1.html'), 'https://m.olx.pl/d/oferta/rtx-CID99-ID1.html');
+    assert.equal(listingUrlOn('Allegro Lokalnie', 'https://allegrolokalnie.pl/oferta/rtx-3070'), 'https://allegrolokalnie.pl/oferta/rtx-3070');
+
+    context.store.recordListing(flip.id, 'OLX', 'listed', 'https://www.olx.pl/d/oferta/rtx-3070-CID99-ID1.html');
+    const events = context.events.length;
+    context.store.recordListing(flip.id, 'OLX', 'listed', 'https://www.olx.pl/d/oferta/rtx-3070-CID99-ID1.html');
+    assert.equal(context.events.length, events, 'repeating a report changes nothing');
+    context.store.recordListing(flip.id, 'OLX', 'failed', null, 'Too late');
+    context.store.recordListing(flip.id, 'Vinted', 'failed', null, `  Vinted asked for a phone number. ${'x'.repeat(600)}`);
+    context.store.recordListing(flip.id, 'Allegro Lokalnie', 'declined');
+    const recorded = context.store.get(flip.id);
+    assert.deepEqual(recorded.listedOn, ['Other', 'OLX'], 'a listed channel joins listedOn for the delist checklist');
+    assert.deepEqual(recorded.listingChannels.map(({ channel, status, url }) => [channel, status, url]), [
+      ['OLX', 'listed', 'https://www.olx.pl/d/oferta/rtx-3070-CID99-ID1.html'],
+      ['Vinted', 'failed', null],
+    ], 'a listed channel is never downgraded, and an unpicked one is not added by a failure');
+    assert.equal(recorded.listingChannels[1].error!.length, 500);
+    assert.match(recorded.listingChannels[1].error!, /^Vinted asked for a phone number\./);
+    assert.deepEqual(context.store.readyToList()[0].channels, [
+      { channel: 'OLX', status: 'listed', url: 'https://www.olx.pl/d/oferta/rtx-3070-CID99-ID1.html' },
+      { channel: 'Vinted', status: 'failed', error: recorded.listingChannels[1].error },
+    ]);
+  } finally { context.close(); }
+});
+
+test("the draft's revision moves only when what gets posted changes", async () => {
+  const context = fixture();
+  try {
+    const flip = context.store.create({ title: 'RTX 3070', buyChannel: 'OLX', boughtOn: '2026-10-01', buyPrice: 900 });
+    context.store.setListing(flip.id, readyDraft);
+    const first = await context.store.addPhoto(flip.id, await image(40, 30).jpeg().toBuffer());
+    let revision = context.store.markReady(flip.id, ['OLX', 'Vinted']).listingRevisedAt!;
+    const moved = (why: string) => {
+      const next = context.store.get(flip.id).listingRevisedAt!;
+      assert.ok(next > revision, `${why} moves the revision`);
+      revision = next;
+    };
+    const kept = (why: string) => assert.equal(context.store.get(flip.id).listingRevisedAt, revision, `${why} keeps the revision`);
+
+    context.store.recordListing(flip.id, 'OLX', 'listed', 'https://www.olx.pl/d/oferta/x-CID99-ID1.html');
+    context.store.recordListing(flip.id, 'Vinted', 'failed', null, 'Upload stalled');
+    kept('recording a status');
+    context.store.setListing(flip.id, { ...readyDraft, delivery: undefined });
+    kept('saving the same draft (delivery left out keeps the stored one)');
+    context.store.markReady(flip.id, ['OLX', 'Vinted']);
+    moved('re-marking ready, which puts the failed channel back to ready');
+    assert.deepEqual(context.store.get(flip.id).listingChannels.map((item) => item.status), ['listed', 'ready']);
+    context.store.markReady(flip.id, ['Vinted']);
+    kept('re-marking with nothing to retry (the listed channel stays picked)');
+    assert.deepEqual(context.store.get(flip.id).listingChannels.map((item) => item.channel), ['OLX', 'Vinted']);
+    context.store.update(flip.id, { note: 'shelf 3', buyCosts: 10 });
+    kept('editing the ledger side');
+    for (const [why, draft] of [
+      ['the title', { ...readyDraft, title: 'RTX 3070 Gaming OC 8GB' }],
+      ['the description', { ...readyDraft, description: 'Sprawna.' }],
+      ['the condition', { ...readyDraft, condition: 'good' as const }],
+      ['the category', { ...readyDraft, category: 'Podzespoły' }],
+      ['the delivery', { ...readyDraft, delivery: { ...readyDraft.delivery, parcelSize: 'large' as const } }],
+      ['a price', { ...readyDraft, prices: { ...readyDraft.prices, Vinted: 1099 } }],
+    ] as const) {
+      context.store.setListing(flip.id, draft);
+      moved(`changing ${why}`);
+    }
+    context.store.setListing(flip.id, { ...readyDraft, prices: { ...readyDraft.prices, 'Allegro Lokalnie': 1250 } });
+    moved('restoring the draft');
+    context.store.setListing(flip.id, { ...readyDraft, prices: { ...readyDraft.prices, 'Allegro Lokalnie': 1300 } });
+    kept('a price for a channel that is not picked');
+    const second = await context.store.addPhoto(flip.id, await image(30, 40).png().toBuffer());
+    moved('adding a photo');
+    context.store.orderPhotos(flip.id, [second.id, first.id]);
+    moved('rearranging the photos');
+    context.store.deletePhoto(second.id);
+    moved('deleting a photo');
+    context.store.markReady(flip.id, ['OLX', 'Vinted', 'Allegro Lokalnie']);
+    moved('picking another channel');
+    assert.equal(context.store.toPost(flip.id).updatedAt, revision);
+    assert.equal(context.store.readyToList()[0].updatedAt, revision);
+  } finally { context.close(); }
+});
+
+test('a ready draft stays complete, and cancelling or a sale takes the flip out of the list', async () => {
+  const context = fixture();
+  try {
+    const flip = context.store.create({ title: 'RTX 3070', buyChannel: 'OLX', boughtOn: '2026-10-01', buyPrice: 900 });
+    context.store.setListing(flip.id, readyDraft);
+    const photo = await context.store.addPhoto(flip.id, await image(40, 30).jpeg().toBuffer());
+    context.store.markReady(flip.id, ['OLX', 'Vinted']);
+    assert.throws(() => context.store.deletePhoto(photo.id), /ready to list, so its draft must keep at least one photo\. Cancel “Ready to list” first/);
+    assert.throws(() => context.store.setListing(flip.id, { ...readyDraft, prices: {}, basePrice: null }), /must keep a price for OLX and Vinted/);
+    assert.throws(() => context.store.setListing(flip.id, null), /must keep a title/);
+    assert.deepEqual(context.store.get(flip.id).listing, readyDraft, 'a refused edit stores nothing');
+
+    context.store.recordListing(flip.id, 'OLX', 'listed', 'https://www.olx.pl/d/oferta/x-CID99-ID1.html');
+    const cancelled = context.store.cancelReady(flip.id);
+    assert.equal(cancelled.readyToList, false);
+    assert.deepEqual(cancelled.listingChannels.map(({ channel, status }) => [channel, status]), [['OLX', 'listed']], 'a listed channel keeps its URL after a cancel');
+    assert.deepEqual(context.store.readyToList(), []);
+    assert.throws(() => context.store.toPost(flip.id), /not marked ready to list/);
+    await assert.rejects(context.store.photoToPost(photo.id), /not on a flip marked ready to list/);
+    // A post that lands after the cancel is still recorded: the listing is live.
+    context.store.recordListing(flip.id, 'Vinted', 'listed', 'https://www.vinted.pl/items/123-rtx');
+    context.store.recordListing(flip.id, 'Allegro Lokalnie', 'failed', null, 'x');
+    assert.deepEqual(context.store.get(flip.id).listingChannels.map(({ channel, status }) => [channel, status]), [['OLX', 'listed'], ['Vinted', 'listed']]);
+    assert.deepEqual(context.store.get(flip.id).listedOn, ['OLX', 'Vinted']);
+    context.store.deletePhoto(photo.id);
+
+    const other = context.store.create({ title: 'Ryzen 7', buyChannel: 'OLX', boughtOn: '2026-10-01', buyPrice: 500 });
+    context.store.setListing(other.id, readyDraft);
+    await context.store.addPhoto(other.id, await image(40, 30).jpeg().toBuffer());
+    context.store.markReady(other.id, ['Vinted']);
+    assert.deepEqual(context.store.readyToList().map((item) => item.id), [other.id]);
+    context.store.update(other.id, { soldOn: '2026-10-20', saleChannel: 'Other', salePrice: 700 });
+    assert.deepEqual(context.store.readyToList(), [], 'a sale takes it out');
+    assert.throws(() => context.store.markReady(other.id, ['Vinted']), /already sold/);
+  } finally { context.close(); }
+});
+
+test('photos are sent for posting as JPEG within 2000 px and about 2 MB', async () => {
+  const wide = await sharp({ create: { width: 3000, height: 1000, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } }).webp().toBuffer();
+  const jpeg = await toPostingJpeg(wide);
+  assert.equal(sniffImageMime(jpeg), 'image/jpeg');
+  assert.deepEqual(await sharp(jpeg).metadata().then(({ width, height }) => [width, height]), [2000, 667]);
+  // Noise barely compresses, so the quality has to come down to fit.
+  const noise = await sharp(randomBytes(2000 * 2000 * 3), { raw: { width: 2000, height: 2000, channels: 3 } }).webp({ lossless: true }).toBuffer();
+  assert.ok((await toPostingJpeg(noise)).byteLength <= MAX_POSTING_PHOTO_BYTES);
+  await assert.rejects(toPostingJpeg(new Uint8Array([1, 2, 3])), (error: unknown) => error instanceof ServiceError && error.status === 415);
 });

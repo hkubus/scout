@@ -1,14 +1,19 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, ArrowLeft, ArrowRight, Check, Download, ImagePlus, Link2, LoaderCircle, Megaphone, MoreHorizontal, Pencil, Plus, RotateCcw, Sparkles, Trash2, Wallet, X } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ArrowRight, Check, Download, ExternalLink, ImagePlus, Link2, LoaderCircle, Megaphone, MoreHorizontal, Pencil, Plus, RotateCcw, Send, Sparkles, Trash2, Wallet, X } from "lucide-react";
 import { api, forgetInFlightGets } from "./api";
 import { subscribe, subscribeStatus } from "./events";
 import {
   DAC7_THRESHOLD,
   FEE_PRESET_NOTES,
   FLIP_CHANNELS,
+  LISTING_CHANNELS,
   LISTING_CONDITIONS,
   LISTING_CONDITION_LABELS,
+  NO_DELIVERY,
+  PARCEL_SIZES,
   UNREGISTERED_QUARTERLY_LIMITS,
+  readyToListGaps,
+  readyToListMessage,
   suggestedListingPrice,
   flipCost,
   flipNet,
@@ -20,7 +25,10 @@ import {
   type FeePresets,
   type FlipChannel,
   type FlipListing,
+  type ListingChannel,
+  type ListingChannelStatus,
   type ListingCondition,
+  type ParcelSize,
 } from "./profit";
 import { dayMonth, dayMonthYear, formatDate } from "./format";
 import type { Flip, FlipImport, FlipPhoto, ResaleListingDraft } from "./types";
@@ -301,8 +309,8 @@ function SellDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; feePre
   );
 }
 
-/** The marketplaces the browser extension fills. */
-const LISTING_PLATFORMS = FLIP_CHANNELS.filter((channel) => channel !== "Other");
+/** The marketplaces the browser extension fills and Hatbot posts on. */
+const LISTING_PLATFORMS = LISTING_CHANNELS;
 const MAX_PHOTO_EDGE = 2000;
 
 /**
@@ -342,6 +350,7 @@ function ListingDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; fee
   const [description, setDescription] = useState(draft?.description ?? "");
   const [condition, setCondition] = useState<ListingCondition | "">(draft?.condition ?? "");
   const [category, setCategory] = useState(draft?.category ?? "");
+  const [delivery, setDelivery] = useState(draft?.delivery ?? NO_DELIVERY);
   // Remembered in this browser, like the search page's AI toggle.
   const [nines, setNines] = useState(() => localStorage.getItem("scout-listing-round-nines") === "1");
   const [basePrice, setBasePrice] = useState(draft?.basePrice ? String(draft.basePrice) : "");
@@ -442,6 +451,7 @@ function ListingDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; fee
       description,
       condition: condition || null,
       ...(category.trim() ? { category: category.trim() } : {}),
+      delivery,
       basePrice: Number.isFinite(base) && base > 0 ? base : null,
       prices: Object.fromEntries(LISTING_PLATFORMS.flatMap((channel) => { const price = priceFor(channel); return price ? [[channel, price]] : []; })),
     };
@@ -491,6 +501,14 @@ function ListingDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; fee
           })}
         </div>
       </div>
+      <div className="field-label">
+        <span>Delivery <span>OLX and Allegro Lokalnie need shipping or pickup; Vinted needs the parcel size</span></span>
+        <div className="listing-delivery">
+          <label className="check-option"><input type="checkbox" checked={delivery.shipping} onChange={(event) => setDelivery((current) => ({ ...current, shipping: event.target.checked }))} /><span><strong>Shipping</strong></span></label>
+          <label className="check-option"><input type="checkbox" checked={delivery.pickup} onChange={(event) => setDelivery((current) => ({ ...current, pickup: event.target.checked }))} /><span><strong>Pickup in person</strong></span></label>
+          <label className="field-label">Vinted parcel size<select value={delivery.parcelSize ?? ""} onChange={(event) => setDelivery((current) => ({ ...current, parcelSize: (event.target.value || null) as ParcelSize | null }))}><option value="">Not set</option>{PARCEL_SIZES.map((size) => <option key={size} value={size}>{PARCEL_SIZE_LABELS[size]}</option>)}</select></label>
+        </div>
+      </div>
       <label className="check-option check-option--inline listing-nines" title="1450 becomes 1449,99 and 1525 becomes 1529,99; prices under 5 zł stay as they are">
         <input type="checkbox" checked={nines} onChange={(event) => { setNines(event.target.checked); localStorage.setItem("scout-listing-round-nines", event.target.checked ? "1" : "0"); }} />
         <span><strong>End prices in …9,99</strong><small>Rounds each asking price to the nearest one, like 1449,99 or 1529,99</small></span>
@@ -518,6 +536,97 @@ function ListingDialog({ flip, feePresets, onClose, onSaved }: { flip: Flip; fee
         </div>
         <small className="field-hint">Photos are resized to at most 2000 px and stored as WebP on your Scout server. The iOS app can add them straight from your phone.</small>
       </div>
+      {error ? <div className="form-error" role="alert"><AlertTriangle size={15} />{error}</div> : null}
+    </Modal>
+  );
+}
+
+const PARCEL_SIZE_LABELS: Record<ParcelSize, string> = { small: "Small (fits a shoebox)", medium: "Medium (a larger box)", large: "Large (a moving box)" };
+
+export const LISTING_STATUS_LABELS: Record<ListingChannelStatus, string> = {
+  ready: "Waiting for Hatbot",
+  listed: "Listed",
+  failed: "Failed",
+  declined: "Declined in Hatbot",
+};
+
+/**
+ * "Ready to list": Hatbot asks you once in its chat, then posts the flip's
+ * listing draft on the picked marketplaces and sends each link back.
+ */
+function ReadyDialog({ flip, onClose, onSaved, onEditListing }: { flip: Flip; onClose: () => void; onSaved: (flip: Flip, message: string) => void; onEditListing: () => void }) {
+  const listed = flip.listingChannels.filter((item) => item.status === "listed").map((item) => item.channel);
+  const [channels, setChannels] = useState<ListingChannel[]>(() => flip.readyToList
+    ? flip.listingChannels.map((item) => item.channel)
+    : LISTING_CHANNELS.filter((channel) => listed.includes(channel) || flip.listing?.prices[channel]));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const gaps = readyToListGaps(flip.listing, flip.photos.length, channels);
+  const retrying = flip.listingChannels.some((item) => (item.status === "failed" || item.status === "declined") && channels.includes(item.channel));
+  const run = async (action: () => Promise<{ flip: Flip }>, message: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      onSaved((await action()).flip, message);
+    } catch (saveError) {
+      setError(errorMessage(saveError));
+      setBusy(false);
+    }
+  };
+  const toggle = (channel: ListingChannel) => setChannels((current) => current.includes(channel) ? current.filter((item) => item !== channel) : LISTING_CHANNELS.filter((item) => item === channel || current.includes(item)));
+  return (
+    <Modal
+      kicker={flip.title}
+      title="Ready to list"
+      onClose={onClose}
+      busy={busy}
+      footer={<>
+        {flip.readyToList ? <button className="outline-button danger-outline ready-cancel" disabled={busy} onClick={() => void run(() => api.cancelReadyToList(flip.id), `${flip.title} is no longer ready to list.`)}>Cancel listing</button> : null}
+        <button className="outline-button" disabled={busy} onClick={onClose}>Close</button>
+        <button className="primary-button" disabled={busy || !channels.length || gaps.length > 0} onClick={() => void run(() => api.markReadyToList(flip.id, channels), `${flip.title} is ready to list. Hatbot will ask you before posting it.`)}>
+          {busy ? <LoaderCircle size={17} className="spin" /> : <Send size={17} />}{flip.readyToList ? (retrying ? "Retry" : "Update") : "Ready to list"}
+        </button>
+      </>}
+    >
+      <p className="field-hint">Hatbot asks you once in its chat, then Haggler posts the listing on each marketplace from its browser and sends the link back here. Editing the listing afterwards makes Hatbot ask again.</p>
+      <div className="field-label">
+        <span>List on</span>
+        <div className="source-options">
+          {LISTING_CHANNELS.map((channel) => (
+            <button
+              key={channel}
+              type="button"
+              className={`source-option ${channels.includes(channel) ? "source-option--selected" : ""}`}
+              aria-pressed={channels.includes(channel)}
+              disabled={busy || listed.includes(channel)}
+              title={listed.includes(channel) ? "Already listed there" : undefined}
+              onClick={() => toggle(channel)}
+            >
+              {channel}
+              {channels.includes(channel) ? <Check size={15} /> : null}
+            </button>
+          ))}
+        </div>
+      </div>
+      {channels.length && gaps.length ? (
+        <div className="form-error" role="status">
+          <AlertTriangle size={15} />{readyToListMessage(gaps)}{" "}
+          <button type="button" className="panel-link" onClick={onEditListing}>Edit listing</button>
+        </div>
+      ) : null}
+      {flip.listingChannels.length ? (
+        <ul className="ready-channels" aria-label="Posting status">
+          {flip.listingChannels.map((item) => (
+            <li key={item.channel}>
+              <strong>{item.channel}</strong>
+              <span className={`status-pill ${item.status === "failed" ? "status-pill--degraded" : item.status === "ready" ? "status-pill--idle" : item.status === "declined" ? "status-pill--warning" : ""}`}><i />{LISTING_STATUS_LABELS[item.status]}</span>
+              {item.url ? <a href={item.url} target="_blank" rel="noopener noreferrer" className="panel-link">Open listing <ExternalLink size={13} /></a> : null}
+              {item.error ? <small>{item.error}</small> : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {flip.listingChannels.some((item) => item.status === "failed" || item.status === "declined") ? <small className="field-hint">Retry sends failed and declined marketplaces to Hatbot again.</small> : null}
       {error ? <div className="form-error" role="alert"><AlertTriangle size={15} />{error}</div> : null}
     </Modal>
   );
@@ -566,6 +675,7 @@ export default function FlipsPage({ onToast }: { onToast: (message: string, type
   const [editing, setEditing] = useState<Flip | "new" | null>(null);
   const [selling, setSelling] = useState<Flip | null>(null);
   const [listing, setListing] = useState<Flip | null>(null);
+  const [readying, setReadying] = useState<Flip | null>(null);
   const today = todayDate();
   const current = quarterOf(today);
   const [recordQuarter, setRecordQuarter] = useState(`${current.year}-Q${current.quarter}`);
@@ -704,7 +814,7 @@ export default function FlipsPage({ onToast }: { onToast: (message: string, type
               const net = flipNet(flip);
               return (
                 <div className="flips-row" role="row" key={flip.id}>
-                  <span><strong>{flip.title}</strong>{flip.note ? <small>{flip.note}</small> : null}{!flip.soldOn && flip.listedOn.length ? <small>Listed on {flip.listedOn.join(", ")}</small> : null}{!flip.soldOn && (flip.listing || flip.photos.length) ? <small>Listing ready{flip.photos.length ? ` · ${flip.photos.length} photo${flip.photos.length === 1 ? "" : "s"}` : ""}</small> : null}</span>
+                  <span><strong>{flip.title}</strong>{flip.note ? <small>{flip.note}</small> : null}{!flip.soldOn && flip.listedOn.length ? <small>Listed on {flip.listedOn.join(", ")}</small> : null}{!flip.soldOn && !flip.readyToList && (flip.listing || flip.photos.length) ? <small>Listing draft{flip.photos.length ? ` · ${flip.photos.length} photo${flip.photos.length === 1 ? "" : "s"}` : ""}</small> : null}{flip.listingChannels.length ? <small className="ready-summary">{flip.readyToList ? "Ready to list: " : ""}{flip.listingChannels.map((item, index) => <span key={item.channel}>{index ? " · " : ""}{item.url ? <a href={item.url} target="_blank" rel="noopener noreferrer">{item.channel} {LISTING_STATUS_LABELS[item.status].toLowerCase()}</a> : `${item.channel} ${LISTING_STATUS_LABELS[item.status].toLowerCase()}`}</span>)}</small> : null}</span>
                   <span data-label="Bought">{formatDay(flip.boughtOn)}<small>{flip.buyChannel}</small></span>
                   <span data-label="Cost">{formatZl(flipCost(flip))}</span>
                   {flip.soldOn ? <span data-label="Sold">{formatZl(flip.salePrice!)}<small>{formatDay(flip.soldOn)} · {flip.saleChannel}{flip.saleFee ? ` · fee ${formatZl(flip.saleFee)}` : ""}</small></span> : <span className="flips-row-empty" />}
@@ -716,6 +826,7 @@ export default function FlipsPage({ onToast }: { onToast: (message: string, type
                       items={[
                         ...(flip.soldOn ? [{ label: "Edit sale", icon: <Pencil size={15} />, onSelect: () => setSelling(flip) }] : []),
                         ...(!flip.soldOn && feePresets ? [{ label: "Listing text and photos", icon: <Megaphone size={15} />, onSelect: () => setListing(flip) }] : []),
+                        ...(!flip.soldOn ? [{ label: flip.readyToList ? "Ready to list: status" : "Ready to list…", icon: <Send size={15} />, onSelect: () => setReadying(flip) }] : []),
                         { label: flip.soldOn ? "Edit purchase" : "Edit", icon: <Pencil size={15} />, onSelect: () => setEditing(flip) },
                         ...(flip.soldOn ? [{ label: "Remove sale", icon: <RotateCcw size={15} />, onSelect: () => void unsell(flip) }] : []),
                         { label: "Delete", icon: <Trash2 size={15} />, danger: true, onSelect: () => void remove(flip) },
@@ -771,6 +882,7 @@ export default function FlipsPage({ onToast }: { onToast: (message: string, type
 
       {editing ? <FlipDialog flip={editing === "new" ? null : editing} onClose={() => setEditing(null)} onSaved={(flip) => { replaceFlip(flip); setEditing(null); onToast(`${flip.title} saved.`); }} /> : null}
       {listing && feePresets ? <ListingDialog flip={listing} feePresets={feePresets} onClose={() => { setListing(null); void load(); }} onSaved={(flip) => { replaceFlip(flip); setListing(null); onToast(`Listing for ${flip.title} saved.`); }} /> : null}
+      {readying ? <ReadyDialog flip={readying} onClose={() => setReadying(null)} onSaved={(flip, message) => { replaceFlip(flip); setReadying(null); onToast(message); }} onEditListing={() => { setListing(readying); setReadying(null); }} /> : null}
       {selling && feePresets ? <SellDialog flip={selling} feePresets={feePresets} onClose={() => setSelling(null)} onSaved={(flip) => { replaceFlip(flip); setSelling(null); onToast(`Sale of ${flip.title} recorded.`); }} /> : null}
     </>
   );
