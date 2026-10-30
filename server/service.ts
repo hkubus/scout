@@ -13,7 +13,7 @@ import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVa
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyChecksWithJev, classifyWatchVariantWithJev, summarizeCheckResults, checkIssue, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
 import { DEFAULT_VISION_MODEL, VisionError, classifyListingRelevanceWithVision, readPurchaseScreenshotWithVision, resolveVisionModel, verifyListingDescriptionWithVision, visionToVerification } from './vision';
 import { MAX_FLIP_PHOTO_BYTES, flipFromRow, sniffImageMime, toWebp } from './flips';
-import { InboxError, MarketplaceInbox, isSessionRenewalRequest } from './inbox';
+import { InboxError, MarketplaceInbox, hasRefreshToken, isSessionRenewalRequest, withoutRefreshTokens } from './inbox';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { Limiter, mapPool } from './limiter';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, percentile, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
@@ -2377,8 +2377,8 @@ export class ScoutService {
     }));
   }
 
-  // revision moves only when the session is imported again, so a connected app
-  // copies a session once per import instead of on every poll.
+  // revision moves when the session is imported again or Scout renews its token,
+  // so a connected app copies a session once per change instead of on every poll.
   private sharedSessionInfo(row: Record<string, any>) {
     return {
       marketplace: row.marketplace as Marketplace,
@@ -2390,19 +2390,29 @@ export class ScoutService {
   // Without sign-in anyone who reaches Scout can connect an app, so nothing is shared then, even
   // sessions shared before sign-in was turned off.
   /** The sessions the operator shared with connected apps, without their cookies. */
-  sharedMarketplaceSessions() {
+  async sharedMarketplaceSessions() {
     if (!this.authEnabled) return [];
-    return (this.stmt('SELECT * FROM marketplace_sessions WHERE shared_with_apps = 1 ORDER BY marketplace').all() as Array<Record<string, any>>)
-      .map((row) => this.sharedSessionInfo(row));
+    const shared = () => this.stmt('SELECT * FROM marketplace_sessions WHERE shared_with_apps = 1 ORDER BY marketplace').all() as Array<Record<string, any>>;
+    // The app's copy has no refresh token, so it lasts as long as the access
+    // token: renew one about to run out, and the new revision hands it over.
+    for (const row of shared()) await this.renewSharedSession(row.marketplace as Marketplace);
+    return shared().map((row) => this.sharedSessionInfo(row));
   }
 
-  /** One shared session with its Playwright storage state, for a connected app's own browser. */
-  sharedMarketplaceSession(marketplace: Marketplace) {
+  /** One shared session with its Playwright storage state, without refresh tokens, for a connected app's own browser. */
+  async sharedMarketplaceSession(marketplace: Marketplace) {
+    const notShared = () => new ServiceError(`The ${marketplace} session isn't shared with connected apps`, 404);
+    if (!this.marketplaceSessionRow(marketplace)?.shared_with_apps || !this.authEnabled) throw notShared();
+    await this.renewSharedSession(marketplace);
     const row = this.marketplaceSessionRow(marketplace);
-    if (!row || !row.shared_with_apps || !this.authEnabled) throw new ServiceError(`The ${marketplace} session isn't shared with connected apps`, 404);
-    const storageState = this.readMarketplaceSession(marketplace);
-    if (!storageState) throw new ServiceError(`The ${marketplace} session isn't shared with connected apps`, 404);
-    return { ...this.sharedSessionInfo(row), storageState };
+    const storageState = row?.shared_with_apps ? this.readMarketplaceSession(marketplace) : null;
+    if (!row || !storageState) throw notShared();
+    return { ...this.sharedSessionInfo(row), storageState: withoutRefreshTokens(storageState) };
+  }
+
+  /** A failed renewal is recorded on the session; the app still gets what Scout has. */
+  private async renewSharedSession(marketplace: Marketplace) {
+    if (marketplaces.includes(marketplace)) await this.inbox.freshSession(marketplace).catch(() => undefined);
   }
 
   private sessionChecksInFlight = new Map<Marketplace, Promise<SessionCheckOutcome & { marketplace: Marketplace; checkedAt: string }>>();
@@ -2418,17 +2428,26 @@ export class ScoutService {
     if (pending) return pending;
     const row = this.marketplaceSessionRow(marketplace);
     if (!row) return Promise.reject(new ServiceError('Marketplace session not found', 404));
-    const ciphertext = String(row.storage_state_encrypted);
+    let ciphertext = String(row.storage_state_encrypted);
     const check = (async () => {
       let outcome: SessionCheckOutcome;
       try {
         const stored = this.readMarketplaceSession(marketplace);
         // Renew first, as page renders do: the probe's browser blocks the
         // page's own renewal, so an expired access token would read as signed out.
-        const state = stored && await this.inbox.freshSession(marketplace).then((session) => session.state, () => stored);
-        outcome = state
-          ? await this.marketplaceRequest(marketplace, () => this.browserLimiter.run(() => this.probeMarketplaceSession(marketplace, state)))
-          : { signedIn: null, detail: 'No stored session' };
+        const renewal = stored && await this.inbox.freshSession(marketplace).then((session) => ({ session, error: null }), (error: unknown) => ({ session: null, error }));
+        // A renewal rewrites the row; the check belongs to the renewed session.
+        if (renewal?.session) ciphertext = renewal.session.version;
+        const renewalError = renewal?.error instanceof Error ? renewal.error.message : renewal?.error ? String(renewal.error) : null;
+        if (!stored || !renewal) outcome = { signedIn: null, detail: 'No stored session' };
+        else {
+          const state = renewal.session?.state ?? stored;
+          outcome = await this.marketplaceRequest(marketplace, () => this.browserLimiter.run(() => this.probeMarketplaceSession(marketplace, state)));
+          // A page that tells neither way after a refused renewal (Vinted's /session-refresh) is signed out.
+          const refused = renewal.error instanceof InboxError && renewal.error.status === 401 && hasRefreshToken(marketplace, stored, Date.now() / 1000);
+          if (refused && outcome.signedIn === null) outcome = { signedIn: false, detail: `Signed out: ${marketplace} refused to renew the session's token; ${outcome.detail}` };
+          else if (renewalError && outcome.signedIn !== true) outcome = { ...outcome, detail: `${outcome.detail} (renewing the token first failed: ${renewalError})` };
+        }
       } catch (error) {
         outcome = { signedIn: null, detail: `Check failed: ${error instanceof Error ? error.message : String(error)}` };
       }

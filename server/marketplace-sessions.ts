@@ -146,5 +146,9 @@ export function classifySessionCheck(marketplace: Marketplace, finalUrl: string,
   if (!isApprovedMarketplaceSessionHost(marketplace, host)) return { signedIn: null, detail: `The account page ended off ${marketplace} (${host})` };
   if (status !== null && (status < 200 || status >= 400)) return { signedIn: null, detail: `The account page answered ${status}; could not tell whether the session is signed in` };
   if (under(page.accountPaths)) return { signedIn: true, detail: 'Signed in: the account page opened' };
+  // Vinted sends an expired access token to /session-refresh, whose script renews it; Scout's browser blocks that.
+  if (marketplace === 'Vinted' && under(['/session-refresh'])) {
+    return { signedIn: null, detail: `The account page went to renew an expired access token (${where}); Scout's own renewal did not take` };
+  }
   return { signedIn: null, detail: `The account page ended on ${where}; could not tell whether the session is signed in` };
 }

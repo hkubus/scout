@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase } from '../server/db';
 import {
   InboxError, cookieHeader, isSessionRenewalRequest, jwtExpiry, mergeSetCookies, parseAllegroInbox, parseAllegroMessages,
-  parseAllegroSubject, parseConversationKey, parseOlxConversations, parseVintedConversation, parseVintedInbox,
+  parseAllegroSubject, parseConversationKey, parseOlxConversations, parseVintedConversation, parseVintedInbox, withoutRefreshTokens,
 } from '../server/inbox';
 import type { MarketplaceStorageState } from '../server/marketplace-sessions';
 import { ScoutService } from '../server/service';
@@ -43,14 +44,15 @@ function marketplace(route: (call: Call, url: URL) => Response | Promise<Respons
   return { calls, fetch, paths };
 }
 
-function fixture(inboxFetch: (url: string, init: RequestInit) => Promise<Response>) {
+function fixture(inboxFetch: (url: string, init: RequestInit) => Promise<Response>, authEnabled = false) {
   const directory = mkdtempSync(join(tmpdir(), 'scout-inbox-'));
   const db = openDatabase(join(directory, 'scout.sqlite'));
-  const service = new ScoutService(db, () => {}, { suggestVariantGroups: async () => [], inboxFetch });
+  const service = new ScoutService(db, () => {}, { suggestVariantGroups: async () => [], inboxFetch, authEnabled });
   return { db, service, close: () => { db.close(); rmSync(directory, { recursive: true, force: true }); } };
 }
 
 const sessionRow = (service: ScoutService, name: Marketplace) => service.marketplaceSessions().find((row) => row.marketplace === name)!;
+const createRevision = (value: string) => createHash('sha256').update(value).digest('hex').slice(0, 16);
 const ciphertext = (db: ReturnType<typeof openDatabase>, name: Marketplace) => (db.prepare('SELECT storage_state_encrypted AS value FROM marketplace_sessions WHERE marketplace = ?').get(name) as { value: string }).value;
 
 function vintedState(accessExpiry: number, refresh = 'refresh-1'): MarketplaceStorageState {
@@ -487,5 +489,67 @@ test('Allegro Lokalnie: unreachable, blocked, HTML and signed-out responses are 
     await assert.rejects(inbox(), { status: 401, message: /Allegro Lokalnie session has expired or was signed out: re-import the session/ });
     assert.equal(sessionRow(context.service, 'Allegro Lokalnie').connected, false);
     assert.equal(fake.calls.length, 4, 'errors are not cached and nothing is retried');
+  } finally { context.close(); }
+});
+
+// ---- Shared sessions and session checks ------------------------------------------------
+
+test('a shared session has no refresh tokens, so the app\'s browser cannot rotate Scout\'s', () => {
+  const vinted = withoutRefreshTokens(vintedState(TS + 3_600));
+  assert.deepEqual(vinted.cookies.map((cookie) => cookie.name), ['access_token_web', 'anon_id']);
+  const olx = olxState(TS + 900);
+  const stripped = withoutRefreshTokens(olx);
+  const cache = JSON.parse(stripped.origins[0].localStorage!.find((item) => item.name === OLX_KEY)!.value);
+  assert.equal(cache.body.refresh_token, undefined);
+  assert.equal(cache.body.access_token, jwt(TS + 900), 'the access token stays');
+  assert.deepEqual(stripped.cookies, olx.cookies);
+  assert.match(JSON.stringify(olx), /olx-refresh-1/, 'the input is left alone');
+});
+
+test('sharing a Vinted session renews an expiring token first and moves the revision', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: T });
+  const fake = marketplace((call) => (call.method === 'POST' ? vintedRenewal(jwt(TS + 7_200), 'refresh-2') : json({}, 500)));
+  const context = fixture(fake.fetch, true);
+  try {
+    context.service.saveMarketplaceSession('Vinted', 'test', vintedState(TS - 60));
+    context.service.shareMarketplaceSession('Vinted', true);
+    const before = createRevision(ciphertext(context.db, 'Vinted'));
+    const [listed] = await context.service.sharedMarketplaceSessions();
+    assert.deepEqual(fake.paths(), ['POST /web/api/auth/refresh']);
+    assert.notEqual(listed.revision, before, 'the renewal shows as a new revision');
+    const shared = await context.service.sharedMarketplaceSession('Vinted');
+    assert.equal(shared.revision, listed.revision);
+    assert.equal(fake.calls.length, 1, 'a fresh token is not renewed again');
+    assert.deepEqual(shared.storageState.cookies.map((cookie) => [cookie.name, cookie.value]), [['access_token_web', jwt(TS + 7_200)], ['anon_id', 'anon-1']]);
+    assert.match(JSON.stringify((context.service as any).readMarketplaceSession('Vinted')), /refresh-2/, 'Scout keeps the rotated refresh token');
+  } finally { context.close(); }
+});
+
+test('a session check after a refused renewal reads signed out, and one after a renewal is recorded', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: T });
+  let renewal = () => json({ code: 100 }, 401);
+  const fake = marketplace(() => renewal());
+  const context = fixture(fake.fetch);
+  const probed: string[] = [];
+  (context.service as any).probeMarketplaceSession = async (_: string, state: MarketplaceStorageState) => {
+    probed.push(cookieHeader(state, new URL('https://www.vinted.pl/'), TS));
+    return renewal === refused
+      ? { signedIn: null, detail: 'The account page went to renew an expired access token (www.vinted.pl/session-refresh)' }
+      : { signedIn: true, detail: 'Signed in: the account page opened' };
+  };
+  const refused = renewal;
+  try {
+    context.service.saveMarketplaceSession('Vinted', 'test', vintedState(TS - 60));
+    const out = await context.service.checkMarketplaceSession('Vinted');
+    assert.equal(out.signedIn, false);
+    assert.match(out.detail, /^Signed out: Vinted refused to renew the session's token; The account page went to renew/);
+    assert.equal(sessionRow(context.service, 'Vinted').signedIn, false);
+
+    renewal = () => vintedRenewal(jwt(TS + 7_200), 'refresh-2');
+    context.service.saveMarketplaceSession('Vinted', 'test', vintedState(TS - 60));
+    const renewed = await context.service.checkMarketplaceSession('Vinted');
+    assert.equal(renewed.signedIn, true);
+    assert.match(probed[1], new RegExp(`access_token_web=${jwt(TS + 7_200)}`), 'the probe used the renewed token');
+    assert.equal(sessionRow(context.service, 'Vinted').signedIn, true, 'the renewal rewrote the row, and the check still landed');
   } finally { context.close(); }
 });

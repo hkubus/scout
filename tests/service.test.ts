@@ -623,6 +623,10 @@ test('classifies the account page by where it ended up', () => {
   assert.equal(classifySessionCheck('OLX', 'https://www.olx.pl/myaccountant/', 200).signedIn, null, 'paths match whole segments');
   assert.equal(classifySessionCheck('Vinted', 'https://example.com/settings/profile', 200).signedIn, null, 'off the marketplace is neither');
   assert.equal(classifySessionCheck('Vinted', 'not a url', 200).signedIn, null);
+  // An expired access token sends Vinted's page to renew it, which Scout's browser blocks (2026-10-30).
+  const refresh = classifySessionCheck('Vinted', 'https://www.vinted.pl/session-refresh?ref_url=%2Fsettings%2Fprofile', 200);
+  assert.equal(refresh.signedIn, null);
+  assert.match(refresh.detail, /renew an expired access token \(www\.vinted\.pl\/session-refresh\)/);
 });
 
 test('a session check records signed in, signed out and undecided', async () => {

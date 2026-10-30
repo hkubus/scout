@@ -196,11 +196,43 @@ export function sessionTokenExpiry(marketplace: Marketplace, state: MarketplaceS
   return null;
 }
 
+/** Whether the session holds a refresh token Scout can renew it with (OLX, Vinted). */
+export function hasRefreshToken(marketplace: Marketplace, state: MarketplaceStorageState, nowSeconds: number) {
+  if (marketplace === 'OLX') return olxAuth(state) !== null;
+  if (marketplace === 'Vinted') return vintedCookie(state, 'refresh_token_web', nowSeconds) !== null;
+  return false;
+}
+
 /** Token-renewal calls Scout makes itself; Chromium renders with a stored session must not make them. */
 export function isSessionRenewalRequest(method: string, url: string) {
   if (method.toUpperCase() !== 'POST') return false;
   const bare = url.split(/[?#]/)[0];
   return bare === OLX_TOKEN_URL || bare === VINTED_REFRESH_URL;
+}
+
+/**
+ * A session for a connected app's own browser, without its refresh tokens.
+ * That browser runs the site's scripts, which renew an expired access token
+ * themselves (Vinted's /session-refresh page) and so spend the refresh token
+ * Scout holds, signing Scout out (seen 2026-10-30). Scout keeps renewing, and
+ * each renewal reaches the app as a new revision.
+ */
+export function withoutRefreshTokens(state: MarketplaceStorageState): MarketplaceStorageState {
+  return {
+    cookies: state.cookies.filter((cookie) => !/^refresh_token/i.test(cookie.name)),
+    origins: state.origins.map((origin) => ({
+      ...origin,
+      localStorage: (origin.localStorage ?? []).map((item) => {
+        if (!item.name.startsWith('@@auth0spajs@@::')) return item;
+        try {
+          const cache = JSON.parse(item.value) as { body?: Record<string, unknown> };
+          if (!cache.body || !('refresh_token' in cache.body)) return item;
+          const { refresh_token: _, ...body } = cache.body;
+          return { ...item, value: JSON.stringify({ ...cache, body }) };
+        } catch { return item; }
+      }),
+    })),
+  };
 }
 
 // ---- Parsers ------------------------------------------------------------------

@@ -509,7 +509,7 @@ test('without sign-in, nothing is shared: anyone on the network could connect an
     context.service.saveMarketplaceSession('OLX', '', olxState('first'));
     assert.throws(() => context.service.shareMarketplaceSession('OLX', true), /sign-in/);
     context.db.prepare('UPDATE marketplace_sessions SET shared_with_apps = 1').run();
-    assert.deepEqual(context.service.sharedMarketplaceSessions(), []);
-    assert.throws(() => context.service.sharedMarketplaceSession('OLX'), /isn't shared/);
+    assert.deepEqual(await context.service.sharedMarketplaceSessions(), []);
+    await assert.rejects(context.service.sharedMarketplaceSession('OLX'), /isn't shared/);
   } finally { context.close(); }
 });
