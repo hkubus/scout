@@ -401,18 +401,18 @@ export function registerScoutListingMcpTools(server: McpServer, flips: FlipStore
 /** Marketplace sessions shared with connected apps (Settings → Marketplace accounts). */
 export function registerScoutSessionMcpTools(server: McpServer, service: ScoutService) {
   server.registerTool('scout_shared_sessions', {
-    description: 'The marketplace browser sessions the owner shared with connected apps in Scout, each {marketplace, label, revision}, without cookies. revision changes only when the owner imports the session again.',
+    description: 'The marketplace browser sessions the owner shared with connected apps in Scout, each {marketplace, label, revision}, without cookies. revision changes when the owner imports the session again or Scout renews its token; fetch the session again then.',
     annotations: { readOnlyHint: true },
   }, async () => {
-    try { return text({ sessions: service.sharedMarketplaceSessions() }); } catch (error) { return toolError(error); }
+    try { return text({ sessions: await service.sharedMarketplaceSessions() }); } catch (error) { return toolError(error); }
   });
 
   server.registerTool('scout_shared_session', {
-    description: 'One shared marketplace browser session: {marketplace, label, revision, storageState}, where storageState is Playwright storage state (cookies and localStorage) for that marketplace\'s sites only. It signs a browser in, so keep it out of logs and model context.',
+    description: 'One shared marketplace browser session: {marketplace, label, revision, storageState}, where storageState is Playwright storage state (cookies and localStorage) for that marketplace\'s sites only, without refresh tokens: Scout renews the session, and a renewal shows as a new revision. It signs a browser in, so keep it out of logs and model context.',
     inputSchema: { marketplace: marketplace.describe('A marketplace from scout_shared_sessions.') },
     annotations: { readOnlyHint: true },
   }, async ({ marketplace: name }) => {
-    try { return text(service.sharedMarketplaceSession(name)); } catch (error) { return toolError(error); }
+    try { return text(await service.sharedMarketplaceSession(name)); } catch (error) { return toolError(error); }
   });
 }
 
