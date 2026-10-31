@@ -8,7 +8,6 @@ import { basename, join, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { listings as seedListings, watches as seedWatches } from '../src/data';
-import type { Marketplace } from '../src/types';
 import { validateSearchUrl } from './marketplaces';
 import { debugApiEnabled, ScoutDebug } from './debug';
 import { backupDatabase, openDatabase, seedDatabase, startWalCheckpointer } from './db';
@@ -19,9 +18,8 @@ import { CONSENT_PATH, isConnectedAppToken, isOAuthRoute, mcpChallenge, OAuthSto
 import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
 import { FlipStore, MAX_FLIP_PHOTO_BYTES, MAX_FLIP_PHOTOS } from './flips';
 import { FLIP_CHANNELS, LISTING_CHANNELS, LISTING_CONDITIONS, PARCEL_SIZES } from '../src/profit';
-import { dashboardTopParam, normalizeSourceIntervals, olxCategoryToJson, ScoutService, ServiceError } from './service';
+import { dashboardTopParam, ScoutService, ServiceError } from './service';
 import { fetchDiscardSummary } from './fetch-diagnostics';
-import { parseVariantGroups } from './variants';
 import { VERIFICATION_CHECKS_MAX, VERIFICATION_CHECK_MAX_CHARS } from './ai';
 
 const port = Number(process.env.PORT ?? 3001);
@@ -572,83 +570,7 @@ app.patch('/api/watches/:id', async (request, reply) => {
     verificationChecks: verificationChecksInput.optional(),
   }).strict().safeParse(request.body);
   if (!patchInput.success) return reply.code(400).send({ error: 'Invalid watch update', details: patchInput.error.flatten() });
-  const body = patchInput.data;
-  if (body.interval !== undefined && (!Number.isInteger(body.interval) || body.interval < 5 || body.interval > 1440)) return reply.code(400).send({ error: 'Interval must be between 5 and 1440 minutes' });
-  const current = db.prepare('SELECT min_price_pln, max_price_pln, sources_json, exact_urls_json, variant_groups_json FROM watches WHERE id = ?').get(params.data.id) as { min_price_pln: number | null; max_price_pln: number | null; sources_json: string; exact_urls_json: string; variant_groups_json: string } | undefined;
-  if (!current) return reply.code(404).send({ error: 'Watch not found' });
-  const sources = body.sources ?? JSON.parse(current.sources_json || '[]') as Marketplace[];
-  const exactUrls = body.exactUrls ?? JSON.parse(current.exact_urls_json || '[]') as string[];
-  for (const url of exactUrls) {
-    const valid = validateSearchUrl(url);
-    if (!valid.valid || !sources.includes(valid.marketplace)) return reply.code(400).send({ error: valid.valid ? 'Exact URL source is not selected' : valid.reason });
-  }
-  const nextMin = body.minPrice === undefined ? current.min_price_pln : body.minPrice;
-  const nextMax = body.maxPrice === undefined ? current.max_price_pln : body.maxPrice;
-  if (nextMin !== null && nextMax !== null && nextMin > nextMax) return reply.code(400).send({ error: 'Minimum price cannot exceed maximum price' });
-  const fields: string[] = [];
-  const values: unknown[] = [];
-  if (body.name !== undefined) { fields.push('name = ?'); values.push(body.name); }
-  if (body.query !== undefined) { fields.push('query = ?'); values.push(body.query); }
-  if (body.terms !== undefined) { fields.push('included_terms = ?'); values.push(body.terms); }
-  if (body.excluded !== undefined) { fields.push('excluded_terms = ?'); values.push(body.excluded); }
-  if (body.sources !== undefined) { fields.push('sources_json = ?'); values.push(JSON.stringify(body.sources)); }
-  if (body.condition !== undefined) { fields.push('condition = ?'); values.push(body.condition); }
-  if (body.exactUrls !== undefined) { fields.push('exact_urls_json = ?'); values.push(JSON.stringify(body.exactUrls)); }
-  if (body.sensitivity !== undefined) { fields.push('sensitivity = ?'); values.push(body.sensitivity); }
-  if (typeof body.enabled === 'boolean') { fields.push('enabled = ?'); values.push(body.enabled ? 1 : 0); }
-  if (body.interval !== undefined) { fields.push('interval_minutes = ?'); values.push(body.interval); }
-  if (body.sourceIntervals !== undefined) { fields.push('source_intervals_json = ?'); values.push(JSON.stringify(normalizeSourceIntervals(sources, body.sourceIntervals))); }
-  if (typeof body.shippingOnly === 'boolean') { fields.push('shipping_only = ?'); values.push(body.shippingOnly ? 1 : 0); }
-  if (typeof body.aiRelevance === 'boolean') { fields.push('ai_relevance = ?'); values.push(body.aiRelevance ? 1 : 0); }
-  if (typeof body.typoVariants === 'boolean') { fields.push('typo_variants = ?'); values.push(body.typoVariants ? 1 : 0); }
-  // The edit dialog always resends the groups, so only a real change counts
-  // as the user taking over from automatic generation.
-  const groupsChanged = body.variantGroups !== undefined && JSON.stringify(body.variantGroups) !== JSON.stringify(parseVariantGroups(current.variant_groups_json));
-  if (groupsChanged) { fields.push('variant_groups_json = ?'); values.push(JSON.stringify(body.variantGroups)); }
-  if (body.variantGroupsAuto !== undefined || groupsChanged) {
-    const groupsAfter = groupsChanged ? body.variantGroups! : parseVariantGroups(current.variant_groups_json);
-    fields.push('variant_groups_auto = ?');
-    values.push(body.variantGroupsAuto && !groupsAfter.length ? 1 : 0);
-    // A fresh opt-in starts over rather than waiting for the watch to grow.
-    if (body.variantGroupsAuto) fields.push('variant_groups_auto_checked = 0');
-  }
-  if (body.referenceMarketWatchId !== undefined) {
-    if (body.referenceMarketWatchId && !db.prepare('SELECT 1 FROM market_watches WHERE id = ?').get(body.referenceMarketWatchId)) {
-      return reply.code(400).send({ error: 'Reference research watch not found' });
-    }
-    fields.push('reference_market_watch_id = ?');
-    values.push(body.referenceMarketWatchId);
-  }
-  if (body.minPrice !== undefined) { fields.push('min_price_pln = ?'); values.push(body.minPrice); }
-  if (body.maxPrice !== undefined) { fields.push('max_price_pln = ?'); values.push(body.maxPrice); }
-  if (body.olxCategory !== undefined) { fields.push('olx_category_json = ?'); values.push(olxCategoryToJson(body.olxCategory)); }
-  if (body.sellerType !== undefined) { fields.push('seller_type = ?'); values.push(body.sellerType); }
-  if (typeof body.ignorePromoted === 'boolean') { fields.push('ignore_promoted = ?'); values.push(body.ignorePromoted ? 1 : 0); }
-  if (body.targetPrice !== undefined) { fields.push('target_price_pln = ?'); values.push(body.targetPrice); }
-  // A 0 zł floor is no floor.
-  if (body.minSaving !== undefined) { fields.push('min_saving_pln = ?'); values.push(body.minSaving || null); }
-  if (body.verificationChecks !== undefined) { fields.push('verification_checks_json = ?'); values.push(JSON.stringify(body.verificationChecks)); }
-  if (body.archived !== undefined) {
-    fields.push('archived_at = ?');
-    values.push(body.archived ? nowIso() : null);
-    if (body.enabled === undefined) {
-      fields.push('enabled = ?');
-      values.push(body.archived ? 0 : 1);
-    }
-  }
-  if (!fields.length) {
-    // Resending the current groups unchanged is a valid no-op.
-    if (body.variantGroups !== undefined) return { ok: true };
-    return reply.code(400).send({ error: 'No supported fields' });
-  }
-  values.push(nowIso(), params.data.id);
-  const result = db.prepare(`UPDATE watches SET ${fields.join(', ')}, updated_at = ? WHERE id = ?`).run(...(values as any[]));
-  if (!result.changes) return reply.code(404).send({ error: 'Watch not found' });
-  // Repartition the watch's saved listings immediately when the model groups
-  // change; otherwise the new keys would only converge one scan at a time.
-  if (groupsChanged) service.retagWatchVariants(params.data.id);
-  emit('watch', { id: params.data.id, archived: body.archived });
-  return { ok: true };
+  return service.updateWatch(params.data.id, patchInput.data);
 });
 
 const searchInput = z.object({
@@ -863,7 +785,6 @@ app.post('/api/market-watches', async (request, reply) => {
   const now = nowIso();
   const watch = service.createMarketWatch({ id, name: value.name, query: value.query, terms: value.terms, excluded: value.excluded, condition: value.condition, sources: value.sources, intervalHours: value.intervalHours, minPrice: value.minPrice, maxPrice: value.maxPrice, shippingOnly: value.shippingOnly, typoVariants: value.typoVariants, olxCategory: value.olxCategory });
   service.queueMarketScan(id);
-  emit('market-watch', { refresh: true, id });
   return reply.code(201).send({ watch });
 });
 
@@ -1112,7 +1033,7 @@ app.get('/events', async (request, reply) => {
 // The MCP SDK (~40 MB RSS) loads on the first /mcp request, not at startup.
 let mcpModules: Promise<[typeof import('./mcp'), typeof import('@modelcontextprotocol/sdk/server/streamableHttp.js')]> | undefined;
 // Live marketplace fetches keep the 30/min cap the dashboard's searches have, even for a connected app.
-const LIVE_MCP_TOOLS = new Set(['scout_search', 'scout_olx_categories', 'scout_queue_scan']);
+const LIVE_MCP_TOOLS = new Set(['scout_search', 'scout_olx_categories', 'scout_queue_scan', 'scout_market_scan', 'scout_market_watch_create']);
 const callsLiveTool = (body: unknown) => (Array.isArray(body) ? body : [body]).some((message) => {
   const call = message as { method?: unknown; params?: { name?: unknown } } | null;
   return call?.method === 'tools/call' && LIVE_MCP_TOOLS.has(String(call.params?.name));

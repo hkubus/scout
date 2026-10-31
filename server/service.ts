@@ -254,6 +254,15 @@ function jevCheckConcurrency() {
 }
 
 /** A new deal watch, with every default already filled in. */
+export interface WatchPatch {
+  name?: string; query?: string; terms?: string; excluded?: string; sources?: Marketplace[];
+  condition?: string; exactUrls?: string[]; sensitivity?: number; enabled?: boolean; interval?: number;
+  sourceIntervals?: Record<string, number>; shippingOnly?: boolean; aiRelevance?: boolean; typoVariants?: boolean;
+  variantGroups?: VariantGroup[]; variantGroupsAuto?: boolean; referenceMarketWatchId?: string | null; archived?: boolean;
+  minPrice?: number | null; maxPrice?: number | null; olxCategory?: OlxCategory | null; sellerType?: SellerType | null;
+  ignorePromoted?: boolean; targetPrice?: number | null; minSaving?: number | null; verificationChecks?: VerificationCheck[];
+}
+
 export interface NewWatch {
   id?: string;
   name: string;
@@ -4642,6 +4651,7 @@ export class ScoutService {
       this.stmt('INSERT INTO market_watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, interval_hours, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, enabled, active_version_id, next_scan_at, last_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?)').run(input.id, input.name, input.query, input.terms, input.excluded, NO_LOCATION_FILTER, input.condition, JSON.stringify(input.sources), input.intervalHours, input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, input.typoVariants ? 1 : 0, olxCategory, versionId, now, now, now);
       this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, input.id, input.query, input.terms, input.excluded, NO_LOCATION_FILTER, input.condition, JSON.stringify(input.sources), input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, input.typoVariants ? 1 : 0, olxCategory, now);
     });
+    this.emit('market-watch', { refresh: true, id: input.id });
     return this.marketResearch().watches.find((watch) => watch.id === input.id)!;
   }
 
@@ -5319,6 +5329,86 @@ export class ScoutService {
     for (const count of this.connectorRunCounts().values()) total += count;
     const rows = this.stmt('SELECT * FROM connector_runs ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?').all(pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
     return { runs: rows.map((row) => ({ id: Number(row.id), source: row.source, status: row.status, message: row.message, startedAt: row.started_at, finishedAt: row.finished_at, duration: duration(row.started_at, row.finished_at) })), pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
+  }
+
+  /** Changes a deal watch; omitted fields keep their stored value. */
+  updateWatch(id: string, body: WatchPatch) {
+    if (body.interval !== undefined && (!Number.isInteger(body.interval) || body.interval < 5 || body.interval > 1440)) throw new ServiceError('Interval must be between 5 and 1440 minutes');
+    const current = this.db.prepare('SELECT min_price_pln, max_price_pln, sources_json, exact_urls_json, variant_groups_json FROM watches WHERE id = ?').get(id) as { min_price_pln: number | null; max_price_pln: number | null; sources_json: string; exact_urls_json: string; variant_groups_json: string } | undefined;
+    if (!current) throw new ServiceError('Watch not found', 404);
+    const sources = body.sources ?? JSON.parse(current.sources_json || '[]') as Marketplace[];
+    const exactUrls = body.exactUrls ?? JSON.parse(current.exact_urls_json || '[]') as string[];
+    for (const url of exactUrls) {
+      const valid = validateSearchUrl(url);
+      if (!valid.valid || !sources.includes(valid.marketplace)) throw new ServiceError(valid.valid ? 'Exact URL source is not selected' : valid.reason);
+    }
+    const nextMin = body.minPrice === undefined ? current.min_price_pln : body.minPrice;
+    const nextMax = body.maxPrice === undefined ? current.max_price_pln : body.maxPrice;
+    if (nextMin !== null && nextMax !== null && nextMin > nextMax) throw new ServiceError('Minimum price cannot exceed maximum price');
+    const fields: string[] = [];
+    const values: unknown[] = [];
+    if (body.name !== undefined) { fields.push('name = ?'); values.push(body.name); }
+    if (body.query !== undefined) { fields.push('query = ?'); values.push(body.query); }
+    if (body.terms !== undefined) { fields.push('included_terms = ?'); values.push(body.terms); }
+    if (body.excluded !== undefined) { fields.push('excluded_terms = ?'); values.push(body.excluded); }
+    if (body.sources !== undefined) { fields.push('sources_json = ?'); values.push(JSON.stringify(body.sources)); }
+    if (body.condition !== undefined) { fields.push('condition = ?'); values.push(body.condition); }
+    if (body.exactUrls !== undefined) { fields.push('exact_urls_json = ?'); values.push(JSON.stringify(body.exactUrls)); }
+    if (body.sensitivity !== undefined) { fields.push('sensitivity = ?'); values.push(body.sensitivity); }
+    if (typeof body.enabled === 'boolean') { fields.push('enabled = ?'); values.push(body.enabled ? 1 : 0); }
+    if (body.interval !== undefined) { fields.push('interval_minutes = ?'); values.push(body.interval); }
+    if (body.sourceIntervals !== undefined) { fields.push('source_intervals_json = ?'); values.push(JSON.stringify(normalizeSourceIntervals(sources, body.sourceIntervals))); }
+    if (typeof body.shippingOnly === 'boolean') { fields.push('shipping_only = ?'); values.push(body.shippingOnly ? 1 : 0); }
+    if (typeof body.aiRelevance === 'boolean') { fields.push('ai_relevance = ?'); values.push(body.aiRelevance ? 1 : 0); }
+    if (typeof body.typoVariants === 'boolean') { fields.push('typo_variants = ?'); values.push(body.typoVariants ? 1 : 0); }
+    // The edit dialog always resends the groups, so only a real change counts
+    // as the user taking over from automatic generation.
+    const groupsChanged = body.variantGroups !== undefined && JSON.stringify(body.variantGroups) !== JSON.stringify(parseVariantGroups(current.variant_groups_json));
+    if (groupsChanged) { fields.push('variant_groups_json = ?'); values.push(JSON.stringify(body.variantGroups)); }
+    if (body.variantGroupsAuto !== undefined || groupsChanged) {
+      const groupsAfter = groupsChanged ? body.variantGroups! : parseVariantGroups(current.variant_groups_json);
+      fields.push('variant_groups_auto = ?');
+      values.push(body.variantGroupsAuto && !groupsAfter.length ? 1 : 0);
+      // A fresh opt-in starts over rather than waiting for the watch to grow.
+      if (body.variantGroupsAuto) fields.push('variant_groups_auto_checked = 0');
+    }
+    if (body.referenceMarketWatchId !== undefined) {
+      if (body.referenceMarketWatchId && !this.db.prepare('SELECT 1 FROM market_watches WHERE id = ?').get(body.referenceMarketWatchId)) {
+        throw new ServiceError('Reference research watch not found');
+      }
+      fields.push('reference_market_watch_id = ?');
+      values.push(body.referenceMarketWatchId);
+    }
+    if (body.minPrice !== undefined) { fields.push('min_price_pln = ?'); values.push(body.minPrice); }
+    if (body.maxPrice !== undefined) { fields.push('max_price_pln = ?'); values.push(body.maxPrice); }
+    if (body.olxCategory !== undefined) { fields.push('olx_category_json = ?'); values.push(olxCategoryToJson(body.olxCategory)); }
+    if (body.sellerType !== undefined) { fields.push('seller_type = ?'); values.push(body.sellerType); }
+    if (typeof body.ignorePromoted === 'boolean') { fields.push('ignore_promoted = ?'); values.push(body.ignorePromoted ? 1 : 0); }
+    if (body.targetPrice !== undefined) { fields.push('target_price_pln = ?'); values.push(body.targetPrice); }
+    // A 0 zł floor is no floor.
+    if (body.minSaving !== undefined) { fields.push('min_saving_pln = ?'); values.push(body.minSaving || null); }
+    if (body.verificationChecks !== undefined) { fields.push('verification_checks_json = ?'); values.push(JSON.stringify(body.verificationChecks)); }
+    if (body.archived !== undefined) {
+      fields.push('archived_at = ?');
+      values.push(body.archived ? nowIso() : null);
+      if (body.enabled === undefined) {
+        fields.push('enabled = ?');
+        values.push(body.archived ? 0 : 1);
+      }
+    }
+    if (!fields.length) {
+      // Resending the current groups unchanged is a valid no-op.
+      if (body.variantGroups !== undefined) return { ok: true };
+      throw new ServiceError('No supported fields');
+    }
+    values.push(nowIso(), id);
+    const result = this.db.prepare(`UPDATE watches SET ${fields.join(', ')}, updated_at = ? WHERE id = ?`).run(...(values as any[]));
+    if (!result.changes) throw new ServiceError('Watch not found', 404);
+    // Repartition the watch's saved listings immediately when the model groups
+    // change; otherwise the new keys would only converge one scan at a time.
+    if (groupsChanged) this.retagWatchVariants(id);
+    this.emit('watch', { id, archived: body.archived });
+    return { ok: true };
   }
 
   deleteWatch(id: string) {
