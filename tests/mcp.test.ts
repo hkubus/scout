@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -9,7 +9,7 @@ import sharp from 'sharp';
 import { openDatabase } from '../server/db';
 import { FlipStore, sniffImageMime } from '../server/flips';
 import { ScoutService } from '../server/service';
-import { MCP_DASHBOARD_LISTINGS, SCOUT_MCP_LISTING_TOOL_NAMES, SCOUT_MCP_SESSION_TOOL_NAMES, SCOUT_MCP_TOOL_NAMES, createScoutMcpServer } from '../server/mcp';
+import { MCP_DASHBOARD_LISTINGS, SCOUT_MCP_FLIP_TOOL_NAMES, SCOUT_MCP_LISTING_TOOL_NAMES, SCOUT_MCP_SESSION_TOOL_NAMES, SCOUT_MCP_TOOL_NAMES, createScoutMcpServer } from '../server/mcp';
 
 if (process.env.SCOUT_JEV_MODE === undefined) process.env.SCOUT_JEV_MODE = 'legacy';
 
@@ -43,7 +43,7 @@ test('exposes the documented Scout tool surface', async () => {
       const listed = await client.listTools();
       assert.deepEqual(listed.tools.map((tool) => tool.name).sort(), [...SCOUT_MCP_TOOL_NAMES].sort());
       // Hatbot's contract: every read tool says so; only these write.
-      const writers = new Set(['scout_queue_scan', 'scout_watch_create', 'scout_record_outcome']);
+      const writers = new Set(['scout_queue_scan', 'scout_watch_create', 'scout_watch_update', 'scout_market_watch_create', 'scout_market_watch_update', 'scout_market_scan', 'scout_listing_action', 'scout_record_outcome']);
       for (const tool of listed.tools) assert.equal(tool.annotations?.readOnlyHint, !writers.has(tool.name), tool.name);
     } finally {
       await client.close();
@@ -326,13 +326,105 @@ test('scout_watch_create makes a watch Scout scans, and refuses a price range up
   } finally { context.close(); }
 });
 
+const call = async (client: Client, name: string, args: Record<string, unknown>) => {
+  const result = await client.callTool({ name, arguments: args }) as never as { isError?: boolean; content: Array<{ type: string; text?: string }> };
+  return { isError: Boolean(result.isError), body: JSON.parse(toolText(result)) };
+};
+
+test('scout_watch_update changes only what it is given, pauses and archives, and refuses a price range upside down', async () => {
+  const context = fixture();
+  try {
+    const { server, client } = await connectedClient(context.service);
+    try {
+      const { body: created } = await call(client, 'scout_watch_create', { name: 'Steam Deck', query: 'steam deck', sources: ['OLX'], maxPrice: 2200, verificationChecks: [{ text: 'Not cracked', mode: 'require' }] });
+      const id = created.watch.id;
+      const updated = await call(client, 'scout_watch_update', { id, targetPrice: 1500, enabled: false });
+      assert.equal(updated.body.watch.targetPrice, 1500);
+      assert.equal(updated.body.watch.enabled, false);
+      assert.equal(updated.body.watch.maxPrice, 2200);
+      assert.equal(updated.body.watch.verificationChecks.length, 1);
+
+      assert.equal((await call(client, 'scout_watch_update', { id, minPrice: 3000 })).isError, true);
+      assert.equal(context.service.watchById(id)!.minPrice, null);
+
+      await call(client, 'scout_watch_update', { id, archived: true });
+      assert.equal(context.service.getWatches().length, 0);
+      assert.equal((await call(client, 'scout_watch_update', { id: 'missing', name: 'x' })).isError, true);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});
+
+test('scout_market_watch_create makes a research watch, and scout_market_watch_update pauses it and refuses a price range upside down', async () => {
+  const context = fixture();
+  try {
+    const { server, client } = await connectedClient(context.service);
+    try {
+      // The first scan would load the marketplaces' pages.
+      const queued = mock.method(context.service, 'queueMarketScan', () => ({ queued: true, message: 'Queued' }));
+      const { body } = await call(client, 'scout_market_watch_create', { name: 'RTX 3080', query: 'rtx 3080', sources: ['OLX', 'Allegro Lokalnie'], maxPrice: 3000, intervalHours: 12 });
+      assert.deepEqual(queued.mock.calls.map((c) => c.arguments), [[body.watch.id]]);
+      queued.mock.restore();
+      const [watch] = context.service.marketResearch().watches;
+      assert.equal(watch.id, body.watch.id);
+      assert.equal(watch.intervalHours, 12);
+      assert.equal(watch.maxPrice, 3000);
+
+      assert.equal((await call(client, 'scout_market_watch_update', { id: watch.id, minPrice: 4000 })).isError, true);
+      const paused = await call(client, 'scout_market_watch_update', { id: watch.id, enabled: false });
+      assert.equal(paused.body.watch.enabled, false);
+      assert.equal(paused.body.watch.maxPrice, 3000);
+      assert.equal((await call(client, 'scout_market_scan', { id: watch.id })).isError, true);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});
+
+test('scout_listing_action keeps the note when only the decision changes', async () => {
+  const context = fixture();
+  try {
+    const { server, client } = await connectedClient(context.service);
+    try {
+      await call(client, 'scout_listing_action', { key: 'OLX:123', note: 'Ask about the box' });
+      const { body } = await call(client, 'scout_listing_action', { key: 'OLX:123', decision: 'watch' });
+      assert.equal(body.action.decision, 'watch');
+      assert.equal(body.action.note, 'Ask about the box');
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});
+
+test('scout_flip_create and scout_flip_update record a buy and its sale', async () => {
+  const context = fixture();
+  try {
+    const { server, client } = await connectedClient(context.service, context.flips);
+    try {
+      const { body } = await call(client, 'scout_flip_create', { title: 'ThinkPad T480', buyChannel: 'OLX', boughtOn: '2026-10-01', buyPrice: 600, buyCosts: 20 });
+      const sold = await call(client, 'scout_flip_update', { id: body.flip.id, soldOn: '2026-10-20', saleChannel: 'Vinted', salePrice: 900, saleFee: 0 });
+      assert.equal(sold.body.flip.salePrice, 900);
+      assert.equal(sold.body.flip.buyPrice, 600);
+      assert.equal(context.flips.get(body.flip.id).soldOn, '2026-10-20');
+      assert.equal((await call(client, 'scout_flip_update', { id: 9999, note: 'x' })).isError, true);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});
+
 test('the listing tools are offered alongside the others when flips are available', async () => {
   const context = fixture();
   try {
     const { server, client } = await connectedClient(context.service, context.flips);
     try {
       const { tools } = await client.listTools();
-      assert.deepEqual(tools.map((tool) => tool.name).sort(), [...SCOUT_MCP_TOOL_NAMES, ...SCOUT_MCP_LISTING_TOOL_NAMES].sort());
+      assert.deepEqual(tools.map((tool) => tool.name).sort(), [...SCOUT_MCP_TOOL_NAMES, ...SCOUT_MCP_LISTING_TOOL_NAMES, ...SCOUT_MCP_FLIP_TOOL_NAMES].sort());
       const annotations = Object.fromEntries(tools.map((tool) => [tool.name, tool.annotations]));
       for (const name of ['scout_flips_to_list', 'scout_flip', 'scout_flip_photo']) assert.equal(annotations[name]?.readOnlyHint, true, name);
       assert.deepEqual(annotations.scout_flip_listed, { readOnlyHint: false, destructiveHint: false, idempotentHint: true });

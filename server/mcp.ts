@@ -4,11 +4,20 @@ import type { ScoutDebug } from './debug';
 import type { FlipStore } from './flips';
 import type { ScoutService } from './service';
 import { ServiceError } from './service';
+import { randomUUID } from 'node:crypto';
 import { VERIFICATION_CHECKS_MAX, VERIFICATION_CHECK_MAX_CHARS } from './ai';
+import { FLIP_CHANNELS } from '../src/profit';
 
 export const MCP_DASHBOARD_LISTINGS = 20;
 
 const marketplace = z.enum(['OLX', 'Allegro Lokalnie', 'Vinted']);
+const sources = z.array(marketplace).min(1).max(3).refine((list) => new Set(list).size === list.length, { message: 'Marketplace sources must be unique' });
+const olxCategory = z.object({ id: z.number().int().positive().max(1_000_000_000), label: z.string().trim().min(1).max(120), path: z.string().trim().max(240).regex(/^(?:[a-z0-9-]+(?:\/[a-z0-9-]+)*)?$/) });
+const verificationChecks = z.array(z.object({ text: z.string().trim().min(1).max(VERIFICATION_CHECK_MAX_CHARS), mode: z.enum(['require', 'exclude']) })).max(VERIFICATION_CHECKS_MAX);
+const watchId = z.string().trim().min(1).max(160);
+const flipChannel = z.enum(FLIP_CHANNELS);
+const flipDate = z.string().regex(/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/).describe('YYYY-MM-DD.');
+const flipAmount = z.number().nonnegative().max(10_000_000);
 
 function text(payload: unknown) {
   // Compact JSON: indentation only costs the agent context tokens.
@@ -36,6 +45,11 @@ export const SCOUT_MCP_TOOL_NAMES = [
   'scout_olx_categories',
   'scout_queue_scan',
   'scout_watch_create',
+  'scout_watch_update',
+  'scout_market_watch_create',
+  'scout_market_watch_update',
+  'scout_market_scan',
+  'scout_listing_action',
   'scout_connectors',
   'scout_price_reference',
   'scout_comparables',
@@ -67,6 +81,12 @@ export const SCOUT_MCP_LISTING_TOOL_NAMES = [
 export const SCOUT_MCP_SESSION_TOOL_NAMES = [
   'scout_shared_sessions',
   'scout_shared_session',
+] as const;
+
+/** Writing the flip ledger: only with the flip store, like the listing tools. */
+export const SCOUT_MCP_FLIP_TOOL_NAMES = [
+  'scout_flip_create',
+  'scout_flip_update',
 ] as const;
 
 export const SCOUT_MCP_DEBUG_TOOL_NAMES = [
@@ -314,15 +334,15 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
     inputSchema: {
       name: z.string().trim().min(1).max(120),
       query: z.string().trim().min(1).max(240).describe('What to search for, as you would type it on the marketplace.'),
-      sources: z.array(marketplace).min(1).max(3).refine((sources) => new Set(sources).size === sources.length, { message: 'Marketplace sources must be unique' }),
+      sources,
       terms: z.string().trim().max(240).optional().default('').describe('Comma-separated words every title must contain.'),
       excluded: z.string().trim().max(240).optional().default('').describe('Comma-separated words that drop a listing.'),
       minPrice: z.number().nonnegative().optional().describe('PLN.'),
       maxPrice: z.number().positive().optional().describe('PLN.'),
       targetPrice: z.number().positive().max(1_000_000).optional().describe('PLN: alert on any listing at or under it, even while Scout is still learning the typical price.'),
       shippingOnly: z.boolean().optional().default(false).describe('Only listings that ship.'),
-      olxCategory: z.object({ id: z.number().int().positive().max(1_000_000_000), label: z.string().trim().min(1).max(120), path: z.string().trim().max(240).regex(/^(?:[a-z0-9-]+(?:\/[a-z0-9-]+)*)?$/) }).optional().describe('An OLX category from scout_olx_categories, to keep OLX results in it.'),
-      verificationChecks: z.array(z.object({ text: z.string().trim().min(1).max(VERIFICATION_CHECK_MAX_CHARS), mode: z.enum(['require', 'exclude']) })).max(VERIFICATION_CHECKS_MAX).optional().default([]).describe('Checks a listing\'s description and photos must pass (require) or fail (exclude).'),
+      olxCategory: olxCategory.optional().describe('An OLX category from scout_olx_categories, to keep OLX results in it.'),
+      verificationChecks: verificationChecks.optional().default([]).describe('Checks a listing\'s description and photos must pass (require) or fail (exclude).'),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
   }, async (input) => {
@@ -337,6 +357,111 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
         verificationChecks: input.verificationChecks,
       }) });
     } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_watch_update', {
+    description: 'Change a deal watch: only the fields you pass change. enabled false pauses it; archived true archives it (and pauses it), archived false brings it back. Returns the watch.',
+    inputSchema: {
+      id: watchId,
+      name: z.string().trim().min(1).max(120).optional(),
+      query: z.string().trim().min(1).max(240).optional(),
+      sources: sources.optional(),
+      terms: z.string().trim().max(240).optional().describe('Comma-separated words every title must contain.'),
+      excluded: z.string().trim().max(240).optional().describe('Comma-separated words that drop a listing.'),
+      minPrice: z.number().nonnegative().nullable().optional().describe('PLN; null clears it.'),
+      maxPrice: z.number().positive().nullable().optional().describe('PLN; null clears it.'),
+      targetPrice: z.number().positive().max(1_000_000).nullable().optional().describe('PLN; null clears it.'),
+      shippingOnly: z.boolean().optional(),
+      olxCategory: olxCategory.nullable().optional(),
+      verificationChecks: verificationChecks.optional().describe('Replaces the watch\'s checks.'),
+      enabled: z.boolean().optional(),
+      archived: z.boolean().optional(),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  }, async ({ id, ...patch }) => {
+    try {
+      service.updateWatch(id, patch);
+      return text({ watch: service.watchById(id) });
+    } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_market_watch_create', {
+    description: 'Create a market-research watch: Scout follows every matching listing until it ends, to learn what such items probably sell for. It scans every intervalHours (default 24), and the first scan starts now. Check scout_market_research first so you don\'t make the same one twice.',
+    inputSchema: {
+      name: z.string().trim().min(1).max(120),
+      query: z.string().trim().min(1).max(240).describe('What to search for, as you would type it on the marketplace.'),
+      sources,
+      terms: z.string().trim().max(240).optional().default('').describe('Comma-separated words every title must contain.'),
+      excluded: z.string().trim().max(240).optional().default('').describe('Comma-separated words that drop a listing.'),
+      minPrice: z.number().nonnegative().optional().describe('PLN.'),
+      maxPrice: z.number().positive().optional().describe('PLN.'),
+      intervalHours: z.number().int().min(6).max(168).optional().default(24),
+      shippingOnly: z.boolean().optional().default(false).describe('Only listings that ship.'),
+      olxCategory: olxCategory.optional().describe('An OLX category from scout_olx_categories, to keep OLX results in it.'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+  }, async (input) => {
+    if (input.minPrice !== undefined && input.maxPrice !== undefined && input.minPrice > input.maxPrice) return toolError(new ServiceError('Minimum price cannot exceed maximum price'));
+    try {
+      const id = `market-watch-${randomUUID()}`;
+      const watch = service.createMarketWatch({
+        id, name: input.name, query: input.query, terms: input.terms, excluded: input.excluded, condition: 'Any', sources: input.sources,
+        intervalHours: input.intervalHours, minPrice: input.minPrice ?? null, maxPrice: input.maxPrice ?? null,
+        shippingOnly: input.shippingOnly, typoVariants: false, olxCategory: input.olxCategory ?? null,
+      });
+      service.queueMarketScan(id);
+      return text({ watch });
+    } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_market_watch_update', {
+    description: 'Change a market-research watch: only the fields you pass change. enabled false pauses it. Changing what it searches for (query, sources, terms, excluded, prices, shippingOnly, olxCategory) starts a new version: the listings it followed so far are kept but marked superseded.',
+    inputSchema: {
+      id: watchId,
+      name: z.string().trim().min(1).max(120).optional(),
+      query: z.string().trim().min(1).max(240).optional(),
+      sources: sources.optional(),
+      terms: z.string().trim().max(240).optional(),
+      excluded: z.string().trim().max(240).optional(),
+      minPrice: z.number().nonnegative().nullable().optional().describe('PLN; null clears it.'),
+      maxPrice: z.number().positive().nullable().optional().describe('PLN; null clears it.'),
+      intervalHours: z.number().int().min(6).max(168).optional(),
+      shippingOnly: z.boolean().optional(),
+      olxCategory: olxCategory.nullable().optional(),
+      enabled: z.boolean().optional(),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  }, async ({ id, ...patch }) => {
+    try {
+      const current = service.marketResearch().watches.find((watch) => watch.id === id);
+      if (!current) throw new ServiceError('Market watch not found', 404);
+      const min = patch.minPrice === undefined ? current.minPrice : patch.minPrice;
+      const max = patch.maxPrice === undefined ? current.maxPrice : patch.maxPrice;
+      if (min != null && max != null && min > max) throw new ServiceError('Minimum price cannot exceed maximum price');
+      service.updateMarketWatch(id, patch);
+      return text({ watch: service.marketResearch().watches.find((watch) => watch.id === id) });
+    } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_market_scan', {
+    description: 'Queue a scan of one enabled market-research watch now. Returns immediately.',
+    inputSchema: { id: watchId },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  }, async ({ id }) => {
+    try { return text(service.queueMarketScan(id)); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_listing_action', {
+    description: 'Mark a listing as the owner would in Scout\'s feed: a decision (buy, watch, pass, or null to clear it), a note, or hidden. Only the fields you pass change. Marks only: nothing is bought or sent.',
+    inputSchema: {
+      key: z.string().min(3).max(500).describe('The listing key, e.g. "OLX:123456".'),
+      decision: z.enum(['buy', 'watch', 'pass']).nullable().optional(),
+      note: z.string().max(2000).optional(),
+      hidden: z.boolean().optional(),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  }, async ({ key, ...patch }) => {
+    try { return text({ action: service.updateListingAction(key, patch) }); } catch (error) { return toolError(error); }
   });
 
   server.registerTool('scout_connectors', {
@@ -395,6 +520,52 @@ export function registerScoutListingMcpTools(server: McpServer, flips: FlipStore
       flips.recordListing(flipId, channel, status, url, problem);
       return text({ ok: true });
     } catch (error) { return toolError(error); }
+  });
+}
+
+/** Writing the flip ledger: the owner's own buys and sales, in PLN. */
+export function registerScoutFlipMcpTools(server: McpServer, flips: FlipStore) {
+  server.registerTool('scout_flip_create', {
+    description: 'Record a flip: something bought to sell again, with what was paid. Returns the flip.',
+    inputSchema: {
+      title: z.string().trim().min(1).max(200),
+      listingKey: z.string().trim().max(240).nullable().optional().describe('The listing it was bought from, e.g. "OLX:123456".'),
+      watchId: z.string().trim().max(160).nullable().optional(),
+      buyChannel: flipChannel,
+      boughtOn: flipDate,
+      buyPrice: flipAmount.describe('PLN.'),
+      buyCosts: flipAmount.optional().describe('PLN: shipping and other costs of buying.'),
+      listedOn: z.array(flipChannel).max(4).optional(),
+      note: z.string().max(2000).optional(),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  }, async (input) => {
+    try { return text({ flip: flips.create(input) }); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_flip_update', {
+    description: 'Change a flip: only the fields you pass change. Record a sale with soldOn, saleChannel and salePrice (saleFee defaults to the channel\'s fee preset); soldOn null takes the sale back. Returns the flip.',
+    inputSchema: {
+      id: z.number().int().positive(),
+      title: z.string().trim().min(1).max(200).optional(),
+      listingKey: z.string().trim().max(240).nullable().optional(),
+      watchId: z.string().trim().max(160).nullable().optional(),
+      buyChannel: flipChannel.optional(),
+      boughtOn: flipDate.optional(),
+      buyPrice: flipAmount.optional(),
+      buyCosts: flipAmount.optional(),
+      listedOn: z.array(flipChannel).max(4).optional(),
+      delisted: z.array(flipChannel).max(4).optional(),
+      note: z.string().max(2000).optional(),
+      soldOn: flipDate.nullable().optional(),
+      saleChannel: flipChannel.nullable().optional(),
+      salePrice: flipAmount.nullable().optional(),
+      saleFee: flipAmount.nullable().optional(),
+      saleCosts: flipAmount.nullable().optional(),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  }, async ({ id, ...patch }) => {
+    try { return text({ flip: flips.update(id, patch) }); } catch (error) { return toolError(error); }
   });
 }
 
@@ -469,7 +640,10 @@ export function createScoutMcpServer(service: ScoutService, debug: ScoutDebug | 
     { capabilities: { tools: {} } },
   );
   registerScoutMcpTools(server, service);
-  if (flips) registerScoutListingMcpTools(server, flips);
+  if (flips) {
+    registerScoutListingMcpTools(server, flips);
+    registerScoutFlipMcpTools(server, flips);
+  }
   if (sessions) registerScoutSessionMcpTools(server, service);
   if (debug) registerScoutDebugMcpTools(server, debug);
   return server;
