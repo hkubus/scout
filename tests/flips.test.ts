@@ -548,6 +548,40 @@ test('a ready draft stays complete, and cancelling or a sale takes the flip out 
   } finally { context.close(); }
 });
 
+test('a sale lists the channels Hatbot posted to that are still up, until each is taken down', async () => {
+  const context = fixture();
+  try {
+    const flip = context.store.create({ title: 'RTX 3070', buyChannel: 'OLX', boughtOn: '2026-10-01', buyPrice: 900, listedOn: ['Other'] });
+    context.store.setListing(flip.id, { ...readyDraft, prices: { ...readyDraft.prices, 'Allegro Lokalnie': 1250 } });
+    await context.store.addPhoto(flip.id, await image(40, 30).jpeg().toBuffer());
+    context.store.markReady(flip.id, ['OLX', 'Vinted', 'Allegro Lokalnie']);
+    context.store.recordListing(flip.id, 'OLX', 'listed', 'https://www.olx.pl/d/oferta/x-CID99-ID1.html');
+    context.store.recordListing(flip.id, 'Vinted', 'listed', 'https://www.vinted.pl/items/123-rtx');
+    context.store.recordListing(flip.id, 'Allegro Lokalnie', 'listed', 'https://allegrolokalnie.pl/oferta/rtx-3070');
+    assert.deepEqual(context.store.toTakeDown(), [], 'nothing before a sale');
+    assert.throws(() => context.store.recordTakenDown(flip.id, 'OLX'), (error: unknown) => error instanceof ServiceError && error.status === 409);
+
+    context.store.update(flip.id, { soldOn: '2026-10-20', saleChannel: 'Vinted', salePrice: 1149, delisted: ['Allegro Lokalnie'] });
+    assert.deepEqual(context.store.toTakeDown(), [{
+      id: flip.id, title: 'RTX 3070', soldOn: '2026-10-20', saleChannel: 'Vinted',
+      channels: [{ channel: 'OLX', url: 'https://www.olx.pl/d/oferta/x-CID99-ID1.html' }],
+    }], 'not where it went, not one the owner ticked, and not Other, which has no listing posted');
+
+    assert.throws(() => context.store.recordTakenDown(flip.id, 'Other'), /Unknown channel "Other"/);
+    assert.throws(() => context.store.recordTakenDown(9999, 'OLX'), (error: unknown) => error instanceof ServiceError && error.status === 404);
+    context.store.recordTakenDown(flip.id, 'OLX');
+    const events = context.events.length;
+    context.store.recordTakenDown(flip.id, 'OLX');
+    assert.equal(context.events.length, events, 'repeating it changes nothing');
+    assert.deepEqual(context.store.get(flip.id).delisted, ['Allegro Lokalnie', 'OLX']);
+    assert.deepEqual(context.store.toTakeDown(), []);
+
+    context.store.update(flip.id, { soldOn: null });
+    context.store.update(flip.id, { soldOn: '2026-10-21', saleChannel: 'Other', salePrice: 1100 });
+    assert.deepEqual(context.store.toTakeDown()[0]?.channels.map((item) => item.channel), ['OLX', 'Allegro Lokalnie', 'Vinted'], 'taking a sale back clears the checklist, and a sale elsewhere takes down every one');
+  } finally { context.close(); }
+});
+
 test('photos are sent for posting as JPEG within 2000 px and about 2 MB', async () => {
   const wide = await sharp({ create: { width: 3000, height: 1000, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } }).webp().toBuffer();
   const jpeg = await toPostingJpeg(wide);

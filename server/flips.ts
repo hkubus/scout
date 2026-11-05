@@ -389,6 +389,31 @@ export class FlipStore {
     }));
   }
 
+  /**
+   * Sold flips still up on a channel Hatbot posted to: listed with a URL, not
+   * where it sold, and not ticked off in the delist checklist yet.
+   */
+  toTakeDown() {
+    const rows = this.db.prepare('SELECT id, title, sold_on, sale_channel, listing_channels_json, delisted_json FROM flips WHERE sold_on IS NOT NULL ORDER BY sold_on, id').all() as Array<Record<string, any>>;
+    return rows.flatMap((row) => {
+      const delisted = channels(row.delisted_json);
+      const up = listingChannelsFromJson(row.listing_channels_json)
+        .filter((item) => item.status === 'listed' && item.url && item.channel !== row.sale_channel && !delisted.includes(item.channel))
+        .map(({ channel, url }) => ({ channel, url: url! }));
+      return up.length ? [{ id: Number(row.id), title: String(row.title), soldOn: String(row.sold_on), saleChannel: isFlipChannel(row.sale_channel) ? row.sale_channel : null, channels: up }] : [];
+    });
+  }
+
+  /** Hatbot took a sold flip's listing down on `channel`: ticked in the delist checklist. */
+  recordTakenDown(flipId: number, channel: string) {
+    if (!isListingChannel(channel)) throw new ServiceError(`Unknown channel "${channel}": use OLX, Allegro Lokalnie or Vinted`, 400);
+    const flip = this.get(flipId);
+    if (!flip.soldOn) throw new ServiceError(`Flip ${flipId} has no sale recorded`, 409);
+    if (flip.delisted.includes(channel)) return;
+    this.db.prepare('UPDATE flips SET delisted_json = ?, updated_at = ? WHERE id = ?').run(JSON.stringify([...flip.delisted, channel]), new Date().toISOString(), flipId);
+    this.onChange({ id: flipId });
+  }
+
   /** The draft of a flip marked ready, as Hatbot posts it. */
   toPost(id: number): FlipToPost {
     const flip = this.get(id);
