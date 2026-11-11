@@ -146,8 +146,6 @@ For every research series Scout computes a p25–median–p75 band of **probable
 - An asking price last seen more than 30 days before the listing disappeared is stale and is excluded — it describes an earlier market, not the exit price.
 - Bands cover a rolling 90-day window and open up (report `learning` with the eligible count) below 4 eligible samples. Percentiles use linear interpolation.
 
-The older raw `estimatedMedianPrice` field remains in the API payload for one release; the UI shows the probable-sale band instead.
-
 ### Research trend charts
 
 Each research watch card offers a price-trend dialog (`GET /api/market-watches/:id/trend?days=30|90|180`). Trend points bucket the current series' price observations into days — one latest observation per listing per day — and draw the median asking price with a shaded p25–p75 band, plus the probable-sale median as a dashed reference line. Preserved-copy dialogs also show the listing's own asking-price sparkline from its stored observations. Open trend dialogs refresh automatically after research scans via the existing `market-watch` event.

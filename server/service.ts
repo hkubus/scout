@@ -4483,19 +4483,12 @@ export class ScoutService {
       WHERE ml.status IN ('active', 'ended') AND ${versionFilter}
       GROUP BY ml.market_watch_id`).all() as Array<{ market_watch_id: string; total: number; active: number | null; ended: number | null }>;
     const statsByWatch = new Map(watchStats.map((stats) => [stats.market_watch_id, stats]));
-    const endedPriceRows = this.stmt(`SELECT ml.market_watch_id, ml.last_price_pln
+    // The raw median of every ended asking price survives only as the page-level
+    // aggregate; watches report the probable-sale band instead.
+    const aggregatePrices = (this.stmt(`SELECT ml.last_price_pln
       FROM market_listings ml
       JOIN market_watches mw ON mw.id = ml.market_watch_id
-      WHERE ml.status = 'ended' AND ml.last_price_pln > 0 AND ${versionFilter}`).all() as Array<{ market_watch_id: string; last_price_pln: number }>;
-    const endedPricesByWatch = new Map<string, number[]>();
-    const aggregatePrices: number[] = [];
-    for (const item of endedPriceRows) {
-      const price = Number(item.last_price_pln);
-      const prices = endedPricesByWatch.get(item.market_watch_id) ?? [];
-      prices.push(price);
-      endedPricesByWatch.set(item.market_watch_id, prices);
-      if (!options.watchId || options.watchId === item.market_watch_id) aggregatePrices.push(price);
-    }
+      WHERE ml.status = 'ended' AND ml.last_price_pln > 0 AND ${versionFilter}${options.watchId ? ' AND ml.market_watch_id = ?' : ''}`).all(...(options.watchId ? [options.watchId] : [])) as Array<{ last_price_pln: number }>).map((item) => Number(item.last_price_pln));
     const bandComputedAt = nowIso();
     const endedSampleRows = this.endedSaleBandRows(null);
     const bandSamplesByWatch = new Map<string, MarketBandSample[]>();
@@ -4510,17 +4503,13 @@ export class ScoutService {
     const watches = watchRows.map((row): MarketWatch => {
       const version = versionsByWatch.get(row.id)!;
       const counts = statsByWatch.get(row.id) ?? { total: 0, active: null, ended: null };
-      const endedPrices = endedPricesByWatch.get(row.id) ?? [];
       return {
         id: row.id, name: row.name, query: version.query, terms: version.included_terms ?? '', excluded: version.excluded_terms ?? '', location: NO_LOCATION_FILTER, condition: version.condition ?? 'Any', sources: parseJson<Marketplace[]>(version.sources_json, []),
         intervalHours: Number(row.interval_hours), minPrice: version.min_price_pln === null || version.min_price_pln === undefined ? null : Number(version.min_price_pln), maxPrice: version.max_price_pln === null || version.max_price_pln === undefined ? null : Number(version.max_price_pln), shippingOnly: Boolean(version.shipping_only), typoVariants: Boolean(version.typo_variants), olxCategory: olxCategoryFromJson(version.olx_category_json), enabled: Boolean(row.enabled), nextScan: Boolean(row.enabled) ? relativeTimeFuture(row.next_scan_at) : 'Paused',
         lastScan: relativeTime(row.last_scan_at), totalListings: Number(counts.total ?? 0), activeListings: Number(counts.active ?? 0), endedListings: Number(counts.ended ?? 0),
-        estimatedMedianPrice: endedPrices.length ? median(endedPrices) : null,
         saleBand: computeSaleBand(bandSamplesByWatch.get(row.id) ?? [], SALE_BAND_WINDOW_DAYS, bandComputedAt),
       };
     });
-    // The aggregate reuses the per-watch fetch above — the same ended rows,
-    // optionally scoped to the requested watch — instead of loading them twice.
     const aggregateCounts = this.stmt(`SELECT SUM(CASE WHEN ml.status = 'active' THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN ml.status = 'ended' THEN 1 ELSE 0 END) AS ended FROM market_listings ml JOIN market_watches mw ON mw.id = ml.market_watch_id WHERE ml.status IN ('active', 'ended') AND ${versionFilter}${options.watchId ? ' AND ml.market_watch_id = ?' : ''}`).get(...(options.watchId ? [options.watchId] : [])) as { active?: number; ended?: number };
 
     const page = Math.max(1, Math.floor(options.page ?? 1));

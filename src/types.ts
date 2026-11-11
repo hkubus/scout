@@ -663,7 +663,6 @@ export interface MarketWatch {
   totalListings: number;
   activeListings: number;
   endedListings: number;
-  estimatedMedianPrice: number | null;
   saleBand: SaleBand | null;
   activeVersionId?: string | null;
 }
