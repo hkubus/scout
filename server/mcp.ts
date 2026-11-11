@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { ScoutDebug } from './debug';
+import { toCompactSearch } from './mcpFormat';
 import type { FlipStore } from './flips';
 import type { ScoutService } from './service';
 import { ServiceError } from './service';
@@ -309,10 +310,16 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       aiRelevance: z.boolean().optional().default(true),
       verificationChecks: z.array(z.object({ text: z.string().trim().min(1).max(120), mode: z.enum(['require', 'exclude']) })).max(8).optional()
         .describe('Jev reads each result: exclude hides near-certain matches; require-confirmed results come back with jevCheck "passed".'),
+      format: z.enum(['full', 'compact']).optional().default('full')
+        .describe('compact: smaller, stable rows with every key present (null when unknown): id "<Marketplace>:<listingId>", asking price in PLN, relevance, match kind; sources carry status ok|error with an errorKind and pipeline counts.'),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
-  }, async ({ olxCategoryId, ...input }) => {
-    try { return text(await service.manualSearch({ ...input, olxCategory: olxCategoryId ? { id: olxCategoryId, label: String(olxCategoryId), path: '' } : null })); } catch (error) { return toolError(error); }
+  }, async ({ olxCategoryId, format, ...input }) => {
+    try {
+      const filters = { ...input, olxCategory: olxCategoryId ? { id: olxCategoryId, label: String(olxCategoryId), path: '' } : null };
+      if (format === 'compact') return text(toCompactSearch(filters, await service.manualSearchDetailed(filters)));
+      return text(await service.manualSearch(filters));
+    } catch (error) { return toolError(error); }
   });
 
   server.registerTool('scout_olx_categories', {
