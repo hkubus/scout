@@ -27,6 +27,8 @@ import { bucketDailyObservations, type MarketTrendObservation } from './marketTr
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
 import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes, AgentFlip, AgentFlips, ConversationResult, InboxResult } from '../src/types';
 import { estimatedNetAtTypical, flipCost, flipNet, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, suggestedListingPrice, type FeePresets } from '../src/profit';
+import type { SearchDeal, SearchScoredAgainst } from '../src/types';
+import type { MatchKind } from './queryMatch';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -4322,6 +4324,8 @@ export class ScoutService {
 
   async manualSearch(input: SearchFilters): Promise<ManualSearchResponse> {
     if (this.activeManualSearches >= 3) throw new ServiceError('Three manual searches are already running. Try again shortly.', 429);
+    // Resolved before any fetch, so an unknown watch id costs no marketplace request.
+    const scoring = this.searchScoring(input);
     this.activeManualSearches += 1;
     // The client pages through results; marketplaces cap their own page size.
     const page = Math.min(Math.max(Math.floor(input.page ?? 1), 1), 10);
@@ -4410,6 +4414,7 @@ export class ScoutService {
           dealStrength: 1, dealLabel: 'Watch', image: listing.imageUrl ?? '', url: listing.url, watch: 'Manual search',
           condition: listing.condition, location: listing.location, shippingAvailable: listing.shippingAvailable ?? null, priceNegotiable: listing.priceNegotiable ?? null,
           postedAt: listing.postedAt ?? null, refreshedAt: listing.refreshedAt ?? null, promoted: listing.promoted ?? null, sellerType: listing.sellerType ?? null,
+          ...(scoring ? { deal: this.searchDeal(scoring, listing) } : {}),
           ...(checkStatus.has(listing) ? { jevCheck: checkStatus.get(listing)!.state, jevCheckNote: checkStatus.get(listing)!.note } : {}),
         }));
         const matches = relevant.length - hiddenByChecks;
@@ -4434,10 +4439,116 @@ export class ScoutService {
       const results = await Promise.all(tasks);
       const unique = new Map<string, Listing>();
       for (const listing of results.flatMap((result) => result.listings)) unique.set(listing.id, listing);
-      return { listings: [...unique.values()].sort((a, b) => a.price - b.price), sources: results.map((result) => result.status) };
+      return {
+        listings: [...unique.values()].sort((a, b) => a.price - b.price),
+        sources: results.map((result) => result.status),
+        ...(scoring === undefined ? {} : { scoredAgainst: scoring?.scoredAgainst ?? null }),
+      };
     } finally {
       this.activeManualSearches -= 1;
     }
+  }
+
+  /**
+   * scoreAgainst on a manual search: the watch whose scan baseline prices the
+   * results, loaded once. "auto" matches the query the way
+   * scout_price_reference does and takes only a match that names the same
+   * product (exact, variant, or broader without a model word), preferring a
+   * watch on the searched marketplaces, then an enabled one, then the most
+   * specific, then the one with the most history. Undefined when not asked,
+   * null when "auto" finds no watch. Database only, and it writes nothing.
+   */
+  private searchScoring(input: Pick<SearchFilters, 'query' | 'terms' | 'excluded' | 'sources' | 'scoreAgainst'>) {
+    const target = input.scoreAgainst?.trim();
+    if (!target) return undefined;
+    const candidate = (row: WatchRow): MatchCandidate => ({
+      kind: 'watch', id: String(row.id), name: String(row.name), query: String(row.query),
+      includedTerms: String(row.included_terms ?? ''), excludedTerms: String(row.excluded_terms ?? ''), groups: parseVariantGroups(row.variant_groups_json),
+    });
+    const options = { terms: input.terms, excluded: input.excluded };
+    let row: WatchRow;
+    let match: MatchKind | null;
+    let baselines: WatchBaselines;
+    if (target === 'auto') {
+      const rows = this.stmt('SELECT * FROM watches WHERE archived_at IS NULL').all() as WatchRow[];
+      const byId = new Map(rows.map((entry) => [String(entry.id), entry]));
+      const requested = new Set(input.sources);
+      const flag = (value: boolean) => (value ? 0 : 1);
+      type Ranked = { entry: QueryMatch; row: WatchRow; overlaps: boolean; enabled: boolean };
+      const order = (a: Ranked, b: Ranked) => matchQuality(a.entry) - matchQuality(b.entry) || flag(a.overlaps) - flag(b.overlaps)
+        || flag(a.enabled) - flag(b.enabled) || b.entry.matchedTokens.length - a.entry.matchedTokens.length;
+      // History costs a baseline query each, so only the best few are loaded.
+      const top = matchQuery(input.query, rows.map(candidate), options)
+        .filter((entry) => matchQuality(entry) <= 1)
+        .map((entry): Ranked => {
+          const watch = byId.get(entry.candidate.id)!;
+          return { entry, row: watch, overlaps: parseJson<Marketplace[]>(watch.sources_json, []).some((source) => requested.has(source)), enabled: Boolean(watch.enabled) };
+        })
+        .sort(order)
+        .slice(0, PRICE_REFERENCE_CANDIDATES)
+        .map((item) => {
+          const loaded = this.watchBaselines(item.row);
+          let samples = 0;
+          for (const bucket of loaded.buckets.values()) samples += bucket.prices.length;
+          return { ...item, baselines: loaded, samples };
+        })
+        .sort((a, b) => order(a, b) || b.samples - a.samples || String(a.row.id).localeCompare(String(b.row.id)))[0];
+      if (!top) return null;
+      ({ row, baselines } = top);
+      match = top.entry.match;
+    } else {
+      const found = this.stmt('SELECT * FROM watches WHERE id = ? AND archived_at IS NULL').get(target) as WatchRow | undefined;
+      if (!found) throw new ServiceError('Watch not found', 404);
+      row = found;
+      match = matchQuery(input.query, [candidate(row)], options)[0]?.match ?? null;
+      baselines = this.watchBaselines(row);
+    }
+    const notes = ['Asking prices, not completed sales.'];
+    if (match === null) notes.push('The query does not match this watch\'s terms, so its typical may be for another product.');
+    if (match === 'narrower') notes.push('The watch is more specific than the query; results it would not keep have no deal.');
+    const scoredAgainst: SearchScoredAgainst = { watchId: String(row.id), name: String(row.name), match, notes };
+    return {
+      row,
+      baselines,
+      variants: this.scanVariantResolver(row, baselines),
+      referenceMedian: row.reference_market_watch_id ? this.referenceBandMedian(String(row.reference_market_watch_id)) : null,
+      // The scan's own deterministic filters. Shipping is left out: a search
+      // result's delivery is often still unknown, and it does not change
+      // which product a listing is.
+      filters: { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, sellerType: sellerTypeFromRow(row.seller_type), ignorePromoted: Boolean(row.ignore_promoted), shippingOnly: false },
+      scoredAgainst,
+    };
+  }
+
+  /**
+   * One search result scored exactly as the watch's scan would score it:
+   * the scan's variant resolution, then variantDealScore with the scan's
+   * reference-series fallback. A typical shows only where the scan would
+   * show one (a ready baseline, or the reference band while learning). Null
+   * when the watch's own filters would not keep the result, since its typical
+   * would then price another product.
+   */
+  private searchDeal(scoring: NonNullable<ReturnType<ScoutService['searchScoring']>>, listing: NormalizedListing): SearchDeal | null {
+    const { row, baselines, variants, referenceMedian, filters } = scoring;
+    if (!filterListings([listing], String(row.query ?? ''), String(row.included_terms ?? ''), String(row.excluded_terms ?? ''), filters).length) return null;
+    const key = variants.get(listing).key;
+    const grouped = baselines.groups.length > 0;
+    const variant = { variantKey: grouped ? key : null, variantLabel: grouped ? variantLabelFor(key, baselines.groups) : null };
+    const { score, useReference, dealStrength: strength } = this.variantDealScore(row, listing.price, baselines, key, referenceMedian);
+    if (score.typical === null || !(score.isReady || useReference)) {
+      return { typical: null, discountPercent: null, deviation: null, tier: null, label: null, qualifies: false, basis: 'learning', ...variant };
+    }
+    const tier = strength ?? 1;
+    return {
+      typical: roundPln(score.typical),
+      discountPercent: score.discountPercent === null ? null : Math.round(score.discountPercent * 10) / 10,
+      deviation: score.deviation === null ? null : Math.round(score.deviation * 100) / 100,
+      tier,
+      label: dealLabelFromStrength(tier),
+      qualifies: score.qualifies,
+      basis: score.isReady ? 'own-history' : 'reference-band',
+      ...variant,
+    };
   }
 
   private marketWatchVersion(row: WatchRow) {

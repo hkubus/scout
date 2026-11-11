@@ -590,6 +590,8 @@ const searchInput = z.object({
   searchId: z.string().trim().min(1).max(80).optional(),
   aiRelevance: z.boolean().optional().default(true),
   verificationChecks: verificationChecksInput.optional().default([]),
+  // "auto" or a watch id: score each result against that watch's typical.
+  scoreAgainst: z.string().trim().min(1).max(160).nullable().optional(),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
 
 // Flip ledger. Calendar dates only: the operator's own bookkeeping days.

@@ -309,6 +309,8 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       aiRelevance: z.boolean().optional().default(true),
       verificationChecks: z.array(z.object({ text: z.string().trim().min(1).max(120), mode: z.enum(['require', 'exclude']) })).max(8).optional()
         .describe('Jev reads each result: exclude hides near-certain matches; require-confirmed results come back with jevCheck "passed".'),
+      scoreAgainst: z.string().trim().min(1).max(160).optional()
+        .describe('"auto" or a watch id. Each result gets deal {typical, discountPercent, deviation, tier, label, qualifies, basis, variantKey, variantLabel}, scored against that watch\'s learned typical asking price exactly as its scan would; deal is null where the watch\'s own filters would not keep the result. "auto" picks the watch the query names (the scout_price_reference match); scoredAgainst says which, or is null when none matches. Database only: no extra fetch or AI call.'),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ olxCategoryId, ...input }) => {
