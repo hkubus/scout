@@ -44,6 +44,15 @@ Decisions made while building, which Hatbot can rely on:
   - Repeating a call changes nothing. `error` is kept to 500 characters.
 - **Prices** are złoty, as the owner set them for each channel (or `basePrice` for a channel without one).
 
+## Taking a sold flip down
+
+Added 2026-11-05. Once the owner records a sale (or Haggler does, through `scout_flip_update`), Hatbot takes the flip's listings down on the other marketplaces it posted to, and Scout ticks each in the delist checklist (`delisted`).
+
+- `scout_flips_to_take_down {}` (read) → `{ flips: [{ id, title, soldOn, saleChannel, channels: [{ channel, url }] }] }`. Every flip with a sale recorded that has a channel `listed` with a URL (so posted through `scout_flip_listed`), other than its `saleChannel` and not in `delisted`. A flip drops out once every such channel is ticked, and when its sale is taken back.
+- `scout_flip_taken_down { flipId, channel }` (write, idempotent) → `{ ok: true }`. Adds the channel to `delisted`. Refused (409) for a flip with no sale recorded, so Hatbot learns the sale was taken back; repeating it changes nothing.
+- The marketplace it sold on is left up: the buyer may still be paying there, and the site usually ends it itself. Channels in "Listed on" without a URL (posted by hand or with the extension) aren't offered, since Hatbot can't tell which listing is ours.
+- The names and descriptions follow the same no-money-words rule as the listing tools (no "sold", "sell" or "buy"), and are checked by the same test.
+
 ## Scout's REST side (web and iOS)
 
 - `PUT /api/flips/:id/ready {channels: ["OLX", "Vinted"]}` marks a flip ready, or re-marks it with these channels; it answers 400 with "Before it can be listed, add …" when something's missing. `DELETE /api/flips/:id/ready` cancels.
@@ -73,4 +82,4 @@ Decisions made while building, which Hatbot can rely on:
 
 ## Not in this
 
-Answering buyers, taking a sold flip off its other channels (the delist checklist already does that), editing or relisting a live listing, and paid promotion.
+Answering buyers (Hatbot does that from Scout's inbox), editing or relisting a live listing, and paid promotion.

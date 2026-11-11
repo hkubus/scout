@@ -71,6 +71,8 @@ export const SCOUT_MCP_LISTING_TOOL_NAMES = [
   'scout_flip',
   'scout_flip_photo',
   'scout_flip_listed',
+  'scout_flips_to_take_down',
+  'scout_flip_taken_down',
 ] as const;
 
 /**
@@ -479,7 +481,7 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
   });
 }
 
-/** The flips the owner marked "Ready to list", for Hatbot to post. */
+/** The flips the owner marked "Ready to list", for Hatbot to post, and to take down once one has a sale. */
 export function registerScoutListingMcpTools(server: McpServer, flips: FlipStore) {
   server.registerTool('scout_flips_to_list', {
     description: 'Flips the owner marked "Ready to list" in Scout, each with its draft revision (updatedAt) and every picked marketplace with its status: ready (to be posted), listed (with url), failed (with error) or declined. updatedAt moves only when what gets posted changes, never when a status is recorded. Database only.',
@@ -518,6 +520,27 @@ export function registerScoutListingMcpTools(server: McpServer, flips: FlipStore
   }, async ({ flipId, channel, status, url, error: problem }) => {
     try {
       flips.recordListing(flipId, channel, status, url, problem);
+      return text({ ok: true });
+    } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_flips_to_take_down', {
+    description: 'Flips with a sale recorded in Scout\'s ledger that are still up on a marketplace a listing was posted to through scout_flip_listed: each {id, title, soldOn, saleChannel, channels: [{channel, url}]}, leaving out the marketplace it went on and any the owner ticked as taken down. Take each listing down, then record it with scout_flip_taken_down. Database only.',
+    annotations: { readOnlyHint: true },
+  }, async () => {
+    try { return text({ flips: flips.toTakeDown() }); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_flip_taken_down', {
+    description: 'Record that a flip\'s listing on one marketplace is down (ended, deleted, or already gone), which ticks it in the delist checklist. Refused for a flip with no sale recorded. Repeating it changes nothing.',
+    inputSchema: {
+      flipId: z.number().int().positive(),
+      channel: z.string().trim().min(1).max(80).describe('OLX, Allegro Lokalnie or Vinted.'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  }, async ({ flipId, channel }) => {
+    try {
+      flips.recordTakenDown(flipId, channel);
       return text({ ok: true });
     } catch (error) { return toolError(error); }
   });

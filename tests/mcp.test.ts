@@ -426,8 +426,8 @@ test('the listing tools are offered alongside the others when flips are availabl
       const { tools } = await client.listTools();
       assert.deepEqual(tools.map((tool) => tool.name).sort(), [...SCOUT_MCP_TOOL_NAMES, ...SCOUT_MCP_LISTING_TOOL_NAMES, ...SCOUT_MCP_FLIP_TOOL_NAMES].sort());
       const annotations = Object.fromEntries(tools.map((tool) => [tool.name, tool.annotations]));
-      for (const name of ['scout_flips_to_list', 'scout_flip', 'scout_flip_photo']) assert.equal(annotations[name]?.readOnlyHint, true, name);
-      assert.deepEqual(annotations.scout_flip_listed, { readOnlyHint: false, destructiveHint: false, idempotentHint: true });
+      for (const name of ['scout_flips_to_list', 'scout_flip', 'scout_flip_photo', 'scout_flips_to_take_down']) assert.equal(annotations[name]?.readOnlyHint, true, name);
+      for (const name of ['scout_flip_listed', 'scout_flip_taken_down']) assert.deepEqual(annotations[name], { readOnlyHint: false, destructiveHint: false, idempotentHint: true }, name);
     } finally {
       await client.close();
       await server.close();
@@ -538,6 +538,14 @@ test('Hatbot reads a ready flip, its draft and photos, and records each channel'
 
       context.flips.cancelReady(flip.id);
       assert.deepEqual(await json('scout_flips_to_list'), { flips: [] });
+
+      assert.deepEqual(await json('scout_flips_to_take_down'), { flips: [] });
+      assert.equal((await call('scout_flip_taken_down', { flipId: flip.id, channel: 'OLX' })).isError, true, 'no sale recorded');
+      context.flips.update(flip.id, { soldOn: '2026-10-20', saleChannel: 'Other', salePrice: 1100 });
+      assert.deepEqual(await json('scout_flips_to_take_down'), { flips: [{ id: flip.id, title: 'RTX 3070', soldOn: '2026-10-20', saleChannel: 'Other', channels: [{ channel: 'OLX', url: 'https://www.olx.pl/d/oferta/rtx-3070-CID99-ID1.html' }] }] });
+      for (let attempt = 0; attempt < 2; attempt += 1) assert.deepEqual(await json('scout_flip_taken_down', { flipId: flip.id, channel: 'OLX' }), { ok: true });
+      assert.deepEqual(await json('scout_flips_to_take_down'), { flips: [] });
+      assert.deepEqual(context.flips.get(flip.id).delisted, ['OLX']);
     } finally {
       await client.close();
       await server.close();

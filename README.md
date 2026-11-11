@@ -166,7 +166,7 @@ The **Flips** page records what you bought, where it is listed for sale, and wha
   - Vinted: 0%.
 
   The fee is stored with each sale, so editing a preset never rewrites past sales.
-- **Delist checklist:** marking an item sold lists the other platforms it is still listed on, and the page warns about any sold item that is still up somewhere else.
+- **Delist checklist:** marking an item sold lists the other platforms it is still listed on, and the page warns about any sold item that is still up somewhere else. Hatbot takes down the ones it posted and ticks them for you.
 - **Działalność nierejestrowana:**
   - Revenue this quarter is tracked against the quarterly limit (10 813,50 zł in 2026).
   - Sales per platform are counted against the DAC7 reporting threshold (30 sales or 2 000 € a year per platform).
@@ -180,7 +180,7 @@ Each unsold flip can hold a listing: title, description, condition, a category k
 
 The **Scout listing helper** Firefox extension in [`extension/`](extension/README.md) opens a platform's listing form and fills it from the flip, photos included, following multi-step forms such as Allegro Lokalnie's to fill each field when its step appears. You check the form and publish it yourself; nothing is submitted automatically. Pressing **I published it** marks the platform in the flip's "Listed on". OLX, Allegro Lokalnie and Vinted offer no listing API for private sellers, except OLX's partner program, so a browser-side helper is the safe way to avoid typing each listing three times.
 
-**Ready to list** (web and iOS) hands a flip to [Hatbot](docs/hatbot-listing-plan.md) instead: pick OLX, Allegro Lokalnie and/or Vinted, Hatbot asks you once in its chat, and its Haggler bot posts the listing from its own browser and reports each marketplace back as listed (with the link, which also joins "Listed on"), failed or declined. Marking needs a complete draft (title, description, condition, a price per picked platform, delivery and a photo) and Scout says what's missing; while a flip is ready its draft stays complete. Pressing it again retries failed and declined platforms, and **Cancel listing** or recording a sale takes the flip off Hatbot's list. Hatbot reads it through the `scout_flips_to_list`, `scout_flip`, `scout_flip_photo` and `scout_flip_listed` MCP tools.
+**Ready to list** (web and iOS) hands a flip to [Hatbot](docs/hatbot-listing-plan.md) instead: pick OLX, Allegro Lokalnie and/or Vinted, and Hatbot's Haggler bot posts the listing from its own browser and reports each marketplace back as listed (with the link, which also joins "Listed on"), failed or declined. Marking needs a complete draft (title, description, condition, a price per picked platform, delivery and a photo) and Scout says what's missing; while a flip is ready its draft stays complete. Pressing it again retries failed and declined platforms, and **Cancel listing** or recording a sale takes the flip off Hatbot's list. Once a sale is recorded, Hatbot takes the listings it posted down on the other platforms and ticks each in the delist checklist; it leaves the one it sold on, where the buyer may still be paying. Hatbot reads all this through the `scout_flips_to_list`, `scout_flip`, `scout_flip_photo`, `scout_flip_listed`, `scout_flips_to_take_down` and `scout_flip_taken_down` MCP tools.
 
 ## Preserved listing copies
 
