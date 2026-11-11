@@ -3296,9 +3296,9 @@ export class ScoutService {
     const { score, dealStrength } = this.variantDealScore(row, Number(association.price_pln), this.watchBaselines(row), next.key, null);
     if (score.isReady && score.typical !== null) {
       const strength = dealStrength ?? 1;
-      this.stmt("UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, typical_source = 'own-history' WHERE id = ?").run(score.typical, strength, dealLabelFromStrength(strength), association.id);
+      this.stmt(`UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, typical_source = 'own-history', ${STORED_SCORE_SET} WHERE id = ?`).run(score.typical, strength, dealLabelFromStrength(strength), ...storedScore(score, true), association.id);
     } else {
-      this.stmt('UPDATE watch_listings SET typical_pln = NULL, deal_strength = NULL, deal_label = NULL, typical_source = NULL WHERE id = ?').run(association.id);
+      this.stmt(`UPDATE watch_listings SET typical_pln = NULL, deal_strength = NULL, deal_label = NULL, typical_source = NULL, ${STORED_SCORE_SET} WHERE id = ?`).run(...storedScore(score, false), association.id);
     }
     this.emit('scan', { refresh: true, watchId });
     return this.listingDetail(listingKey, watchId);
@@ -3936,6 +3936,8 @@ export class ScoutService {
     decision?: ListingDecision | 'none';
     /** Defaults to `all` so internal callers (dashboard feed) keep today's rows. */
     visibility?: 'visible' | 'hidden' | 'all';
+    /** Only rows that pass Scout's alert gate (QUALIFIES_SQL). */
+    qualifiesOnly?: boolean;
   } = {}, knownWatches?: Watch[]) {
     const freshnessCutoff = new Date(Date.now() - MATCH_VISIBILITY_MS).toISOString();
     const aiFilteredPredicate = 'EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = \'irrelevant\' OR (r.relevance_status IS NULL AND r.relevant = 0)) AND w.ai_relevance = 1)';
@@ -3960,6 +3962,7 @@ export class ScoutService {
     if (options.minStrength && options.minStrength > 1) { predicates.push('COALESCE(wl.deal_strength, 1) >= ?'); params.push(Math.min(5, Math.floor(options.minStrength))); }
     if (options.visibility === 'hidden') predicates.push('COALESCE(a.hidden, 0) = 1');
     else if (options.visibility === 'visible') predicates.push('COALESCE(a.hidden, 0) = 0');
+    if (options.qualifiesOnly) predicates.push(QUALIFIES_SQL);
     const query = options.q?.trim().toLowerCase() ?? '';
     if (query) {
       predicates.push("lower(COALESCE(l.title, '') || ' ' || COALESCE(l.subtitle, '') || ' ' || COALESCE(l.condition, '') || ' ' || COALESCE(l.location, '')) LIKE ? ESCAPE '\\'");
@@ -6347,7 +6350,7 @@ export class ScoutService {
       const discountPercent = score.discountPercent ?? 0;
       const dealStrength = scoredStrength ?? 1;
       const dealLabel = dealLabelFromStrength(dealStrength);
-      this.stmt("UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, typical_source = 'own-history', last_seen_at = ? WHERE id = ?").run(score.typical, dealStrength, dealLabel, observedAt, association.id);
+      this.stmt(`UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, typical_source = 'own-history', ${STORED_SCORE_SET}, last_seen_at = ? WHERE id = ?`).run(score.typical, dealStrength, dealLabel, ...storedScore(score, true), observedAt, association.id);
       this.stmt('UPDATE observations SET baseline_pln = ?, discount_percent = ?, deal_strength = ?, deal_label = ? WHERE id = ?').run(score.typical, discountPercent, dealStrength, dealLabel, observationId);
       if ((score.qualifies && meetsMinSaving(row, listing.price, score.typical)) || targetPrice !== null) return candidate(score.typical, discountPercent, score.confidence, dealStrength);
     } else if (useReference && score.typical !== null) {
@@ -6356,9 +6359,10 @@ export class ScoutService {
       const discountPercent = score.discountPercent ?? 0;
       const dealStrength = scoredStrength ?? 1;
       const dealLabel = dealLabelFromStrength(dealStrength);
-      this.stmt("UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, typical_source = 'reference-band', last_seen_at = ? WHERE id = ?").run(score.typical, dealStrength, dealLabel, observedAt, association.id);
+      this.stmt(`UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, typical_source = 'reference-band', ${STORED_SCORE_SET}, last_seen_at = ? WHERE id = ?`).run(score.typical, dealStrength, dealLabel, ...storedScore(score, true), observedAt, association.id);
       if (targetPrice !== null) return candidate(score.typical, discountPercent, score.confidence, dealStrength);
     } else {
+      this.stmt(`UPDATE watch_listings SET ${STORED_SCORE_SET} WHERE id = ?`).run(...storedScore(score, false), association.id);
       this.stmt('UPDATE observations SET baseline_pln = NULL, discount_percent = NULL WHERE id = ?').run(observationId);
       if (targetPrice !== null) return candidate(null, null, 0, null);
     }
@@ -6850,6 +6854,28 @@ export function meetsMinSaving(row: WatchRow, price: number, typical: number) {
   const floor = watchPlnFromRow(row.min_saving_pln);
   return floor === null || typical - price >= floor;
 }
+
+/** The watch_listings columns storedScore fills, in its order. */
+const STORED_SCORE_SET = 'discount_percent = ?, deviation = ?, confidence = ?, qualifies = ?';
+
+/**
+ * A scoring's values for STORED_SCORE_SET. Discount and deviation are kept
+ * only alongside the typical_pln written with them; without one they are
+ * cleared, as observations.discount_percent is.
+ */
+function storedScore(score: ScoreResult, withTypical: boolean): [number | null, number | null, number, number] {
+  return [withTypical ? score.discountPercent : null, withTypical ? score.deviation : null, score.confidence, score.qualifies ? 1 : 0];
+}
+
+/**
+ * "Would Scout alert?" for a feed row (aliases wl, l, w), as storeListing
+ * decides it: a qualifying score that clears the watch's minimum saving, or
+ * a price at or below its target. Both rules are read here rather than
+ * stored, so editing them needs no rescore. Hidden listings, AI-filtered
+ * ones and the description check before Very strong+ alerts are separate.
+ */
+const QUALIFIES_SQL = `((wl.qualifies = 1 AND (w.min_saving_pln IS NULL OR w.min_saving_pln <= 0 OR wl.typical_pln - l.price_pln >= w.min_saving_pln))
+  OR (w.target_price_pln > 0 AND l.price_pln > 0 AND l.price_pln <= w.target_price_pln))`;
 
 export function sellerTypeFromRow(value: unknown): SellerType | null {
   return value === 'private' || value === 'business' ? value : null;

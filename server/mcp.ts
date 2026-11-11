@@ -141,6 +141,7 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       sort: z.enum(['newest', 'strongest', 'price']).optional().default('newest'),
       decision: z.enum(['buy', 'watch', 'pass']).optional(),
       visibility: z.enum(['visible', 'hidden', 'all']).optional().default('visible'),
+      qualifiesOnly: z.boolean().optional().describe('Only listings that would alert: a deal score that passes the watch\'s alert gate and minimum saving, or a target-price hit, at the last scan. Very strong+ deals are also checked against their description before alerting.'),
     },
     annotations: { readOnlyHint: true },
   }, async (input) => {

@@ -10,6 +10,7 @@ import { listingDescriptionVerificationInputHash, listingRelevanceInputHash } fr
 import { VisionError } from '../server/vision';
 import { ScoutService, ServiceError, dashboardTopParam, decryptSecret, olxCategoryFromJson, olxCategoryToJson, encryptSecret, escapeDiscordMarkdown, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
 import { OTHER_VARIANT_KEY } from '../server/variants';
+import { scoreDeal } from '../server/scoring';
 
 // Pin the legacy DeepSeek path for pre-existing tests: live Jev is the
 // production default whenever a key is available, but these tests assert
@@ -2094,7 +2095,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals', '030_perf_indexes', '031_flips', '032_flip_listings', '033_verification_checks', '033_watch_alert_targets', '034_flip_ready_to_list', '034_listing_seller', '035_connected_apps', '035_negotiation_outcomes', '036_shared_sessions', '037_marketplace_session_checks']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals', '030_perf_indexes', '031_flips', '032_flip_listings', '033_verification_checks', '033_watch_alert_targets', '034_flip_ready_to_list', '034_listing_seller', '035_connected_apps', '035_negotiation_outcomes', '036_shared_sessions', '037_marketplace_session_checks', '038_watch_listing_scores']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -2584,7 +2585,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 42);
+    assert.equal(after.migrations.count, 43);
   } finally { context.close(); }
 });
 
@@ -3875,6 +3876,15 @@ test('moves a listing to a variant manually, re-scores it, and keeps the pick ac
     assert.equal(moved.listing.typical, 2600);
     assert.equal(moved.listing.dealLabel, 'Exceptional');
     assert.deepEqual(moved.variantGroups?.map((group) => group.id), ['mini', 'base', 'pro']);
+    // The stored score follows the move: scored against 13 Pro, it would alert.
+    const storedScore = () => ({ ...context.db.prepare("SELECT wl.discount_percent, wl.deviation, wl.confidence, wl.qualifies FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE wl.watch_id = 'manual-variant-watch' AND l.listing_id = 'iPhone-13-0'").get() as Record<string, unknown> });
+    const rescored = (variant: string) => {
+      const watchRow = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('manual-variant-watch');
+      const { score } = (context.service as any).variantDealScore(watchRow, 1900, (context.service as any).watchBaselines(watchRow), variant, null);
+      return { discount_percent: score.discountPercent, deviation: score.deviation, confidence: score.confidence, qualifies: score.qualifies ? 1 : 0 };
+    };
+    assert.deepEqual(storedScore(), rescored('pro'));
+    assert.equal(storedScore().qualifies, 1);
 
     // A scan that sees the listing again, and a variant edit, both keep the manual pick.
     (context.service as any).processDealCandidates = async () => {};
@@ -3890,6 +3900,8 @@ test('moves a listing to a variant manually, re-scores it, and keeps the pick ac
     // Back to automatic: the rules put it in the base variant again.
     const automatic = context.service.setListingVariant('manual-variant-watch', key, null);
     assert.deepEqual([automatic.listing.variantKey, automatic.listing.variantSource, automatic.listing.typical], ['base', 'rule', 2000]);
+    assert.deepEqual(storedScore(), rescored('base'));
+    assert.equal(storedScore().qualifies, 0);
 
     // A manual pick whose variant is removed falls back to the rules.
     context.service.setListingVariant('manual-variant-watch', key, 'pro');
@@ -4271,4 +4283,56 @@ test('target prices alert while learning on every channel, and the minimum savin
     globalThis.fetch = originalFetch;
     context.close();
   }
+});
+
+test('storeListing keeps each listing\'s latest deal score, and qualifiesOnly lists what would alert', () => {
+  const context = fixture();
+  try {
+    seedWatch(context.db, 'score-watch');
+    const service = context.service as any;
+    const row = () => context.db.prepare('SELECT * FROM watches WHERE id = ?').get('score-watch');
+    const listing = (id: string, price: number) => ({ marketplace: 'OLX' as const, listingId: id, title: `CPU ${id}`, price, currency: 'PLN' as const, url: `https://www.olx.pl/d/oferta/cpu-${id}`, observedAt: new Date().toISOString() });
+    const store = (id: string, price: number) => service.storeListing(row(), listing(id, price), service.createScan('score-watch', 'watch', 'OLX'), service.watchBaselines(row()));
+    const stored = (id: string) => ({ ...context.db.prepare(`SELECT wl.discount_percent, wl.deviation, wl.confidence, wl.qualifies FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id
+      WHERE wl.watch_id = 'score-watch' AND l.listing_id = ?`).get(id) as Record<string, unknown> });
+    const columns = (score: ReturnType<typeof scoreDeal>) => ({ discount_percent: score.discountPercent, deviation: score.deviation, confidence: score.confidence, qualifies: score.qualifies ? 1 : 0 });
+    const qualifying = (options: { q?: string } = {}) => context.service.listingsPage({ qualifiesOnly: true, ...options }).listings.map((item) => item.listingId).sort();
+    const base = Array.from({ length: 32 }, (_, index) => 990 + (index % 5) * 5);
+
+    // Learning: five prices give scoreDeal a median, but no typical is
+    // stored yet, so discount and deviation stay empty like the feed's.
+    base.slice(0, 5).forEach((price, index) => store(`base-${index}`, price));
+    const learning = scoreDeal(base.slice(0, 5), 500, { observedHours: 0 });
+    assert.ok(learning.discountPercent! > 0);
+    store('learning', 500);
+    assert.deepEqual(stored('learning'), { ...columns(learning), discount_percent: null, deviation: null });
+    assert.deepEqual(stored('learning'), { discount_percent: null, deviation: null, confidence: 10, qualifies: 0 });
+
+    // Ready: the stored values are exactly scoreDeal's on the same baseline.
+    base.slice(5).forEach((price, index) => store(`base-${index + 5}`, price));
+    context.db.prepare('UPDATE observations SET observed_at = ? WHERE watch_id = ?').run(new Date(Date.now() - 8 * 60 * 60_000).toISOString(), 'score-watch');
+    const prices = [...base, 500];
+    const expected = new Map<string, ReturnType<typeof scoreDeal>>();
+    for (const [id, price] of [['deal', 670], ['fair', 980]] as const) {
+      expected.set(id, scoreDeal(prices, price, { observedHours: 8 }));
+      store(id, price);
+      prices.push(price);
+      assert.deepEqual(stored(id), columns(expected.get(id)!), id);
+    }
+    assert.deepEqual([expected.get('deal')!.qualifies, expected.get('fair')!.qualifies], [true, false]);
+    assert.equal(stored('deal').confidence, 100);
+
+    // The watch's alert rules are applied when reading. 'learning' was
+    // scored while the watch learned, so only a target hit lists it before
+    // its next scan.
+    assert.deepEqual(qualifying(), ['deal']);
+    context.db.prepare('UPDATE watches SET min_saving_pln = 400 WHERE id = ?').run('score-watch');
+    assert.deepEqual(qualifying(), [], '330 zł saved is under the 400 zł floor');
+    context.db.prepare('UPDATE watches SET target_price_pln = 600 WHERE id = ?').run('score-watch');
+    assert.deepEqual(qualifying(), ['learning'], 'target hits ignore the floor');
+    context.db.prepare('UPDATE watches SET min_saving_pln = 300 WHERE id = ?').run('score-watch');
+    assert.deepEqual(qualifying(), ['deal', 'learning']);
+    assert.deepEqual(qualifying({ q: 'deal' }), ['deal']);
+    assert.equal(context.service.listingsPage({ qualifiesOnly: false }).pagination.total, 35);
+  } finally { context.close(); }
 });

@@ -352,6 +352,7 @@ app.get('/api/listings', async (request, reply) => {
     visibility: z.enum(['visible', 'hidden', 'all']).optional().default('visible'),
     minStrength: z.coerce.number().int().min(1).max(5).optional(),
     aiFiltered: z.enum(['exclude', 'include', 'only']).optional(),
+    qualifiesOnly: z.string().regex(/^(?:true|false)$/i).transform((value) => value.toLowerCase() === 'true').optional(),
   }).strict().safeParse(request.query);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid listing filters' });
   const query = parsed.data;
@@ -366,6 +367,7 @@ app.get('/api/listings', async (request, reply) => {
     visibility: query.visibility,
     minStrength: query.minStrength,
     aiFiltered: query.aiFiltered,
+    qualifiesOnly: query.qualifiesOnly,
   });
   return { listings: page.listings, pagination: page.pagination };
 });
