@@ -4387,6 +4387,7 @@ export class ScoutService {
         let relevant = filtered;
         let relevanceNote = '';
         let relevanceResult: RelevanceFilterResult | null = null;
+        let relevanceFailed = false;
         try {
           const relevance = await this.filterListingsByAiRelevance(filtered, {
             query: input.query,
@@ -4400,6 +4401,7 @@ export class ScoutService {
             : relevance.unknown ? ` · ${relevance.unknown} AI checks unknown`
               : relevance.excluded ? ` · ${relevance.excluded} excluded by AI` : '';
         } catch (error) {
+          relevanceFailed = input.aiRelevance !== false;
           this.log('error', 'watch', `Manual search AI relevance fallback to deterministic: ${error instanceof Error ? error.message : String(error)}`.slice(0, 500));
         }
         let capped = relevant.slice(0, MANUAL_SEARCH_RESULT_CAP);
@@ -4452,7 +4454,8 @@ export class ScoutService {
             const key = `${listing.marketplace}:${listing.listingId}`;
             details.listings.set(key, {
               listingId: listing.listingId,
-              relevance: relevanceResult?.statuses?.get(listing) ?? 'not-checked',
+              // A check that threw kept the listing without a verdict, as the budget running out does.
+              relevance: relevanceResult?.statuses?.get(listing) ?? (relevanceFailed ? 'unknown' : 'not-checked'),
               match: rescuedKeys.has(key) ? 'rescued' : strictKeys.has(key) ? 'strict' : 'relaxed',
               matchedVia: 'query',
               flags: [],

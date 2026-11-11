@@ -260,6 +260,21 @@ test('past the AI budget rows come back as relevance "unknown" and the source co
   }
 });
 
+test('a relevance check that throws keeps the rows as "unknown"; with it off they are "not-checked"', async () => {
+  const context = fixture();
+  (context.service as any).fetchOlxApi = olxOk;
+  (context.service as any).filterListingsByAiRelevance = async () => { throw new Error('relevance cache unavailable'); };
+  try {
+    const relevance = async (aiRelevance: boolean) => {
+      const result = await context.service.manualSearchDetailed({ query: '13 128gb', sources: ['OLX'], aiRelevance });
+      assert.ok(result.listings.length > 0);
+      return [...new Set(result.listings.map((listing) => result.details.listings.get(listing.id)?.relevance))];
+    };
+    assert.deepEqual(await relevance(true), ['unknown']);
+    assert.deepEqual(await relevance(false), ['not-checked']);
+  } finally { context.close(); }
+});
+
 test('compact rows say which matched strictly and which a Jev near-miss rescue brought back', async () => {
   const restore = liveJevEnv();
   const context = fixture({
