@@ -43,6 +43,8 @@ export interface CompactListing {
   variantKey: string | null;
   variant: string | null;
   url: string;
+  /** The listing's photo, for a chart or card; null when it has none. */
+  image: string | null;
   condition: string | null;
   location: string | null;
   shippingAvailable: boolean | null;
@@ -76,6 +78,7 @@ export function compactListing(listing: Listing): CompactListing {
     variantKey: listing.variantKey ?? null,
     variant: listing.variantLabel ?? null,
     url: listing.url,
+    image: listing.image || null,
     condition: listing.condition ?? null,
     location: listing.location ?? null,
     shippingAvailable: listing.shippingAvailable ?? null,

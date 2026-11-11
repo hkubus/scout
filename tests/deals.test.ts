@@ -194,7 +194,7 @@ test('Strong+ matches the dashboard count, and scout_deals answers it best first
       id: 'OLX:exc', listingId: 'exc', source: 'OLX', title: 'iPhone 13 exc', price: 600, typical: 1000, discountPercent: 40,
       // OLX's default fee preset is 0%, so reselling at typical nets 1000 - 600.
       tier: 'exceptional', dealLabel: 'Exceptional', typicalSource: 'own-history', estimatedNet: 400,
-      watchId: 'deal-ready', watch: 'Ready watch', variantKey: null, variant: null, url: 'https://example.test/exc',
+      watchId: 'deal-ready', watch: 'Ready watch', variantKey: null, variant: null, url: 'https://example.test/exc', image: null,
       condition: null, location: null, shippingAvailable: null, negotiable: null, sellerType: null, postedAt: null,
       seenAt: first.seenAt, decision: null, verification: 'pass',
     });
@@ -212,6 +212,7 @@ test('compact rows give a signed discount and mark hidden rows', () => {
   const context = fixture();
   try {
     seed(context.db, ROWS);
+    context.db.prepare("UPDATE listings SET image_url = 'https://example.test/very.jpg' WHERE listing_id = 'very'").run();
     const rows = context.service.listingsPage({ visibility: 'all', pageSize: 100 }).listings.map(compactListing);
     const byId = new Map(rows.map((row) => [row.listingId, row]));
     assert.equal(byId.get('above')?.discountPercent, -10);
@@ -221,5 +222,8 @@ test('compact rows give a signed discount and mark hidden rows', () => {
     assert.equal('hidden' in byId.get('exc')!, false);
     assert.equal(byId.get('very')?.source, 'Vinted');
     assert.equal(byId.get('very')?.shippingAvailable, true);
+    // The photo, for a chart or card; null without one, never "".
+    assert.equal(byId.get('very')?.image, 'https://example.test/very.jpg');
+    assert.equal(byId.get('exc')?.image, null);
   } finally { context.close(); }
 });
