@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { ScoutDebug } from './debug';
+import { toCompactSearch } from './mcpFormat';
 import type { FlipStore } from './flips';
 import type { ScoutService } from './service';
 import { ServiceError } from './service';
@@ -8,6 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { VERIFICATION_CHECKS_MAX, VERIFICATION_CHECK_MAX_CHARS } from './ai';
 import { FLIP_CHANNELS } from '../src/profit';
 import { DEAL_TIERS, DEAL_TIER_STRENGTH, DEALS_DEFAULT_LIMIT, DEALS_MAX_LIMIT, LISTING_VERIFICATION_FILTERS, compactListing, dealsForAgent } from './deals';
+import { MARKETPLACE_SEARCH_SORTS } from './marketplaces';
 
 export const MCP_DASHBOARD_LISTINGS = 20;
 
@@ -336,13 +338,21 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       ownerType: z.enum(['private', 'business']).nullable().optional(),
       olxCategoryId: z.number().int().positive().optional().describe('OLX only: search one category; ids come from scout_olx_categories.'),
       page: z.number().int().min(1).max(10).optional().default(1),
+      sort: z.enum(MARKETPLACE_SEARCH_SORTS).optional().default('relevance')
+        .describe('Which listings each marketplace returns: relevance keeps its own order; newest asks for the most recently posted first, as watch scans do, to catch fresh underpriced ones. Allegro Lokalnie lists newest first either way. Results still come back sorted by price.'),
       aiRelevance: z.boolean().optional().default(true),
       verificationChecks: z.array(z.object({ text: z.string().trim().min(1).max(120), mode: z.enum(['require', 'exclude']) })).max(8).optional()
         .describe('Jev reads each result: exclude hides near-certain matches; require-confirmed results come back with jevCheck "passed".'),
+      format: z.enum(['full', 'compact']).optional().default('full')
+        .describe('compact: smaller, stable rows with every key present (null when unknown): id "<Marketplace>:<listingId>", asking price in PLN, relevance, match kind; sources carry status ok|error with an errorKind and pipeline counts.'),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
-  }, async ({ olxCategoryId, ...input }) => {
-    try { return text(await service.manualSearch({ ...input, olxCategory: olxCategoryId ? { id: olxCategoryId, label: String(olxCategoryId), path: '' } : null })); } catch (error) { return toolError(error); }
+  }, async ({ olxCategoryId, format, ...input }) => {
+    try {
+      const filters = { ...input, olxCategory: olxCategoryId ? { id: olxCategoryId, label: String(olxCategoryId), path: '' } : null };
+      if (format === 'compact') return text(toCompactSearch(filters, await service.manualSearchDetailed(filters)));
+      return text(await service.manualSearch(filters));
+    } catch (error) { return toolError(error); }
   });
 
   server.registerTool('scout_olx_categories', {

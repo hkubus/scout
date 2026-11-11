@@ -337,6 +337,57 @@ test('scout_flips returns the ledger compactly and rejects an unknown status', a
   } finally { context.close(); }
 });
 
+test('scout_search sort: newest asks every marketplace for its newest listings, and the default keeps each one\'s own order', async () => {
+  const context = fixture();
+  try {
+    const requested: URL[] = [];
+    const service = context.service as any;
+    service.fetchOlxApi = async (url: string) => { requested.push(new URL(url)); return { status: 200, json: { data: [], metadata: { visible_total_count: 0 } } }; };
+    // Vinted tries its catalog page first, then the catalog API; Allegro
+    // Lokalnie only has its search page. Every request is recorded and none
+    // leaves the process.
+    service.fetchVintedItemPage = async (url: string) => { requested.push(new URL(url)); return { status: 403, body: '' }; };
+    service.fetchVintedApi = async (url: string) => { requested.push(new URL(url)); return { status: 200, json: { items: [], pagination: { current_page: 1, total_pages: 0, total_entries: 0, per_page: 20 }, code: 0 } }; };
+    service.fetchPublicPage = async (url: string) => { requested.push(new URL(url)); throw new Error('offline'); };
+    const { server, client } = await connectedClient(context.service);
+    try {
+      const tool = (await client.listTools()).tools.find((entry) => entry.name === 'scout_search')!;
+      const sort = (tool.inputSchema.properties as Record<string, { enum?: string[]; default?: string }>).sort;
+      assert.deepEqual([sort.enum, sort.default], [['relevance', 'newest'], 'relevance']);
+
+      const search = async (extra: Record<string, unknown>) => {
+        requested.length = 0;
+        const result = await client.callTool({ name: 'scout_search', arguments: { query: 'steam deck', sources: ['OLX', 'Allegro Lokalnie', 'Vinted'], aiRelevance: false, ...extra } }) as { isError?: boolean };
+        assert.equal(result.isError, undefined);
+        const on = (host: string) => requested.filter((url) => url.hostname.endsWith(host));
+        assert.ok(on('olx.pl').length && on('allegrolokalnie.pl').length && on('vinted.pl').length, 'every marketplace was asked');
+        return {
+          olx: on('olx.pl').map((url) => url.searchParams.get('sort_by')),
+          allegro: on('allegrolokalnie.pl').map((url) => url.searchParams.get('sort')),
+          vinted: on('vinted.pl').map((url) => url.searchParams.get('order')),
+        };
+      };
+      const newest = await search({ sort: 'newest' });
+      assert.ok(newest.olx.every((value) => value === 'created_at:desc'), String(newest.olx));
+      assert.ok(newest.allegro.every((value) => value === 'startingTime-desc'), String(newest.allegro));
+      assert.ok(newest.vinted.every((value) => value === 'newest_first'), String(newest.vinted));
+
+      for (const extra of [{}, { sort: 'relevance' }]) {
+        const own = await search(extra);
+        assert.ok([...own.olx, ...own.allegro, ...own.vinted].every((value) => value === null), JSON.stringify({ extra, own }));
+      }
+
+      requested.length = 0;
+      const refused = await client.callTool({ name: 'scout_search', arguments: { query: 'steam deck', sources: ['OLX'], sort: 'price_asc' } }) as { isError?: boolean };
+      assert.equal(refused.isError, true);
+      assert.equal(requested.length, 0);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});
+
 test('scout_inbox and scout_conversation are read-only and report a missing session in the tool error shape', async () => {
   const context = fixture();
   try {

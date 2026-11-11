@@ -8,7 +8,7 @@ import { basename, join, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { listings as seedListings, watches as seedWatches } from '../src/data';
-import { validateSearchUrl } from './marketplaces';
+import { MARKETPLACE_SEARCH_SORTS, validateSearchUrl } from './marketplaces';
 import { debugApiEnabled, ScoutDebug } from './debug';
 import { backupDatabase, openDatabase, seedDatabase, startWalCheckpointer } from './db';
 import { buildDiscordEmbed } from './notifications';
@@ -598,6 +598,7 @@ const searchInput = z.object({
   ownerType: z.enum(['private', 'business']).nullable().optional().default(null),
   olxCategory: olxCategoryInput.nullable().optional().default(null),
   page: z.number().int().min(1).max(10).optional().default(1),
+  sort: z.enum(MARKETPLACE_SEARCH_SORTS).optional().default('relevance'),
   searchId: z.string().trim().min(1).max(80).optional(),
   aiRelevance: z.boolean().optional().default(true),
   verificationChecks: verificationChecksInput.optional().default([]),
