@@ -23,6 +23,7 @@ import { matchQuality, matchQuery, type MatchCandidate, type QueryMatch } from '
 import { conditionClass, daysListed, outcomeShare, priceDrops, shareOfAsking, titleSimilarity } from './negotiation';
 import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assignVariant, finalizeVariantSuggestions, parseVariantGroups, suggestVariantGroupsFromTitles, variantLabelFor, type VariantGroup, type VariantSample } from './variants';
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
+import type { ListingVerificationFilter } from './deals';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
 import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes, AgentFlip, AgentFlips, ConversationResult, InboxResult } from '../src/types';
@@ -139,7 +140,7 @@ const connectorDefinitions: Array<Pick<Connector, 'name' | 'kind' | 'color'>> = 
 ];
 const marketplaces: Marketplace[] = ['OLX', 'Allegro Lokalnie', 'Vinted'];
 export const DEFAULT_NIGHT_INTERVAL_MINUTES = 30;
-const MATCH_VISIBILITY_MS = 12 * 60 * 60_000;
+export const MATCH_VISIBILITY_MS = 12 * 60 * 60_000;
 /**
  * Rows a single manual-search request keeps per source before truncating. The
  * client pages past it with `page` instead of losing results silently.
@@ -3931,7 +3932,24 @@ export class ScoutService {
     aiFiltered?: 'exclude' | 'include' | 'only';
     /** Lowest deal strength (1-5) to include. */
     minStrength?: number;
-    sort?: 'newest' | 'strongest' | 'price';
+    /** Lowest percent below the typical price the row displays; rows without one are left out. */
+    minDiscount?: number;
+    /** One model variant id of the watch (`__other__` is the unmatched bucket). */
+    variantKey?: string;
+    minPrice?: number;
+    maxPrice?: number;
+    /** AI description check status; `none` keeps never-checked rows. */
+    verification?: ListingVerificationFilter;
+    /** Leave out rows the AI description check rejected. */
+    excludeRejected?: boolean;
+    /** Leave out rows marked Pass. */
+    excludePassed?: boolean;
+    /**
+     * `discount` is percent below the displayed typical, rows without one
+     * last; `deal` is strength, then that discount, then newest (the Top
+     * deals order).
+     */
+    sort?: 'newest' | 'strongest' | 'price' | 'discount' | 'deal';
     /** `none` keeps only untriaged rows. */
     decision?: ListingDecision | 'none';
     /** Defaults to `all` so internal callers (dashboard feed) keep today's rows. */
@@ -3965,12 +3983,33 @@ export class ScoutService {
       predicates.push("lower(COALESCE(l.title, '') || ' ' || COALESCE(l.subtitle, '') || ' ' || COALESCE(l.condition, '') || ' ' || COALESCE(l.location, '')) LIKE ? ESCAPE '\\'");
       params.push(`%${ScoutService.escapeLike(query)}%`);
     }
+    if (options.variantKey) { predicates.push('wl.variant_key = ?'); params.push(options.variantKey); }
+    if (options.minPrice !== undefined) { predicates.push('l.price_pln >= ?'); params.push(options.minPrice); }
+    if (options.maxPrice !== undefined) { predicates.push('l.price_pln <= ?'); params.push(options.maxPrice); }
+    if (options.verification === 'none') predicates.push('l.ai_description_verification_status IS NULL');
+    else if (options.verification) { predicates.push('l.ai_description_verification_status = ?'); params.push(options.verification); }
+    if (options.excludeRejected) predicates.push("COALESCE(l.ai_description_verification_status, '') <> 'reject'");
+    if (options.excludePassed) predicates.push("COALESCE(a.decision, '') <> 'pass'");
+    const watches = new Map((knownWatches ?? this.getWatches()).map((watch) => [watch.id, watch]));
+    // Percent below the typical listingFromRow displays: an own-history or
+    // reference-band typical, or a legacy one once its watch is ready. One
+    // json_each bind keeps a single statement shape for any set of watches.
+    const discountSql = "(CASE WHEN COALESCE(wl.typical_pln, l.typical_pln) > 0 AND (wl.typical_source IN ('own-history', 'reference-band') OR wl.watch_id IN (SELECT value FROM json_each(?))) THEN (COALESCE(wl.typical_pln, l.typical_pln) - l.price_pln) * 100.0 / COALESCE(wl.typical_pln, l.typical_pln) END)";
+    const usesDiscount = options.minDiscount !== undefined || options.sort === 'discount' || options.sort === 'deal';
+    const readyWatchIdsJson = usesDiscount ? JSON.stringify([...watches.values()].filter((watch) => watch.readiness === 100).map((watch) => watch.id)) : '[]';
+    if (options.minDiscount !== undefined) { predicates.push(`${discountSql} >= ?`); params.push(readyWatchIdsJson, options.minDiscount); }
     const where = predicates.join(' AND ');
+    // SQLite sorts NULL lowest, so DESC puts rows without a typical last.
+    const orderParams: unknown[] = options.sort === 'discount' || options.sort === 'deal' ? [readyWatchIdsJson] : [];
     const orderBy = options.sort === 'strongest'
       ? 'wl.deal_strength DESC, wl.last_seen_at DESC, wl.id DESC'
       : options.sort === 'price'
         ? 'l.price_pln ASC, wl.last_seen_at DESC, wl.id DESC'
-        : 'wl.last_seen_at DESC, wl.id DESC';
+        : options.sort === 'discount'
+          ? `${discountSql} DESC, wl.last_seen_at DESC, wl.id DESC`
+          : options.sort === 'deal'
+            ? `wl.deal_strength DESC, ${discountSql} DESC, wl.last_seen_at DESC, wl.id DESC`
+            : 'wl.last_seen_at DESC, wl.id DESC';
     const total = Number((this.stmt(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(500, Math.floor(options.pageSize ?? 200)));
@@ -3980,8 +4019,7 @@ export class ScoutService {
       JOIN watches w ON w.id = wl.watch_id
       LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id
       WHERE ${where}
-      ORDER BY ${orderBy} LIMIT ? OFFSET ?`).all(...params, pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
-    const watches = new Map((knownWatches ?? this.getWatches()).map((watch) => [watch.id, watch]));
+      ORDER BY ${orderBy} LIMIT ? OFFSET ?`).all(...params, ...orderParams, pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
     const feePresets = this.feePresets();
     const listings = rows.map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100, watches.get(row.watch_id)?.variantGroups ?? [], feePresets));
     return { listings, pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
