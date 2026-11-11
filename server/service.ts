@@ -24,7 +24,7 @@ import { conditionClass, daysListed, outcomeShare, priceDrops, shareOfAsking, ti
 import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assignVariant, finalizeVariantSuggestions, parseVariantGroups, suggestVariantGroupsFromTitles, variantLabelFor, type VariantGroup, type VariantSample } from './variants';
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
-import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
+import { summarizeAnalytics, type AnalyticsRow } from './analytics';
 import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes, AgentFlip, AgentFlips, ConversationResult, InboxResult } from '../src/types';
 import { estimatedNetAtTypical, flipCost, flipNet, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, suggestedListingPrice, type FeePresets } from '../src/profit';
 
@@ -3826,24 +3826,25 @@ export class ScoutService {
     const params: unknown[] = [cutoff];
     if (watchId) { predicates.push('w.id = ?'); params.push(watchId); }
     if (marketplace) { predicates.push('l.marketplace = ?'); params.push(marketplace); }
-    const rows = this.stmt(`SELECT date(o.observed_at) AS day, o.listing_id AS listing_id, o.watch_id AS watch_id, w.name AS watch_name, l.marketplace AS marketplace, o.price_pln AS price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at, wl.first_seen_at AS first_seen_at
+    // Columns in AnalyticsRow order.
+    const statement = this.stmt(`SELECT date(o.observed_at) AS day, o.listing_id AS listing_id, o.watch_id AS watch_id, w.name AS watch_name, l.marketplace AS marketplace, o.price_pln AS price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at, wl.first_seen_at AS first_seen_at
       FROM watches w
       JOIN watch_listings wl ON wl.watch_id = w.id
       JOIN listings l ON l.id = wl.listing_id
       CROSS JOIN observations o INDEXED BY observations_watch_listing ON o.watch_id = wl.watch_id AND o.listing_id = wl.listing_id
       WHERE ${predicates.join(' AND ')}
-      GROUP BY day, o.watch_id, o.listing_id`).all(...params) as Array<Record<string, any>>;
-    const observations: AnalyticsObservation[] = rows.map((row) => ({
-      day: String(row.day),
-      listingId: Number(row.listing_id),
-      watchId: String(row.watch_id),
-      watchName: String(row.watch_name),
-      marketplace: row.marketplace as Marketplace,
-      price: Number(row.price_pln),
-      typical: row.typical_pln === null || row.typical_pln === undefined ? null : Number(row.typical_pln),
-      observedAt: String(row.observed_at),
-      firstSeenAt: String(row.first_seen_at),
-    }));
+      GROUP BY day, o.watch_id, o.listing_id`);
+    // Positional rows: a 180-day range is ~100k rows, and node:sqlite's row
+    // objects hold over twice the heap of arrays and are slower to read.
+    // setReturnArrays arrived in Node 22.16 and 24; older 22.x maps the objects.
+    let rows: AnalyticsRow[];
+    if (typeof statement.setReturnArrays === 'function') {
+      statement.setReturnArrays(true);
+      rows = statement.all(...params);
+    } else {
+      rows = (statement.all(...params) as Array<Record<string, unknown>>).map((row): AnalyticsRow => [row.day, row.listing_id, row.watch_id, row.watch_name, row.marketplace, row.price_pln, row.typical_pln, row.observed_at, row.first_seen_at]);
+    }
+    const deals = summarizeAnalytics(rows, cutoff);
 
     const scanPredicates = ["watch_kind = 'watch'", 'started_at >= ?'];
     const scanParams: unknown[] = [cutoff];
@@ -3865,7 +3866,7 @@ export class ScoutService {
         averageMs: row.average_ms === null || row.average_ms === undefined ? null : Number(row.average_ms),
       });
     }
-    const marketplaceComparison: AnalyticsMarketplaceRow[] = marketplaceDeals(observations).map((row) => {
+    const marketplaceComparison: AnalyticsMarketplaceRow[] = deals.marketplaceDeals.map((row) => {
       const scan = scanByMarketplace.get(row.marketplace);
       return {
         ...row,
@@ -3900,7 +3901,7 @@ export class ScoutService {
     };
 
     const overview: AnalyticsOverview = {
-      ...dealOverview(observations, cutoff),
+      ...deals.overview,
       scanRuns,
       scanSuccessRate: scanRuns > 0 ? (scansCompleted / scanRuns) * 100 : null,
     };
@@ -3911,9 +3912,9 @@ export class ScoutService {
       marketplace,
       generatedAt: nowIso(),
       overview,
-      trend: trendPoints(observations),
-      discountDistribution: discountDistribution(observations),
-      watchLeaderboard: watchLeaderboard(observations),
+      trend: deals.trend,
+      discountDistribution: deals.discountDistribution,
+      watchLeaderboard: deals.watchLeaderboard,
       marketplaceComparison,
       triage,
       aiQuality,
