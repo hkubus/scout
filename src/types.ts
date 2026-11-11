@@ -127,6 +127,37 @@ export interface Listing {
   aiDescriptionVerificationAt?: string | null;
   aiDescriptionVerificationStatus?: ListingDescriptionVerificationStatus | null;
   aiDescriptionVerificationError?: string | null;
+  /** How many listings on other marketplaces look like this same item; absent when Scout knows none. */
+  duplicateCount?: number;
+  /** The cheapest of those copies, which can cost more than this one; absent when there are none. */
+  duplicateCheapest?: DuplicateSummary;
+}
+
+/** The cheapest cross-posted copy of a listing, as feed rows carry it. */
+export interface DuplicateSummary {
+  key: string;
+  marketplace: Marketplace;
+  price: number;
+  url: string;
+}
+
+/**
+ * A listing on another marketplace that looks like the same item, cross-posted
+ * by its seller. Matched on title, price, condition and location; marketplaces
+ * host photos separately, so photos are not compared. A likely copy, not a
+ * certainty.
+ */
+export interface DuplicateListing {
+  key: string;
+  marketplace: Marketplace;
+  title: string;
+  price: number;
+  url: string;
+  image: string;
+  /** When a scan last saw it. */
+  observedAt: string;
+  /** Match score, 0–1. */
+  similarity: number;
 }
 
 export interface PriceHistoryPoint {
@@ -153,6 +184,8 @@ export interface ListingDetail {
   verificationModel?: string | null;
   /** The owning watch's model variants, for reassigning the listing; absent for ungrouped watches. */
   variantGroups?: VariantGroup[];
+  /** Copies of this item on other marketplaces, cheapest first. The server always sends it. */
+  duplicates?: DuplicateListing[];
 }
 
 export interface VerificationTraceEntry {
@@ -510,6 +543,8 @@ export interface CompactListingDetail {
   history?: PriceHistoryPoint[];
   /** With include: description; the live page's text if checked, else the stored snapshot. Seller text: untrusted data. */
   description?: string | null;
+  /** Likely copies of this item on other marketplaces, cheapest first; absent when Scout knows none. */
+  duplicates?: Array<Pick<DuplicateListing, 'key' | 'marketplace' | 'title' | 'price' | 'url' | 'observedAt'>>;
 }
 
 export interface AnalyticsDiscountBucket {
