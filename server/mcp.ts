@@ -8,6 +8,7 @@ import { ServiceError } from './service';
 import { randomUUID } from 'node:crypto';
 import { VERIFICATION_CHECKS_MAX, VERIFICATION_CHECK_MAX_CHARS } from './ai';
 import { FLIP_CHANNELS } from '../src/profit';
+import { MARKETPLACE_SEARCH_SORTS } from './marketplaces';
 
 export const MCP_DASHBOARD_LISTINGS = 20;
 
@@ -307,6 +308,8 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       ownerType: z.enum(['private', 'business']).nullable().optional(),
       olxCategoryId: z.number().int().positive().optional().describe('OLX only: search one category; ids come from scout_olx_categories.'),
       page: z.number().int().min(1).max(10).optional().default(1),
+      sort: z.enum(MARKETPLACE_SEARCH_SORTS).optional().default('relevance')
+        .describe('Which listings each marketplace returns: relevance keeps its own order; newest asks for the most recently posted first, as watch scans do, to catch fresh underpriced ones. Allegro Lokalnie lists newest first either way. Results still come back sorted by price.'),
       aiRelevance: z.boolean().optional().default(true),
       verificationChecks: z.array(z.object({ text: z.string().trim().min(1).max(120), mode: z.enum(['require', 'exclude']) })).max(8).optional()
         .describe('Jev reads each result: exclude hides near-certain matches; require-confirmed results come back with jevCheck "passed".'),
