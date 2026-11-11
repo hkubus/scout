@@ -7,9 +7,6 @@ import ScoutKit
 struct ScoutTimelineProvider: AppIntentTimelineProvider {
     /// WidgetKit rations reloads; the app also reloads widgets when its data changes.
     private static let refreshInterval: TimeInterval = 15 * 60
-    /// The widget shows 6 deals at most; asking the server for a few more
-    /// keeps its ties in the same order as `WidgetSnapshot.make`'s re-sort.
-    private static let dashboardTop = 12
     /// Shorter than the app's 20 s: an unreachable LAN or VPN server
     /// otherwise keeps the extension and radio busy for each timeline.
     private static let dashboardTimeout: TimeInterval = 10
@@ -77,7 +74,7 @@ struct ScoutTimelineProvider: AppIntentTimelineProvider {
                 snapshot = shared
             } else {
                 snapshot = try await WidgetFeed.shared.snapshot(for: source) { [isDemo] in
-                    WidgetSnapshot.make(from: try await client.dashboard(top: Self.dashboardTop, timeout: Self.dashboardTimeout), isDemo: isDemo, source: source)
+                    WidgetSnapshot.make(from: try await client.dashboard(top: WidgetSnapshot.dashboardTop, timeout: Self.dashboardTimeout), isDemo: isDemo, source: source)
                 }
             }
             // Only download photos the widget hasn't saved already.

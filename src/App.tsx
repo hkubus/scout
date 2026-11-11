@@ -1095,7 +1095,8 @@ function Overview({
 }) {
   const [marketplace, setMarketplace] = useState<"All" | Marketplace>("All");
   // Strong+ deals still worth a look: not hidden, not filtered by AI, not
-  // passed (the widget's rule). Untriaged rows lead within a tier.
+  // passed (the widget's rule). Untriaged rows lead within a tier, then the
+  // deepest discount, as in the Strongest sort.
   const { topDeals, total, aiFilteredCount } = useMemo(() => {
     let aiFilteredCount = 0;
     const candidates: Listing[] = [];
@@ -1114,6 +1115,9 @@ function Overview({
       const aTriaged = a.decision ? 1 : 0;
       const bTriaged = b.decision ? 1 : 0;
       if (aTriaged !== bTriaged) return aTriaged - bTriaged;
+      const aBelow = a.belowTypical ?? 0;
+      const bBelow = b.belowTypical ?? 0;
+      if (aBelow !== bBelow) return aBelow - bBelow;
       return (Date.parse(b.firstSeenAt ?? b.observedAt) || 0) - (Date.parse(a.firstSeenAt ?? a.observedAt) || 0);
     });
     return { topDeals: candidates.slice(0, TOP_DEALS), total: candidates.length, aiFilteredCount };

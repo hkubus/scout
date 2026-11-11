@@ -27,6 +27,7 @@ import { bucketDailyObservations, type MarketTrendObservation } from './marketTr
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
 import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes, AgentFlip, AgentFlips, ConversationResult, InboxResult } from '../src/types';
 import { estimatedNetAtTypical, flipCost, flipNet, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, suggestedListingPrice, type FeePresets } from '../src/profit';
+import { compareStrongest } from '../src/listingRows';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -695,11 +696,6 @@ function dealLabelFromStrength(strength: number): DealLabel {
   return strength >= 5 ? 'Exceptional' : strength === 4 ? 'Very strong' : strength === 3 ? 'Strong' : 'Watch';
 }
 
-/**
- * The widget's deal order (WidgetSnapshot.make in the iOS ScoutKit): visible,
- * untriaged-or-kept rows by deal strength, then the deepest discount, then
- * the newest. Array.prototype.sort is stable, so ties keep feed order.
- */
 /** Parses the `?top=` query value of GET /api/dashboard; anything but an integer from 1 to 50 means the full dashboard. */
 export function dashboardTopParam(value: unknown): number | undefined {
   if (typeof value !== 'string' || !/^\d{1,2}$/.test(value)) return undefined;
@@ -707,16 +703,15 @@ export function dashboardTopParam(value: unknown): number | undefined {
   return top >= 1 && top <= 50 ? top : undefined;
 }
 
+/**
+ * The widget's deals (WidgetSnapshot.make in the iOS ScoutKit): visible rows
+ * not filtered by AI or passed, in the strongest order (compareStrongest).
+ * Array.prototype.sort is stable, so ties keep feed order.
+ */
 export function widgetDeals(listings: Listing[], limit: number) {
   return listings
     .filter((listing) => listing.hidden !== true && listing.aiFiltered !== true && listing.decision !== 'pass')
-    .sort((left, right) => {
-      if (left.dealStrength !== right.dealStrength) return right.dealStrength - left.dealStrength;
-      const leftBelow = left.belowTypical ?? 0;
-      const rightBelow = right.belowTypical ?? 0;
-      if (leftBelow !== rightBelow) return leftBelow - rightBelow;
-      return left.observedAt === right.observedAt ? 0 : left.observedAt > right.observedAt ? -1 : 1;
-    })
+    .sort(compareStrongest)
     .slice(0, limit);
 }
 
@@ -3966,8 +3961,11 @@ export class ScoutService {
       params.push(`%${ScoutService.escapeLike(query)}%`);
     }
     const where = predicates.join(' AND ');
+    // Strongest is compareStrongest in SQL: the tier, then the deepest
+    // discount (the lowest price-to-typical ratio; at or above typical, or
+    // without one, counts as no discount), then the newest.
     const orderBy = options.sort === 'strongest'
-      ? 'wl.deal_strength DESC, wl.last_seen_at DESC, wl.id DESC'
+      ? 'COALESCE(wl.deal_strength, 1) DESC, CASE WHEN COALESCE(wl.typical_pln, l.typical_pln) > 0 THEN MIN(1.0, l.price_pln * 1.0 / COALESCE(wl.typical_pln, l.typical_pln)) ELSE 1.0 END ASC, wl.last_seen_at DESC, wl.id DESC'
       : options.sort === 'price'
         ? 'l.price_pln ASC, wl.last_seen_at DESC, wl.id DESC'
         : 'wl.last_seen_at DESC, wl.id DESC';
