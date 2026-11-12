@@ -1,9 +1,9 @@
 /**
  * Pure aggregation for the cross-watch Analytics page. The service feeds in
  * daily-deduped observations (one latest row per day, watch, and listing) and
- * these helpers reduce them into charts and leaderboards. All "discount"
- * figures compare an asking price to its learned baseline — they are deal
- * heuristics, never confirmed sale prices.
+ * summarizeAnalytics reduces them into charts and leaderboards in one pass.
+ * All "discount" figures compare an asking price to its learned baseline —
+ * they are deal heuristics, never confirmed sale prices.
  */
 
 import { dealStrength, median, percentile } from './scoring';
@@ -16,152 +16,182 @@ import type {
   Marketplace,
 } from '../src/types';
 
-export interface AnalyticsObservation {
-  day: string;
-  listingId: number;
-  watchId: string;
-  watchName: string;
-  marketplace: Marketplace;
-  price: number;
-  typical: number | null;
-  observedAt: string;
-  firstSeenAt: string;
+/**
+ * One daily-deduped observation in the column order of the service's
+ * analytics SQL, read positionally (StatementSync#setReturnArrays). Values are
+ * raw SQLite values; the tables are not STRICT, so they are converted here.
+ */
+export type AnalyticsRow = readonly [
+  day: unknown,
+  listingId: unknown,
+  watchId: unknown,
+  watchName: unknown,
+  marketplace: unknown,
+  price: unknown,
+  typical: unknown,
+  observedAt: unknown,
+  firstSeenAt: unknown,
+];
+
+const DAY = 0;
+const LISTING_ID = 1;
+const WATCH_ID = 2;
+const WATCH_NAME = 3;
+const MARKETPLACE = 4;
+const PRICE = 5;
+const TYPICAL = 6;
+const OBSERVED_AT = 7;
+const FIRST_SEEN_AT = 8;
+
+export interface AnalyticsSummary {
+  overview: Omit<AnalyticsOverview, 'scanRuns' | 'scanSuccessRate'>;
+  trend: AnalyticsTrendPoint[];
+  discountDistribution: AnalyticsDiscountBucket[];
+  watchLeaderboard: AnalyticsWatchLeaderboardRow[];
+  marketplaceDeals: AnalyticsMarketplaceDeals[];
 }
+
+const DISCOUNT_BUCKETS = [
+  { label: '<10%', min: -Infinity, max: 10 },
+  { label: '10–20%', min: 10, max: 20 },
+  { label: '20–30%', min: 20, max: 30 },
+  { label: '30–50%', min: 30, max: 50 },
+  { label: '≥50%', min: 50, max: Infinity },
+];
+
+const priceOf = (row: AnalyticsRow) => Number(row[PRICE]);
+const typicalOf = (row: AnalyticsRow) => (row[TYPICAL] === null || row[TYPICAL] === undefined ? null : Number(row[TYPICAL]));
 
 /** Strong or better on the feed's deal-strength scale, so every "strong" count means the same thing. */
-export function isStrongDeal(row: Pick<AnalyticsObservation, 'price' | 'typical'>): boolean {
-  return (dealStrength(row.price, row.typical) ?? 0) >= 3;
+function isStrongDeal(price: number, typical: number | null): boolean {
+  return (dealStrength(price, typical) ?? 0) >= 3;
 }
 
-export function discountPercentFor(row: Pick<AnalyticsObservation, 'price' | 'typical'>): number | null {
-  return row.typical !== null && Number.isFinite(row.typical) && row.typical > 0
-    ? ((row.typical - row.price) / row.typical) * 100
+function discountPercent(price: number, typical: number | null): number | null {
+  return typical !== null && Number.isFinite(typical) && typical > 0
+    ? ((typical - price) / typical) * 100
     : null;
 }
 
-function discounts(rows: AnalyticsObservation[]): number[] {
-  return rows.map((row) => discountPercentFor(row)).filter((value): value is number => value !== null);
-}
+/**
+ * Builds every deal section from the grouped rows, read once in SQL order.
+ * A row replaces the kept one only when its observedAt is strictly later, so
+ * the first row wins ties. The pass keeps, per listing, the latest row across
+ * watches and the earliest first-seen time (overview, and the marketplace
+ * split, since a listing belongs to one marketplace); per day, the latest row
+ * per listing (trend and distribution); and per watch, the latest row per
+ * listing (leaderboard).
+ */
+export function summarizeAnalytics(rows: readonly AnalyticsRow[], cutoff: string): AnalyticsSummary {
+  const listings = new Map<number, { latest: AnalyticsRow; latestAt: string; firstSeenAt: string }>();
+  const days = new Map<string, Map<number, AnalyticsRow>>();
+  const watches = new Map<string, { watchName: string; latest: Map<number, AnalyticsRow>; lastSeenAt: string | null }>();
+  for (const row of rows) {
+    const listingId = Number(row[LISTING_ID]);
+    const observedAt = String(row[OBSERVED_AT]);
+    const firstSeenAt = String(row[FIRST_SEEN_AT]);
+    const listing = listings.get(listingId);
+    if (!listing) listings.set(listingId, { latest: row, latestAt: observedAt, firstSeenAt });
+    else {
+      if (observedAt > listing.latestAt) { listing.latest = row; listing.latestAt = observedAt; }
+      if (!listing.firstSeenAt || firstSeenAt < listing.firstSeenAt) listing.firstSeenAt = firstSeenAt;
+    }
 
-/** Latest observation per listing across watches, so a deal is counted once. */
-function latestPerListing(observations: AnalyticsObservation[]): AnalyticsObservation[] {
-  const latest = new Map<number, AnalyticsObservation>();
-  for (const observation of observations) {
-    const previous = latest.get(observation.listingId);
-    if (!previous || observation.observedAt > previous.observedAt) latest.set(observation.listingId, observation);
-  }
-  return Array.from(latest.values());
-}
+    const day = String(row[DAY]);
+    let daily = days.get(day);
+    if (!daily) days.set(day, (daily = new Map()));
+    const sameDay = daily.get(listingId);
+    if (!sameDay || observedAt > String(sameDay[OBSERVED_AT])) daily.set(listingId, row);
 
-export function dealOverview(observations: AnalyticsObservation[], cutoff: string): Omit<AnalyticsOverview, 'scanRuns' | 'scanSuccessRate'> {
-  const firstSeen = new Map<number, string>();
-  for (const observation of observations) {
-    const existing = firstSeen.get(observation.listingId);
-    if (!existing || observation.firstSeenAt < existing) firstSeen.set(observation.listingId, observation.firstSeenAt);
+    const watchId = String(row[WATCH_ID]);
+    let watch = watches.get(watchId);
+    if (!watch) watches.set(watchId, (watch = { watchName: String(row[WATCH_NAME]), latest: new Map(), lastSeenAt: null }));
+    const sameWatch = watch.latest.get(listingId);
+    if (!sameWatch || observedAt > String(sameWatch[OBSERVED_AT])) watch.latest.set(listingId, row);
+    if (watch.lastSeenAt === null || observedAt > watch.lastSeenAt) watch.lastSeenAt = observedAt;
   }
-  const latest = latestPerListing(observations);
-  const values = discounts(latest);
-  return {
-    trackedListings: firstSeen.size,
-    newListings: Array.from(firstSeen.values()).filter((value) => value >= cutoff).length,
-    strongDeals: latest.filter(isStrongDeal).length,
-    medianDiscountPercent: median(values),
-  };
-}
 
-export function trendPoints(observations: AnalyticsObservation[]): AnalyticsTrendPoint[] {
-  const daily = new Map<string, Map<number, AnalyticsObservation>>();
-  for (const observation of observations) {
-    const day = daily.get(observation.day) ?? new Map<number, AnalyticsObservation>();
-    const previous = day.get(observation.listingId);
-    if (!previous || observation.observedAt > previous.observedAt) day.set(observation.listingId, observation);
-    daily.set(observation.day, day);
+  const discounts: number[] = [];
+  let strongDeals = 0;
+  let newListings = 0;
+  const markets = new Map<Marketplace, { listings: number; strongDeals: number; discounts: number[] }>();
+  for (const listing of listings.values()) {
+    if (listing.firstSeenAt >= cutoff) newListings += 1;
+    const price = priceOf(listing.latest);
+    const typical = typicalOf(listing.latest);
+    const strong = isStrongDeal(price, typical);
+    const discount = discountPercent(price, typical);
+    if (strong) strongDeals += 1;
+    if (discount !== null) discounts.push(discount);
+    const marketplace = listing.latest[MARKETPLACE] as Marketplace;
+    let market = markets.get(marketplace);
+    if (!market) markets.set(marketplace, (market = { listings: 0, strongDeals: 0, discounts: [] }));
+    market.listings += 1;
+    if (strong) market.strongDeals += 1;
+    if (discount !== null) market.discounts.push(discount);
   }
-  return Array.from(daily.entries()).sort(([left], [right]) => left.localeCompare(right)).map(([date, rows]) => {
-    const list = Array.from(rows.values());
-    const prices = list.map((row) => row.price);
-    const strongDealCount = list.filter(isStrongDeal).length;
+
+  const buckets = DISCOUNT_BUCKETS.map((bucket) => ({ label: bucket.label, count: 0 }));
+  const trend = Array.from(days.entries()).sort(([left], [right]) => left.localeCompare(right)).map(([date, latest]) => {
+    const prices: number[] = [];
+    let strongDealCount = 0;
+    for (const row of latest.values()) {
+      const price = priceOf(row);
+      const typical = typicalOf(row);
+      prices.push(price);
+      if (isStrongDeal(price, typical)) strongDealCount += 1;
+      const discount = discountPercent(price, typical);
+      if (discount === null) continue;
+      const index = DISCOUNT_BUCKETS.findIndex((bucket) => discount >= bucket.min && discount < bucket.max);
+      if (index !== -1) buckets[index].count += 1;
+    }
     return {
       date,
       medianPrice: median(prices),
       lowerPrice: percentile(prices, 0.25),
       upperPrice: percentile(prices, 0.75),
-      listingCount: list.length,
+      listingCount: latest.size,
       strongDealCount,
     };
   });
-}
 
-export function discountDistribution(observations: AnalyticsObservation[]): AnalyticsDiscountBucket[] {
-  const bounds = [
-    { label: '<10%', min: -Infinity, max: 10 },
-    { label: '10–20%', min: 10, max: 20 },
-    { label: '20–30%', min: 20, max: 30 },
-    { label: '30–50%', min: 30, max: 50 },
-    { label: '≥50%', min: 50, max: Infinity },
-  ];
-  const buckets = bounds.map((bound) => ({ label: bound.label, count: 0 }));
-  const daily = new Map<string, Map<number, AnalyticsObservation>>();
-  for (const observation of observations) {
-    const day = daily.get(observation.day) ?? new Map<number, AnalyticsObservation>();
-    const previous = day.get(observation.listingId);
-    if (!previous || observation.observedAt > previous.observedAt) day.set(observation.listingId, observation);
-    daily.set(observation.day, day);
-  }
-  for (const rows of daily.values()) {
-    for (const row of rows.values()) {
-      const discount = discountPercentFor(row);
-      if (discount === null) continue;
-      const index = bounds.findIndex((bound) => discount >= bound.min && discount < bound.max);
-      if (index !== -1) buckets[index].count += 1;
+  const watchLeaderboard = Array.from(watches.entries()).map(([watchId, watch]) => {
+    const watchDiscounts: number[] = [];
+    let watchStrongDeals = 0;
+    for (const row of watch.latest.values()) {
+      const price = priceOf(row);
+      const typical = typicalOf(row);
+      if (isStrongDeal(price, typical)) watchStrongDeals += 1;
+      const discount = discountPercent(price, typical);
+      if (discount !== null) watchDiscounts.push(discount);
     }
-  }
-  return buckets;
-}
-
-export function watchLeaderboard(observations: AnalyticsObservation[]): AnalyticsWatchLeaderboardRow[] {
-  const byWatch = new Map<string, { watchName: string; listings: Set<number>; latest: Map<number, AnalyticsObservation> }>();
-  for (const observation of observations) {
-    const entry = byWatch.get(observation.watchId) ?? { watchName: observation.watchName, listings: new Set<number>(), latest: new Map<number, AnalyticsObservation>() };
-    entry.listings.add(observation.listingId);
-    const previous = entry.latest.get(observation.listingId);
-    if (!previous || observation.observedAt > previous.observedAt) entry.latest.set(observation.listingId, observation);
-    byWatch.set(observation.watchId, entry);
-  }
-  return Array.from(byWatch.entries()).map(([watchId, entry]) => {
-    const latest = Array.from(entry.latest.values());
-    const values = discounts(latest);
-    const lastSeenAt = Array.from(entry.latest.values()).reduce<string | null>(
-      (latest, observation) => (latest === null || observation.observedAt > latest ? observation.observedAt : latest),
-      null,
-    );
     return {
       watchId,
-      watchName: entry.watchName,
-      listings: entry.listings.size,
-      strongDeals: latest.filter(isStrongDeal).length,
-      medianDiscountPercent: median(values),
-      lastSeenAt,
+      watchName: watch.watchName,
+      listings: watch.latest.size,
+      strongDeals: watchStrongDeals,
+      medianDiscountPercent: median(watchDiscounts),
+      lastSeenAt: watch.lastSeenAt,
     };
   }).sort((left, right) => right.strongDeals - left.strongDeals || right.listings - left.listings || left.watchName.localeCompare(right.watchName));
-}
 
-export function marketplaceDeals(observations: AnalyticsObservation[]): AnalyticsMarketplaceDeals[] {
-  const byMarketplace = new Map<Marketplace, Map<number, AnalyticsObservation>>();
-  for (const observation of observations) {
-    const listings = byMarketplace.get(observation.marketplace) ?? new Map<number, AnalyticsObservation>();
-    const previous = listings.get(observation.listingId);
-    if (!previous || observation.observedAt > previous.observedAt) listings.set(observation.listingId, observation);
-    byMarketplace.set(observation.marketplace, listings);
-  }
-  return Array.from(byMarketplace.entries()).map(([marketplace, listings]) => {
-    const rows = Array.from(listings.values());
-    const values = discounts(rows);
-    return {
-      marketplace,
-      listings: rows.length,
-      strongDeals: rows.filter(isStrongDeal).length,
-      medianDiscountPercent: median(values),
-    };
-  }).sort((left, right) => right.listings - left.listings || left.marketplace.localeCompare(right.marketplace));
+  const marketplaceDeals = Array.from(markets.entries()).map(([marketplace, market]) => ({
+    marketplace,
+    listings: market.listings,
+    strongDeals: market.strongDeals,
+    medianDiscountPercent: median(market.discounts),
+  })).sort((left, right) => right.listings - left.listings || left.marketplace.localeCompare(right.marketplace));
+
+  return {
+    overview: {
+      trackedListings: listings.size,
+      newListings,
+      strongDeals,
+      medianDiscountPercent: median(discounts),
+    },
+    trend,
+    discountDistribution: buckets,
+    watchLeaderboard,
+    marketplaceDeals,
+  };
 }

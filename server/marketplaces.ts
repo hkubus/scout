@@ -66,7 +66,18 @@ export type MarketplaceSearchResult = NormalizedListing[] & {
   empty: boolean;
 };
 
-export type MarketplaceSearchSort = 'newest';
+/**
+ * The order a marketplace lists search results in, which decides what one
+ * page holds. `relevance` sends no order, so each marketplace uses its own
+ * default: Vinted ranks by relevance, OLX's offers API is not newest-first,
+ * and Allegro Lokalnie has no relevance order and lists newest first anyway.
+ * `newest` asks for the most recently posted listings first.
+ *
+ * There is no price order: no marketplace's price sort has been verified
+ * against its search endpoint (OLX's offers API, Vinted's catalog API).
+ */
+export const MARKETPLACE_SEARCH_SORTS = ['relevance', 'newest'] as const;
+export type MarketplaceSearchSort = (typeof MARKETPLACE_SEARCH_SORTS)[number];
 
 export interface MarketplaceSearchFilters {
   minPrice?: number | null;
