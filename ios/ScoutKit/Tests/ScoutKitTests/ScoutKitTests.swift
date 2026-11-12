@@ -82,9 +82,10 @@ final class ClientTests: XCTestCase {
     }
 
     func testListingsQueryItems() {
-        let query = ListingsQuery(page: 2, marketplace: .vinted, search: "  xm5 ", watchId: "w1", sort: .strongest, decision: .buy)
+        let query = ListingsQuery(page: 2, marketplace: .vinted, search: "  xm5 ", watchId: "w1", sort: .strongest, decision: .buy, minStrength: 3)
         let items = Dictionary(uniqueKeysWithValues: query.queryItems.map { ($0.name, $0.value ?? "") })
-        XCTAssertEqual(items, ["page": "2", "pageSize": "50", "sort": "strongest", "visibility": "visible", "marketplace": "Vinted", "q": "xm5", "watchId": "w1", "decision": "buy"])
+        XCTAssertEqual(items, ["page": "2", "pageSize": "50", "sort": "strongest", "visibility": "visible", "marketplace": "Vinted", "q": "xm5", "watchId": "w1", "decision": "buy", "minStrength": "3"])
+        XCTAssertNil(ListingsQuery().queryItems.first { $0.name == "minStrength" })
     }
 
     func testMapsServerErrors() async {
@@ -393,6 +394,36 @@ final class WidgetSnapshotTests: XCTestCase {
         XCTAssertEqual(snapshot.stats, dashboard.stats)
     }
 
+    func testStrongestFirstOrdersATierByTheDeepestDiscount() {
+        let base = DemoTransport.dashboard().listings[0]
+        func deal(_ id: String, _ strength: Double, _ below: Double?, _ observedAt: String) -> Listing {
+            var listing = base
+            listing.id = id
+            listing.dealStrength = strength
+            listing.belowTypical = below
+            listing.observedAt = observedAt
+            return listing
+        }
+        let listings = [
+            deal("no-typical", 4, nil, "2026-11-11T10:00:00.000Z"),
+            deal("shallow", 4, -15, "2026-11-11T12:00:00.000Z"),
+            deal("weaker-tier", 3, -40, "2026-11-11T13:00:00.000Z"),
+            deal("deep-old", 4, -30, "2026-11-11T09:00:00.000Z"),
+            deal("deep-new", 4, -30, "2026-11-11T11:00:00.000Z"),
+            deal("at-typical", 4, 0, "2026-11-11T11:30:00.000Z"),
+        ]
+        XCTAssertEqual(WidgetSnapshot.strongestFirst(listings).map(\.id), ["deep-new", "deep-old", "shallow", "at-typical", "no-typical", "weaker-tier"])
+    }
+
+    func testDemoStrongDealsQueryFollowsTheServerOrder() async throws {
+        let client = ScoutClient(baseURL: DemoTransport.baseURL, transport: DemoTransport())
+        let full = try await client.dashboard()
+        let page = try await client.listings(ListingsQuery(sort: .strongest, minStrength: 3))
+        XCTAssertFalse(page.listings.isEmpty)
+        XCTAssertTrue(page.listings.allSatisfy { $0.dealStrength >= 3 })
+        XCTAssertEqual(page.listings, WidgetSnapshot.strongestFirst(full.listings.filter { $0.hidden != true && $0.aiFiltered != true && $0.dealStrength >= 3 }))
+    }
+
     func testDeepLinkRoundTrips() throws {
         let deal = try XCTUnwrap(WidgetSnapshot.make(from: DemoTransport.dashboard()).deals.first { $0.marketplace == .allegroLokalnie })
         XCTAssertEqual(deal.deepLink.absoluteString, "scout://listing?key=Allegro%20Lokalnie:344821&watchId=watch-sony")
@@ -581,7 +612,7 @@ final class WidgetSnapshotTests: XCTestCase {
         XCTAssertEqual(top.lastScan, full.lastScan)
         XCTAssertEqual(top.lastScanTime, full.lastScanTime)
         let now = Date()
-        let widgetTop = try await client.dashboard(top: 12, timeout: 10)
+        let widgetTop = try await client.dashboard(top: WidgetSnapshot.dashboardTop, timeout: 10)
         XCTAssertEqual(WidgetSnapshot.make(from: widgetTop, now: now), WidgetSnapshot.make(from: full, now: now))
         // Anything but an integer from 1 to 50 gets the full dashboard.
         for value in ["0", "51", "-1", "x", "", "2.5"] {

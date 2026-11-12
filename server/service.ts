@@ -30,6 +30,7 @@ import { DUPLICATE_WINDOW_DAYS, findDuplicatePairs } from './duplicates';
 import { summarizeAnalytics, type AnalyticsRow } from './analytics';
 import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, DuplicateListing, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes, AgentFlip, AgentFlips, ConversationResult, InboxResult } from '../src/types';
 import { estimatedNetAtTypical, flipCost, flipNet, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, suggestedListingPrice, type FeePresets } from '../src/profit';
+import { compareStrongest } from '../src/listingRows';
 import type { SearchDeal, SearchScoredAgainst } from '../src/types';
 import type { MatchKind } from './queryMatch';
 
@@ -715,11 +716,6 @@ function dealLabelFromStrength(strength: number): DealLabel {
   return strength >= 5 ? 'Exceptional' : strength === 4 ? 'Very strong' : strength === 3 ? 'Strong' : 'Watch';
 }
 
-/**
- * The widget's deal order (WidgetSnapshot.make in the iOS ScoutKit): visible,
- * untriaged-or-kept rows by deal strength, then the deepest discount, then
- * the newest. Array.prototype.sort is stable, so ties keep feed order.
- */
 /** Parses the `?top=` query value of GET /api/dashboard; anything but an integer from 1 to 50 means the full dashboard. */
 export function dashboardTopParam(value: unknown): number | undefined {
   if (typeof value !== 'string' || !/^\d{1,2}$/.test(value)) return undefined;
@@ -727,16 +723,15 @@ export function dashboardTopParam(value: unknown): number | undefined {
   return top >= 1 && top <= 50 ? top : undefined;
 }
 
+/**
+ * The widget's deals (WidgetSnapshot.make in the iOS ScoutKit): visible rows
+ * not filtered by AI or passed, in the strongest order (compareStrongest).
+ * Array.prototype.sort is stable, so ties keep feed order.
+ */
 export function widgetDeals(listings: Listing[], limit: number) {
   return listings
     .filter((listing) => listing.hidden !== true && listing.aiFiltered !== true && listing.decision !== 'pass')
-    .sort((left, right) => {
-      if (left.dealStrength !== right.dealStrength) return right.dealStrength - left.dealStrength;
-      const leftBelow = left.belowTypical ?? 0;
-      const rightBelow = right.belowTypical ?? 0;
-      if (leftBelow !== rightBelow) return leftBelow - rightBelow;
-      return left.observedAt === right.observedAt ? 0 : left.observedAt > right.observedAt ? -1 : 1;
-    })
+    .sort(compareStrongest)
     .slice(0, limit);
 }
 
@@ -4088,14 +4083,17 @@ export class ScoutService {
     // reference-band typical, or a legacy one once its watch is ready. One
     // json_each bind keeps a single statement shape for any set of watches.
     const discountSql = "(CASE WHEN COALESCE(wl.typical_pln, l.typical_pln) > 0 AND (wl.typical_source IN ('own-history', 'reference-band') OR wl.watch_id IN (SELECT value FROM json_each(?))) THEN (COALESCE(wl.typical_pln, l.typical_pln) - l.price_pln) * 100.0 / COALESCE(wl.typical_pln, l.typical_pln) END)";
-    const usesDiscount = options.minDiscount !== undefined || options.sort === 'discount' || options.sort === 'deal';
+    const usesDiscount = options.minDiscount !== undefined || options.sort === 'discount' || options.sort === 'deal' || options.sort === 'strongest';
     const readyWatchIdsJson = usesDiscount ? JSON.stringify([...watches.values()].filter((watch) => watch.readiness === 100).map((watch) => watch.id)) : '[]';
     if (options.minDiscount !== undefined) { predicates.push(`${discountSql} >= ?`); params.push(readyWatchIdsJson, options.minDiscount); }
     const where = predicates.join(' AND ');
-    // SQLite sorts NULL lowest, so DESC puts rows without a typical last.
-    const orderParams: unknown[] = options.sort === 'discount' || options.sort === 'deal' ? [readyWatchIdsJson] : [];
+    // Strongest is compareStrongest in SQL: the tier, then the deepest
+    // discount below the typical the row shows (at or above it, or without
+    // one, counts as none), then the newest. SQLite sorts NULL lowest, so
+    // DESC puts rows without a typical last for discount and deal.
+    const orderParams: unknown[] = options.sort === 'discount' || options.sort === 'deal' || options.sort === 'strongest' ? [readyWatchIdsJson] : [];
     const orderBy = options.sort === 'strongest'
-      ? 'wl.deal_strength DESC, wl.last_seen_at DESC, wl.id DESC'
+      ? `COALESCE(wl.deal_strength, 1) DESC, MAX(0, COALESCE(${discountSql}, 0)) DESC, wl.last_seen_at DESC, wl.id DESC`
       : options.sort === 'price'
         ? 'l.price_pln ASC, wl.last_seen_at DESC, wl.id DESC'
         : options.sort === 'discount'

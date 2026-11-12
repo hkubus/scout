@@ -3,7 +3,7 @@ import { Search, SlidersHorizontal, X } from "lucide-react";
 import { api } from "./api";
 import { subscribe } from "./events";
 import { applyListingActionToPage, isListingActionEvent, listingActionKey, type DecisionFilter, type ListingActionEvent } from "./listingActions";
-import { pageForFilters, reuseUnchangedListings } from "./listingRows";
+import { compareStrongest, pageForFilters, reuseUnchangedListings } from "./listingRows";
 import ListingTable from "./ListingTable";
 import type { Listing, ListingAction, Marketplace } from "./types";
 import { PageHeader, SelectControl } from "./ui";
@@ -160,7 +160,7 @@ export default function ListingsPage({
     }
     return matches.sort((a, b) =>
       sort === "Strongest"
-        ? b.dealStrength - a.dealStrength
+        ? compareStrongest(a, b)
         : sort === "Price"
           ? a.price - b.price
           : (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0),

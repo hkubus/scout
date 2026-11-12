@@ -10,6 +10,7 @@ import { listingDescriptionVerificationInputHash, listingRelevanceInputHash } fr
 import { VisionError } from '../server/vision';
 import { ScoutService, ServiceError, dashboardTopParam, decryptSecret, olxCategoryFromJson, olxCategoryToJson, encryptSecret, escapeDiscordMarkdown, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
 import { OTHER_VARIANT_KEY } from '../server/variants';
+import { compareStrongest } from '../src/listingRows';
 import { scoreDeal } from '../server/scoring';
 import { legacyAnalyticsSections } from './legacyAnalytics';
 
@@ -169,6 +170,35 @@ test('carries the AI description check on feed rows only for checked listings', 
     assert.ok(unchecked);
     assert.equal('aiDescriptionVerification' in unchecked, false);
     assert.equal('aiDescriptionVerificationStatus' in unchecked, false);
+  } finally { context.close(); }
+});
+
+test('sorts the strongest listing page by tier, then the deepest discount, then the newest, as the widget does', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const now = Date.now();
+    const rows = context.db.prepare('SELECT wl.id, l.price_pln AS price FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id').all() as Array<{ id: number; price: number }>;
+    const update = context.db.prepare('UPDATE watch_listings SET last_seen_at = ?, deal_strength = ?, deal_label = NULL, typical_pln = ?, typical_source = ? WHERE id = ?');
+    for (const { id, price } of rows) {
+      // Two tiers; within them discounts of several depths, rows above
+      // typical and rows without one (both count as no discount). Every
+      // seventh typical is a legacy one, shown only once its watch is ready,
+      // so the order follows the typical a row shows. Distinct times, so the
+      // expected order is fully determined.
+      const factor = [null, 0.8, 1.25, 1.5, 2][id % 5];
+      const typical = factor === null ? null : price * factor;
+      update.run(new Date(now - id * 1000).toISOString(), id % 3 === 0 ? 4 : 5, typical, typical === null || id % 7 === 0 ? null : 'own-history', id);
+    }
+    const key = (listing: { associationId?: string }) => listing.associationId;
+    const page = context.service.listingsPage({ pageSize: 500, sort: 'strongest', aiFiltered: 'include', visibility: 'all' }).listings;
+    assert.ok(page.length > 20);
+    assert.ok(page.some((listing) => listing.belowTypical === null) && page.some((listing) => listing.belowTypical === -0 || listing.belowTypical === 0));
+    assert.ok(new Set(page.map((listing) => listing.belowTypical)).size >= 4);
+    assert.deepEqual(page.map(key), [...page].sort(compareStrongest).map(key));
+
+    const visible = context.service.listingsPage({ pageSize: 500, sort: 'strongest' }).listings.filter((listing) => listing.decision !== 'pass');
+    assert.deepEqual(context.service.dashboard({ top: 50 }).listings.map(key), visible.slice(0, 50).map(key));
   } finally { context.close(); }
 });
 

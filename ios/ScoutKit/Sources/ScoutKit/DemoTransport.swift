@@ -359,11 +359,15 @@ public actor DemoTransport: HTTPTransport {
 
     private func listingsPage(_ query: [String: String]) -> ListingsPage {
         let search = (query["q"] ?? "").lowercased()
+        let minStrength = query["minStrength"].flatMap(Double.init) ?? 1
+        // The server leaves AI-filtered rows out unless asked otherwise.
         var listings = dashboard.listings.map(applyAction).filter { listing in
             (query["watchId"].map { $0 == listing.watchId } ?? true)
                 && (query["marketplace"].map { $0 == listing.marketplace.rawValue } ?? true)
                 && (query["decision"].map { $0 == listing.decision?.rawValue } ?? true)
                 && (search.isEmpty || listing.title.lowercased().contains(search))
+                && listing.dealStrength >= minStrength
+                && listing.aiFiltered != true
         }
         switch query["visibility"] ?? "visible" {
         case "hidden": listings = listings.filter { $0.hidden == true }
@@ -371,7 +375,7 @@ public actor DemoTransport: HTTPTransport {
         default: listings = listings.filter { $0.hidden != true }
         }
         switch query["sort"] {
-        case "strongest": listings.sort { $0.dealStrength > $1.dealStrength }
+        case "strongest": listings = WidgetSnapshot.strongestFirst(listings)
         case "price": listings.sort { $0.price < $1.price }
         default: listings.sort { $0.observedAt > $1.observedAt }
         }

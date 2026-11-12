@@ -2,7 +2,7 @@
 
 A native SwiftUI client for a self-hosted Scout server. It covers:
 
-- the top deals (Strong or better, untriaged first), with the AI description check's verdict on each row and the untriaged count on the tab;
+- the top deals (Strong or better across the whole feed), sorted by strongest deal (the tier, untriaged first, then the deepest discount), newest, or lowest price; the sort is remembered. Each row shows the AI description check's verdict, and the tab shows the untriaged count;
 - live marketplace search, like the web Search page, with recent searches and "Save as watch";
 - the paginated listing history with triage (buy / maybe / pass / hide): swipe a row, or long-press it for a photo preview, triage, **I bought this**, and the listing's link. Hiding (and deleting a flip) shows an Undo toast;
 - listing detail with price history, the AI description check, when the listing was really posted, seller type, and a resale estimate after the platform's fee with **I bought this**;

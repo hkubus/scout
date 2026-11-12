@@ -3,6 +3,22 @@ import type { DuplicateSummary, Listing } from "./types";
 /** The row identity ListingTable keys by (one listing can appear once per watch). */
 export const listingRowKey = (listing: Listing) => listing.associationId ?? listing.id;
 
+type StrongestFields = Pick<Listing, "dealStrength" | "belowTypical" | "observedAt">;
+
+/**
+ * The "strongest" order: deal strength, then the deepest discount below
+ * typical (rows at or above typical, or without one, count as none), then the
+ * newest. GET /api/listings?sort=strongest sorts the same way in SQL, and the
+ * iOS ScoutKit's `WidgetSnapshot.strongestFirst` mirrors it.
+ */
+export function compareStrongest(a: StrongestFields, b: StrongestFields) {
+  if (a.dealStrength !== b.dealStrength) return b.dealStrength - a.dealStrength;
+  const aBelow = a.belowTypical ?? 0;
+  const bBelow = b.belowTypical ?? 0;
+  if (aBelow !== bBelow) return aBelow - bBelow;
+  return a.observedAt === b.observedAt ? 0 : a.observedAt > b.observedAt ? -1 : 1;
+}
+
 /** The cheapest cross-posted copy is a small flat object, so it compares by its fields. */
 const sameDuplicateSummary = (a: DuplicateSummary | undefined, b: DuplicateSummary | undefined) =>
   a === b || (a !== undefined && b !== undefined && a.key === b.key && a.marketplace === b.marketplace && a.price === b.price && a.url === b.url);

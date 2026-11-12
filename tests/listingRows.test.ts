@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { pageForFilters, reuseUnchangedListings, sameListingFields } from '../src/listingRows';
+import { compareStrongest, pageForFilters, reuseUnchangedListings, sameListingFields } from '../src/listingRows';
 import type { Listing } from '../src/types';
 
 const row = (id: string, extra: Partial<Listing> = {}) => ({ id, title: `Item ${id}`, price: 100, typical: null, observed: '1 min ago', hidden: false, ...extra }) as unknown as Listing;
@@ -57,4 +57,17 @@ test('a filter change restarts paging, and earlier filters do not bring their pa
   assert.deepEqual(state, { key: 'olx', page: 1 });
   state = pageForFilters(state, 'all');
   assert.deepEqual(state, { key: 'all', page: 1 });
+});
+
+test('orders the strongest by tier, then the deepest discount, then the newest', () => {
+  const deal = (id: string, dealStrength: number, belowTypical: number | null, observedAt: string) => row(id, { dealStrength, belowTypical, observedAt });
+  const rows = [
+    deal('no-typical', 4, null, '2026-11-11T10:00:00.000Z'),
+    deal('shallow', 4, -15, '2026-11-11T12:00:00.000Z'),
+    deal('weaker-tier', 3, -40, '2026-11-11T13:00:00.000Z'),
+    deal('deep-old', 4, -30, '2026-11-11T09:00:00.000Z'),
+    deal('deep-new', 4, -30, '2026-11-11T11:00:00.000Z'),
+    deal('at-typical', 4, 0, '2026-11-11T11:30:00.000Z'),
+  ];
+  assert.deepEqual(rows.sort(compareStrongest).map((listing) => listing.id), ['deep-new', 'deep-old', 'shallow', 'at-typical', 'no-typical', 'weaker-tier']);
 });
