@@ -221,6 +221,22 @@ export interface VerificationComparison {
   llm: { ok: true; verification: ListingDescriptionVerification; raw: unknown } | { ok: false; error: string };
 }
 
+/** scout_verify_listing: a listing's stored description-check verdict after an on-demand check in one watch's context. */
+export interface AgentListingVerification {
+  key: string;
+  /** The watch whose query, terms and checks the check used; null for the generic check. */
+  watch: { id: string; name: string } | null;
+  /** pass, reject or unknown; fallback after a provider outage. */
+  status: ListingDescriptionVerificationStatus | null;
+  verification: ListingDescriptionVerification | null;
+  checks: VerificationCheck[];
+  model: string | null;
+  verifiedAt: string | null;
+  error: string | null;
+  /** True when the verdict was one Scout had already stored, so no AI call ran for it. */
+  reused: boolean;
+}
+
 /**
  * Current visible Strong+ findings for one watch, split by deal tier. Counts
  * are listings still seen within the feed freshness window, excluding rows the
