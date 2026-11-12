@@ -1754,7 +1754,7 @@ test('manual search rows carry quick flags from title, condition and the OLX des
     (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
       { id: 'FLAG-DMG', url: 'https://www.olx.pl/d/oferta/flag-dmg', title: 'GPU RTX 3060', created_time: fresh, params: [price(650)] },
     ], metadata: { visible_total_count: 1 } } });
-    assert.equal((await search()).listings.length, 1);
+    assert.equal((await search({ refresh: true })).listings.length, 1);
     const resighted = context.db.prepare("SELECT condition, price_pln, flags_json FROM listings WHERE listing_id = 'FLAG-DMG'").get() as { condition: string; price_pln: number; flags_json: string };
     assert.deepEqual([resighted.condition, resighted.price_pln], ['Uszkodzone', 650]);
     assert.deepEqual(JSON.parse(resighted.flags_json), [{ flag: 'damaged', match: 'uszkodzone', in: 'condition' }]);

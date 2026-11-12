@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { toCompactSearch } from '../server/mcpFormat';
+import { manualSearchKey } from '../server/searchRuns';
 import { filterTypoRows, rewriteTypoTerms } from '../server/service';
 import { liveJevEnv, olxOffer, olxPage, searchFixture, searchInput } from './searchFixture';
 
@@ -184,6 +185,26 @@ test('a misspelled search with no answer in time is left out, and its marketplac
     else process.env.SCOUT_SEARCH_TYPO_WAIT_MS = previous;
     context.close();
   }
+});
+
+test('excludeFlags hides a flagged row a misspelled search found, and is part of the search key', async () => {
+  const context = searchFixture();
+  const queries: string[] = [];
+  (context.service as any).fetchOlxApi = typoStub({
+    'iphone 13': [olxOffer('A-1', 'iPhone 13 128GB', 2000)],
+    'iphon 13': [olxOffer('B-1', 'Iphon 13 128GB', 800), olxOffer('B-3', 'Iphon 13 na części', 300, 'Uszkodzone')],
+  }, queries);
+  try {
+    const input = { typoVariants: true, aiRelevance: false };
+    const all = await context.service.manualSearch(searchInput('iphone 13', input));
+    assert.deepEqual(all.listings.map((listing) => listing.id).sort(), ['OLX:A-1', 'OLX:B-1', 'OLX:B-3']);
+    const hidden = await context.service.manualSearchDetailed(searchInput('iphone 13', { ...input, excludeFlags: ['damaged', 'for_parts'] }));
+    assert.equal(hidden.fromCache, undefined);
+    assert.deepEqual(hidden.listings.map((listing) => listing.id).sort(), ['OLX:A-1', 'OLX:B-1']);
+    assert.equal(hidden.details.sources.get('OLX')?.flagExcluded, 1);
+    assert.equal(manualSearchKey(searchInput('q', { excludeFlags: ['for_parts', 'damaged', 'damaged'] })), manualSearchKey(searchInput('q', { excludeFlags: ['damaged', 'for_parts'] })));
+    assert.equal(manualSearchKey(searchInput('q', { excludeFlags: [] })), manualSearchKey(searchInput('q')));
+  } finally { context.close(); }
 });
 
 test('typed terms hold a typo row to its own spelling', async () => {
