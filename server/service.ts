@@ -16,7 +16,7 @@ import { MAX_FLIP_PHOTO_BYTES, flipFromRow, sniffImageMime, toWebp } from './fli
 import { InboxError, MarketplaceInbox, hasRefreshToken, isSessionRenewalRequest, withoutRefreshTokens } from './inbox';
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { Limiter, mapPool } from './limiter';
-import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, percentile, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
+import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, ownRobustScale, percentile, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
 import { searchErrorKind, type ManualSearchDetailedResponse, type ManualSearchDetails } from './mcpFormat';
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
@@ -85,6 +85,9 @@ type DealNotificationCandidate = {
  */
 /** `stats` is filled once the bucket is complete, so every listing in a scan reuses its median and MAD. */
 type WatchVariantBucket = { prices: number[]; firstObservedAt: string | null; latestObservedAt?: string | null; stats?: PriceStats };
+/** One (watch, variant) row of watches(): sample stats plus the latest stored typical. */
+type WatchVariantEntry = { samples: number; first_observed: string | null; typical: number | null; typicalSource: 'own-history' | 'reference-band' | null };
+type WatchTypicalFigures = Required<Pick<Watch, 'typical' | 'typicalSource' | 'p25' | 'p75' | 'robustScale'>>;
 type WatchBaselines = {
   groups: VariantGroup[];
   buckets: Map<string, WatchVariantBucket>;
@@ -2606,8 +2609,9 @@ export class ScoutService {
   private watchFromRow(
     row: WatchRow,
     stats: { samples: number; first_observed: string | null } = { samples: 0, first_observed: null },
-    variantStats: Map<string, { samples: number; first_observed: string | null; typical: number | null }> = new Map(),
+    variantStats: Map<string, WatchVariantEntry> = new Map(),
     dealCounts: WatchDealCounts = { exceptional: 0, veryStrong: 0, strong: 0 },
+    figures: WatchTypicalFigures = { typical: null, typicalSource: null, p25: null, p75: null, robustScale: null },
   ): Watch {
     const samples = Number(stats?.samples ?? 0);
     const observationHours = stats?.first_observed ? Math.max(0, Math.floor((Date.now() - Date.parse(stats.first_observed)) / 3_600_000)) : 0;
@@ -2676,6 +2680,7 @@ export class ScoutService {
       variantGroupsAuto: !variantGroups.length && row.variant_groups_auto !== undefined && Boolean(row.variant_groups_auto),
       variants,
       dealCounts,
+      ...figures,
       minPrice: row.min_price_pln === null ? null : Number(row.min_price_pln),
       maxPrice: row.max_price_pln === null ? null : Number(row.max_price_pln),
       olxCategory: olxCategoryFromJson(row.olx_category_json),
@@ -2770,9 +2775,11 @@ export class ScoutService {
    * Watches with their baseline stats. `onlyWatchId` restricts every query to
    * one watch (archived or not) for callers that need a single watch's
    * readiness or groups; the filtered statements are separate fixed shapes
-   * with the id bound as a parameter.
+   * with the id bound as a parameter. `figures: false` skips the watch-wide
+   * typical figures (left null) for internal callers that only need
+   * readiness and groups.
    */
-  private watches(includeArchived: boolean, onlyWatchId?: string) {
+  private watches(includeArchived: boolean, onlyWatchId?: string, figures = true) {
     const single = onlyWatchId !== undefined;
     const rows = (single
       ? this.stmt('SELECT * FROM watches WHERE id = ?').all(onlyWatchId)
@@ -2806,18 +2813,18 @@ export class ScoutService {
     // Latest stored typical per variant. Every association in a variant shares
     // the value written by the most recent scan; MAX(last_seen_at) picks that
     // row so a stale pre-regroup value cannot win.
-    const typicalRows = this.stmt(`SELECT wl.watch_id, COALESCE(wl.variant_key, ?) AS variant_key, wl.typical_pln AS typical, MAX(wl.last_seen_at) AS last_seen_at
+    const typicalRows = this.stmt(`SELECT wl.watch_id, COALESCE(wl.variant_key, ?) AS variant_key, wl.typical_pln AS typical, wl.typical_source AS typical_source, MAX(wl.last_seen_at) AS last_seen_at
       FROM watch_listings wl
       JOIN watches w ON w.id = wl.watch_id
       WHERE wl.typical_pln IS NOT NULL${includeArchived ? '' : ' AND w.archived_at IS NULL'}${single ? ' AND wl.watch_id = ?' : ''}
-      GROUP BY wl.watch_id, COALESCE(wl.variant_key, ?)`).all(OTHER_VARIANT_KEY, ...(single ? [onlyWatchId] : []), OTHER_VARIANT_KEY) as Array<{ watch_id: string; variant_key: string; typical: number }>;
+      GROUP BY wl.watch_id, COALESCE(wl.variant_key, ?)`).all(OTHER_VARIANT_KEY, ...(single ? [onlyWatchId] : []), OTHER_VARIANT_KEY) as Array<{ watch_id: string; variant_key: string; typical: number; typical_source: string | null }>;
     const statsByWatch = new Map<string, { samples: number; first_observed: string | null }>();
-    const variantsByWatch = new Map<string, Map<string, { samples: number; first_observed: string | null; typical: number | null }>>();
+    const variantsByWatch = new Map<string, Map<string, WatchVariantEntry>>();
     const variantEntry = (watchId: string, key: string) => {
       let byVariant = variantsByWatch.get(watchId);
       if (!byVariant) { byVariant = new Map(); variantsByWatch.set(watchId, byVariant); }
       let entry = byVariant.get(key);
-      if (!entry) { entry = { samples: 0, first_observed: null, typical: null }; byVariant.set(key, entry); }
+      if (!entry) { entry = { samples: 0, first_observed: null, typical: null, typicalSource: null }; byVariant.set(key, entry); }
       return entry;
     };
     for (const stats of statsRows) {
@@ -2832,8 +2839,11 @@ export class ScoutService {
       statsByWatch.set(stats.watch_id, aggregate);
     }
     for (const row of typicalRows) {
-      variantEntry(row.watch_id, row.variant_key ?? OTHER_VARIANT_KEY).typical = Number(row.typical);
+      const entry = variantEntry(row.watch_id, row.variant_key ?? OTHER_VARIANT_KEY);
+      entry.typical = Number(row.typical);
+      entry.typicalSource = row.typical_source === 'own-history' || row.typical_source === 'reference-band' ? row.typical_source : null;
     }
+    const figuresByWatch = figures ? this.ungroupedWatchFigures(rows, variantsByWatch) : new Map<string, WatchTypicalFigures>();
     // Current Strong+ findings per watch, bucketed by tier. The predicates
     // mirror listingsPage (fresh association, not AI-filtered irrelevant, the
     // watch's shipping/price filters) and additionally skip rows the user hid,
@@ -2862,7 +2872,65 @@ export class ScoutService {
       else if (strength === 3) counts.strong += count;
       dealCountsByWatch.set(row.watch_id, counts);
     }
-    return rows.map((row) => this.watchFromRow(row, statsByWatch.get(row.id), variantsByWatch.get(row.id) ?? new Map(), dealCountsByWatch.get(row.id) ?? { exceptional: 0, veryStrong: 0, strong: 0 }));
+    return rows.map((row) => this.watchFromRow(row, statsByWatch.get(row.id), variantsByWatch.get(row.id) ?? new Map(), dealCountsByWatch.get(row.id) ?? { exceptional: 0, veryStrong: 0, strong: 0 }, figuresByWatch.get(row.id)));
+  }
+
+  /**
+   * Watch-wide figures for watches without model variants. `typical` is the
+   * value the latest scan stored, exactly as `variants[].typical` is per
+   * variant. The spread comes from the watch's current baseline, the one the
+   * next scan scores against (watchBaselines: each listing's newest in-range
+   * price, newest 400 listings). It includes the latest scan's own listings,
+   * so for a listing already scored it only approximates the scale that
+   * scan used. Read for all such watches in one association-driven query
+   * with one index seek per listing. A reference-band typical takes its
+   * p25/p75 from the research series' band, since its own prices are still
+   * too few; robustScale always uses own prices, as scoring does.
+   */
+  private ungroupedWatchFigures(rows: WatchRow[], variantsByWatch: Map<string, Map<string, WatchVariantEntry>>) {
+    const figures = new Map<string, WatchTypicalFigures>();
+    const typed = rows.flatMap((row) => {
+      const entry = variantsByWatch.get(row.id)?.get(OTHER_VARIANT_KEY);
+      return entry?.typical != null && !parseVariantGroups(row.variant_groups_json).length ? [{ row, typical: entry.typical, typicalSource: entry.typicalSource }] : [];
+    });
+    if (!typed.length) return figures;
+    const priceRows = this.stmt(`SELECT x.watch_id AS watch_id, o.price_pln AS price_pln
+      FROM (
+        SELECT wl.watch_id AS watch_id,
+          (SELECT o2.id FROM observations o2 INDEXED BY observations_watch_listing
+            WHERE o2.watch_id = wl.watch_id AND o2.listing_id = wl.listing_id
+              AND (w.min_price_pln IS NULL OR o2.price_pln >= w.min_price_pln) AND (w.max_price_pln IS NULL OR o2.price_pln <= w.max_price_pln)
+            ORDER BY o2.observed_at DESC, o2.id DESC LIMIT 1) AS latest_id
+        FROM watch_listings wl
+        JOIN watches w ON w.id = wl.watch_id
+        JOIN listings l ON l.id = wl.listing_id
+        WHERE wl.watch_id IN (SELECT value FROM json_each(?))
+          AND (w.ai_relevance = 0 OR NOT EXISTS (SELECT 1 FROM listing_relevance r WHERE r.watch_id = wl.watch_id AND r.marketplace = l.marketplace AND r.listing_id = l.listing_id AND (r.relevance_status = 'irrelevant' OR (r.relevance_status IS NULL AND r.relevant = 0))))
+          AND (w.shipping_only = 0 OR (l.marketplace = 'Vinted' OR l.shipping_available = 1))
+      ) x JOIN observations o ON o.id = x.latest_id
+      ORDER BY o.observed_at DESC, o.id DESC`).all(JSON.stringify(typed.map(({ row }) => String(row.id)))) as Array<{ watch_id: string; price_pln: number }>;
+    const pricesByWatch = new Map<string, number[]>();
+    for (const item of priceRows) {
+      const price = Number(item.price_pln);
+      if (!Number.isFinite(price) || price <= 0) continue;
+      let prices = pricesByWatch.get(item.watch_id);
+      if (!prices) { prices = []; pricesByWatch.set(item.watch_id, prices); }
+      if (prices.length < 400) prices.push(price);
+    }
+    for (const { row, typical, typicalSource } of typed) {
+      const stats = priceStats(pricesByWatch.get(row.id) ?? []);
+      let p25: number | null = null;
+      let p75: number | null = null;
+      if (typicalSource === 'reference-band' && row.reference_market_watch_id) {
+        const band = this.referenceBand(String(row.reference_market_watch_id));
+        if (band.eligibleCount >= MIN_BAND_SAMPLES) { p25 = roundPln(band.p25); p75 = roundPln(band.p75); }
+      } else if (stats.usable.length >= MIN_BAND_SAMPLES) {
+        p25 = roundPln(percentile(stats.usable, 0.25));
+        p75 = roundPln(percentile(stats.usable, 0.75));
+      }
+      figures.set(row.id, { typical, typicalSource, p25, p75, robustScale: roundPln(ownRobustScale(stats, typical)) });
+    }
+    return figures;
   }
 
   getWatches() {
@@ -4014,7 +4082,8 @@ export class ScoutService {
     else if (options.verification) { predicates.push('l.ai_description_verification_status = ?'); params.push(options.verification); }
     if (options.excludeRejected) predicates.push("COALESCE(l.ai_description_verification_status, '') <> 'reject'");
     if (options.excludePassed) predicates.push("COALESCE(a.decision, '') <> 'pass'");
-    const watches = new Map((knownWatches ?? this.getWatches()).map((watch) => [watch.id, watch]));
+    // Rows need only readiness and groups, not the watch-wide typical figures.
+    const watches = new Map((knownWatches ?? this.watches(false, undefined, false)).map((watch) => [watch.id, watch]));
     // Percent below the typical listingFromRow displays: an own-history or
     // reference-band typical, or a legacy one once its watch is ready. One
     // json_each bind keeps a single statement shape for any set of watches.
@@ -4064,7 +4133,7 @@ export class ScoutService {
       ORDER BY CASE WHEN wl.id IS NOT NULL THEN 0 ELSE 1 END, wl.last_seen_at DESC LIMIT 1`).get(watchId ?? null, watchId ?? null, marketplace, listingId, watchId ?? null, watchId ?? null) as Record<string, any> | undefined;
     if (!row) throw new ServiceError('Listing detail is not available yet', 404);
     // Only the associated watch's readiness and groups are needed.
-    const watch = row.watch_id != null ? this.watchById(String(row.watch_id)) : undefined;
+    const watch = row.watch_id != null ? this.watches(true, String(row.watch_id), false)[0] : undefined;
     const listing = this.listingFromRow(row, watch?.readiness === 100, watch?.variantGroups ?? []);
     // Split instead of '(? IS NULL OR watch_id = ?)' so the watch-scoped read
     // seeks observations_watch_listing. The unscoped form is exact because
@@ -5387,7 +5456,8 @@ export class ScoutService {
    */
   dashboard(options: { top?: number } = {}): DashboardData {
     const top = typeof options.top === 'number' && Number.isInteger(options.top) && options.top >= 1 && options.top <= 50 ? options.top : null;
-    const watches = this.getWatches();
+    // The widget (top set) only needs the watches for its deals, not their figures.
+    const watches = top === null ? this.getWatches() : this.watches(false, undefined, false);
     const listings = this.getListings(watches, true);
     const today = new Date();
     today.setHours(0, 0, 0, 0);
