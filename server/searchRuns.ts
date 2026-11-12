@@ -5,9 +5,25 @@
  * reports parts (one per marketplace) as they finish, and every caller
  * attached to the run sees each part once, including the ones that finished
  * before it joined.
+ *
+ * Each caller has its own deadline, the wait for a slot included. At the
+ * deadline a running search answers with the parts that finished; one still
+ * queued gets the busy error. The run itself keeps going for whoever repeats
+ * the search, until `maxRunMs`, until every caller has disconnected, or until
+ * a queued search needs its slot and no caller is waiting on it any more.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { SearchFilters } from '../src/types';
+
+/**
+ * What a manual search's own work runs under: marketplace requests and AI
+ * calls read it to stop waiting for a slot once the search is stopped.
+ */
+export interface SearchScope {
+  signal: AbortSignal;
+}
+export const searchScope = new AsyncLocalStorage<SearchScope>();
 
 /**
  * Inputs that never change a search's result: they name or pace the call.
@@ -66,38 +82,63 @@ export class SearchQueueTimeoutError extends Error {
   }
 }
 
+/** A run was stopped (every caller left, a queued search took its slot, or it ran too long), or a caller left. */
+export class SearchStoppedError extends Error {
+  constructor(readonly reason: 'aborted' | 'preempted' | 'max-time') {
+    super(reason === 'aborted' ? 'Search cancelled' : reason === 'preempted' ? 'Search stopped to free its slot for a waiting search' : 'Search stopped after its time limit');
+    this.name = 'SearchStoppedError';
+  }
+}
+
 export interface SearchRunSettings {
   /** Runs at once; more wait in FIFO order. */
   slots: number;
-  /** How long a caller waits for its search, the queue included. */
+  /** A caller's deadline when it names none, the queue included. */
   deadlineMs: number;
+  /** The longest a run may hold a slot. */
+  maxRunMs: number;
 }
 
 export interface SearchRunHandle<Part> {
-  /** One finished part, shown to every caller attached now or later. */
+  /** One finished part, shown to every caller still waiting now or joining later. */
   report(part: Part): void;
+  /** Throws SearchStoppedError once the run has been stopped; call it before each phase. */
+  checkpoint(): void;
 }
 
 export interface SearchCall<Part, Result> {
   /** Runs the search; only the call that starts a run executes it, joiners share its result. */
   execute: (run: SearchRunHandle<Part>) => Promise<Result>;
-  /** Each finished part, once. */
+  /** Each finished part, once, while this caller waits. */
   onPart?: (part: Part) => void;
+  /** This caller's deadline; the settings' default when omitted. */
+  deadlineMs?: number;
+  /** The caller went away (disconnected): it stops waiting, and a run nobody else wants stops. */
+  signal?: AbortSignal;
+  /** What this caller gets at its deadline from the parts finished by then. */
+  partial: (parts: Part[]) => Result;
+}
+
+export interface SearchOutcome<Result> {
+  result: Result;
+  /** False when the deadline cut the search short. */
+  complete: boolean;
 }
 
 interface Caller<Part> {
   onPart?: (part: Part) => void;
+  state: 'waiting' | 'expired' | 'aborted' | 'done';
 }
 
 interface Run<Part, Result> {
   key: string;
   parts: Part[];
   callers: Set<Caller<Part>>;
+  controller: AbortController;
   /** Settles with the search; rejects with SearchQueueTimeoutError when dropped from the queue. */
   result: Promise<Result>;
-  /** Resolves once the run holds a slot. */
-  started: Promise<void>;
   holdsSlot: boolean;
+  settled: boolean;
   grant: () => void;
   drop: () => void;
 }
@@ -114,18 +155,33 @@ export class SearchRuns<Part, Result> {
     return { running: this.running.size, queued: this.queued.length };
   }
 
-  async search(key: string, call: SearchCall<Part, Result>): Promise<Result> {
-    const deadlineAt = Date.now() + this.settings.deadlineMs;
+  search(key: string, call: SearchCall<Part, Result>): Promise<SearchOutcome<Result>> {
+    if (call.signal?.aborted) return Promise.reject(new SearchStoppedError('aborted'));
+    const deadlineAt = Date.now() + (call.deadlineMs ?? this.settings.deadlineMs);
     const run = this.inFlight.get(key) ?? this.start(key, call.execute);
-    const caller: Caller<Part> = { onPart: call.onPart };
+    const caller: Caller<Part> = { onPart: call.onPart, state: 'waiting' };
     run.callers.add(caller);
     for (const part of run.parts) caller.onPart?.(part);
-    try {
-      if (!run.holdsSlot) await this.waitForSlot(run, deadlineAt);
-      return await run.result;
-    } finally {
-      run.callers.delete(caller);
-    }
+    return new Promise<SearchOutcome<Result>>((resolve, reject) => {
+      const leave = (state: Caller<Part>['state'], answer: () => void) => {
+        if (caller.state !== 'waiting') return;
+        caller.state = state;
+        clearTimeout(timer);
+        call.signal?.removeEventListener('abort', onAbort);
+        answer();
+        this.callerLeft(run);
+      };
+      const onAbort = () => leave('aborted', () => reject(new SearchStoppedError('aborted')));
+      const timer = setTimeout(() => leave('expired', () => {
+        if (run.holdsSlot) resolve({ result: call.partial([...run.parts]), complete: false });
+        else reject(new SearchQueueTimeoutError());
+      }), Math.max(0, deadlineAt - Date.now()));
+      call.signal?.addEventListener('abort', onAbort, { once: true });
+      run.result.then(
+        (result) => leave('done', () => resolve({ result, complete: true })),
+        (error) => leave('done', () => reject(error)),
+      );
+    });
   }
 
   private start(key: string, execute: SearchCall<Part, Result>['execute']): Run<Part, Result> {
@@ -139,56 +195,90 @@ export class SearchRuns<Part, Result> {
       key,
       parts: [],
       callers: new Set(),
-      started,
+      controller: new AbortController(),
       holdsSlot: false,
+      settled: false,
       grant: () => { run.holdsSlot = true; this.running.add(run); grant(); },
       drop,
-      result: Promise.resolve() as unknown as Promise<Result>,
+      result: started as unknown as Promise<Result>,
     };
     const handle: SearchRunHandle<Part> = {
       report: (part) => {
         run.parts.push(part);
-        for (const caller of run.callers) caller.onPart?.(part);
+        for (const caller of run.callers) if (caller.state === 'waiting') caller.onPart?.(part);
+      },
+      checkpoint: () => {
+        if (run.controller.signal.aborted) throw run.controller.signal.reason instanceof Error ? run.controller.signal.reason : new SearchStoppedError('aborted');
       },
     };
     run.result = (async () => {
+      let limit: ReturnType<typeof setTimeout> | undefined;
       try {
         await started;
-        return await execute(handle);
+        limit = setTimeout(() => this.stop(run, 'max-time'), this.settings.maxRunMs);
+        limit.unref?.();
+        return await searchScope.run({ signal: run.controller.signal }, () => execute(handle));
       } finally {
-        this.finish(run);
+        clearTimeout(limit);
+        run.settled = true;
+        this.release(run);
       }
     })();
     // A dropped run's rejection reaches only the callers still waiting on it.
     run.result.catch(() => {});
     this.inFlight.set(key, run);
     if (this.running.size < this.settings.slots) run.grant();
-    else this.queued.push(run);
+    else {
+      this.queued.push(run);
+      this.preemptOrphans();
+    }
     return run;
   }
 
-  /** Waits for the run's slot until the caller's deadline; a run nobody waits for leaves the queue. */
-  private async waitForSlot(run: Run<Part, Result>, deadlineAt: number) {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), Math.max(0, deadlineAt - Date.now())); });
-    try {
-      const outcome = await Promise.race([run.started.then(() => 'started' as const), timeout]);
-      if (outcome === 'started') return;
-      // Other callers may still wait on this run with later deadlines.
-      if (run.callers.size <= 1 && !run.holdsSlot) {
-        const index = this.queued.indexOf(run);
-        if (index >= 0) this.queued.splice(index, 1);
-        if (this.inFlight.get(run.key) === run) this.inFlight.delete(run.key);
-        run.drop();
-      }
-      throw new SearchQueueTimeoutError();
-    } finally {
-      clearTimeout(timer);
+  /** A caller stopped waiting: a run nobody waits on leaves the queue, stops, or becomes an orphan. */
+  private callerLeft(run: Run<Part, Result>) {
+    const states = [...run.callers].map((caller) => caller.state);
+    if (run.settled || states.includes('waiting')) return;
+    if (!run.holdsSlot) {
+      const index = this.queued.indexOf(run);
+      if (index >= 0) this.queued.splice(index, 1);
+      this.forget(run);
+      run.drop();
+      return;
+    }
+    if (states.every((state) => state === 'aborted')) {
+      this.stop(run, 'aborted');
+      return;
+    }
+    // Expired callers may repeat the search, so the run keeps going unless
+    // a queued search needs the slot.
+    this.preemptOrphans();
+  }
+
+  /** Frees slots held by runs no caller waits on, while a queued search needs one. */
+  private preemptOrphans() {
+    while (this.queued.length) {
+      const orphan = [...this.running].find((run) => ![...run.callers].some((caller) => caller.state === 'waiting'));
+      if (!orphan) return;
+      this.stop(orphan, 'preempted');
+      if (this.running.has(orphan)) return;
     }
   }
 
-  private finish(run: Run<Part, Result>) {
+  /** Stops a run where it next checks in and frees its slot at once; its queued requests are dropped. */
+  private stop(run: Run<Part, Result>, reason: SearchStoppedError['reason']) {
+    if (run.settled || run.controller.signal.aborted) return;
+    run.controller.abort(new SearchStoppedError(reason));
+    this.forget(run);
+    this.release(run);
+  }
+
+  private forget(run: Run<Part, Result>) {
     if (this.inFlight.get(run.key) === run) this.inFlight.delete(run.key);
+  }
+
+  private release(run: Run<Part, Result>) {
+    this.forget(run);
     if (!this.running.delete(run)) return;
     this.queued.shift()?.grant();
   }

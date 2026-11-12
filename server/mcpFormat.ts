@@ -13,8 +13,11 @@ export const COMPACT_SEARCH_SCHEMA_VERSION = 1;
 export type SearchRelevance = 'relevant' | 'unknown' | 'not-checked';
 /** strict: every query term matched; relaxed: most terms matched; rescued: a Jev near-miss rescue. */
 export type SearchMatch = 'strict' | 'relaxed' | 'rescued';
-/** backoff: skipped, since the connector is paused after repeated failed scans (ignoreBackoff searches it anyway). */
-export type SearchErrorKind = 'timeout' | 'blocked' | 'http' | 'parse' | 'redirect' | 'session' | 'config' | 'backoff' | 'unknown';
+/**
+ * backoff: skipped, since the connector is paused after repeated failed scans (ignoreBackoff searches it anyway).
+ * deadline: not finished within the call's deadline; the search keeps running, so a repeat can return it.
+ */
+export type SearchErrorKind = 'timeout' | 'blocked' | 'http' | 'parse' | 'redirect' | 'session' | 'config' | 'backoff' | 'deadline' | 'unknown';
 
 export interface ManualSearchListingDetail {
   listingId: string;
@@ -167,6 +170,7 @@ export function searchErrorKind(error: unknown): SearchErrorKind {
   if (/no usable markup|no supported listing|did not contain|not a valid PLN amount/i.test(message)) return 'parse';
   // Scout's own skip message, for a status that reaches here without details.
   if (/^Skipped: connector backoff/.test(message)) return 'backoff';
+  if (/^Not finished within the \d+ s deadline/.test(message)) return 'deadline';
   return 'unknown';
 }
 

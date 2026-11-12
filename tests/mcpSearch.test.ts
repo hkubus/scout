@@ -105,3 +105,20 @@ test('scout_search advertises typoVariants off by default, with its cost', async
     context.close();
   }
 });
+
+test('scout_search takes a deadline, the wait for a slot included', async () => {
+  const context = searchFixture();
+  const { client, close } = await connectedClient(context.service);
+  try {
+    const tool = (await client.listTools()).tools.find((entry) => entry.name === 'scout_search')!;
+    const schema = (tool.inputSchema.properties as Record<string, any>).deadlineMs;
+    assert.deepEqual({ type: schema.type, minimum: schema.minimum, maximum: schema.maximum }, { type: 'integer', minimum: 5000, maximum: 120000 });
+    assert.match(schema.description, /errorKind "deadline"/);
+    assert.equal((tool.inputSchema.required as string[]).includes('deadlineMs'), false);
+    const refused = await client.callTool({ name: 'scout_search', arguments: { query: 'x', sources: ['OLX'], deadlineMs: 1000 } });
+    assert.equal(refused.isError, true);
+  } finally {
+    await close();
+    context.close();
+  }
+});

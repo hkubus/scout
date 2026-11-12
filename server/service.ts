@@ -20,7 +20,7 @@ import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStre
 import { legacyTypoVariants, pickVariantBatch, typoVariantPairs, type TypoVariant } from './typos';
 import { isDamagedLabel, normalizeRequestedCondition } from './searchCondition';
 import { EMPTY_SEARCH_SOURCE, compactDuplicateNote, searchErrorKind, type ManualSearchDetailedResponse, type ManualSearchDetails, type ManualSearchListingDetail, type ManualSearchSourceDetail } from './mcpFormat';
-import { SearchQueueTimeoutError, SearchRuns, manualSearchKey, type SearchRunHandle, type SearchRunSettings } from './searchRuns';
+import { SearchQueueTimeoutError, SearchRuns, SearchStoppedError, manualSearchKey, searchScope, type SearchRunHandle, type SearchRunSettings } from './searchRuns';
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
 import { matchQuality, matchQuery, type MatchCandidate, type QueryMatch } from './queryMatch';
 import { conditionClass, daysListed, groupOutcomes, MIN_OUTCOME_AGREED, priceDrops, shareOfAsking, titleSimilarity, type OutcomeRow } from './negotiation';
@@ -338,6 +338,24 @@ interface ManualSearchPart {
   listingDetails: Array<[string, ManualSearchListingDetail]>;
 }
 
+/** A marketplace a manual search's deadline cut off. */
+function deadlinePart(source: Marketplace, elapsedMs: number, deadlineMs: number): ManualSearchPart {
+  return {
+    listings: [],
+    status: {
+      source, status: 'error', count: 0, pendingShipping: 0, durationMs: elapsedMs,
+      message: `Not finished within the ${Math.round(deadlineMs / 1000)} s deadline; the search keeps running for a while, so repeating it shortly can return this marketplace too`,
+    },
+    detail: { ...EMPTY_SEARCH_SOURCE, errorKind: 'deadline' },
+    listingDetails: [],
+  };
+}
+
+export interface ManualSearchOptions {
+  /** Aborted when the client goes away: the call stops waiting, and a search no one else waits for stops. */
+  signal?: AbortSignal;
+}
+
 /** Manual searches allowed to run at once; more wait for a slot. */
 const MANUAL_SEARCH_SLOTS = 3;
 /**
@@ -352,6 +370,14 @@ function searchDeadlineMs(requested?: number | null) {
   const configured = Number.parseInt(process.env.SCOUT_SEARCH_DEADLINE_MS ?? '', 10);
   const value = requested ?? (Number.isFinite(configured) ? configured : DEFAULT_SEARCH_DEADLINE_MS);
   return Math.min(Math.max(Math.floor(value), MIN_SEARCH_DEADLINE_MS), MAX_SEARCH_DEADLINE_MS);
+}
+/**
+ * How long a search keeps running after its callers' deadlines, so a repeat
+ * can join it (SCOUT_SEARCH_MAX_MS, default 120 s, at least the longest deadline).
+ */
+function searchMaxRunMs() {
+  const configured = Number.parseInt(process.env.SCOUT_SEARCH_MAX_MS ?? '', 10);
+  return Number.isFinite(configured) ? Math.max(configured, MAX_SEARCH_DEADLINE_MS) : MAX_SEARCH_DEADLINE_MS;
 }
 
 /** A new deal watch, with every default already filled in. */
@@ -847,11 +873,13 @@ export class ScoutService {
   private logSequence = 0;
   private readonly logBuffer: LogEntry[] = [];
   private readonly searchRuns: SearchRuns<ManualSearchPart, ManualSearchPart[]>;
+  private readonly searchDeadlineDefaultMs: number;
 
   constructor(db: Database, emit: (event: string, payload: unknown) => void, dependencies: ScoutServiceDependencies = {}) {
     this.db = db;
     this.emit = emit;
-    this.searchRuns = new SearchRuns({ slots: MANUAL_SEARCH_SLOTS, deadlineMs: searchDeadlineMs(), ...dependencies.manualSearch });
+    this.searchRuns = new SearchRuns({ slots: MANUAL_SEARCH_SLOTS, deadlineMs: searchDeadlineMs(), maxRunMs: searchMaxRunMs(), ...dependencies.manualSearch });
+    this.searchDeadlineDefaultMs = dependencies.manualSearch?.deadlineMs ?? searchDeadlineMs();
     this.classifyListingRelevance = dependencies.classifyListingRelevance ?? classifyListingRelevanceWithDeepSeek;
     this.verifyListingDescription = dependencies.verifyListingDescription ?? verifyListingDescriptionWithDeepSeek;
     this.jevRelevance = dependencies.classifyListingRelevanceWithJev ?? classifyListingRelevanceWithJev;
@@ -4834,9 +4862,9 @@ export class ScoutService {
    * `manualSearch` plus per-listing and per-source side tables (relevance
    * verdict, match kind, pipeline counts, error kind) for compact MCP output.
    */
-  async manualSearchDetailed(input: SearchFilters): Promise<ManualSearchDetailedResponse> {
+  async manualSearchDetailed(input: SearchFilters, options: ManualSearchOptions = {}): Promise<ManualSearchDetailedResponse> {
     const details: ManualSearchDetails = { listings: new Map(), sources: new Map() };
-    const response = await this.manualSearch(input, details);
+    const response = await this.manualSearch(input, details, options);
     return { ...response, details };
   }
 
@@ -4844,25 +4872,38 @@ export class ScoutService {
    * `details`, when given, is filled in place; the response itself is the
    * same either way. Up to three searches run at once; the rest wait for a
    * slot until their deadline, and an identical search already running is
-   * joined rather than run twice.
+   * joined rather than run twice. At the deadline (the wait included) the
+   * marketplaces that finished come back and the rest are errors of kind
+   * `deadline`; `options.signal` (the client went away) stops waiting.
    */
-  async manualSearch(input: SearchFilters, details?: ManualSearchDetails): Promise<ManualSearchResponse> {
+  async manualSearch(input: SearchFilters, details?: ManualSearchDetails, options: ManualSearchOptions = {}): Promise<ManualSearchResponse> {
     // Resolved before any fetch, so an unknown watch id costs no marketplace request.
     const scoring = this.searchScoring(input);
     const page = manualSearchPage(input);
     // Misspellings of the query ride along on page 1 only, most realistic first.
     const typoPairs = input.typoVariants && page === 1 ? typoVariantPairs(input.query, { max: searchTypoVariantCount() }) : [];
+    const deadlineMs = input.deadlineMs == null ? this.searchDeadlineDefaultMs : searchDeadlineMs(input.deadlineMs);
+    const calledAt = Date.now();
+    // Stream each source to the client that asked, so a fast marketplace is
+    // visible while a slow one is still fetching. The response stays
+    // authoritative and reconciles anything the stream missed.
+    const progress = (part: ManualSearchPart) => this.emitSearchProgress(input.searchId, page, part.status.source, part.status, part.listings);
     let parts: ManualSearchPart[];
     try {
-      parts = await this.searchRuns.search(manualSearchKey(input), {
+      ({ result: parts } = await this.searchRuns.search(manualSearchKey(input), {
         execute: (run) => this.runManualSearch(input, scoring, typoPairs, run),
-        // Stream each source to the client that asked, so a fast marketplace
-        // is visible while a slow one is still fetching. The response stays
-        // authoritative and reconciles anything the stream missed.
-        onPart: (part) => this.emitSearchProgress(input.searchId, page, part.status.source, part.status, part.listings),
-      });
+        onPart: progress,
+        deadlineMs,
+        signal: options.signal,
+        partial: (finished) => input.sources.map((source) => finished.find((part) => part.status.source === source) ?? (() => {
+          const part = deadlinePart(source, Date.now() - calledAt, deadlineMs);
+          progress(part);
+          return part;
+        })()),
+      }));
     } catch (error) {
       if (error instanceof SearchQueueTimeoutError) throw new ServiceError(error.message, 429);
+      if (error instanceof SearchStoppedError) throw new ServiceError(error.message, 499);
       throw error;
     }
     if (details) {
@@ -4912,6 +4953,9 @@ export class ScoutService {
       }
       try {
         const searchOptions = { ...input, condition, olxCategoryId: input.olxCategory?.id ?? null, page };
+        // A stopped run (every caller gone, its slot needed, or out of time)
+        // starts no further phase; the error part reaches no one.
+        run.checkpoint();
         const fetched = await this.fetchSearchPages(source, input.query, searchOptions);
         // Typo variants start only once the marketplace answered the query's
         // own page, so a blocked one is never asked again; each misspelled
@@ -4921,6 +4965,7 @@ export class ScoutService {
         const foundByTypo = new Map<string, TypoVariant>();
         const variantStatuses: SearchTypoVariantStatus[] = [];
         if (typoPairs.length) {
+          run.checkpoint();
           const pages = await Promise.all(typoPairs.map(async (variant) => {
             try {
               return { variant, rows: await this.fetchSearchPages(source, variant.query, searchOptions), error: null };
@@ -4958,6 +5003,7 @@ export class ScoutService {
         const typoComparable = typoRows.length ? filterTypoRows(typoRows, typoOf, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters) : [];
         // Cache-first like watch scans: only a few cold listings fetch an item
         // page per search; the rest surface as pending delivery checks.
+        run.checkpoint();
         if (input.shippingOnly) await this.enrichShipping(typoComparable.length ? [...comparable, ...typoComparable] : comparable, source);
         let filtered = filterListings(comparable, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, shippingOnly: input.shippingOnly, relaxTerms: true });
         const typoFiltered = typoComparable.length ? filterTypoRows(typoComparable, typoOf, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, shippingOnly: input.shippingOnly }) : [];
@@ -4967,6 +5013,7 @@ export class ScoutService {
         // any failure keeps the deterministic set. Turning AI relevance off
         // skips it too, and rows the relaxed pass already kept cost nothing.
         const rescuedKeys = new Set<string>();
+        run.checkpoint();
         if (input.aiRelevance !== false) {
           try {
             const kept = new Set(comparable.map((listing) => `${listing.marketplace}:${listing.listingId}`));
@@ -4997,6 +5044,7 @@ export class ScoutService {
         // not-configured keeps the deterministic set. An unexpected throw
         // (e.g. cache/transaction failure) must not turn a good deterministic
         // result into a user-visible search error.
+        run.checkpoint();
         let relevant = filtered;
         let relevanceNote = '';
         let relevanceResult: RelevanceFilterResult | null = null;
@@ -5026,6 +5074,7 @@ export class ScoutService {
         let checksNote = '';
         let hiddenByChecks = 0;
         if (checks.length) {
+          run.checkpoint();
           try {
             const checked = await this.applySearchChecks(capped, checks);
             capped = checked.listings;
@@ -6495,12 +6544,14 @@ export class ScoutService {
     const key = segments.join('/');
     let pending = this.olxPathCache.get(key);
     if (!pending) {
-      pending = resolveOlxSearchPath(segments, async (path) => {
+      // Shared by every scan and search that asks, so it runs outside the
+      // asking search's scope: stopping that search must not fail the rest.
+      pending = searchScope.exit(() => resolveOlxSearchPath(segments, async (path) => {
         const { status, json } = await this.fetchOlxApi(buildOlxFriendlyLinksUrl(path));
         if (status === 404) return null;
         if (status < 200 || status >= 300) throw new Error(`OLX path lookup returned HTTP ${status}`);
         return parseOlxFriendlyLinks(json);
-      });
+      }));
       pending.catch((error) => { if (!(error instanceof SearchConfigError)) this.olxPathCache.delete(key); });
       this.olxPathCache.set(key, pending);
     }
@@ -6538,7 +6589,9 @@ export class ScoutService {
       limiter = new Limiter(MARKETPLACE_REQUEST_CONCURRENCY);
       this.marketplaceLimiters.set(marketplace, limiter);
     }
-    return limiter.run(task);
+    // A manual search that has been stopped drops its requests still
+    // waiting here instead of firing them later.
+    return limiter.run(task, { signal: searchScope.getStore()?.signal });
   }
 
   private fetchOlxApi(url: string) { return this.marketplaceRequest('OLX', () => this.requestOlxApi(url)); }

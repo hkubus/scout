@@ -364,20 +364,24 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
         .describe('A marketplace that failed two or more scans in a row is paused for a while (5 min, doubling up to 6 h); searches skip it and report status "error", errorKind "backoff" (compact) and backoffUntil. true searches it anyway.'),
       typoVariants: z.boolean().optional().default(false)
         .describe('Page 1 only: also search up to 2 misspellings of the query (iphone 13 → iphon 13, play station → playstation) on each marketplace whose own page loaded, for listings that misspell the product. Costs up to 2 extra page fetches per marketplace. Each result gets matchedVia "query" or "typo:<spelling>", each source its variants, and typoVariants lists the spellings tried. Typo rows join the AI relevance check after every main-page row, inside the same 40-check budget per marketplace, so on a cold search they are the rows left unjudged: relevance "unknown" (compact), never "relevant". Set it on the first search for a product, not on later pages or rewordings.'),
+      deadlineMs: z.number().int().min(5000).max(120000).optional()
+        .describe('Answer within this many ms (default 45000), the wait for a free search slot included. Up to three searches run at once and the rest wait their turn. A marketplace not finished by then comes back as an error with errorKind "deadline" (compact); the search keeps running for a while, so repeating the same call shortly returns it. Still waiting for a slot at the deadline: the call fails as busy.'),
       format: z.enum(['full', 'compact']).optional().default('full')
         .describe('compact: smaller, stable rows with every key present (null when unknown): id "<Marketplace>:<listingId>", asking price in PLN, relevance, match kind, duplicateCount (0 when none) and duplicateCheapest (null when none) for results a scan already stored that are also listed on another marketplace; sources carry status ok|error with an errorKind and pipeline counts.'),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
-  }, async ({ olxCategoryId, format, ...input }) => {
+  }, async ({ olxCategoryId, format, ...input }, extra) => {
     if (input.minPrice != null && input.maxPrice != null && input.minPrice > input.maxPrice) return toolError(new ServiceError('Minimum price cannot exceed maximum price'));
     try {
       const filters = { ...input, sources: [...new Set(input.sources)], olxCategory: olxCategoryId ? { id: olxCategoryId, label: String(olxCategoryId), path: '' } : null };
+      // Aborted when the client cancels the call or its connection closes.
+      const options = { signal: extra.signal };
       if (format === 'compact') {
-        const result = await service.manualSearchDetailed(filters);
+        const result = await service.manualSearchDetailed(filters, options);
         service.withDuplicates(result.listings);
         return text(toCompactSearch(filters, result));
       }
-      return text(await service.manualSearch(filters));
+      return text(await service.manualSearch(filters, undefined, options));
     } catch (error) { return toolError(error); }
   });
 

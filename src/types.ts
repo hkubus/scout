@@ -735,6 +735,12 @@ export interface SearchFilters {
    * marketplace whose own page loaded, for listings that misspell the product.
    */
   typoVariants?: boolean;
+  /**
+   * Answer within this many ms (5000-120000; the server default otherwise),
+   * the wait for a free search slot included. Marketplaces not finished by
+   * then come back as errors; the search keeps running for a repeat to join.
+   */
+  deadlineMs?: number;
 }
 
 /** One misspelled search a manual search with typoVariants ran on a marketplace. */

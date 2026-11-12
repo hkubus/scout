@@ -610,6 +610,8 @@ const searchInput = z.object({
   scoreAgainst: z.string().trim().min(1).max(160).nullable().optional(),
   // Search marketplaces paused after repeated failed scans anyway.
   ignoreBackoff: z.boolean().optional().default(false),
+  // Answer within this many ms, the wait for a search slot included.
+  deadlineMs: z.number().int().min(5000).max(120000).optional(),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
 
 // Flip ledger. Calendar dates only: the operator's own bookkeeping days.
@@ -770,7 +772,12 @@ app.get('/api/marketplaces/olx/categories', async (request, reply) => {
 app.post('/api/search', async (request, reply) => {
   const parsed = searchInput.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid search', details: parsed.error.flatten() });
-  return service.manualSearch(parsed.data);
+  // A client that goes away stops waiting; a search no one else waits for stops too.
+  const gone = new AbortController();
+  reply.raw.on('close', () => {
+    if (!reply.raw.writableEnded) gone.abort();
+  });
+  return service.manualSearch(parsed.data, undefined, { signal: gone.signal });
 });
 
 const marketWatchInput = z.object({
