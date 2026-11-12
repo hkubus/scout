@@ -18,11 +18,13 @@ import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { Limiter, mapPool } from './limiter';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, percentile, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
+import { searchErrorKind, type ManualSearchDetailedResponse, type ManualSearchDetails } from './mcpFormat';
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
 import { matchQuality, matchQuery, type MatchCandidate, type QueryMatch } from './queryMatch';
 import { conditionClass, daysListed, outcomeShare, priceDrops, shareOfAsking, titleSimilarity } from './negotiation';
 import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assignVariant, finalizeVariantSuggestions, parseVariantGroups, suggestVariantGroupsFromTitles, variantLabelFor, type VariantGroup, type VariantSample } from './variants';
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
+import type { ListingVerificationFilter } from './deals';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
 import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes, AgentFlip, AgentFlips, ConversationResult, InboxResult } from '../src/types';
@@ -44,6 +46,10 @@ type RelevanceFilterResult = {
   /** Listings kept without an AI call because the deal-strength gate excluded them. */
   skipped: number;
   notConfigured: boolean;
+  /** Each kept listing's verdict; absent when the pass did not run (disabled, not configured, empty). */
+  statuses?: Map<NormalizedListing, 'relevant' | 'unknown'>;
+  /** Kept as unknown because the per-pass AI budget ran out. */
+  budgetExhausted?: number;
 };
 
 type DealNotificationCandidate = {
@@ -141,7 +147,7 @@ const connectorDefinitions: Array<Pick<Connector, 'name' | 'kind' | 'color'>> = 
 ];
 const marketplaces: Marketplace[] = ['OLX', 'Allegro Lokalnie', 'Vinted'];
 export const DEFAULT_NIGHT_INTERVAL_MINUTES = 30;
-const MATCH_VISIBILITY_MS = 12 * 60 * 60_000;
+export const MATCH_VISIBILITY_MS = 12 * 60 * 60_000;
 /**
  * Rows a single manual-search request keeps per source before truncating. The
  * client pages past it with `page` instead of losing results silently.
@@ -1483,6 +1489,7 @@ export class ScoutService {
     const AI_RELEVANCE_BUDGET_PER_SCAN = 40;
     let aiCalls = 0;
     let skipped = 0;
+    let budgetExhausted = 0;
     const pendingClassifications = new Map<string, Promise<{ relevant: boolean }>>();
     const pendingLive = new Map<string, Promise<{ relevant: boolean; status: 'relevant' | 'irrelevant' | 'unknown'; reason: string; error?: string }>>();
     // Relevance rows are collected while the AI calls are awaited and flushed
@@ -1583,6 +1590,7 @@ export class ScoutService {
       // uses each listing's own URL and thumbnail, which the hash omits.
       const liveKey = `${inputHash}|${listing.url}|${listing.imageUrl ?? ''}`;
       if (aiCalls >= AI_RELEVANCE_BUDGET_PER_SCAN && !pendingClassifications.has(inputHash) && !pendingLive.has(liveKey)) {
+        budgetExhausted += 1;
         persistNotJudged(listing, inputHash, cached, 'AI relevance budget exhausted for this scan');
         return { listing, status: 'unknown' as const };
       }
@@ -1636,6 +1644,8 @@ export class ScoutService {
       unknown: classified.filter((item) => item.status === 'unknown').length - skipped,
       skipped,
       notConfigured: false,
+      statuses: new Map(classified.flatMap((item) => item.status === 'irrelevant' ? [] : [[item.listing, item.status] as const])),
+      budgetExhausted,
     };
   }
 
@@ -3933,7 +3943,24 @@ export class ScoutService {
     aiFiltered?: 'exclude' | 'include' | 'only';
     /** Lowest deal strength (1-5) to include. */
     minStrength?: number;
-    sort?: 'newest' | 'strongest' | 'price';
+    /** Lowest percent below the typical price the row displays; rows without one are left out. */
+    minDiscount?: number;
+    /** One model variant id of the watch (`__other__` is the unmatched bucket). */
+    variantKey?: string;
+    minPrice?: number;
+    maxPrice?: number;
+    /** AI description check status; `none` keeps never-checked rows. */
+    verification?: ListingVerificationFilter;
+    /** Leave out rows the AI description check rejected. */
+    excludeRejected?: boolean;
+    /** Leave out rows marked Pass. */
+    excludePassed?: boolean;
+    /**
+     * `discount` is percent below the displayed typical, rows without one
+     * last; `deal` is strength, then that discount, then newest (the Top
+     * deals order).
+     */
+    sort?: 'newest' | 'strongest' | 'price' | 'discount' | 'deal';
     /** `none` keeps only untriaged rows. */
     decision?: ListingDecision | 'none';
     /** Defaults to `all` so internal callers (dashboard feed) keep today's rows. */
@@ -3967,12 +3994,33 @@ export class ScoutService {
       predicates.push("lower(COALESCE(l.title, '') || ' ' || COALESCE(l.subtitle, '') || ' ' || COALESCE(l.condition, '') || ' ' || COALESCE(l.location, '')) LIKE ? ESCAPE '\\'");
       params.push(`%${ScoutService.escapeLike(query)}%`);
     }
+    if (options.variantKey) { predicates.push('wl.variant_key = ?'); params.push(options.variantKey); }
+    if (options.minPrice !== undefined) { predicates.push('l.price_pln >= ?'); params.push(options.minPrice); }
+    if (options.maxPrice !== undefined) { predicates.push('l.price_pln <= ?'); params.push(options.maxPrice); }
+    if (options.verification === 'none') predicates.push('l.ai_description_verification_status IS NULL');
+    else if (options.verification) { predicates.push('l.ai_description_verification_status = ?'); params.push(options.verification); }
+    if (options.excludeRejected) predicates.push("COALESCE(l.ai_description_verification_status, '') <> 'reject'");
+    if (options.excludePassed) predicates.push("COALESCE(a.decision, '') <> 'pass'");
+    const watches = new Map((knownWatches ?? this.getWatches()).map((watch) => [watch.id, watch]));
+    // Percent below the typical listingFromRow displays: an own-history or
+    // reference-band typical, or a legacy one once its watch is ready. One
+    // json_each bind keeps a single statement shape for any set of watches.
+    const discountSql = "(CASE WHEN COALESCE(wl.typical_pln, l.typical_pln) > 0 AND (wl.typical_source IN ('own-history', 'reference-band') OR wl.watch_id IN (SELECT value FROM json_each(?))) THEN (COALESCE(wl.typical_pln, l.typical_pln) - l.price_pln) * 100.0 / COALESCE(wl.typical_pln, l.typical_pln) END)";
+    const usesDiscount = options.minDiscount !== undefined || options.sort === 'discount' || options.sort === 'deal';
+    const readyWatchIdsJson = usesDiscount ? JSON.stringify([...watches.values()].filter((watch) => watch.readiness === 100).map((watch) => watch.id)) : '[]';
+    if (options.minDiscount !== undefined) { predicates.push(`${discountSql} >= ?`); params.push(readyWatchIdsJson, options.minDiscount); }
     const where = predicates.join(' AND ');
+    // SQLite sorts NULL lowest, so DESC puts rows without a typical last.
+    const orderParams: unknown[] = options.sort === 'discount' || options.sort === 'deal' ? [readyWatchIdsJson] : [];
     const orderBy = options.sort === 'strongest'
       ? 'wl.deal_strength DESC, wl.last_seen_at DESC, wl.id DESC'
       : options.sort === 'price'
         ? 'l.price_pln ASC, wl.last_seen_at DESC, wl.id DESC'
-        : 'wl.last_seen_at DESC, wl.id DESC';
+        : options.sort === 'discount'
+          ? `${discountSql} DESC, wl.last_seen_at DESC, wl.id DESC`
+          : options.sort === 'deal'
+            ? `wl.deal_strength DESC, ${discountSql} DESC, wl.last_seen_at DESC, wl.id DESC`
+            : 'wl.last_seen_at DESC, wl.id DESC';
     const total = Number((this.stmt(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
     const pageSize = Math.max(1, Math.min(500, Math.floor(options.pageSize ?? 200)));
@@ -3982,8 +4030,7 @@ export class ScoutService {
       JOIN watches w ON w.id = wl.watch_id
       LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id
       WHERE ${where}
-      ORDER BY ${orderBy} LIMIT ? OFFSET ?`).all(...params, pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
-    const watches = new Map((knownWatches ?? this.getWatches()).map((watch) => [watch.id, watch]));
+      ORDER BY ${orderBy} LIMIT ? OFFSET ?`).all(...params, ...orderParams, pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
     const feePresets = this.feePresets();
     const listings = rows.map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100, watches.get(row.watch_id)?.variantGroups ?? [], feePresets));
     return { listings, pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
@@ -4322,7 +4369,18 @@ export class ScoutService {
     this.emit('search', { searchId: id, page, source, status, listings });
   }
 
-  async manualSearch(input: SearchFilters): Promise<ManualSearchResponse> {
+  /**
+   * `manualSearch` plus per-listing and per-source side tables (relevance
+   * verdict, match kind, pipeline counts, error kind) for compact MCP output.
+   */
+  async manualSearchDetailed(input: SearchFilters): Promise<ManualSearchDetailedResponse> {
+    const details: ManualSearchDetails = { listings: new Map(), sources: new Map() };
+    const response = await this.manualSearch(input, details);
+    return { ...response, details };
+  }
+
+  /** `details`, when given, is filled in place; the response itself is the same either way. */
+  async manualSearch(input: SearchFilters, details?: ManualSearchDetails): Promise<ManualSearchResponse> {
     if (this.activeManualSearches >= 3) throw new ServiceError('Three manual searches are already running. Try again shortly.', 429);
     // Resolved before any fetch, so an unknown watch id costs no marketplace request.
     const scoring = this.searchScoring(input);
@@ -4343,6 +4401,7 @@ export class ScoutService {
         // P1/P3 near-miss rescue: deterministic substring misses that pass
         // everything else get one bounded Jev judgment each. Fail-closed:
         // any failure keeps the deterministic set.
+        const rescuedKeys = new Set<string>();
         try {
           const rescued = await this.fuzzyRescueForSearch(fetched, {
             query: input.query, includedTerms: input.terms ?? '', excludedTerms: input.excluded ?? '', condition: input.condition,
@@ -4353,6 +4412,7 @@ export class ScoutService {
               const key = `${listing.marketplace}:${listing.listingId}`;
               if (!seen.has(key)) {
                 seen.add(key);
+                rescuedKeys.add(key);
                 filtered.push(listing);
               }
             }
@@ -4368,18 +4428,22 @@ export class ScoutService {
         // result into a user-visible search error.
         let relevant = filtered;
         let relevanceNote = '';
+        let relevanceResult: RelevanceFilterResult | null = null;
+        let relevanceFailed = false;
         try {
           const relevance = await this.filterListingsByAiRelevance(filtered, {
             query: input.query,
             includedTerms: input.terms ?? '',
             excludedTerms: input.excluded ?? '',
           }, undefined, input.aiRelevance !== false);
+          relevanceResult = relevance;
           relevant = relevance.listings;
           relevanceNote = relevance.notConfigured
             ? ''
             : relevance.unknown ? ` · ${relevance.unknown} AI checks unknown`
               : relevance.excluded ? ` · ${relevance.excluded} excluded by AI` : '';
         } catch (error) {
+          relevanceFailed = input.aiRelevance !== false;
           this.log('error', 'watch', `Manual search AI relevance fallback to deterministic: ${error instanceof Error ? error.message : String(error)}`.slice(0, 500));
         }
         let capped = relevant.slice(0, MANUAL_SEARCH_RESULT_CAP);
@@ -4424,6 +4488,33 @@ export class ScoutService {
             ? `${matches} matches${relevanceNote}${checksNote}${truncated ? ` · showing the first ${MANUAL_SEARCH_RESULT_CAP}` : ''}`
             : 'No matching listings',
         };
+        if (details) {
+          // Strict means every query term matched; a kept row that is neither
+          // strict nor rescued came through the relaxed (most-terms) pass.
+          const strictKeys = new Set(filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters)
+            .map((listing) => `${listing.marketplace}:${listing.listingId}`));
+          for (const listing of capped) {
+            const key = `${listing.marketplace}:${listing.listingId}`;
+            details.listings.set(key, {
+              listingId: listing.listingId,
+              // A check that threw kept the listing without a verdict, as the budget running out does.
+              relevance: relevanceResult?.statuses?.get(listing) ?? (relevanceFailed ? 'unknown' : 'not-checked'),
+              match: rescuedKeys.has(key) ? 'rescued' : strictKeys.has(key) ? 'strict' : 'relaxed',
+              matchedVia: 'query',
+              flags: [],
+            });
+          }
+          details.sources.set(source, {
+            fetched: fetched.length,
+            matched: filtered.length,
+            aiExcluded: relevanceResult?.excluded ?? 0,
+            aiUnknown: relevanceResult?.unknown ?? 0,
+            aiBudgetExhausted: relevanceResult?.budgetExhausted ?? 0,
+            returned: listings.length,
+            truncated,
+            errorKind: null,
+          });
+        }
         // Stream this source to the originating client so a fast marketplace is
         // visible while a slow one is still fetching. The HTTP response below
         // stays authoritative and reconciles anything the stream missed.
@@ -4432,6 +4523,7 @@ export class ScoutService {
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Search failed';
         const status: SearchSourceStatus = { source, status: 'error', count: 0, pendingShipping: 0, durationMs: Date.now() - started, message };
+        details?.sources.set(source, { fetched: 0, matched: 0, aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, returned: 0, truncated: false, errorKind: searchErrorKind(error) });
         this.emitSearchProgress(input.searchId, page, source, status, []);
         return { listings: [] as Listing[], status };
       }

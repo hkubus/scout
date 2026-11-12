@@ -49,6 +49,20 @@ test('adds marketplace-native newest ordering for generated watch URLs', () => {
   assert.equal(manual.searchParams.has('search[order]'), false);
 });
 
+test('relevance sends no order, so each marketplace keeps its own', () => {
+  const orderParams = ['search[order]', 'sort', 'order', 'sort_by'];
+  const urls = [
+    buildMarketplaceSearchUrl('OLX', 'steam deck', { sort: 'relevance' }),
+    buildMarketplaceSearchUrl('Allegro Lokalnie', 'steam deck', { sort: 'relevance' }),
+    buildMarketplaceSearchUrl('Vinted', 'steam deck', { sort: 'relevance' }),
+    buildOlxSearchApiUrl('steam deck', { sort: 'relevance' }),
+    buildVintedSearchApiUrl('steam deck', { sort: 'relevance' }),
+  ];
+  for (const url of urls) {
+    for (const param of orderParams) assert.equal(new URL(url).searchParams.has(param), false, `${url} has ${param}`);
+  }
+});
+
 test('normalizes Polish prices and deduplicates by marketplace/listing id', () => {
   assert.equal(parsePolishPrice('1 899,00 zł'), 1899);
   const listing = normalizeListing({ marketplace: 'OLX', listingId: 'abc', title: '  Deck  512GB ', price: '1 899 zł', url: 'https://www.olx.pl/d/oferta/deck-abc' });

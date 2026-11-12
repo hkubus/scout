@@ -611,6 +611,12 @@ export interface SearchFilters {
   olxCategory?: OlxCategory | null;
   /** 1-based marketplace result page; the UI pages past the per-request cap. */
   page?: number;
+  /**
+   * Which listings each marketplace returns: `relevance` (default) keeps its
+   * own order, `newest` asks for the most recently posted first, as watch
+   * scans do. Results still come back sorted by price either way.
+   */
+  sort?: "relevance" | "newest";
   /** Client-generated id that correlates streamed per-source progress events. */
   searchId?: string;
   /** Run the Jev/LLM relevance filter for this search; default true when omitted. */

@@ -45,6 +45,14 @@ test('exposes the documented Scout tool surface', async () => {
       // Hatbot's contract: every read tool says so; only these write.
       const writers = new Set(['scout_queue_scan', 'scout_watch_create', 'scout_watch_update', 'scout_market_watch_create', 'scout_market_watch_update', 'scout_market_scan', 'scout_listing_action', 'scout_record_outcome']);
       for (const tool of listed.tools) assert.equal(tool.annotations?.readOnlyHint, !writers.has(tool.name), tool.name);
+      for (const tool of listed.tools) if (!writers.has(tool.name)) assert.equal(tool.annotations?.destructiveHint, undefined, tool.name);
+      const deals = listed.tools.find((tool) => tool.name === 'scout_deals')!;
+      assert.deepEqual(deals.annotations, { readOnlyHint: true, idempotentHint: true });
+      const listingsSchema = listed.tools.find((tool) => tool.name === 'scout_listings')!.inputSchema.properties as Record<string, { enum?: string[] }>;
+      assert.deepEqual(listingsSchema.sort.enum, ['newest', 'strongest', 'price', 'discount']);
+      assert.deepEqual(listingsSchema.format.enum, ['full', 'compact']);
+      assert.deepEqual(listingsSchema.minTier.enum, ['strong', 'very-strong', 'exceptional']);
+      for (const key of ['minDiscount', 'variantKey', 'minPrice', 'maxPrice', 'verification']) assert.ok(listingsSchema[key], key);
     } finally {
       await client.close();
       await server.close();
@@ -123,6 +131,56 @@ test('scout_listings defaults to a compact page and scout_queue_scan surfaces se
       const queued = await client.callTool({ name: 'scout_queue_scan', arguments: {} }) as never as { isError?: boolean; content: Array<{ text?: string }> };
       assert.equal(queued.isError, true);
       assert.match(String(queued.content[0].text), /no enabled watches/i);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});
+
+test('scout_deals answers Strong+ deals right now with no arguments, and scout_listings filters by tier and discount', async () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at)
+      VALUES ('deal-watch', 'Deal watch', 'iphone 13', '["OLX"]', 1, ?, ?, ?)`).run(now, now, now);
+    const insertListing = context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    const insertLink = context.db.prepare(`INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at, typical_pln, deal_strength, deal_label, typical_source)
+      VALUES ('deal-watch', ?, ?, ?, 1000, ?, ?, 'own-history')`);
+    // [id, price, strength]: strength 5 at 30% beats strength 4 at 35%.
+    const rows: Array<[string, number, number, string]> = [
+      ['strong', 880, 3, 'Strong'], ['very', 650, 4, 'Very strong'], ['exceptional', 700, 5, 'Exceptional'],
+      ['watch', 950, 2, 'Watch'], ['hidden', 500, 5, 'Exceptional'], ['strong-deeper', 860, 3, 'Strong'],
+    ];
+    for (const [id, price, strength, label] of rows) {
+      const { lastInsertRowid } = insertListing.run('OLX', id, `iPhone 13 ${id}`, price, `https://www.olx.pl/d/oferta/${id}`, now, now);
+      insertLink.run(lastInsertRowid, now, now, strength, label);
+    }
+    context.service.updateListingAction('OLX:hidden', { hidden: true });
+    const { server, client } = await connectedClient(context.service);
+    try {
+      const call = async (name: string, args: Record<string, unknown>) => JSON.parse(toolText(await client.callTool({ name, arguments: args }) as never));
+      const deals = await call('scout_deals', {});
+      assert.equal(deals.schemaVersion, 1);
+      assert.equal(deals.minTier, 'strong');
+      assert.equal(deals.total, 4);
+      assert.deepEqual(deals.deals.map((deal: { id: string }) => deal.id), ['OLX:exceptional', 'OLX:very', 'OLX:strong-deeper', 'OLX:strong']);
+      assert.deepEqual(deals.deals.map((deal: { tier: string }) => deal.tier), ['exceptional', 'very-strong', 'strong', 'strong']);
+      assert.deepEqual(deals.deals.map((deal: { discountPercent: number }) => deal.discountPercent), [30, 35, 14, 12]);
+      assert.equal(deals.total, context.service.dashboard().stats.strongDeals);
+      assert.deepEqual((await call('scout_deals', { minTier: 'very-strong', limit: 1 })).deals.map((deal: { id: string }) => deal.id), ['OLX:exceptional']);
+
+      // The default scout_listings output is unchanged: full rows.
+      const full = await call('scout_listings', {});
+      assert.deepEqual(Object.keys(full), ['listings', 'pagination']);
+      assert.equal(full.pagination.total, 5);
+      assert.ok('dealStrength' in full.listings[0] && 'image' in full.listings[0]);
+      const strong = await call('scout_listings', { minTier: 'strong', sort: 'discount', format: 'compact' });
+      assert.deepEqual(strong.listings.map((row: { id: string }) => row.id), ['OLX:very', 'OLX:exceptional', 'OLX:strong-deeper', 'OLX:strong']);
+      assert.deepEqual(Object.keys(strong.listings[0]), Object.keys(deals.deals[0]));
+      assert.deepEqual((await call('scout_listings', { minDiscount: 30, format: 'compact' })).listings.map((row: { id: string }) => row.id).sort(), ['OLX:exceptional', 'OLX:very']);
+      assert.deepEqual((await call('scout_listings', { maxPrice: 700, minPrice: 650 })).listings.map((row: { id: string }) => row.id).sort(), ['OLX:exceptional', 'OLX:very']);
+      assert.equal((await call('scout_listings', { verification: 'none' })).pagination.total, 5);
     } finally {
       await client.close();
       await server.close();
@@ -272,6 +330,57 @@ test('scout_flips returns the ledger compactly and rejects an unknown status', a
       assert.deepEqual([flips.open.count, flips.open.items[0].cost, flips.open.items[0].breakEven.Vinted, flips.sold], [1, 1020, 1020, undefined]);
       const failed = await client.callTool({ name: 'scout_flips', arguments: { status: 'archived' } }) as { isError?: boolean };
       assert.equal(failed.isError, true);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});
+
+test('scout_search sort: newest asks every marketplace for its newest listings, and the default keeps each one\'s own order', async () => {
+  const context = fixture();
+  try {
+    const requested: URL[] = [];
+    const service = context.service as any;
+    service.fetchOlxApi = async (url: string) => { requested.push(new URL(url)); return { status: 200, json: { data: [], metadata: { visible_total_count: 0 } } }; };
+    // Vinted tries its catalog page first, then the catalog API; Allegro
+    // Lokalnie only has its search page. Every request is recorded and none
+    // leaves the process.
+    service.fetchVintedItemPage = async (url: string) => { requested.push(new URL(url)); return { status: 403, body: '' }; };
+    service.fetchVintedApi = async (url: string) => { requested.push(new URL(url)); return { status: 200, json: { items: [], pagination: { current_page: 1, total_pages: 0, total_entries: 0, per_page: 20 }, code: 0 } }; };
+    service.fetchPublicPage = async (url: string) => { requested.push(new URL(url)); throw new Error('offline'); };
+    const { server, client } = await connectedClient(context.service);
+    try {
+      const tool = (await client.listTools()).tools.find((entry) => entry.name === 'scout_search')!;
+      const sort = (tool.inputSchema.properties as Record<string, { enum?: string[]; default?: string }>).sort;
+      assert.deepEqual([sort.enum, sort.default], [['relevance', 'newest'], 'relevance']);
+
+      const search = async (extra: Record<string, unknown>) => {
+        requested.length = 0;
+        const result = await client.callTool({ name: 'scout_search', arguments: { query: 'steam deck', sources: ['OLX', 'Allegro Lokalnie', 'Vinted'], aiRelevance: false, ...extra } }) as { isError?: boolean };
+        assert.equal(result.isError, undefined);
+        const on = (host: string) => requested.filter((url) => url.hostname.endsWith(host));
+        assert.ok(on('olx.pl').length && on('allegrolokalnie.pl').length && on('vinted.pl').length, 'every marketplace was asked');
+        return {
+          olx: on('olx.pl').map((url) => url.searchParams.get('sort_by')),
+          allegro: on('allegrolokalnie.pl').map((url) => url.searchParams.get('sort')),
+          vinted: on('vinted.pl').map((url) => url.searchParams.get('order')),
+        };
+      };
+      const newest = await search({ sort: 'newest' });
+      assert.ok(newest.olx.every((value) => value === 'created_at:desc'), String(newest.olx));
+      assert.ok(newest.allegro.every((value) => value === 'startingTime-desc'), String(newest.allegro));
+      assert.ok(newest.vinted.every((value) => value === 'newest_first'), String(newest.vinted));
+
+      for (const extra of [{}, { sort: 'relevance' }]) {
+        const own = await search(extra);
+        assert.ok([...own.olx, ...own.allegro, ...own.vinted].every((value) => value === null), JSON.stringify({ extra, own }));
+      }
+
+      requested.length = 0;
+      const refused = await client.callTool({ name: 'scout_search', arguments: { query: 'steam deck', sources: ['OLX'], sort: 'price_asc' } }) as { isError?: boolean };
+      assert.equal(refused.isError, true);
+      assert.equal(requested.length, 0);
     } finally {
       await client.close();
       await server.close();
