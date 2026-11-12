@@ -182,11 +182,13 @@ test('sorts the strongest listing page by tier, then the deepest discount, then 
     const update = context.db.prepare('UPDATE watch_listings SET last_seen_at = ?, deal_strength = ?, deal_label = NULL, typical_pln = ?, typical_source = ? WHERE id = ?');
     for (const { id, price } of rows) {
       // Two tiers; within them discounts of several depths, rows above
-      // typical and rows without one (both count as no discount). Distinct
-      // times, so the expected order is fully determined.
+      // typical and rows without one (both count as no discount). Every
+      // seventh typical is a legacy one, shown only once its watch is ready,
+      // so the order follows the typical a row shows. Distinct times, so the
+      // expected order is fully determined.
       const factor = [null, 0.8, 1.25, 1.5, 2][id % 5];
       const typical = factor === null ? null : price * factor;
-      update.run(new Date(now - id * 1000).toISOString(), id % 3 === 0 ? 4 : 5, typical, typical === null ? null : 'own-history', id);
+      update.run(new Date(now - id * 1000).toISOString(), id % 3 === 0 ? 4 : 5, typical, typical === null || id % 7 === 0 ? null : 'own-history', id);
     }
     const key = (listing: { associationId?: string }) => listing.associationId;
     const page = context.service.listingsPage({ pageSize: 500, sort: 'strongest', aiFiltered: 'include', visibility: 'all' }).listings;

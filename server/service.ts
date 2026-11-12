@@ -4083,17 +4083,17 @@ export class ScoutService {
     // reference-band typical, or a legacy one once its watch is ready. One
     // json_each bind keeps a single statement shape for any set of watches.
     const discountSql = "(CASE WHEN COALESCE(wl.typical_pln, l.typical_pln) > 0 AND (wl.typical_source IN ('own-history', 'reference-band') OR wl.watch_id IN (SELECT value FROM json_each(?))) THEN (COALESCE(wl.typical_pln, l.typical_pln) - l.price_pln) * 100.0 / COALESCE(wl.typical_pln, l.typical_pln) END)";
-    const usesDiscount = options.minDiscount !== undefined || options.sort === 'discount' || options.sort === 'deal';
+    const usesDiscount = options.minDiscount !== undefined || options.sort === 'discount' || options.sort === 'deal' || options.sort === 'strongest';
     const readyWatchIdsJson = usesDiscount ? JSON.stringify([...watches.values()].filter((watch) => watch.readiness === 100).map((watch) => watch.id)) : '[]';
     if (options.minDiscount !== undefined) { predicates.push(`${discountSql} >= ?`); params.push(readyWatchIdsJson, options.minDiscount); }
     const where = predicates.join(' AND ');
     // Strongest is compareStrongest in SQL: the tier, then the deepest
-    // discount (the lowest price-to-typical ratio; at or above typical, or
-    // without one, counts as no discount), then the newest.
-    // SQLite sorts NULL lowest, so DESC puts rows without a typical last.
-    const orderParams: unknown[] = options.sort === 'discount' || options.sort === 'deal' ? [readyWatchIdsJson] : [];
+    // discount below the typical the row shows (at or above it, or without
+    // one, counts as none), then the newest. SQLite sorts NULL lowest, so
+    // DESC puts rows without a typical last for discount and deal.
+    const orderParams: unknown[] = options.sort === 'discount' || options.sort === 'deal' || options.sort === 'strongest' ? [readyWatchIdsJson] : [];
     const orderBy = options.sort === 'strongest'
-      ? 'COALESCE(wl.deal_strength, 1) DESC, CASE WHEN COALESCE(wl.typical_pln, l.typical_pln) > 0 THEN MIN(1.0, l.price_pln * 1.0 / COALESCE(wl.typical_pln, l.typical_pln)) ELSE 1.0 END ASC, wl.last_seen_at DESC, wl.id DESC'
+      ? `COALESCE(wl.deal_strength, 1) DESC, MAX(0, COALESCE(${discountSql}, 0)) DESC, wl.last_seen_at DESC, wl.id DESC`
       : options.sort === 'price'
         ? 'l.price_pln ASC, wl.last_seen_at DESC, wl.id DESC'
         : options.sort === 'discount'
