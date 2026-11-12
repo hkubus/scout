@@ -17,7 +17,7 @@ import { api } from "./api";
 import { watchPresetFromListing, type WatchPreset } from "./presets";
 import { PriceSparkline } from "./PriceSparkline";
 import { marketplaceColors } from "./data";
-import { listingAge } from "./listingSignals";
+import { askingPriceComparison, formatAge, listingAge, vintedFeesNote } from "./listingSignals";
 import { DEFAULT_FEE_PRESETS, FLIP_CHANNELS, saleFee, type FeePresets, type FlipChannel } from "./profit";
 import { dayMonth, formatDate } from "./format";
 import { decisionLabels, discountDisplay, formatPln, ListingThumbnail } from "./ui";
@@ -279,7 +279,7 @@ export default function ListingDetailDrawer({
           </div>
           {facts.length ? <p className="drawer-facts">{facts.join(" · ")}</p> : null}
           {verificationStatus && verificationStatus !== "not-configured" ? <VerificationLine status={verificationStatus} /> : null}
-          {detail.duplicates?.length ? <CrossPosts copies={detail.duplicates} price={currentListing.price} /> : null}
+          {detail.duplicates?.length ? <CrossPosts copies={detail.duplicates} listing={currentListing} /> : null}
 
           <div className="decision-grid" role="group" aria-label="Decision">
             {(["buy", "watch", "pass"] as ListingDecision[]).map((option) => {
@@ -468,8 +468,13 @@ export default function ListingDetailDrawer({
   );
 }
 
-/** Likely copies of this item on other marketplaces, cheapest first, with what each costs against this one. */
-function CrossPosts({ copies, price }: { copies: DuplicateListing[]; price: number }) {
+/**
+ * Likely copies of this item on other marketplaces, cheapest first, with how
+ * each one's asking price compares and how long ago a scan last saw it. The
+ * feed chip counts only copies seen in the last 3 days; this lists them all.
+ */
+export function CrossPosts({ copies, listing, now = Date.now() }: { copies: DuplicateListing[]; listing: Pick<Listing, "marketplace" | "price">; now?: number }) {
+  const feesNote = vintedFeesNote(listing.marketplace, ...copies.map((copy) => copy.marketplace));
   return (
     <section className="drawer-section cross-posts" aria-label="Possibly also listed on other marketplaces">
       <div className="drawer-section-heading">
@@ -478,7 +483,8 @@ function CrossPosts({ copies, price }: { copies: DuplicateListing[]; price: numb
       </div>
       <ul className="cross-post-list">
         {copies.map((copy) => {
-          const difference = Math.round(copy.price - price);
+          const difference = Math.round(copy.price - listing.price);
+          const seen = formatAge(copy.observedAt, now);
           return (
             <li key={copy.key}>
               <a href={copy.url} target="_blank" rel="noopener noreferrer" title={`Open on ${copy.marketplace}: ${copy.title}`}>
@@ -489,8 +495,8 @@ function CrossPosts({ copies, price }: { copies: DuplicateListing[]; price: numb
                 </span>
                 <span className="cross-post-price">
                   <strong>{formatPln(copy.price)}</strong>
-                  <small className={difference < 0 ? "result-positive" : "drawer-muted"}>
-                    {difference === 0 ? "same price" : `${difference < 0 ? "−" : "+"}${formatPln(Math.abs(difference))}`} · seen {formatDate(dayMonth, copy.observedAt)}
+                  <small className={difference < 0 ? "result-positive" : "drawer-muted"} title={`Last seen ${formatDate(dayMonth, copy.observedAt)}`}>
+                    {askingPriceComparison(copy.price, listing.price)}{seen ? ` · seen ${seen} ago` : ""}
                   </small>
                 </span>
                 <ExternalLink size={14} aria-hidden="true" />
@@ -499,7 +505,7 @@ function CrossPosts({ copies, price }: { copies: DuplicateListing[]; price: numb
           );
         })}
       </ul>
-      <p className="drawer-section-copy">Matched by title, price, condition and place. Marketplaces host photos separately, so Scout can't compare them: check it is the same item before buying.</p>
+      <p className="drawer-section-copy">{feesNote ? `${feesNote} ` : ""}Matched by title, price, condition and place. Marketplaces host photos separately, so Scout can't compare them: check it is the same item before buying.</p>
     </section>
   );
 }

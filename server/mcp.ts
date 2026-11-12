@@ -154,7 +154,7 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       minPrice: z.number().nonnegative().optional().describe('PLN.'),
       maxPrice: z.number().nonnegative().optional().describe('PLN.'),
       verification: z.enum(LISTING_VERIFICATION_FILTERS).optional().describe('AI description check status; none = never checked.'),
-      format: z.enum(['full', 'compact']).optional().describe('compact: short rows (id, price, typical, discountPercent, tier, estimatedNet, watch, variant, url, seenAt, verification...), as scout_deals returns. Default full.'),
+      format: z.enum(['full', 'compact']).optional().describe('compact: short rows (id, price, typical, discountPercent, tier, estimatedNet, watch, variant, url, seenAt, verification...; duplicateCount and duplicateCheapest when the item is also listed on another marketplace), as scout_deals returns. Default full.'),
     },
     annotations: { readOnlyHint: true },
   }, async ({ minTier, format, ...input }) => {
@@ -165,7 +165,7 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
   });
 
   server.registerTool('scout_deals', {
-    description: 'Strong+ deals right now, best first: listings a watch scan saw in the last 12 h at deal strength Strong (3) or better (minTier raises it), leaving out ones you hid or passed, AI-irrelevant ones, and ones the AI description check rejected (unless includeRejected). Ordered by tier, then percent below typical, then newest, like Deals → Top deals. Each row has typical, discountPercent, tier and estimatedNet (resale at typical after the marketplace fee, less the price). total counts every match. Database only; asking prices, not sales.',
+    description: 'Strong+ deals right now, best first: listings a watch scan saw in the last 12 h at deal strength Strong (3) or better (minTier raises it), leaving out ones you hid or passed, AI-irrelevant ones, and ones the AI description check rejected (unless includeRejected). Ordered by tier, then percent below typical, then newest, like Deals → Top deals. Each row has typical, discountPercent, tier and estimatedNet (resale at typical after the marketplace fee, less the price). A row whose item is also listed on another marketplace (a copy seen in the last 3 days) adds duplicateCount and duplicateCheapest, the copy with the lowest asking price; its note says when Vinted\'s buyer-protection fee and shipping are left out. total counts every match. Database only; asking prices, not sales.',
     inputSchema: {
       minTier: dealTier.optional().default('strong'),
       marketplace: marketplace.optional(),
@@ -181,7 +181,7 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
   });
 
   server.registerTool('scout_listing_detail', {
-    description: 'Detail for one listing: scoring, triage action and a negotiation block (days listed, price drops, negotiable flag, seller and their other listings, relists). format full (default) adds price history, description snapshot and verification trace; compact leaves them out unless included. live: true makes one request to check the listing is still up at its price; sellerListings: true makes one for the seller\'s current listings. Nothing is written.',
+    description: 'Detail for one listing: scoring, triage action and a negotiation block (days listed, price drops, negotiable flag, seller and their other listings, relists). format full (default) adds price history, description snapshot and verification trace; compact leaves them out unless included. live: true makes one request to check the listing is still up at its price; sellerListings: true makes one for the seller\'s current listings. duplicates lists likely copies on other marketplaces, cheapest asking price first, with when each was last seen. Nothing is written.',
     inputSchema: {
       key: z.string().min(3).max(500).describe('<Marketplace>:<listingId>'),
       watchId: z.string().min(1).max(160).optional(),

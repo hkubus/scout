@@ -56,3 +56,15 @@ test('rejects malformed payloads', () => {
   assert.equal(isListingActionEvent({ refresh: true }), false);
   assert.equal(isListingActionEvent({ key: 'OLX:1', decision: null, hidden: false }), true);
 });
+
+test('hiding a listing drops it at once as other rows\' cheapest copy', () => {
+  const cheapest = { key: 'Vinted:9', marketplace: 'Vinted' as const, price: 90, url: 'https://example.test/9', observedAt: '2026-11-12T10:00:00.000Z' };
+  const rows = [row('OLX:1', { duplicateCount: 2, duplicateCheapest: cheapest }), row('OLX:2', { duplicateCount: 1, duplicateCheapest: { ...cheapest, key: 'Vinted:8' } }), row('Vinted:9')];
+  const patched = patchListingRows(rows, { key: 'Vinted:9', decision: null, hidden: true });
+  assert.equal('duplicateCount' in patched[0], false);
+  assert.equal('duplicateCheapest' in patched[0], false);
+  assert.equal(patched[1], rows[1]);
+  assert.equal(patched[2].hidden, true);
+  // Unhiding leaves rows alone; the reconcile brings the copy back.
+  assert.equal(patchListingRows(rows, { key: 'Vinted:8', decision: null, hidden: false }), rows);
+});

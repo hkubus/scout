@@ -1,4 +1,5 @@
-import type { DealLabel, Listing, ListingDecision, ListingDescriptionVerificationStatus, Marketplace, SellerType } from '../src/types';
+import type { DealLabel, DuplicateSummary, Listing, ListingDecision, ListingDescriptionVerificationStatus, Marketplace, SellerType } from '../src/types';
+import { vintedFeesNote } from '../src/listingSignals';
 import type { ScoutService } from './service';
 import { MATCH_VISIBILITY_MS } from './service';
 
@@ -57,6 +58,32 @@ export interface CompactListing {
   verification: ListingDescriptionVerificationStatus | null;
   /** Only on rows you hid. */
   hidden?: true;
+  /**
+   * Only on rows with likely copies of the same item on other marketplaces
+   * that a scan saw in the last 3 days (copies you hid never count): how many.
+   */
+  duplicateCount?: number;
+  /** With duplicateCount: the copy with the lowest asking price, which can be above this row's price. */
+  duplicateCheapest?: CompactDuplicate;
+}
+
+/** A likely copy of a compact row's item on another marketplace. */
+export interface CompactDuplicate {
+  /** `<Marketplace>:<listingId>`. */
+  id: string;
+  source: Marketplace;
+  /** Its asking price. */
+  price: number;
+  url: string;
+  /** When a scan last saw it. */
+  seenAt: string;
+  /** Only when either listing is on Vinted: its buyer-protection fee and shipping are in neither price. */
+  note?: string;
+}
+
+function compactDuplicate(listing: Listing, copy: DuplicateSummary): CompactDuplicate {
+  const note = vintedFeesNote(listing.marketplace, copy.marketplace);
+  return { id: copy.key, source: copy.marketplace, price: copy.price, url: copy.url, seenAt: copy.observedAt, ...(note ? { note } : {}) };
 }
 
 export function compactListing(listing: Listing): CompactListing {
@@ -89,6 +116,9 @@ export function compactListing(listing: Listing): CompactListing {
     decision: listing.decision ?? null,
     verification: listing.aiDescriptionVerificationStatus ?? null,
     ...(listing.hidden ? { hidden: true as const } : {}),
+    ...(listing.duplicateCount && listing.duplicateCheapest
+      ? { duplicateCount: listing.duplicateCount, duplicateCheapest: compactDuplicate(listing, listing.duplicateCheapest) }
+      : {}),
   };
 }
 

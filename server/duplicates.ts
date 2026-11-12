@@ -16,6 +16,12 @@ import { QUERY_STOPWORDS } from './text';
 export const DUPLICATE_SIMILARITY = 0.75;
 /** Only listings a scan saw within this many days are compared. */
 export const DUPLICATE_WINDOW_DAYS = 14;
+/**
+ * Feed rows (the chip, and the compact rows agents read) count only copies a
+ * scan saw within this many days; the listing detail also lists older ones,
+ * with when each was last seen.
+ */
+export const DUPLICATE_FEED_DAYS = 3;
 /** Copies further apart in price than this share of the cheaper one never match. */
 export const DUPLICATE_MAX_PRICE_GAP = 0.25;
 /** Titles must share at least this many words; "iPhone 13" alone says too little. */
