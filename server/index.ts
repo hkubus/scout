@@ -438,7 +438,7 @@ app.get('/api/watches/:id/analytics', async (request, reply) => {
   if (!params.success) return reply.code(400).send({ error: 'A valid watch id is required' });
   const parsed = z.object({ days: z.coerce.number().int().min(7).max(180).default(30) }).safeParse(request.query);
   if (!parsed.success) return reply.code(400).send({ error: 'Analytics range must be between 7 and 180 days' });
-  return service.watchAnalytics(params.data.id, parsed.data.days);
+  return service.watchAnalytics(params.data.id, parsed.data.days, { negotiations: true });
 });
 app.get('/api/analytics', async (request, reply) => {
   const parsed = z.object({
@@ -447,7 +447,7 @@ app.get('/api/analytics', async (request, reply) => {
     marketplace: marketplaceParam.optional(),
   }).strict().safeParse(request.query);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid analytics filters' });
-  return service.analytics(parsed.data);
+  return service.analytics({ ...parsed.data, negotiations: true });
 });
 app.get('/api/connectors', async () => ({ connectors: service.getConnectors() }));
 app.get('/api/notifications', async (request, reply) => {

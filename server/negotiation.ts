@@ -3,7 +3,7 @@
  * scout_listing_detail's negotiation block, recorded outcomes).
  */
 import { listingConditionFromLabel } from '../src/profit';
-import type { OutcomeShare } from '../src/types';
+import type { Marketplace, NegotiationRole, OutcomeShare, PriceReferenceOutcomes, RoleOutcomes } from '../src/types';
 import { percentile } from './scoring';
 import { normalizeFilterText } from './text';
 
@@ -72,9 +72,50 @@ export function shareOfAsking(price: number | null, asking: number) {
   return price !== null && price > 0 && asking > 0 ? Math.round((price / asking) * 100) / 100 : null;
 }
 
+/**
+ * Agreed negotiations a group needs before Scout's screens show its share of
+ * asking. The share itself is computed the same way everywhere (as
+ * scout_price_reference reports it); below this the screens show the counts.
+ */
+export const MIN_OUTCOME_AGREED = 3;
+
 /** How a set of recorded negotiations went: how many, how many agreed, and the median share of asking paid. */
 export function outcomeShare(rows: Array<{ outcome: string; asking: number; price: number | null }>): OutcomeShare {
   const shares = rows.filter((row) => row.outcome === 'agreed').map((row) => shareOfAsking(row.price, row.asking)).filter((share): share is number => share !== null);
   const median = percentile(shares, 0.5);
   return { negotiations: rows.length, agreed: shares.length, shareOfAsking: median === null ? null : Math.round(median * 100) / 100 };
+}
+
+export interface OutcomeRow {
+  marketplace: string;
+  watchId: string | null;
+  role: string;
+  outcome: string;
+  asking: number;
+  price: number | null;
+}
+
+/**
+ * Recorded negotiations by role: overall, per marketplace (in `order`), and
+ * per watch in the order given. Outcomes filed under no listed watch count
+ * only in the role and marketplace figures; a role with none is left out.
+ */
+export function groupOutcomes(rows: OutcomeRow[], watches: Array<{ id: string; name: string }>, order: readonly Marketplace[]): PriceReferenceOutcomes {
+  const byMarketplace = (items: OutcomeRow[]) => Object.fromEntries(order
+    .filter((source) => items.some((item) => item.marketplace === source))
+    .map((source) => [source, outcomeShare(items.filter((item) => item.marketplace === source))])) as RoleOutcomes['marketplaces'];
+  const result: PriceReferenceOutcomes = {};
+  for (const role of ['buy', 'sell'] as const satisfies readonly NegotiationRole[]) {
+    const own = rows.filter((row) => row.role === role);
+    if (!own.length) continue;
+    result[role] = {
+      ...outcomeShare(own),
+      marketplaces: byMarketplace(own),
+      watches: watches.flatMap((watch) => {
+        const items = own.filter((item) => item.watchId === watch.id);
+        return items.length ? [{ id: watch.id, name: watch.name, ...outcomeShare(items), marketplaces: byMarketplace(items) }] : [];
+      }),
+    };
+  }
+  return result;
 }

@@ -345,6 +345,14 @@ test('scout_record_outcome takes Hatbot\'s call, is idempotent per negotiation, 
 
       const reference = JSON.parse(toolText(await client.callTool({ name: 'scout_price_reference', arguments: { query: 'rtx 3080' } }) as never));
       assert.deepEqual(reference.outcomes.buy.marketplaces.OLX, { negotiations: 1, agreed: 1, shareOfAsking: 0.85 });
+
+      // scout_analytics adds them only when asked, with the same share.
+      const analytics = async (args: Record<string, unknown>) => JSON.parse(toolText(await client.callTool({ name: 'scout_analytics', arguments: args }) as never));
+      assert.equal('negotiations' in await analytics({}), false);
+      assert.deepEqual((await analytics({ negotiations: true })).negotiations, {
+        minAgreed: 3,
+        buy: { negotiations: 1, agreed: 1, shareOfAsking: 0.85, marketplaces: { OLX: { negotiations: 1, agreed: 1, shareOfAsking: 0.85 } }, watches: [] },
+      });
     } finally {
       await client.close();
       await server.close();

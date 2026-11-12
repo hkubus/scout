@@ -128,6 +128,10 @@ struct WatchDetailView: View {
                 }
             }
 
+            if let negotiations = analytics?.negotiations {
+                NegotiationOutcomesSection(figures: negotiations)
+            }
+
             Section {
                 DisclosureGroup("Search settings") {
                     LabeledContent("Query", value: watch.query)

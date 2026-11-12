@@ -21,6 +21,7 @@ import {
 import { api } from "./api";
 import { marketplaceColors } from "./data";
 import { AnalyticsTrendChart, formatAnalyticsDate, formatAnalyticsPrice } from "./AnalyticsTrendChart";
+import { NegotiationOutcomesCard } from "./NegotiationFigures";
 import type { Watch, WatchAnalytics } from "./types";
 import { formatPln, PageHeader } from "./ui";
 
@@ -463,6 +464,7 @@ export function WatchAnalyticsDialog({ watch, onClose }: { watch: Watch; onClose
                   {analytics.sources.length ? <div className="analytics-source-list">{analytics.sources.map((source) => <div className="analytics-source-row" key={source.source}><span><i style={{ background: marketplaceColors[source.source] }} />{source.source}</span><strong>{formatAnalyticsPrice(source.medianPrice)}</strong><small>{source.listingCount} listing{source.listingCount === 1 ? "" : "s"}</small></div>)}</div> : <div className="analytics-inline-empty">No current listings in this range.</div>}
                 </section>
               </div>
+              {analytics.negotiations ? <div className="analytics-detail-grid analytics-detail-grid--single"><NegotiationOutcomesCard figures={analytics.negotiations} /></div> : null}
             </>
           ) : null}
         </div>

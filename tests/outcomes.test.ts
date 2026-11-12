@@ -125,3 +125,82 @@ test('scout_price_reference reports outcomes by marketplace and watch, apart fro
     assert.deepEqual(context.service.priceReference({ query: 'iphone 13' }).outcomes?.sell?.watches.map((watch) => watch.id), ['phones']);
   } finally { context.close(); }
 });
+
+test('analytics shows recorded outcomes by watch and marketplace, all time, only when asked', () => {
+  const context = fixture();
+  try {
+    seedWatch(context.db, 'gpus', 'rtx 3080', 'RTX 3080', gpuPrices);
+    seedWatch(context.db, 'phones', 'iphone 13', 'iPhone 13', [2000, 2000, 2000, 2000]);
+    seedWatch(context.db, 'old', 'kindle', 'Kindle', []);
+    seedWatch(context.db, 'gone', 'steam deck', 'Steam Deck', []);
+    seedWatch(context.db, 'quiet', 'pixel 8', 'Pixel 8', []);
+    assert.equal(context.service.analytics({ negotiations: true }).negotiations, null, 'null until an outcome is recorded');
+    assert.equal(context.service.watchAnalytics('gpus', 30, { negotiations: true }).negotiations, null);
+
+    const record = (negotiationId: string, listingKey: string, asking: number, price: number | null, extra: Record<string, unknown> = {}) =>
+      context.service.recordOutcome({ negotiationId, listingKey, outcome: price === null ? 'lost' : 'agreed', asking, price, ...extra });
+    record('o1', 'OLX:gpus-0', 1000, 800);
+    record('o2', 'OLX:gpus-1', 1000, 900);
+    record('o3', 'OLX:gpus-2', 1000, 950);
+    record('o4', 'OLX:gpus-3', 1000, null);
+    record('v1', 'Vinted:501', 1000, 700, { watchId: 'gpus' });
+    record('p1', 'OLX:phones-0', 2000, 1800);
+    record('p2', 'OLX:phones-1', 2000, 1600);
+    record('r1', 'OLX:old-listing', 1000, 950, { watchId: 'old' });
+    record('u1', 'Vinted:999', 1000, 600);
+    record('g1', 'Allegro Lokalnie:deck', 1000, 1000, { watchId: 'gone' });
+    record('s1', 'OLX:phones-2', 2000, 1900, { role: 'sell' });
+    context.service.archiveWatch('old', true);
+    context.service.deleteWatch('gone');
+
+    // The figures are opt-in, so scout_analytics' output is unchanged.
+    assert.equal('negotiations' in context.service.analytics(), false);
+    assert.equal('negotiations' in context.service.watchAnalytics('gpus', 30), false);
+
+    const gpus = {
+      id: 'gpus', name: 'gpus name', negotiations: 5, agreed: 4, shareOfAsking: 0.85,
+      marketplaces: { OLX: { negotiations: 4, agreed: 3, shareOfAsking: 0.9 }, Vinted: { negotiations: 1, agreed: 1, shareOfAsking: 0.7 } },
+    };
+    // Two agreed is below the screens' minimum, but the share is reported
+    // as scout_price_reference reports it; minAgreed tells the screen.
+    const phones = { id: 'phones', name: 'phones name', negotiations: 2, agreed: 2, shareOfAsking: 0.85, marketplaces: { OLX: { negotiations: 2, agreed: 2, shareOfAsking: 0.85 } } };
+    assert.deepEqual(context.service.analytics({ days: 7, negotiations: true }).negotiations, {
+      minAgreed: 3,
+      buy: {
+        // The unfiled outcome and the deleted watch's count only here and per marketplace.
+        negotiations: 10, agreed: 9, shareOfAsking: 0.9,
+        marketplaces: {
+          OLX: { negotiations: 7, agreed: 6, shareOfAsking: 0.9 },
+          'Allegro Lokalnie': { negotiations: 1, agreed: 1, shareOfAsking: 1 },
+          Vinted: { negotiations: 2, agreed: 2, shareOfAsking: 0.65 },
+        },
+        // Most agreed first; an archived watch still shows by name.
+        watches: [gpus, phones, { id: 'old', name: 'old name', negotiations: 1, agreed: 1, shareOfAsking: 0.95, marketplaces: { OLX: { negotiations: 1, agreed: 1, shareOfAsking: 0.95 } } }],
+      },
+      sell: {
+        negotiations: 1, agreed: 1, shareOfAsking: 0.95, marketplaces: { OLX: { negotiations: 1, agreed: 1, shareOfAsking: 0.95 } },
+        watches: [{ id: 'phones', name: 'phones name', negotiations: 1, agreed: 1, shareOfAsking: 0.95, marketplaces: { OLX: { negotiations: 1, agreed: 1, shareOfAsking: 0.95 } } }],
+      },
+    });
+
+    // The page's watch and marketplace filters narrow them.
+    assert.deepEqual(context.service.analytics({ watchId: 'gpus', negotiations: true }).negotiations, {
+      minAgreed: 3, buy: { negotiations: 5, agreed: 4, shareOfAsking: 0.85, marketplaces: gpus.marketplaces, watches: [gpus] },
+    });
+    assert.deepEqual(context.service.analytics({ marketplace: 'Vinted', negotiations: true }).negotiations, {
+      minAgreed: 3,
+      buy: {
+        negotiations: 2, agreed: 2, shareOfAsking: 0.65, marketplaces: { Vinted: { negotiations: 2, agreed: 2, shareOfAsking: 0.65 } },
+        watches: [{ id: 'gpus', name: 'gpus name', negotiations: 1, agreed: 1, shareOfAsking: 0.7, marketplaces: { Vinted: { negotiations: 1, agreed: 1, shareOfAsking: 0.7 } } }],
+      },
+    });
+    assert.deepEqual(context.service.analytics({ watchId: 'phones', marketplace: 'Vinted', negotiations: true }).negotiations, { minAgreed: 3 }, 'outcomes exist, none match');
+
+    // A watch's own figures list no watches; one with none has null.
+    assert.deepEqual(context.service.watchAnalytics('gpus', 30, { negotiations: true }).negotiations, {
+      minAgreed: 3, buy: { negotiations: 5, agreed: 4, shareOfAsking: 0.85, marketplaces: gpus.marketplaces, watches: [] },
+    });
+    assert.deepEqual(Object.keys(context.service.watchAnalytics('phones', 30, { negotiations: true }).negotiations ?? {}), ['minAgreed', 'buy', 'sell']);
+    assert.equal(context.service.watchAnalytics('quiet', 30, { negotiations: true }).negotiations, null);
+  } finally { context.close(); }
+});

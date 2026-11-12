@@ -166,6 +166,10 @@ struct AnalyticsView: View {
             }
         }
 
+        if let negotiations = data.negotiations {
+            NegotiationOutcomesSection(figures: negotiations, showsWatches: store.watchId == nil)
+        }
+
         Section {
             DisclosureGroup("Diagnostics") {
                 LabeledContent("Scan runs", value: "\(data.overview.scanRuns) · \(Format.percent(data.overview.scanSuccessRate, digits: 0)) OK")

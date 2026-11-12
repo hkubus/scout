@@ -432,6 +432,9 @@ public struct AnalyticsData: Codable, Hashable, Sendable {
     public var marketplaceComparison: [MarketplaceRow]
     public var triage: Triage
     public var aiQuality: AIQuality
+    /// Your recorded negotiations under the watch and marketplace filters,
+    /// all time. Nil until one is recorded, and on older servers.
+    public var negotiations: NegotiationFigures?
 }
 
 // MARK: - Settings

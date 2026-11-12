@@ -9,6 +9,7 @@ import {
 import { api } from "./api";
 import { marketplaceColors } from "./data";
 import { AnalyticsTrendChart } from "./AnalyticsTrendChart";
+import { NegotiationOutcomesSection } from "./NegotiationFigures";
 import { dayMonth, formatDate } from "./format";
 import { PageHeader, SelectControl } from "./ui";
 import type { AnalyticsData, Marketplace, Watch } from "./types";
@@ -220,6 +221,8 @@ export default function AnalyticsPage({
               </table>
             ) : <div className="analytics-inline-empty">No marketplace scans in this range yet.</div>}
           </section>
+
+          {data.negotiations ? <NegotiationOutcomesSection figures={data.negotiations} showAllRow={watchId === "All"} /> : null}
 
           <details className="analytics-section analytics-diagnostics">
             <summary>Diagnostics: scans, triage and AI quality</summary>
