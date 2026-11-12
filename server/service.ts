@@ -18,6 +18,7 @@ import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { Limiter, mapPool } from './limiter';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, ownRobustScale, percentile, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
+import { isDamagedLabel, normalizeRequestedCondition } from './searchCondition';
 import { compactDuplicateNote, searchErrorKind, type ManualSearchDetailedResponse, type ManualSearchDetails } from './mcpFormat';
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
 import { matchQuality, matchQuery, type MatchCandidate, type QueryMatch } from './queryMatch';
@@ -1893,7 +1894,7 @@ export class ScoutService {
   private async fuzzyRescueForSearch(
     fetched: NormalizedListing[],
     search: { query: string; includedTerms: string; excludedTerms: string; condition?: string },
-    finalFilters: { minPrice?: number | null; maxPrice?: number | null; condition?: string; shippingOnly: boolean; sellerType?: SellerType | null; ignorePromoted?: boolean },
+    finalFilters: { minPrice?: number | null; maxPrice?: number | null; condition?: string; shippingOnly: boolean; sellerType?: SellerType | null; ignorePromoted?: boolean; excludeDamaged?: boolean },
     source: Marketplace,
     gate?: (listing: NormalizedListing) => boolean,
   ): Promise<NormalizedListing[]> {
@@ -4791,38 +4792,56 @@ export class ScoutService {
     this.activeManualSearches += 1;
     // The client pages through results; marketplaces cap their own page size.
     const page = Math.min(Math.max(Math.floor(input.page ?? 1), 1), 10);
+    // Free text from agents ("używany", "na części"): one known condition, or
+    // any condition with a note rather than an empty page.
+    const requested = normalizeRequestedCondition(input.condition);
+    const condition = requested.condition;
+    const conditionNote = requested.recognized ? '' : ` · condition "${String(input.condition).trim()}" not recognised, showing any condition`;
     try {
       const tasks = input.sources.map(async (source) => {
       const started = Date.now();
       try {
-        const fetched = await this.fetchSearchPages(source, input.query, { ...input, olxCategoryId: input.olxCategory?.id ?? null, page });
-        const deterministicFilters = { minPrice: input.minPrice, maxPrice: input.maxPrice, condition: input.condition, sellerType: input.ownerType ?? null, shippingOnly: false };
-        const comparable = filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters);
+        const fetched = await this.fetchSearchPages(source, input.query, { ...input, condition, olxCategoryId: input.olxCategory?.id ?? null, page });
+        const deterministicFilters = { minPrice: input.minPrice, maxPrice: input.maxPrice, condition, sellerType: input.ownerType ?? null, excludeDamaged: condition === 'Used', shippingOnly: false };
+        const strict = filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters);
+        // When no listing matches every query word, fall back to those that
+        // match most of them (never for typed included terms) instead of an
+        // empty page. The relaxed pass reads the whole page: the strict set is
+        // empty by then, so filtering it again could never add a row.
+        const relaxedMatch = !strict.length && Boolean(fetched.length);
+        const comparable = relaxedMatch
+          ? filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, relaxTerms: true })
+          : strict;
+        const relaxedNote = relaxedMatch && comparable.length ? ' · matched most query words' : '';
         // Cache-first like watch scans: only a few cold listings fetch an item
         // page per search; the rest surface as pending delivery checks.
         if (input.shippingOnly) await this.enrichShipping(comparable, source);
         let filtered = filterListings(comparable, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, shippingOnly: input.shippingOnly, relaxTerms: true });
         // P1/P3 near-miss rescue: deterministic substring misses that pass
         // everything else get one bounded Jev judgment each. Fail-closed:
-        // any failure keeps the deterministic set.
+        // any failure keeps the deterministic set. Turning AI relevance off
+        // skips it too, and rows the relaxed pass already kept cost nothing.
         const rescuedKeys = new Set<string>();
-        try {
-          const rescued = await this.fuzzyRescueForSearch(fetched, {
-            query: input.query, includedTerms: input.terms ?? '', excludedTerms: input.excluded ?? '', condition: input.condition,
-          }, { ...deterministicFilters, shippingOnly: Boolean(input.shippingOnly) }, source);
-          if (rescued.length) {
-            const seen = new Set(filtered.map((listing) => `${listing.marketplace}:${listing.listingId}`));
-            for (const listing of rescued) {
-              const key = `${listing.marketplace}:${listing.listingId}`;
-              if (!seen.has(key)) {
-                seen.add(key);
-                rescuedKeys.add(key);
-                filtered.push(listing);
+        if (input.aiRelevance !== false) {
+          try {
+            const kept = new Set(comparable.map((listing) => `${listing.marketplace}:${listing.listingId}`));
+            const rescued = await this.fuzzyRescueForSearch(fetched.filter((listing) => !kept.has(`${listing.marketplace}:${listing.listingId}`)), {
+              query: input.query, includedTerms: input.terms ?? '', excludedTerms: input.excluded ?? '', condition,
+            }, { ...deterministicFilters, shippingOnly: Boolean(input.shippingOnly) }, source);
+            if (rescued.length) {
+              const seen = new Set(filtered.map((listing) => `${listing.marketplace}:${listing.listingId}`));
+              for (const listing of rescued) {
+                const key = `${listing.marketplace}:${listing.listingId}`;
+                if (!seen.has(key)) {
+                  seen.add(key);
+                  rescuedKeys.add(key);
+                  filtered.push(listing);
+                }
               }
             }
+          } catch {
+            // Rescue is recall-only; any failure keeps the deterministic set.
           }
-        } catch {
-          // Rescue is recall-only; any failure keeps the deterministic set.
         }
         // Same AI relevance gate as watch scans (Jev live, DeepSeek legacy),
         // but the search form can opt out per search (aiRelevance: false) to
@@ -4888,15 +4907,14 @@ export class ScoutService {
         const matches = relevant.length - hiddenByChecks;
         const status: SearchSourceStatus = {
           source, status: 'ok', count: matches, pendingShipping, durationMs: Date.now() - started,
-          message: matches
-            ? `${matches} matches${relevanceNote}${checksNote}${truncated ? ` · showing the first ${MANUAL_SEARCH_RESULT_CAP}` : ''}`
-            : 'No matching listings',
+          message: `${matches
+            ? `${matches} matches${relaxedNote}${relevanceNote}${checksNote}${truncated ? ` · showing the first ${MANUAL_SEARCH_RESULT_CAP}` : ''}`
+            : 'No matching listings'}${conditionNote}`,
         };
         if (details) {
           // Strict means every query term matched; a kept row that is neither
           // strict nor rescued came through the relaxed (most-terms) pass.
-          const strictKeys = new Set(filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters)
-            .map((listing) => `${listing.marketplace}:${listing.listingId}`));
+          const strictKeys = new Set(strict.map((listing) => `${listing.marketplace}:${listing.listingId}`));
           for (const listing of capped) {
             const key = `${listing.marketplace}:${listing.listingId}`;
             details.listings.set(key, {
@@ -6182,7 +6200,8 @@ export class ScoutService {
             return score.qualifies || (dealStrength ?? 0) >= 4 || listingHitsTarget(row, listing.price);
           };
           try {
-            if (!matchingExact.length) {
+            // The watch's AI relevance switch covers the rescue too, as it does on manual search.
+            if (!matchingExact.length && (row.ai_relevance === undefined || Boolean(row.ai_relevance))) {
               const rescued = await this.fuzzyRescueForSearch(fetched, {
                 query: row.query, includedTerms: row.included_terms ?? '', excludedTerms: row.excluded_terms ?? '', condition: row.condition,
               }, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) }, source, strongEnough);
@@ -7534,6 +7553,11 @@ export type ListingFilters = {
    * dropping the whole page. Never relaxes user-typed included/excluded terms.
    */
   relaxTerms?: boolean;
+  /**
+   * Manual search only: drop listings whose condition says damaged or for
+   * parts, so a search for used items does not return broken ones.
+   */
+  excludeDamaged?: boolean;
 };
 
 const CONDITION_ALIASES: Record<string, string[]> = {
@@ -7547,6 +7571,7 @@ function matchesRequestedCondition(requestedCondition: string, listingCondition:
   const isNew = /(^| )(new|nowe|nowy|nowa)( |$)/.test(listingCondition);
   if (requestedCondition === 'new') return isNew;
   if (requestedCondition === 'used') return Boolean(listingCondition) && !isNew;
+  if (requestedCondition === 'damaged') return isDamagedLabel(listingCondition);
   return (CONDITION_ALIASES[requestedCondition.replace(/\s+$/, '')] ?? [requestedCondition]).some((alias) => listingCondition.includes(alias));
 }
 
@@ -7573,7 +7598,8 @@ function evaluateDeterministic(
   const shippingOk = !options.shippingOnly || listing.marketplace === 'Vinted' || listing.shippingAvailable === true;
   const sellerOk = (!options.sellerType || !listing.sellerType || listing.sellerType === options.sellerType)
     && (!options.ignorePromoted || listing.promoted !== true);
-  return { termOk, conditionOk, priceOk, shippingOk, sellerOk };
+  const damagedOk = !options.excludeDamaged || !isDamagedLabel(condition);
+  return { termOk, conditionOk, priceOk, shippingOk, sellerOk, damagedOk };
 }
 
 export function filterListings(listings: NormalizedListing[], query: string, includedRaw: string, excludedRaw: string, filters: ListingFilters | boolean = {}) {
@@ -7586,7 +7612,7 @@ export function filterListings(listings: NormalizedListing[], query: string, inc
     const title = normalizeFilterText(listing.title);
     const condition = normalizeFilterText(listing.condition ?? '');
     const evaluated = evaluateDeterministic(listing, title, condition, included, excluded, requestedCondition, options, relaxed);
-    return evaluated.termOk && evaluated.conditionOk && evaluated.priceOk && evaluated.shippingOk && evaluated.sellerOk;
+    return evaluated.termOk && evaluated.conditionOk && evaluated.priceOk && evaluated.shippingOk && evaluated.sellerOk && evaluated.damagedOk;
   });
   const strict = evaluate(false);
   // Only manual search opts into the relaxed retry, and never when the user
@@ -7619,7 +7645,8 @@ export function findFuzzyRescueCandidates(
     const title = normalizeFilterText(listing.title);
     const condition = normalizeFilterText(listing.condition ?? '');
     const evaluated = evaluateDeterministic(listing, title, condition, included, excluded, requestedCondition, options);
-    if (!evaluated.priceOk || !evaluated.shippingOk || !evaluated.sellerOk) continue;
+    // A damaged listing on a used search is a hard drop, so no Jev call is spent on it.
+    if (!evaluated.priceOk || !evaluated.shippingOk || !evaluated.sellerOk || !evaluated.damagedOk) continue;
     if (!evaluated.termOk && evaluated.conditionOk && hasTermFilter) termCandidates.push(listing);
     else if (!evaluated.conditionOk && evaluated.termOk && hasConditionFilter) conditionCandidates.push(listing);
   }

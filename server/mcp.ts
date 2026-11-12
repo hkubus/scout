@@ -348,7 +348,8 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       minPrice: z.number().nonnegative().nullable().optional(),
       maxPrice: z.number().positive().nullable().optional(),
       shippingOnly: z.boolean().optional().default(false),
-      condition: z.string().max(80).optional().default('Any'),
+      condition: z.string().max(80).optional().default('Any')
+        .describe('Any, New, Used (leaves out damaged listings), Damaged, or a grade (like new / very good / good); Polish forms such as "używany" or "na części" work too. Anything else searches any condition, and each source\'s message says so.'),
       ownerType: z.enum(['private', 'business']).nullable().optional(),
       olxCategoryId: z.number().int().positive().optional().describe('OLX only: search one category; ids come from scout_olx_categories.'),
       page: z.number().int().min(1).max(10).optional().default(1),
@@ -364,8 +365,9 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ olxCategoryId, format, ...input }) => {
+    if (input.minPrice != null && input.maxPrice != null && input.minPrice > input.maxPrice) return toolError(new ServiceError('Minimum price cannot exceed maximum price'));
     try {
-      const filters = { ...input, olxCategory: olxCategoryId ? { id: olxCategoryId, label: String(olxCategoryId), path: '' } : null };
+      const filters = { ...input, sources: [...new Set(input.sources)], olxCategory: olxCategoryId ? { id: olxCategoryId, label: String(olxCategoryId), path: '' } : null };
       if (format === 'compact') {
         const result = await service.manualSearchDetailed(filters);
         service.withDuplicates(result.listings);
