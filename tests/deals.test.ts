@@ -300,7 +300,7 @@ test('scout_deals leaves out stored quick flags on request; rows not yet stored 
     assert.equal('flags' in all.deals.find((deal) => deal.listingId === 'exc')!, false, 'unflagged rows omit the key');
 
     const narrowed = dealsForAgent(context.service, { excludeFlags: ['for_parts', 'swap'] });
-    assert.deepEqual(narrowed.deals.map((deal) => deal.listingId), ['exc', 'legacy-learning', 'pro-1', 'strong', 'kept', 'other-1']);
+    assert.deepEqual(narrowed.deals.map((deal) => deal.listingId), ['exc', 'legacy-learning', 'pro-1', 'strong', 'other-1', 'kept']);
     assert.equal(narrowed.total, 6);
 
     await context.service.backfillListingFlags();
