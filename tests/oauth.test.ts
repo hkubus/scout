@@ -463,6 +463,24 @@ test('a connected-app token works on /mcp only, and a disconnected one not at al
   }
 });
 
+test("an API token's /mcp calls count like other API calls, except live marketplace tools", { timeout: 180_000 }, async () => {
+  const scout = await startScout({ SCOUT_PASSWORD: PASSWORD, SCOUT_API_TOKENS: STATIC_TOKEN });
+  try {
+    const { origin } = scout;
+    // Past the 30/min every /mcp POST used to share with the dashboard's searches.
+    for (let call = 0; call < 40; call += 1) assert.equal((await mcpPost(origin, STATIC_TOKEN)).status, 200);
+    // Live tools still share it, with the dashboard's own searches.
+    const search = await fetch(`${origin}/api/search`, { method: 'POST', headers: { authorization: `Bearer ${STATIC_TOKEN}`, 'content-type': 'application/json' }, body: '{}' });
+    assert.equal(search.status, 400);
+    const scan = { method: 'tools/call', params: { name: 'scout_queue_scan', arguments: { watchId: 'no-such-watch' } } };
+    for (let call = 0; call < 29; call += 1) assert.equal((await mcpPost(origin, STATIC_TOKEN, scan)).status, 200);
+    assert.equal((await mcpPost(origin, STATIC_TOKEN, scan)).status, 429);
+    assert.equal((await mcpPost(origin, STATIC_TOKEN)).status, 200);
+  } finally {
+    await scout.stop();
+  }
+});
+
 test('works the same with sign-in off, and still honours Disconnect', { timeout: 180_000 }, async () => {
   const scout = await startScout({ SCOUT_AUTH: 'off' });
   try {

@@ -16,7 +16,7 @@ import { compressApiResponse } from './compression';
 import { ScoutLogController } from './request-log';
 import { apiTokenCredentialId, bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
 import { CONSENT_PATH, isConnectedAppToken, isOAuthRoute, mcpChallenge, OAuthStore, registerOAuthRoutes } from './oauth';
-import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
+import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, mcpRateClass, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
 import { FlipStore, MAX_FLIP_PHOTO_BYTES, MAX_FLIP_PHOTOS } from './flips';
 import { FLIP_CHANNELS, LISTING_CHANNELS, LISTING_CONDITIONS, PARCEL_SIZES } from '../src/profit';
 import { dashboardTopParam, ScoutService, ServiceError } from './service';
@@ -124,8 +124,10 @@ app.addHook('onRequest', async (request, reply) => {
   if (!isProtectedRoute(route) && !isOAuthRoute(route)) return;
 
   // A connected app (Hatbot) gets its own bucket, so it neither eats nor runs out of the dashboard's.
+  // Other /mcp POSTs count like any API call; the handler charges live tool
+  // calls to the expensive bucket once the body is parsed and auth passed.
   const connectedApp = route === '/mcp' && isConnectedAppToken(bearerToken(request.headers.authorization) ?? '');
-  const expensive = !connectedApp && (route === '/mcp' || /\/search$|\/categories$|\/scan$|\/check$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/listing-draft$|\/flips\/import\/(?:url|screenshot)$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route));
+  const expensive = !connectedApp && (/\/search$|\/categories$|\/scan$|\/check$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/listing-draft$|\/flips\/import\/(?:url|screenshot)$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route));
   // Registration is public, so it gets the tightest bucket of its own.
   const limit = route === '/oauth/register' ? 10 : route === '/oauth/token' || route === CONSENT_PATH ? 30 : expensive ? 30 : connectedApp ? 120 : 240;
   // Snapshot images use the general limit so a screen of saved photos loads.
@@ -1061,15 +1063,11 @@ app.get('/events', async (request, reply) => {
 // got through OAuth (server/oauth.ts).
 // The MCP SDK (~40 MB RSS) loads on the first /mcp request, not at startup.
 let mcpModules: Promise<[typeof import('./mcp'), typeof import('@modelcontextprotocol/sdk/server/streamableHttp.js')]> | undefined;
-// Live marketplace fetches (and scout_verify_listing's AI calls) keep the 30/min cap the dashboard's searches have, even for a connected app.
-const LIVE_MCP_TOOLS = new Set(['scout_search', 'scout_olx_categories', 'scout_queue_scan', 'scout_market_scan', 'scout_market_watch_create', 'scout_verify_listing']);
-const callsLiveTool = (body: unknown) => (Array.isArray(body) ? body : [body]).some((message) => {
-  const call = message as { method?: unknown; params?: { name?: unknown } } | null;
-  return call?.method === 'tools/call' && LIVE_MCP_TOOLS.has(String(call.params?.name));
-});
-
 app.post('/mcp', async (request, reply) => {
-  if (request.scoutAuth === 'app' && callsLiveTool(request.body)) {
+  // Live marketplace fetches (and scout_verify_listing's AI calls) share the
+  // 30/min cap the dashboard's searches have, for every caller: API tokens,
+  // sessions and connected apps.
+  if (mcpRateClass(request.body) === 'live') {
     const bucket = rateLimiter.consume(`${rateLimitKey(request.ip)}:expensive`, 30);
     if (!bucket.allowed) {
       reply.header('Retry-After', String(bucket.retryAfterSeconds));

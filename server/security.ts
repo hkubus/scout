@@ -70,6 +70,24 @@ export function rateLimitKey(ip: string) {
   return `${groups.slice(0, 4).map((group) => group.toString(16)).join(':')}::/64`;
 }
 
+/** MCP tools that fetch marketplace pages live or start scans, plus scout_verify_listing's AI calls. */
+const LIVE_MCP_TOOLS = new Set(['scout_search', 'scout_olx_categories', 'scout_queue_scan', 'scout_market_scan', 'scout_market_watch_create', 'scout_verify_listing']);
+
+/**
+ * How an authenticated /mcp POST is rate limited: `live` when any JSON-RPC
+ * message in it (a single message or a batch) calls a tool that fetches
+ * marketplaces live or makes AI calls on demand, which shares the dashboard's
+ * 30/min search bucket; every other message (initialize, tools/list,
+ * notifications, database-only tools) is `general`, like any other API call.
+ */
+export function mcpRateClass(body: unknown): 'live' | 'general' {
+  const live = (Array.isArray(body) ? body : [body]).some((message) => {
+    const call = message as { method?: unknown; params?: { name?: unknown } } | null;
+    return call?.method === 'tools/call' && LIVE_MCP_TOOLS.has(String(call.params?.name));
+  });
+  return live ? 'live' : 'general';
+}
+
 type RateLimitBucket = { count: number; resetAt: number };
 
 export class RateLimiter {
