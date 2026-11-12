@@ -9,10 +9,10 @@ const dirtyAfter = (...events: string[]) => new Set<LiveResource>(events.flatMap
 test('a scan refetches only what the visible view renders', () => {
   const fetched = Object.fromEntries(views.map((view) => {
     const plan = planFlush(view, dirtyAfter('scan'), true, false);
-    return [view, [plan.dashboard && 'dashboard', plan.connectors && 'connectors', plan.page].filter(Boolean)];
+    return [view, [plan.dashboard && 'dashboard', plan.deals && 'deals', plan.connectors && 'connectors', plan.page].filter(Boolean)];
   }));
   assert.deepEqual(fetched, {
-    overview: ['dashboard'],
+    overview: ['dashboard', 'deals'],
     search: [],
     watches: [],
     'market-research': [],
@@ -28,7 +28,22 @@ test('flags stay dirty for views that are not shown, except pages that fetch on 
   const plan = planFlush('settings', dirtyAfter('scan', 'market-watch'), true, false);
   assert.deepEqual(plan.clear.sort(), ['analytics', 'listings', 'market']);
   const overview = planFlush('overview', dirtyAfter('scan'), true, false);
-  assert.deepEqual(overview.clear.sort(), ['analytics', 'connectors', 'dashboard', 'listings', 'watchList']);
+  assert.deepEqual(overview.clear.sort(), ['analytics', 'connectors', 'dashboard', 'deals', 'listings', 'watchList']);
+});
+
+test('Overview\'s Top deals stay stale until Overview shows, and follow what changes rows', () => {
+  // Only Overview fetches them; elsewhere the flag waits for it.
+  for (const view of views.filter((view) => view !== 'overview')) {
+    const plan = planFlush(view, dirtyAfter('scan'), true, false);
+    assert.equal(plan.deals, false, view);
+    assert.ok(!plan.clear.includes('deals'), view);
+  }
+  // A dashboard request in flight does not hold them back.
+  assert.equal(planFlush('overview', dirtyAfter('scan'), true, true).deals, true);
+  for (const event of ['scan', 'watch', 'listing-action', 'fee-presets']) assert.ok(eventResources[event].includes('deals'), event);
+  // Notifications record connector runs only; the web dashboard carries no rows, so seller fees leave it alone.
+  assert.ok(!eventResources.notification.includes('deals'));
+  assert.deepEqual(planFlush('overview', dirtyAfter('fee-presets'), true, false), { dashboard: false, deals: true, connectors: false, page: null, clear: ['deals', 'listings'] });
 });
 
 test('analytics and watches load the dashboard for watch names only when needed', () => {

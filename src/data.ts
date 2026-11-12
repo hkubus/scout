@@ -37,7 +37,7 @@ export const connectors: Connector[] = [
   { name: 'ntfy', kind: 'ntfy', status: 'Idle', detail: 'Priority-filtered alerts', lastSuccess: 'Never', color: '#4f9da6', requests: 0, latency: '—' },
 ];
 
-export const dashboardSeed: DashboardData = { listings, watches, connectors, stats: { watching: watches.length, newToday: listings.length, strongDeals: listings.filter((listing) => listing.dealStrength >= 4).length }, lastScan: '1m ago', lastScanTime: '10:24:18' };
+export const dashboardSeed: DashboardData = { listings, watches, connectors, stats: { watching: watches.length, newToday: listings.length, strongDeals: listings.filter((listing) => listing.dealStrength >= 4).length, aiFiltered: 0 }, lastScan: '1m ago', lastScanTime: '10:24:18' };
 
 export const emptyDashboard: DashboardData = {
   listings: [],
@@ -49,7 +49,7 @@ export const emptyDashboard: DashboardData = {
     { name: 'Discord', kind: 'discord', status: 'Idle', detail: 'Webhook not configured', lastSuccess: 'Never', color: '#32a85b', requests: 0, latency: '—' },
     { name: 'ntfy', kind: 'ntfy', status: 'Idle', detail: 'ntfy not configured', lastSuccess: 'Never', color: '#4f9da6', requests: 0, latency: '—' },
   ],
-  stats: { watching: 0, newToday: 0, strongDeals: 0 },
+  stats: { watching: 0, newToday: 0, strongDeals: 0, aiFiltered: 0 },
   lastScan: 'Never',
   lastScanTime: '—',
 };

@@ -1,14 +1,15 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Search, SlidersHorizontal, X } from "lucide-react";
 import { api } from "./api";
 import { subscribe } from "./events";
 import { applyListingActionToPage, isListingActionEvent, listingActionKey, type DecisionFilter, type ListingActionEvent } from "./listingActions";
-import { compareStrongest, pageForFilters, reuseUnchangedListings } from "./listingRows";
+import { pageForFilters, reuseUnchangedListings } from "./listingRows";
 import ListingTable from "./ListingTable";
 import type { Listing, ListingAction, Marketplace } from "./types";
 import { PageHeader, SelectControl } from "./ui";
 
 const PAGE_SIZE = 50;
+const noListings: Listing[] = [];
 
 type Sort = "Newest" | "Strongest" | "Price";
 type Visibility = "Visible" | "Hidden" | "AI" | "All";
@@ -49,13 +50,11 @@ const sortOptions = [
 ];
 
 export default function ListingsPage({
-  listings,
   refreshKey,
   preset,
   onSelectListing,
   onToggleHidden,
 }: {
-  listings: Listing[];
   /** Bumped when server events (scans, listing actions) leave the fetched page stale. */
   refreshKey: number;
   preset: ListingsPreset;
@@ -141,31 +140,9 @@ export default function ListingsPage({
     if (action) applyListingAction({ key: listingActionKey(listing), decision: action.decision, hidden: action.hidden });
   }, [applyListingAction, onToggleHidden]);
 
-  // Offline fallback only: an unreachable API filters the dashboard feed in
-  // memory. Server-backed results already cover every page and are pre-sorted.
-  const filtered = useMemo(() => {
-    if (remoteListings) return remoteListings;
-    const normalizedSearch = debouncedSearch.toLowerCase();
-    const matches: Listing[] = [];
-    for (const listing of listings) {
-      if (marketplace !== "All" && listing.marketplace !== marketplace) continue;
-      if (watchId && listing.watchId !== watchId) continue;
-      if (listing.dealStrength < minStrength) continue;
-      if (decision === "none" ? listing.decision : decision !== "All" && listing.decision !== decision) continue;
-      if (visibility === "AI" ? !listing.aiFiltered : listing.aiFiltered) continue;
-      if (visibility === "Visible" && listing.hidden) continue;
-      if (visibility === "Hidden" && !listing.hidden) continue;
-      if (!`${listing.title} ${listing.subtitle} ${listing.condition ?? ""} ${listing.location ?? ""}`.toLowerCase().includes(normalizedSearch)) continue;
-      matches.push(listing);
-    }
-    return matches.sort((a, b) =>
-      sort === "Strongest"
-        ? compareStrongest(a, b)
-        : sort === "Price"
-          ? a.price - b.price
-          : (Date.parse(b.observedAt) || 0) - (Date.parse(a.observedAt) || 0),
-    ).slice(0, PAGE_SIZE);
-  }, [remoteListings, listings, marketplace, debouncedSearch, watchId, minStrength, sort, decision, visibility]);
+  // Every page comes from the server, filtered and sorted; an unreachable API
+  // leaves the table empty under the offline banner.
+  const filtered = remoteListings ?? noListings;
 
   const activeFilters = (marketplace !== "All" ? 1 : 0) + (minStrength > 1 ? 1 : 0) + (decision !== "All" ? 1 : 0) + (visibility !== "Visible" ? 1 : 0);
   const pageCount = pagination ? Math.max(1, Math.ceil(pagination.total / pagination.pageSize)) : 1;

@@ -20,7 +20,7 @@ import {
   Wallet,
   WifiOff,
 } from "lucide-react";
-import { api, ApiError, forgetInFlightGets, UNAUTHORIZED_EVENT, type AuthSession } from "./api";
+import { api, ApiError, forgetInFlightGets, TOP_DEALS, topDealsQuery, UNAUTHORIZED_EVENT, type AuthSession } from "./api";
 import { emptyDashboard } from "./data";
 import { reconnectPending, subscribe, subscribeStatus, type StreamStatus } from "./events";
 import { isListingActionEvent, patchListingRows } from "./listingActions";
@@ -165,6 +165,17 @@ function takeBootDashboard() {
   bootDashboard = null;
   return pending;
 }
+// Overview's rows come from their own request, so it starts alongside.
+let bootTopDeals: ReturnType<typeof api.listings> | null = initialView === "overview" && bootDashboard ? api.listings(topDealsQuery()) : null;
+bootTopDeals?.catch(() => {});
+function takeBootTopDeals() {
+  const pending = bootTopDeals;
+  bootTopDeals = null;
+  return pending;
+}
+
+/** Overview's Top deals for one marketplace, as fetched; triage patches rows in place. */
+type TopDeals = { marketplace: "All" | Marketplace; listings: Listing[]; total: number };
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
@@ -337,6 +348,8 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [data, setData] = useState<DashboardData>(emptyDashboard);
+  const [topDeals, setTopDeals] = useState<TopDeals | null>(null);
+  const [overviewMarketplace, setOverviewMarketplace] = useState<"All" | Marketplace>("All");
   const [isLoading, setIsLoading] = useState(true);
   const [connection, setConnection] = useState<
     "loading" | "online" | "offline"
@@ -375,6 +388,8 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
   const dashboardLoaded = useRef(false);
   const dashboardFetches = useRef(0);
   const connectorsSequence = useRef(0);
+  const dealsSequence = useRef(0);
+  const overviewMarketplaceRef = useRef(overviewMarketplace);
   const streamStatus = useRef<StreamStatus | null>(null);
   const flushTimer = useRef<number | null>(null);
   const flushRef = useRef<() => Promise<void>>(async () => {});
@@ -396,11 +411,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
         const next = await (boot ?? api.dashboard());
         if (sequence !== refreshSequence.current) return;
         dashboardLoaded.current = true;
-        // Unchanged rows keep their identity, so Overview's filtered list and rows skip.
-        setData((previous) => {
-          const listings = reuseUnchangedListings(previous.listings, next.listings);
-          return listings === next.listings ? next : { ...next, listings };
-        });
+        setData(next);
         setConnection("online");
         // Events that arrived while this request was in flight need a fresh one.
         if (dirty.current.has("dashboard")) scheduleFlush();
@@ -420,6 +431,36 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     },
     [notify, scheduleFlush],
   );
+  // Overview's Top deals: the server ranks them (GET /api/listings?sort=deal).
+  // Only the newest request applies; a failed one stays dirty for the next flush.
+  const refreshDeals = useCallback(async () => {
+    const sequence = ++dealsSequence.current;
+    dirty.current.delete("deals");
+    const marketplace = overviewMarketplaceRef.current;
+    const boot = takeBootTopDeals();
+    try {
+      const page = await (boot && marketplace === "All" ? boot : api.listings(topDealsQuery(marketplace === "All" ? undefined : marketplace)));
+      if (sequence !== dealsSequence.current) return;
+      // Unchanged rows keep their identity, so their memoized rows skip.
+      setTopDeals((previous) => ({
+        marketplace,
+        listings: previous ? reuseUnchangedListings(previous.listings, page.listings) : page.listings,
+        total: page.pagination.total,
+      }));
+    } catch (error) {
+      // The boot request's 401 fired while the session check was still deciding.
+      if (boot && error instanceof ApiError && error.status === 401) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+      if (sequence !== dealsSequence.current) return;
+      dirty.current.add("deals");
+      // Leave the loading state; the offline banner says why it is empty.
+      setTopDeals((previous) => previous ?? { marketplace, listings: [], total: 0 });
+    }
+  }, []);
+  const changeOverviewMarketplace = useCallback((marketplace: "All" | Marketplace) => {
+    overviewMarketplaceRef.current = marketplace;
+    setOverviewMarketplace(marketplace);
+    void refreshDeals();
+  }, [refreshDeals]);
   const flush = useCallback(async () => {
     if (document.hidden) return;
     const plan = planFlush(viewRef.current, dirty.current, dashboardLoaded.current, dashboardFetches.current > 0);
@@ -434,6 +475,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     if (plan.page === "market") setMarketRefreshKey((value) => value + 1);
     const pending: Array<Promise<unknown>> = [];
     if (plan.dashboard) pending.push(refreshData(!dashboardLoaded.current));
+    if (plan.deals) pending.push(refreshDeals());
     if (plan.connectors) {
       // Only the newest request applies, so an older one landing late cannot overwrite it.
       const sequence = ++connectorsSequence.current;
@@ -445,7 +487,7 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
       ));
     }
     await Promise.all(pending);
-  }, [refreshData]);
+  }, [refreshData, refreshDeals]);
   flushRef.current = flush;
 
   useEffect(() => {
@@ -478,7 +520,8 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
     let triageTimer: number | null = null;
     const onListingAction = (payload: unknown) => {
       if (!isListingActionEvent(payload)) return;
-      setData((previous) => {
+      setTopDeals((previous) => {
+        if (!previous) return previous;
         const listings = patchListingRows(previous.listings, payload);
         return listings === previous.listings ? previous : { ...previous, listings };
       });
@@ -733,14 +776,14 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
   const showWatchListings = (watch: Watch, strongOnly = false) =>
     openView("listings", { watchId: watch.id, watchName: watch.name, ...(strongOnly ? { minStrength: 3, sort: "Strongest" as const } : {}) });
   const updateListingAction = useCallback((listing: Listing) => {
-    setData((previous) => ({
+    setTopDeals((previous) => previous && {
       ...previous,
       listings: previous.listings.map((item) =>
         item.id === listing.id
           ? { ...item, decision: listing.decision, note: listing.note, hidden: listing.hidden }
           : item,
       ),
-    }));
+    });
     setSelectedListing((current) =>
       current?.id === listing.id ? { ...current, decision: listing.decision, note: listing.note, hidden: listing.hidden } : current,
     );
@@ -804,13 +847,16 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
               Scout’s API is unavailable. Changes are disabled until the
               connection returns.
             </span>
-            <button onClick={() => refreshData(true)}>Retry</button>
+            <button onClick={() => { void refreshData(true); if (view === "overview") void refreshDeals(); }}>Retry</button>
           </div>
         ) : null}
         <SectionTabs view={view} onNavigate={openView} />
         {view === "overview" ? (
         <Overview
           data={data}
+          deals={topDeals}
+          marketplace={overviewMarketplace}
+          onMarketplace={changeOverviewMarketplace}
           isLoading={isLoading}
           scanning={scanning}
           onNewWatch={() => { setWatchPreset(null); setShowWatchDialog(true); }}
@@ -857,7 +903,6 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
           <Suspense fallback={<div className="table-loading"><LoaderCircle size={18} className="spin" />Loading listings…</div>}>
             <LazyListingsPage
               key={listingsPreset.key}
-              listings={data.listings}
               refreshKey={listingsRefreshKey}
               preset={listingsPreset.filters}
               onSelectListing={openListing}
@@ -1071,11 +1116,11 @@ function SectionTabs({ view, onNavigate }: { view: View; onNavigate: (view: View
   );
 }
 
-/** How many deals Overview shows; the rest are one click away in Listings. */
-const TOP_DEALS = 20;
-
 function Overview({
   data,
+  deals,
+  marketplace,
+  onMarketplace,
   isLoading,
   scanning,
   onNewWatch,
@@ -1085,6 +1130,10 @@ function Overview({
   onToggleHidden,
 }: {
   data: DashboardData;
+  /** Null until the first response; while another marketplace loads, the previous one's rows stay. */
+  deals: TopDeals | null;
+  marketplace: "All" | Marketplace;
+  onMarketplace: (marketplace: "All" | Marketplace) => void;
   isLoading: boolean;
   scanning: boolean;
   onNewWatch: () => void;
@@ -1093,35 +1142,15 @@ function Overview({
   onSelectListing: (listing: Listing) => void;
   onToggleHidden: (listing: Listing) => void;
 }) {
-  const [marketplace, setMarketplace] = useState<"All" | Marketplace>("All");
-  // Strong+ deals still worth a look: not hidden, not filtered by AI, not
-  // passed (the widget's rule). Untriaged rows lead within a tier, then the
-  // deepest discount, as in the Strongest sort.
-  const { topDeals, total, aiFilteredCount } = useMemo(() => {
-    let aiFilteredCount = 0;
-    const candidates: Listing[] = [];
-    for (const listing of data.listings) {
-      if (listing.hidden) continue;
-      if (listing.aiFiltered) {
-        aiFilteredCount += 1;
-        continue;
-      }
-      if (listing.decision === "pass" || listing.dealStrength < 3) continue;
-      if (marketplace !== "All" && listing.marketplace !== marketplace) continue;
-      candidates.push(listing);
-    }
-    candidates.sort((a, b) => {
-      if (b.dealStrength !== a.dealStrength) return b.dealStrength - a.dealStrength;
-      const aTriaged = a.decision ? 1 : 0;
-      const bTriaged = b.decision ? 1 : 0;
-      if (aTriaged !== bTriaged) return aTriaged - bTriaged;
-      const aBelow = a.belowTypical ?? 0;
-      const bBelow = b.belowTypical ?? 0;
-      if (aBelow !== bBelow) return aBelow - bBelow;
-      return (Date.parse(b.firstSeenAt ?? b.observedAt) || 0) - (Date.parse(a.firstSeenAt ?? a.observedAt) || 0);
-    });
-    return { topDeals: candidates.slice(0, TOP_DEALS), total: candidates.length, aiFilteredCount };
-  }, [data.listings, marketplace]);
+  // Strong+ deals still worth a look (not hidden, passed or filtered by AI),
+  // ranked by the server. A row hidden or passed here leaves at once and a
+  // spare row takes its place until the reconcile refetch.
+  const { topDeals, total } = useMemo(() => {
+    if (!deals) return { topDeals: [], total: 0 };
+    const kept = deals.listings.filter((listing) => !listing.hidden && listing.decision !== "pass");
+    return { topDeals: kept.slice(0, TOP_DEALS), total: Math.max(kept.length, deals.total - (deals.listings.length - kept.length)) };
+  }, [deals]);
+  const aiFilteredCount = data.stats.aiFiltered;
   const troubled = data.connectors.filter((connector) => connector.status === "Degraded" || connector.status === "Warning");
   return (
     <>
@@ -1176,13 +1205,13 @@ function Overview({
               label="Marketplace"
               value={marketplace}
               options={[{ value: "All", label: "All marketplaces" }, "OLX", "Allegro Lokalnie", "Vinted"]}
-              onChange={(value) => setMarketplace(value as "All" | Marketplace)}
+              onChange={(value) => onMarketplace(value as "All" | Marketplace)}
             />
           </div>
         </div>
         <ListingTable
           listings={topDeals}
-          isLoading={isLoading}
+          isLoading={!deals}
           onSelect={onSelectListing}
           onToggleHidden={onToggleHidden}
           empty={

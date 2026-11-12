@@ -6,8 +6,10 @@ import type { View } from "./types";
  * rest stays stale until a view that needs it is shown.
  */
 export type LiveResource =
-  /** GET /api/dashboard: overview listings, stats, watches and connectors. */
+  /** GET /api/dashboard: stats, watches and connectors (the web app's form carries no listings). */
   | "dashboard"
+  /** Overview's Top deals (GET /api/listings?sort=deal), kept while other views show. */
+  | "deals"
   /** The connector rows alone (GET /api/connectors on the Connectors view). */
   | "connectors"
   /** Watch names and settings, which Analytics and Watches read from the dashboard. */
@@ -16,7 +18,7 @@ export type LiveResource =
   | "analytics"
   | "market";
 
-export const allLiveResources: readonly LiveResource[] = ["dashboard", "connectors", "watchList", "listings", "analytics", "market"];
+export const allLiveResources: readonly LiveResource[] = ["dashboard", "deals", "connectors", "watchList", "listings", "analytics", "market"];
 
 /** Everything a dashboard response refreshes. */
 export const dashboardResources: readonly LiveResource[] = ["dashboard", "connectors", "watchList"];
@@ -28,15 +30,15 @@ export const dashboardResources: readonly LiveResource[] = ["dashboard", "connec
  * LogsPage and `search` to SearchPage.
  */
 export const eventResources: Readonly<Record<string, readonly LiveResource[]>> = {
-  scan: ["dashboard", "connectors", "listings", "analytics"],
-  watch: ["dashboard", "connectors", "watchList", "listings", "analytics"],
+  scan: ["dashboard", "deals", "connectors", "listings", "analytics"],
+  watch: ["dashboard", "deals", "connectors", "watchList", "listings", "analytics"],
   // Notifications only record connector runs.
   notification: ["dashboard", "connectors"],
   // Analytics counts ordinary watch scans only, so research scans leave it alone.
   "market-watch": ["market"],
-  "listing-action": ["dashboard", "listings", "analytics"],
+  "listing-action": ["dashboard", "deals", "listings", "analytics"],
   // Listings carry an estimated net computed from the seller-fee presets.
-  "fee-presets": ["dashboard", "listings"],
+  "fee-presets": ["deals", "listings"],
 };
 
 /** Pages that fetch their own data on mount and refetch when their refresh key changes. */
@@ -45,6 +47,8 @@ const pageResources = { listings: "listings", analytics: "analytics", "market-re
 export type FlushPlan = {
   /** Fetch GET /api/dashboard. */
   dashboard: boolean;
+  /** Fetch Overview's Top deals. */
+  deals: boolean;
   /** Fetch GET /api/connectors and merge it into the dashboard data. */
   connectors: boolean;
   /** Bump the mounted page's refresh key. */
@@ -66,6 +70,8 @@ export function planFlush(view: View, dirty: ReadonlySet<LiveResource>, dashboar
     ((view === "analytics" || view === "watches") && (!dashboardLoaded || (view === "analytics" && dirty.has("watchList"))));
   const dashboard = needsDashboard && dirty.has("dashboard") && !dashboardInFlight;
   if (dashboard) clear.push(...dashboardResources);
+  const deals = view === "overview" && dirty.has("deals");
+  if (deals) clear.push("deals");
   const connectors = view === "connectors" && dirty.has("connectors");
   if (connectors) clear.push("connectors");
   let page: FlushPlan["page"] = null;
@@ -75,7 +81,7 @@ export function planFlush(view: View, dirty: ReadonlySet<LiveResource>, dashboar
     clear.push(resource);
     if (pageView === view) page = resource;
   }
-  return { dashboard, connectors, page, clear };
+  return { dashboard, deals, connectors, page, clear };
 }
 
 /**

@@ -882,6 +882,11 @@ function dealLabelFromStrength(strength: number): DealLabel {
   return strength >= 5 ? 'Exceptional' : strength === 4 ? 'Very strong' : strength === 3 ? 'Strong' : 'Watch';
 }
 
+/** Parses the `?listings=` query value of GET /api/dashboard: `none` leaves the feed rows out (the web app's form). */
+export function dashboardListingsParam(value: unknown): 'none' | undefined {
+  return value === 'none' ? 'none' : undefined;
+}
+
 /** Parses the `?top=` query value of GET /api/dashboard; anything but an integer from 1 to 50 means the full dashboard. */
 export function dashboardTopParam(value: unknown): number | undefined {
   if (typeof value !== 'string' || !/^\d{1,2}$/.test(value)) return undefined;
@@ -4234,6 +4239,8 @@ export class ScoutService {
     aiFiltered?: 'exclude' | 'include' | 'only';
     /** Lowest deal strength (1-5) to include. */
     minStrength?: number;
+    /** Only rows posted at or after this ISO time (first seen by the watch when the source gives no posting time). */
+    arrivedSince?: string;
     /** Lowest percent below the typical price the row displays; rows without one are left out. */
     minDiscount?: number;
     /** One model variant id of the watch (`__other__` is the unmatched bucket). */
@@ -4248,8 +4255,8 @@ export class ScoutService {
     excludePassed?: boolean;
     /**
      * `discount` is percent below the displayed typical, rows without one
-     * last; `deal` is strength, then that discount, then newest (the Top
-     * deals order).
+     * last; `deal` is strength, then untriaged before Buy/Maybe, then that
+     * discount, then newest (the Top deals order).
      */
     sort?: 'newest' | 'strongest' | 'price' | 'discount' | 'deal';
     /** `none` keeps only untriaged rows. */
@@ -4280,6 +4287,7 @@ export class ScoutService {
     if (options.decision === 'none') predicates.push('a.decision IS NULL');
     else if (options.decision) { predicates.push('a.decision = ?'); params.push(options.decision); }
     if (options.minStrength && options.minStrength > 1) { predicates.push('COALESCE(wl.deal_strength, 1) >= ?'); params.push(Math.min(5, Math.floor(options.minStrength))); }
+    if (options.arrivedSince) { predicates.push('julianday(COALESCE(l.posted_at, wl.first_seen_at, wl.last_seen_at)) >= julianday(?)'); params.push(options.arrivedSince); }
     if (options.visibility === 'hidden') predicates.push('COALESCE(a.hidden, 0) = 1');
     else if (options.visibility === 'visible') predicates.push('COALESCE(a.hidden, 0) = 0');
     if (options.qualifiesOnly) predicates.push(QUALIFIES_SQL);
@@ -4308,7 +4316,8 @@ export class ScoutService {
     // Strongest is compareStrongest in SQL: the tier, then the deepest
     // discount below the typical the row shows (at or above it, or without
     // one, counts as none), then the newest. SQLite sorts NULL lowest, so
-    // DESC puts rows without a typical last for discount and deal.
+    // DESC puts rows without a typical last for discount and deal. Deal (the
+    // Overview's Top deals) puts untriaged rows first within a tier.
     const orderParams: unknown[] = options.sort === 'discount' || options.sort === 'deal' || options.sort === 'strongest' ? [readyWatchIdsJson] : [];
     const orderBy = options.sort === 'strongest'
       ? `COALESCE(wl.deal_strength, 1) DESC, MAX(0, COALESCE(${discountSql}, 0)) DESC, wl.last_seen_at DESC, wl.id DESC`
@@ -4317,7 +4326,7 @@ export class ScoutService {
         : options.sort === 'discount'
           ? `${discountSql} DESC, wl.last_seen_at DESC, wl.id DESC`
           : options.sort === 'deal'
-            ? `wl.deal_strength DESC, ${discountSql} DESC, wl.last_seen_at DESC, wl.id DESC`
+            ? `wl.deal_strength DESC, a.decision IS NOT NULL, ${discountSql} DESC, wl.last_seen_at DESC, wl.id DESC`
             : 'wl.last_seen_at DESC, wl.id DESC';
     const total = Number((this.stmt(`SELECT COUNT(*) AS count FROM listings l JOIN watch_listings wl ON wl.listing_id = l.id JOIN watches w ON w.id = wl.watch_id LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id WHERE ${where}`).get(...params) as { count?: number }).count ?? 0);
     const page = Math.max(1, Math.floor(options.page ?? 1));
@@ -6005,32 +6014,20 @@ export class ScoutService {
   }
 
   /**
-   * `top` (an integer from 1 to 50) serves the home screen widget: every
-   * scalar is computed over the same 500-row feed, `listings` holds only the
-   * strongest `top` rows in WidgetSnapshot.make's order, and `watches` and
-   * `connectors` are empty (connector reads are skipped). Any other value
-   * returns the full dashboard.
+   * The full dashboard carries the newest 500 feed rows in `listings`.
+   * `top` (an integer from 1 to 50) serves the home screen widget: `listings`
+   * holds only the strongest `top` of those rows in WidgetSnapshot.make's
+   * order, and `watches` and `connectors` are empty (connector reads are
+   * skipped). `listings: 'none'` serves the web app, whose Overview pages its
+   * Top deals from GET /api/listings?sort=deal: `listings` is empty and no
+   * feed row is built. `top` wins when both are set; any other value returns
+   * the full dashboard. `stats` is the same in every form (dashboardStats).
    */
-  dashboard(options: { top?: number } = {}): DashboardData {
+  dashboard(options: { top?: number; listings?: 'none' } = {}): DashboardData {
     const top = typeof options.top === 'number' && Number.isInteger(options.top) && options.top >= 1 && options.top <= 50 ? options.top : null;
     // The widget (top set) only needs the watches for its deals, not their figures.
     const watches = top === null ? this.getWatches() : this.watches(false, undefined, false);
-    const listings = this.getListings(watches, true);
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const todayTime = today.getTime();
-    let newToday = 0;
-    let strongDeals = 0;
-    for (const listing of listings) {
-      if (listing.aiFiltered || listing.hidden) continue;
-      // Posted today, not merely bumped or re-seen today: OLX refreshes keep
-      // old offers at the top of "newest". Sources without a posting time
-      // fall back to when Scout first saw the listing.
-      const arrivedAt = listing.postedAt ?? listing.firstSeenAt ?? listing.observedAt;
-      if (Date.parse(arrivedAt) >= todayTime) newToday += 1;
-      // Strong and above (>=12% below typical), the same tier as the Strong+ filters.
-      if (listing.dealStrength >= 3) strongDeals += 1;
-    }
+    const listings = top === null && options.listings === 'none' ? [] : this.getListings(watches, true);
     const lastScan = parseJson<{ at?: string }>(this.getSetting('last_scan'), {});
     return {
       watches: top === null ? watches : [],
@@ -6038,11 +6035,33 @@ export class ScoutService {
       connectors: top === null ? this.getConnectors() : [],
       stats: {
         watching: watches.reduce((count, watch) => count + (watch.enabled ? 1 : 0), 0),
-        newToday,
-        strongDeals,
+        ...this.dashboardStats(watches),
       },
       lastScan: relativeTime(lastScan.at),
       lastScanTime: timeOnly(lastScan.at),
+    };
+  }
+
+  /**
+   * The dashboard's feed counters: the totals of the visible (not hidden)
+   * 12 h feed lists they stand for, counted by listingsPage itself.
+   * - `strongDeals`: Strong and above (deal strength 3+), the Strong+
+   *   filter's rows, kept by AI relevance filtering;
+   * - `newToday`: kept rows posted since local midnight, not merely bumped
+   *   or re-seen today (OLX refreshes keep old offers at the top of
+   *   "newest"); sources without a posting time fall back to when the watch
+   *   first saw the listing;
+   * - `aiFiltered`: the rows AI relevance filtering judged irrelevant.
+   */
+  private dashboardStats(watches: Watch[]) {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const count = (options: NonNullable<Parameters<ScoutService['listingsPage']>[0]>) =>
+      this.listingsPage({ ...options, visibility: 'visible', page: 1, pageSize: 1 }, watches).pagination.total;
+    return {
+      newToday: count({ aiFiltered: 'exclude', arrivedSince: today.toISOString() }),
+      strongDeals: count({ aiFiltered: 'exclude', minStrength: 3 }),
+      aiFiltered: count({ aiFiltered: 'only' }),
     };
   }
 

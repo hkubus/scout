@@ -79,7 +79,7 @@ test('scout_readiness and scout_dashboard report the empty database truthfully',
       assert.ok(readiness.status === 'ready' || readiness.status === 'not-ready');
 
       const dashboard = JSON.parse(toolText(await client.callTool({ name: 'scout_dashboard', arguments: {} }) as never));
-      assert.deepEqual(dashboard.stats, { watching: 0, newToday: 0, strongDeals: 0 });
+      assert.deepEqual(dashboard.stats, { watching: 0, newToday: 0, strongDeals: 0, aiFiltered: 0 });
     } finally {
       await client.close();
       await server.close();

@@ -122,7 +122,8 @@ export interface DealsInput {
 /**
  * "Strong+ deals right now": the visible feed at the tier and up, without
  * rows you passed or the description check rejected, best first in the Top
- * deals order (strength, then discount, then newest). Database only.
+ * deals order (strength, then untriaged first, then discount, then newest).
+ * Database only.
  */
 export function dealsForAgent(service: Pick<ScoutService, 'listingsPage'>, input: DealsInput = {}) {
   const minTier = input.minTier ?? 'strong';
