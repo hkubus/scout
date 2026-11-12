@@ -170,7 +170,8 @@ export function searchErrorKind(error: unknown): SearchErrorKind {
   return 'unknown';
 }
 
-const EMPTY_SOURCE: ManualSearchSourceDetail = { fetched: 0, matched: 0, aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, returned: 0, truncated: false, errorKind: null };
+/** A source that never got as far as fetching. */
+export const EMPTY_SEARCH_SOURCE: ManualSearchSourceDetail = { fetched: 0, matched: 0, aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, returned: 0, truncated: false, errorKind: null };
 
 function compactListing(listing: Listing, detail: ManualSearchListingDetail | undefined, ownerType: SearchFilters['ownerType']): CompactSearchListing {
   const listingId = detail?.listingId ?? listing.listingId ?? listing.id.slice(listing.id.indexOf(':') + 1);
@@ -213,7 +214,7 @@ export function toCompactSearch(input: Pick<SearchFilters, 'query' | 'page' | 'o
     page: Math.min(Math.max(Math.floor(input.page ?? 1), 1), 10),
     listings: result.listings.map((listing) => compactListing(listing, result.details.listings.get(listing.id), input.ownerType)),
     sources: result.sources.map((status) => {
-      const detail = result.details.sources.get(status.source) ?? EMPTY_SOURCE;
+      const detail = result.details.sources.get(status.source) ?? EMPTY_SEARCH_SOURCE;
       const failed = status.status === 'error';
       return {
         source: status.source,

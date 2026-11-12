@@ -19,7 +19,8 @@ import { Limiter, mapPool } from './limiter';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, ownRobustScale, percentile, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
 import { legacyTypoVariants, pickVariantBatch, typoVariantPairs, type TypoVariant } from './typos';
 import { isDamagedLabel, normalizeRequestedCondition } from './searchCondition';
-import { compactDuplicateNote, searchErrorKind, type ManualSearchDetailedResponse, type ManualSearchDetails } from './mcpFormat';
+import { EMPTY_SEARCH_SOURCE, compactDuplicateNote, searchErrorKind, type ManualSearchDetailedResponse, type ManualSearchDetails, type ManualSearchListingDetail, type ManualSearchSourceDetail } from './mcpFormat';
+import { SearchQueueTimeoutError, SearchRuns, manualSearchKey, type SearchRunHandle, type SearchRunSettings } from './searchRuns';
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
 import { matchQuality, matchQuery, type MatchCandidate, type QueryMatch } from './queryMatch';
 import { conditionClass, daysListed, groupOutcomes, MIN_OUTCOME_AGREED, priceDrops, shareOfAsking, titleSimilarity, type OutcomeRow } from './negotiation';
@@ -324,6 +325,35 @@ function searchTypoVariantCount() {
   return Math.min(Math.max(configured, 0), MAX_SEARCH_TYPO_VARIANTS);
 }
 
+/** The 1-based marketplace page a manual search asks for (1 to 10). */
+function manualSearchPage(input: Pick<SearchFilters, 'page'>) {
+  return Math.min(Math.max(Math.floor(input.page ?? 1), 1), 10);
+}
+
+/** One marketplace's share of a manual search, reported as soon as it finishes. */
+interface ManualSearchPart {
+  listings: Listing[];
+  status: SearchSourceStatus;
+  detail: ManualSearchSourceDetail;
+  listingDetails: Array<[string, ManualSearchListingDetail]>;
+}
+
+/** Manual searches allowed to run at once; more wait for a slot. */
+const MANUAL_SEARCH_SLOTS = 3;
+/**
+ * How long a manual search may take, the wait for a slot included
+ * (SCOUT_SEARCH_DEADLINE_MS, 5 to 120 s). 45 s fits behind nginx's 60 s
+ * default proxy timeout and inside the apps' 90 s.
+ */
+const DEFAULT_SEARCH_DEADLINE_MS = 45_000;
+const MIN_SEARCH_DEADLINE_MS = 5_000;
+const MAX_SEARCH_DEADLINE_MS = 120_000;
+function searchDeadlineMs(requested?: number | null) {
+  const configured = Number.parseInt(process.env.SCOUT_SEARCH_DEADLINE_MS ?? '', 10);
+  const value = requested ?? (Number.isFinite(configured) ? configured : DEFAULT_SEARCH_DEADLINE_MS);
+  return Math.min(Math.max(Math.floor(value), MIN_SEARCH_DEADLINE_MS), MAX_SEARCH_DEADLINE_MS);
+}
+
 /** A new deal watch, with every default already filled in. */
 export interface WatchPatch {
   name?: string; query?: string; terms?: string; excluded?: string; sources?: Marketplace[];
@@ -392,6 +422,8 @@ export interface ScoutServiceDependencies {
   inboxFetch?: (url: string, init: RequestInit) => Promise<Response>;
   publicExposureWarning?: boolean;
   authEnabled?: boolean;
+  /** Manual-search queue settings (tests shrink them); defaults come from the environment. */
+  manualSearch?: Partial<SearchRunSettings>;
 }
 
 function inboxServiceError(error: unknown) {
@@ -812,13 +844,14 @@ export class ScoutService {
   private readonly publicExposureWarning: boolean;
   private readonly authEnabled: boolean;
   private readonly schedulerOwner = `scheduler-${process.pid}-${randomBytes(8).toString('hex')}`;
-  private activeManualSearches = 0;
   private logSequence = 0;
   private readonly logBuffer: LogEntry[] = [];
+  private readonly searchRuns: SearchRuns<ManualSearchPart, ManualSearchPart[]>;
 
   constructor(db: Database, emit: (event: string, payload: unknown) => void, dependencies: ScoutServiceDependencies = {}) {
     this.db = db;
     this.emit = emit;
+    this.searchRuns = new SearchRuns({ slots: MANUAL_SEARCH_SLOTS, deadlineMs: searchDeadlineMs(), ...dependencies.manualSearch });
     this.classifyListingRelevance = dependencies.classifyListingRelevance ?? classifyListingRelevanceWithDeepSeek;
     this.verifyListingDescription = dependencies.verifyListingDescription ?? verifyListingDescriptionWithDeepSeek;
     this.jevRelevance = dependencies.classifyListingRelevanceWithJev ?? classifyListingRelevanceWithJev;
@@ -4807,24 +4840,64 @@ export class ScoutService {
     return { ...response, details };
   }
 
-  /** `details`, when given, is filled in place; the response itself is the same either way. */
+  /**
+   * `details`, when given, is filled in place; the response itself is the
+   * same either way. Up to three searches run at once; the rest wait for a
+   * slot until their deadline, and an identical search already running is
+   * joined rather than run twice.
+   */
   async manualSearch(input: SearchFilters, details?: ManualSearchDetails): Promise<ManualSearchResponse> {
-    if (this.activeManualSearches >= 3) throw new ServiceError('Three manual searches are already running. Try again shortly.', 429);
     // Resolved before any fetch, so an unknown watch id costs no marketplace request.
     const scoring = this.searchScoring(input);
-    this.activeManualSearches += 1;
+    const page = manualSearchPage(input);
+    // Misspellings of the query ride along on page 1 only, most realistic first.
+    const typoPairs = input.typoVariants && page === 1 ? typoVariantPairs(input.query, { max: searchTypoVariantCount() }) : [];
+    let parts: ManualSearchPart[];
+    try {
+      parts = await this.searchRuns.search(manualSearchKey(input), {
+        execute: (run) => this.runManualSearch(input, scoring, typoPairs, run),
+        // Stream each source to the client that asked, so a fast marketplace
+        // is visible while a slow one is still fetching. The response stays
+        // authoritative and reconciles anything the stream missed.
+        onPart: (part) => this.emitSearchProgress(input.searchId, page, part.status.source, part.status, part.listings),
+      });
+    } catch (error) {
+      if (error instanceof SearchQueueTimeoutError) throw new ServiceError(error.message, 429);
+      throw error;
+    }
+    if (details) {
+      for (const part of parts) {
+        details.sources.set(part.status.source, part.detail);
+        for (const [key, detail] of part.listingDetails) details.listings.set(key, detail);
+      }
+    }
+    const unique = new Map<string, Listing>();
+    for (const listing of parts.flatMap((part) => part.listings)) unique.set(listing.id, listing);
+    return {
+      listings: [...unique.values()].sort((a, b) => a.price - b.price),
+      sources: parts.map((part) => part.status),
+      ...(scoring === undefined ? {} : { scoredAgainst: scoring?.scoredAgainst ?? null }),
+      ...(input.typoVariants ? { typoVariants: typoPairs.map((variant) => variant.query) } : {}),
+    };
+  }
+
+  /** One manual search's marketplaces, each reported to the run as it finishes. */
+  private async runManualSearch(
+    input: SearchFilters,
+    scoring: ReturnType<ScoutService['searchScoring']>,
+    typoPairs: TypoVariant[],
+    run: SearchRunHandle<ManualSearchPart>,
+  ): Promise<ManualSearchPart[]> {
     // The client pages through results; marketplaces cap their own page size.
-    const page = Math.min(Math.max(Math.floor(input.page ?? 1), 1), 10);
+    const page = manualSearchPage(input);
     // Free text from agents ("używany", "na części"): one known condition, or
     // any condition with a note rather than an empty page.
     const requested = normalizeRequestedCondition(input.condition);
     const condition = requested.condition;
     const conditionNote = requested.recognized ? '' : ` · condition "${String(input.condition).trim()}" not recognised, showing any condition`;
-    // Misspellings of the query ride along on page 1 only, most realistic first.
-    const typoPairs = input.typoVariants && page === 1 ? typoVariantPairs(input.query, { max: searchTypoVariantCount() }) : [];
     const listingKey = (listing: NormalizedListing) => `${listing.marketplace}:${listing.listingId}`;
-    try {
-      const tasks = input.sources.map(async (source) => {
+    const report = (part: ManualSearchPart) => { run.report(part); return part; };
+    const tasks = input.sources.map(async (source): Promise<ManualSearchPart> => {
       const started = Date.now();
       // A marketplace that failed repeatedly is paused for scans; searches
       // skip it too unless asked not to. Read-only: a search never records a
@@ -4835,9 +4908,7 @@ export class ScoutService {
           source, status: 'error', count: 0, pendingShipping: 0, durationMs: 0,
           message: `Skipped: connector backoff active until ${backoffUntil} after repeated failed scans`, backoffUntil,
         };
-        details?.sources.set(source, { fetched: 0, matched: 0, aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, returned: 0, truncated: false, errorKind: 'backoff' });
-        this.emitSearchProgress(input.searchId, page, source, status, []);
-        return { listings: [] as Listing[], status };
+        return report({ listings: [], status, detail: { ...EMPTY_SEARCH_SOURCE, errorKind: 'backoff' }, listingDetails: [] });
       }
       try {
         const searchOptions = { ...input, condition, olxCategoryId: input.olxCategory?.id ?? null, page };
@@ -4996,23 +5067,25 @@ export class ScoutService {
             : 'No matching listings'}${conditionNote}`,
           ...(input.typoVariants ? { variants: variantStatuses } : {}),
         };
-        if (details) {
-          // Strict means every query term matched; a kept row that is neither
-          // strict nor rescued came through the relaxed (most-terms) pass.
-          // A typo row matched every word of the query or of its own spelling.
-          const strictKeys = new Set([...strict, ...typoFiltered].map(listingKey));
-          for (const listing of capped) {
-            const key = `${listing.marketplace}:${listing.listingId}`;
-            details.listings.set(key, {
-              listingId: listing.listingId,
-              // A check that threw kept the listing without a verdict, as the budget running out does.
-              relevance: relevanceResult?.statuses?.get(listing) ?? (relevanceFailed ? 'unknown' : 'not-checked'),
-              match: rescuedKeys.has(key) ? 'rescued' : strictKeys.has(key) ? 'strict' : 'relaxed',
-              matchedVia: matchedVia(listing),
-              flags: [],
-            });
-          }
-          details.sources.set(source, {
+        // Strict means every query term matched; a kept row that is neither
+        // strict nor rescued came through the relaxed (most-terms) pass.
+        // A typo row matched every word of the query or of its own spelling.
+        const strictKeys = new Set([...strict, ...typoFiltered].map(listingKey));
+        const listingDetails = capped.map((listing): [string, ManualSearchListingDetail] => {
+          const key = listingKey(listing);
+          return [key, {
+            listingId: listing.listingId,
+            // A check that threw kept the listing without a verdict, as the budget running out does.
+            relevance: relevanceResult?.statuses?.get(listing) ?? (relevanceFailed ? 'unknown' : 'not-checked'),
+            match: rescuedKeys.has(key) ? 'rescued' : strictKeys.has(key) ? 'strict' : 'relaxed',
+            matchedVia: matchedVia(listing),
+            flags: [],
+          }];
+        });
+        return report({
+          listings,
+          status,
+          detail: {
             fetched: fetched.length + typoRows.length,
             matched: filtered.length,
             aiExcluded: relevanceResult?.excluded ?? 0,
@@ -5021,33 +5094,16 @@ export class ScoutService {
             returned: listings.length,
             truncated,
             errorKind: null,
-          });
-        }
-        // Stream this source to the originating client so a fast marketplace is
-        // visible while a slow one is still fetching. The HTTP response below
-        // stays authoritative and reconciles anything the stream missed.
-        this.emitSearchProgress(input.searchId, page, source, status, listings);
-        return { listings, status };
+          },
+          listingDetails,
+        });
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Search failed';
         const status: SearchSourceStatus = { source, status: 'error', count: 0, pendingShipping: 0, durationMs: Date.now() - started, message };
-        details?.sources.set(source, { fetched: 0, matched: 0, aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, returned: 0, truncated: false, errorKind: searchErrorKind(error) });
-        this.emitSearchProgress(input.searchId, page, source, status, []);
-        return { listings: [] as Listing[], status };
+        return report({ listings: [], status, detail: { ...EMPTY_SEARCH_SOURCE, errorKind: searchErrorKind(error) }, listingDetails: [] });
       }
-      });
-      const results = await Promise.all(tasks);
-      const unique = new Map<string, Listing>();
-      for (const listing of results.flatMap((result) => result.listings)) unique.set(listing.id, listing);
-      return {
-        listings: [...unique.values()].sort((a, b) => a.price - b.price),
-        sources: results.map((result) => result.status),
-        ...(scoring === undefined ? {} : { scoredAgainst: scoring?.scoredAgainst ?? null }),
-        ...(input.typoVariants ? { typoVariants: typoPairs.map((variant) => variant.query) } : {}),
-      };
-    } finally {
-      this.activeManualSearches -= 1;
-    }
+    });
+    return Promise.all(tasks);
   }
 
   /**
