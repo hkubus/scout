@@ -172,4 +172,4 @@ Each milestone is one reviewable unit: branch per milestone, run `npm run typech
 ## Open decisions logged for the user (do not resolve silently)
 
 1. Whether the reference-band fallback may ever loosen the alert readiness gate (plan assumes: no).
-2. Whether `estimatedMedianPrice` stays exposed alongside `saleBand` or is replaced in the UI (plan: keep field one release, replace UI label with "Probable-sale median").
+2. Whether `estimatedMedianPrice` stays exposed alongside `saleBand` or is replaced in the UI (plan: keep field one release, replace UI label with "Probable-sale median"). Resolved: the UI moved to `saleBand`, and `estimatedMedianPrice` was then dropped from the API, MCP output and ScoutKit; the page-level `aggregates.overallMedianPrice` remains.

@@ -2041,7 +2041,7 @@ test('keeps market research separate and reports ended-listing price estimates',
     const research = context.service.marketResearch();
     const { saleBand, ...marketWatch } = research.watches[0];
     assert.deepEqual(marketWatch, {
-      id: 'market-watch', name: 'GPU market', query: 'rtx 4070', terms: '12gb', excluded: 'parts', location: 'Polska', condition: 'New', sources: ['OLX', 'Vinted'], intervalHours: 24, minPrice: 1000, maxPrice: 2500, shippingOnly: true, typoVariants: false, olxCategory: null, enabled: true, nextScan: 'due now', lastScan: 'just now', totalListings: 3, activeListings: 1, endedListings: 2, estimatedMedianPrice: 2200,
+      id: 'market-watch', name: 'GPU market', query: 'rtx 4070', terms: '12gb', excluded: 'parts', location: 'Polska', condition: 'New', sources: ['OLX', 'Vinted'], intervalHours: 24, minPrice: 1000, maxPrice: 2500, shippingOnly: true, typoVariants: false, olxCategory: null, enabled: true, nextScan: 'due now', lastScan: 'just now', totalListings: 3, activeListings: 1, endedListings: 2,
     });
     // Both ended rows lack a verified ended reason, so the band stays open.
     assert.deepEqual({ ...saleBand, computedAt: null }, { p25: null, median: null, p75: null, sampleCount: 2, eligibleCount: 0, excludedStale: 0, windowDays: 90, computedAt: null });
@@ -2049,7 +2049,6 @@ test('keeps market research separate and reports ended-listing price estimates',
     assert.equal(research.watches[0].totalListings, 3);
     assert.equal(research.watches[0].activeListings, 1);
     assert.equal(research.watches[0].endedListings, 2);
-    assert.equal(research.watches[0].estimatedMedianPrice, 2200);
     assert.equal(research.listings.find((item) => item.listingId === 'ended-1')?.observations, 1);
     context.service.deleteMarketWatch('market-watch');
     assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM market_listings').get() as { count: number }).count, 0);
@@ -2452,6 +2451,10 @@ test('creates immutable research series and computes aggregates across the full 
     const insert = context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ended', 3)`);
     for (let price = 1; price <= 401; price += 1) insert.run('median-watch', 'median-watch:v1', 'OLX', `median-${price}`, 'CPU', `https://www.olx.pl/d/oferta/median-${price}`, price, price, price, now, now);
+    // Another watch's ended price counts only in the unscoped aggregate.
+    context.service.createMarketWatch({ id: 'other-watch', name: 'Other', query: 'gpu', terms: '', excluded: '', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
+    insert.run('other-watch', 'other-watch:v1', 'OLX', 'other-1', 'GPU', 'https://www.olx.pl/d/oferta/other-1', 9000, 9000, 9000, now, now);
+    assert.equal(context.service.marketResearch().aggregates?.overallMedianPrice, 201.5);
     const research = context.service.marketResearch({ page: 2, pageSize: 100, watchId: 'median-watch' });
     assert.equal(research.aggregates?.overallMedianPrice, 201);
     assert.deepEqual(research.pagination, { page: 2, pageSize: 100, total: 401, hasNext: true });

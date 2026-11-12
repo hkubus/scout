@@ -23,7 +23,7 @@ const MARKETPLACES = ['OLX', 'Allegro Lokalnie', 'Vinted'];
 const COMPACT_LISTING_KEYS = [
   'id', 'listingId', 'source', 'title', 'price', 'shipping', 'shippingAvailable', 'url', 'image', 'sellerType',
   'condition', 'location', 'negotiable', 'postedAt', 'refreshedAt', 'relevance', 'match', 'matchedVia', 'flags',
-  'jevCheck', 'jevCheckNote',
+  'jevCheck', 'jevCheckNote', 'deal',
 ];
 const COMPACT_SOURCE_KEYS = [
   'source', 'status', 'errorKind', 'message', 'fetched', 'matched', 'returned', 'aiExcluded', 'aiUnknown',
@@ -97,7 +97,7 @@ test('compact scout_search: stable keys, the documented values and one line of J
       assert.ok(!text.includes('\n'), 'compact output has no newline');
       const payload = JSON.parse(text);
       assertHatContract(payload);
-      assert.deepEqual(Object.keys(payload), ['schemaVersion', 'format', 'query', 'page', 'listings', 'sources']);
+      assert.deepEqual(Object.keys(payload), ['schemaVersion', 'format', 'query', 'page', 'listings', 'sources', 'scoredAgainst']);
       assert.equal(payload.query, '13 128gb');
       assert.equal(payload.page, 1);
       // The fixture's second offer is free and never parsed.
@@ -110,7 +110,7 @@ test('compact scout_search: stable keys, the documented values and one line of J
         url: 'https://www.olx.pl/d/oferta/iphon-13-128gb-100-baterii-black-CID99-ID1bVYyE.html', image: '<checked>',
         sellerType: null, condition: 'Używane', location: 'Małopolskie, Łapanów', negotiable: false,
         postedAt: '2026-08-20T17:40:08.000Z', refreshedAt: '2026-08-31T14:51:09.000Z',
-        relevance: 'not-checked', match: 'strict', matchedVia: 'query', flags: [], jevCheck: null, jevCheckNote: null,
+        relevance: 'not-checked', match: 'strict', matchedVia: 'query', flags: [], jevCheck: null, jevCheckNote: null, deal: null,
       });
       const [source] = payload.sources;
       assert.equal(typeof source.durationMs, 'number');

@@ -340,10 +340,12 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       olxCategoryId: z.number().int().positive().optional().describe('OLX only: search one category; ids come from scout_olx_categories.'),
       page: z.number().int().min(1).max(10).optional().default(1),
       sort: z.enum(MARKETPLACE_SEARCH_SORTS).optional().default('relevance')
-        .describe('Which listings each marketplace returns: relevance keeps its own order; newest asks for the most recently posted first, as watch scans do, to catch fresh underpriced ones. Allegro Lokalnie lists newest first either way. Results still come back sorted by price.'),
+        .describe('Which listings each marketplace returns: relevance keeps its own ranking; newest asks for the most recently posted first, as watch scans do, to catch fresh underpriced ones. Allegro Lokalnie lists newest first either way. Results still come back sorted by price.'),
       aiRelevance: z.boolean().optional().default(true),
       verificationChecks: z.array(z.object({ text: z.string().trim().min(1).max(120), mode: z.enum(['require', 'exclude']) })).max(8).optional()
         .describe('Jev reads each result: exclude hides near-certain matches; require-confirmed results come back with jevCheck "passed".'),
+      scoreAgainst: z.string().trim().min(1).max(160).optional()
+        .describe('"auto" or a watch id. Each result gets deal {typical, discountPercent, deviation, tier, label, qualifies, basis, variantKey, variantLabel}, scored against that watch\'s learned typical asking price exactly as its scan would; deal is null where the watch\'s own filters would not keep the result. "auto" picks the watch the query names (the scout_price_reference match); scoredAgainst says which, or is null when none matches. Compact rows carry deal too. Database only: no extra fetch or AI call.'),
       format: z.enum(['full', 'compact']).optional().default('full')
         .describe('compact: smaller, stable rows with every key present (null when unknown): id "<Marketplace>:<listingId>", asking price in PLN, relevance, match kind; sources carry status ok|error with an errorKind and pipeline counts.'),
     },

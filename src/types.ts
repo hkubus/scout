@@ -112,6 +112,12 @@ export interface Listing {
   estimatedNet?: number | null;
   /** The price is at or below the watch's target price. */
   targetHit?: boolean;
+  /**
+   * Manual search with scoreAgainst only: this result scored against the
+   * watch's learned typical the way its scan would. Null when the watch's own
+   * filters would not keep the result.
+   */
+  deal?: SearchDeal | null;
   /** Manual search only: Jev's verdict on the search's checks (rejected listings are not returned). */
   jevCheck?: "passed" | "unconfirmed" | "unchecked";
   /** Failed or unconfirmed checks, or why the listing was not checked. */
@@ -617,6 +623,43 @@ export interface SearchFilters {
   aiRelevance?: boolean;
   /** Things for Jev to confirm (require) or rule out (exclude) on each result. */
   verificationChecks?: VerificationCheck[];
+  /**
+   * Score each result against a watch's learned typical: "auto" picks the
+   * watch the query matches, anything else is a watch id. Database only.
+   */
+  scoreAgainst?: string | null;
+}
+
+/**
+ * A manual-search result priced against a watch's baseline, exactly as the
+ * watch's scan would score it at this price. Asking prices, not sales.
+ */
+export interface SearchDeal {
+  /** The variant bucket's typical asking price; null while the watch is still learning it. */
+  typical: number | null;
+  /** Percent below the typical, one decimal; negative above it. */
+  discountPercent: number | null;
+  /** Robust z-score below the typical, two decimals. */
+  deviation: number | null;
+  /** Deal strength on the feed's scale: 5 Exceptional, 4 Very strong, 3 Strong, 2 Watch, 1 at or above typical. */
+  tier: number | null;
+  label: DealLabel | null;
+  /** Clears the watch's deal bar (a ready baseline, 18%+ off and the spread test), as a scan decides. */
+  qualifies: boolean;
+  /** own-history: the watch's ready baseline; reference-band: its research series while learning; learning: no typical yet. */
+  basis: 'own-history' | 'reference-band' | 'learning';
+  /** The model variant this result scored in, on a watch with variants. */
+  variantKey: string | null;
+  variantLabel: string | null;
+}
+
+/** Which watch a manual search's results were scored against (scoreAgainst). */
+export interface SearchScoredAgainst {
+  watchId: string;
+  name: string;
+  /** How the query matched the watch; null when scoreAgainst named a watch the query does not match. */
+  match: 'exact' | 'variant' | 'broader' | 'narrower' | null;
+  notes: string[];
 }
 
 export interface SearchSourceStatus {
@@ -632,6 +675,8 @@ export interface SearchSourceStatus {
 export interface ManualSearchResponse {
   listings: Listing[];
   sources: SearchSourceStatus[];
+  /** Only when scoreAgainst was sent: the watch used, or null when "auto" matched none. */
+  scoredAgainst?: SearchScoredAgainst | null;
 }
 
 /** Probable-sale estimate band — never a confirmed/completed-sale price. */
@@ -669,7 +714,6 @@ export interface MarketWatch {
   totalListings: number;
   activeListings: number;
   endedListings: number;
-  estimatedMedianPrice: number | null;
   saleBand: SaleBand | null;
   activeVersionId?: string | null;
 }

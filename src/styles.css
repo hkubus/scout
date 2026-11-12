@@ -301,6 +301,9 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .shipping-state--unknown { color: var(--muted); }
 .search-price-cell { display: grid; align-content: center; gap: 3px; }
 .search-price-cell > strong { color: var(--text-strong); font-size: inherit; }
+.search-deal { color: var(--muted); font-size: 11px; }
+.search-deal .discount-cell { font-size: inherit; }
+.search-scored-note { margin: -4px 0 10px; color: var(--muted); font-size: 12px; }
 .negotiability-state { width: fit-content; padding: 2px 5px; border-radius: 4px; background: var(--surface-muted); font-size: 9px; font-weight: 650; line-height: 1.2; white-space: nowrap; }
 .negotiability-state--yes { color: var(--green); background: rgba(58, 171, 97, .1); }
 .negotiability-state--no { color: var(--muted); }
