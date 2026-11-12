@@ -40,19 +40,27 @@ function doubledLetterRemovals(token: string): string[] {
   return variants;
 }
 
+/** One misspelled query, and the query words it changed (`from`) into which (`to`). */
+export interface TypoVariant {
+  query: string;
+  from: string;
+  to: string;
+}
+
 /**
- * Up to `max` unique, deterministic misspellings of the query. Tokens shorter
- * than six characters are left alone (their mutations are noise, not typos).
- * One token is mutated per variant; every other token stays verbatim.
+ * Up to `max` unique, deterministic misspellings of the query, each with the
+ * token it changed. Tokens shorter than six characters are left alone (their
+ * mutations are noise, not typos). One token is mutated per variant; every
+ * other token stays verbatim.
  */
-export function typoVariants(query: string, opts: { max?: number } = {}): string[] {
+export function typoVariantPairs(query: string, opts: { max?: number } = {}): TypoVariant[] {
   const max = Math.max(0, Math.floor(opts.max ?? 3));
   const tokens = query.trim().split(/\s+/).filter(Boolean);
-  const variants: string[] = [];
-  const push = (candidate: string) => {
+  const variants: TypoVariant[] = [];
+  const push = (candidate: string, from: string, to: string) => {
     if (variants.length >= max) return;
-    if (candidate === query || variants.includes(candidate)) return;
-    variants.push(candidate);
+    if (candidate === query || variants.some((variant) => variant.query === candidate)) return;
+    variants.push({ query: candidate, from, to });
   };
   for (let index = 0; index < tokens.length && variants.length < max; index += 1) {
     const token = tokens[index];
@@ -63,11 +71,16 @@ export function typoVariants(query: string, opts: { max?: number } = {}): string
       ...doubledLetterRemovals(token),
     ];
     for (const candidate of candidates) {
-      push([...tokens.slice(0, index), candidate, ...tokens.slice(index + 1)].join(' '));
+      push([...tokens.slice(0, index), candidate, ...tokens.slice(index + 1)].join(' '), token, candidate);
       if (variants.length >= max) break;
     }
   }
   return variants;
+}
+
+/** The misspelled queries alone; see typoVariantPairs. */
+export function typoVariants(query: string, opts: { max?: number } = {}): string[] {
+  return typoVariantPairs(query, opts).map((variant) => variant.query);
 }
 
 /**
@@ -76,7 +89,7 @@ export function typoVariants(query: string, opts: { max?: number } = {}): string
  * Over enough scans every variant is fetched; no scan ever fetches more
  * than `max` of them.
  */
-export function pickVariantBatch(variants: string[], scanOrdinal: number, max: number): string[] {
+export function pickVariantBatch<T>(variants: T[], scanOrdinal: number, max: number): T[] {
   if (!variants.length || max <= 0) return [];
   const start = ((Math.floor(scanOrdinal) % variants.length) + variants.length) % variants.length;
   const count = Math.min(max, variants.length);

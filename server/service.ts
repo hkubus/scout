@@ -17,7 +17,7 @@ import { InboxError, MarketplaceInbox, hasRefreshToken, isSessionRenewalRequest,
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { Limiter, mapPool } from './limiter';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, ownRobustScale, percentile, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
-import { pickVariantBatch, typoVariants } from './typos';
+import { pickVariantBatch, typoVariantPairs, typoVariants, type TypoVariant } from './typos';
 import { isDamagedLabel, normalizeRequestedCondition } from './searchCondition';
 import { compactDuplicateNote, searchErrorKind, type ManualSearchDetailedResponse, type ManualSearchDetails } from './mcpFormat';
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
@@ -6185,20 +6185,34 @@ export class ScoutService {
             : await this.fetchSearchPages(source, row.query, searchFilters, onPath);
           // Typo variants append at most one page per variant query after the
           // main page; exact-URL watches pin their own searches instead.
-          const variantQueries = matchingExact.length || !row.typo_variants
+          const variantBatch = matchingExact.length || !row.typo_variants
             ? []
-            : pickVariantBatch(typoVariants(String(row.query)), scanOrdinal(), TYPO_VARIANTS_PER_SCAN);
+            : pickVariantBatch(typoVariantPairs(String(row.query)), scanOrdinal(), TYPO_VARIANTS_PER_SCAN);
+          const listingKey = (listing: NormalizedListing) => `${listing.marketplace}:${listing.listingId}`;
+          const fetched = [...new Map(mainListings.map((listing) => [listingKey(listing), listing])).values()];
+          // A row only a variant page returned remembers the misspelling that
+          // found it; the main page wins a row both returned.
+          const foundByTypo = new Map<string, TypoVariant>();
+          const seenKeys = new Set(fetched.map(listingKey));
           const variantFetches: string[] = [];
-          for (const variantQuery of variantQueries) {
-            variantFetches.push(`"${variantQuery}"`);
-            mainListings.push(...await this.fetchSearchPages(source, variantQuery, searchFilters, onPath));
+          for (const variant of variantBatch) {
+            variantFetches.push(`"${variant.query}"`);
+            for (const listing of await this.fetchSearchPages(source, variant.query, searchFilters, onPath)) {
+              const key = listingKey(listing);
+              if (seenKeys.has(key)) continue;
+              seenKeys.add(key);
+              foundByTypo.set(key, variant);
+              fetched.push(listing);
+            }
           }
-          const fetched = [...new Map(mainListings.map((listing) => [`${listing.marketplace}:${listing.listingId}`, listing])).values()];
           this.log('info', 'watch', `${row.name} · ${source}: ${matchingExact.length ? `exact-urls (${matchingExact.length})` : 'query-search'}${variantFetches.length ? ` + typo-variants (${variantFetches.join(', ')})` : ''} → ${paths.join(' → ') || 'no fetch'} · fetched=${fetched.length}`);
           const deterministicFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, sellerType: sellerTypeFromRow(row.seller_type), ignorePromoted: Boolean(row.ignore_promoted), shippingOnly: false };
-          const comparable = filterListings(fetched, row.query, row.included_terms, row.excluded_terms, deterministicFilters);
+          const filterScan = (rows: NormalizedListing[], filters: ListingFilters) => foundByTypo.size
+            ? filterTypoRows(rows, (listing) => foundByTypo.get(listingKey(listing)), row.query, row.included_terms ?? '', row.excluded_terms ?? '', filters)
+            : filterListings(rows, row.query, row.included_terms, row.excluded_terms, filters);
+          const comparable = filterScan(fetched, deterministicFilters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
-          let filtered = filterListings(comparable, row.query, row.included_terms, row.excluded_terms, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) });
+          let filtered = filterScan(comparable, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) });
           // Per-variant baselines and first-observation queries are computed
           // once per scan, before the AI passes: both the fuzzy rescue and the
           // relevance pass need the same scoring to decide which listings are
@@ -6217,7 +6231,10 @@ export class ScoutService {
           try {
             // The watch's AI relevance switch covers the rescue too, as it does on manual search.
             if (!matchingExact.length && (row.ai_relevance === undefined || Boolean(row.ai_relevance))) {
-              const rescued = await this.fuzzyRescueForSearch(fetched, {
+              // A typo row kept by its own spelling is no near-miss to rescue.
+              const comparableKeys = new Set(comparable.map(listingKey));
+              const rescuePool = foundByTypo.size ? fetched.filter((listing) => !comparableKeys.has(listingKey(listing))) : fetched;
+              const rescued = await this.fuzzyRescueForSearch(rescuePool, {
                 query: row.query, includedTerms: row.included_terms ?? '', excludedTerms: row.excluded_terms ?? '', condition: row.condition,
               }, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) }, source, strongEnough);
               if (rescued.length) {
@@ -7642,6 +7659,50 @@ export function filterListings(listings: NormalizedListing[], query: string, inc
   // typed explicit included terms (those are a hard requirement).
   if (strict.length || !options.relaxTerms || explicitTerms) return strict;
   return evaluate(true);
+}
+
+/**
+ * Typed included terms with the typo variant's misspelling swapped in, so a
+ * row found by "iphon 13" is held to "iphon" where the user typed "iphone".
+ * A term without the corrected word stays as typed.
+ */
+export function rewriteTypoTerms(includedRaw: string, variant: TypoVariant) {
+  const from = normalizeFilterText(variant.from);
+  const to = normalizeFilterText(variant.to);
+  if (!from || !includedRaw.trim()) return includedRaw;
+  return includedRaw.split(',').map((term) => {
+    const normalized = ` ${normalizeFilterText(term)} `;
+    return normalized.includes(` ${from} `) ? normalized.replace(` ${from} `, ` ${to} `).trim() : term;
+  }).join(',');
+}
+
+/**
+ * filterListings for a scan that also fetched typo-variant pages. A row only
+ * a variant page returned is kept when it matches the original query or the
+ * misspelling it was found by; every other row is held to the original query
+ * alone. Plain substring matching against the original query drops "Iphon 13"
+ * for "iphone 13", which is the row the variant exists to find.
+ */
+export function filterTypoRows(
+  listings: NormalizedListing[],
+  variantOf: (listing: NormalizedListing) => TypoVariant | undefined,
+  query: string,
+  includedRaw: string,
+  excludedRaw: string,
+  filters: ListingFilters,
+) {
+  const kept = new Set(filterListings(listings, query, includedRaw, excludedRaw, filters));
+  const byVariant = new Map<TypoVariant, NormalizedListing[]>();
+  for (const listing of listings) {
+    if (kept.has(listing)) continue;
+    const variant = variantOf(listing);
+    if (!variant) continue;
+    byVariant.set(variant, [...(byVariant.get(variant) ?? []), listing]);
+  }
+  for (const [variant, group] of byVariant) {
+    for (const listing of filterListings(group, variant.query, rewriteTypoTerms(includedRaw, variant), excludedRaw, { ...filters, relaxTerms: false })) kept.add(listing);
+  }
+  return listings.filter((listing) => kept.has(listing));
 }
 
 /**
