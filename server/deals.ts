@@ -1,5 +1,5 @@
-import type { DealLabel, DuplicateSummary, Listing, ListingDecision, ListingDescriptionVerificationStatus, Marketplace, SellerType } from '../src/types';
-import { vintedFeesNote } from '../src/listingSignals';
+import type { DealLabel, Listing, ListingDecision, ListingDescriptionVerificationStatus, Marketplace, SellerType } from '../src/types';
+import { compactDuplicate, compactDuplicateNote, type CompactDuplicate } from './mcpFormat';
 import type { ScoutService } from './service';
 import { MATCH_VISIBILITY_MS } from './service';
 
@@ -67,23 +67,10 @@ export interface CompactListing {
   duplicateCheapest?: CompactDuplicate;
 }
 
-/** A likely copy of a compact row's item on another marketplace. */
-export interface CompactDuplicate {
-  /** `<Marketplace>:<listingId>`. */
-  id: string;
-  source: Marketplace;
-  /** Its asking price. */
-  price: number;
-  url: string;
-  /** When a scan last saw it. */
-  seenAt: string;
-  /** Only when either listing is on Vinted: its buyer-protection fee and shipping are in neither price. */
-  note?: string;
-}
-
-function compactDuplicate(listing: Listing, copy: DuplicateSummary): CompactDuplicate {
-  const note = vintedFeesNote(listing.marketplace, copy.marketplace);
-  return { id: copy.key, source: copy.marketplace, price: copy.price, url: copy.url, seenAt: copy.observedAt, ...(note ? { note } : {}) };
+/** A full listing row with the Vinted fees note on its cheapest copy, as the compact rows carry it. */
+export function withDuplicateNote<T extends Listing>(listing: T): T {
+  if (!listing.duplicateCheapest) return listing;
+  return { ...listing, duplicateCheapest: compactDuplicateNote(listing, listing.duplicateCheapest) };
 }
 
 export function compactListing(listing: Listing): CompactListing {

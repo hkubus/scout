@@ -18,7 +18,7 @@ import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { Limiter, mapPool } from './limiter';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, ownRobustScale, percentile, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
-import { searchErrorKind, type ManualSearchDetailedResponse, type ManualSearchDetails } from './mcpFormat';
+import { compactDuplicateNote, searchErrorKind, type ManualSearchDetailedResponse, type ManualSearchDetails } from './mcpFormat';
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
 import { matchQuality, matchQuery, type MatchCandidate, type QueryMatch } from './queryMatch';
 import { conditionClass, daysListed, outcomeShare, priceDrops, shareOfAsking, titleSimilarity } from './negotiation';
@@ -4257,11 +4257,17 @@ export class ScoutService {
    * in the last DUPLICATE_FEED_DAYS days; rows without such copies stay as
    * they are.
    */
-  private withDuplicates(listings: Listing[]) {
+  /**
+   * Adds duplicateCount and duplicateCheapest to rows with likely copies on
+   * other marketplaces seen in the last DUPLICATE_FEED_DAYS days. Search
+   * results only have copies once a scan stored them.
+   */
+  withDuplicates(listings: Listing[]) {
     const seenSince = new Date(Date.now() - DUPLICATE_FEED_DAYS * 24 * 60 * 60_000).toISOString();
-    const copies = this.duplicatesByKey(listings.map((listing) => [listing.marketplace, listing.listingId ?? '']), seenSince);
+    const listingIdOf = (listing: Listing) => listing.listingId ?? listing.id.slice(listing.marketplace.length + 1);
+    const copies = this.duplicatesByKey(listings.map((listing) => [listing.marketplace, listingIdOf(listing)]), seenSince);
     for (const listing of listings) {
-      const found = copies.get(`${listing.marketplace}:${listing.listingId}`);
+      const found = copies.get(`${listing.marketplace}:${listingIdOf(listing)}`);
       if (!found?.length) continue;
       const cheapest = found[0];
       listing.duplicateCount = found.length;
@@ -4411,7 +4417,11 @@ export class ScoutService {
       seller,
       relists,
     };
-    if (!compact) return { ...detail, negotiation, liveCheck };
+    if (!compact) {
+      // Agents get the Vinted fees note on each copy, as the compact detail has it.
+      const duplicates = detail.duplicates?.map((copy) => compactDuplicateNote({ marketplace }, copy));
+      return { ...detail, ...(duplicates ? { duplicates } : {}), negotiation, liveCheck };
+    }
 
     const listing = detail.listing;
     const result: CompactListingDetail = {

@@ -514,3 +514,47 @@ test('compact rows Hatbot reads (scout_deals, compact scout_listings) gain the c
     assert.deepEqual(withoutVinted.duplicateCheapest && { ...withoutVinted.duplicateCheapest, seenAt: undefined }, { id: 'Allegro Lokalnie:a1', source: 'Allegro Lokalnie', price: 1950, url: 'https://example.test/a1', seenAt: undefined });
   } finally { context.close(); }
 });
+
+test('full scout_listings rows and the full scout_listing_detail note Vinted fees on copies, as the compact formats do', async () => {
+  const context = fixture();
+  try {
+    seedThreeCopies(context.db);
+    context.service.refreshDuplicatePairs();
+    const rows = (await callTool(context.service, 'scout_listings', { visibility: 'all', pageSize: 50 })).listings;
+    const olx = rows.find((row: any) => row.id === 'OLX:o1');
+    assert.equal(olx.duplicateCount, 2);
+    assert.deepEqual({ ...olx.duplicateCheapest, observedAt: undefined }, { key: 'Vinted:v1', marketplace: 'Vinted', price: 1800, url: 'https://example.test/v1', observedAt: undefined, note: VINTED_FEES_NOTE });
+    // The REST rows stay as they were: the dashboard says it in the chip's tooltip.
+    assert.equal('note' in rowFor(context.service, 'OLX:o1').duplicateCheapest!, false);
+
+    const detail = await callTool(context.service, 'scout_listing_detail', { key: 'OLX:o1' });
+    assert.deepEqual(detail.duplicates.map((copy: any) => [copy.key, copy.note ?? null]), [['Vinted:v1', VINTED_FEES_NOTE], ['Allegro Lokalnie:a1', null]]);
+    assert.equal(typeof detail.duplicates[0].similarity, 'number');
+    const rest = context.service.listingDetail('OLX:o1');
+    assert.equal(rest.duplicates?.some((copy) => 'note' in copy), false);
+  } finally { context.close(); }
+});
+
+test('compact scout_search rows always carry duplicateCount and duplicateCheapest', async () => {
+  const context = fixture();
+  try {
+    seedThreeCopies(context.db);
+    context.service.refreshDuplicatePairs();
+    // A search result is not a stored row: no listingId field, only its id.
+    const { listingId: _stored, duplicateCount: _count, duplicateCheapest: _cheapest, ...olx } = rowFor(context.service, 'OLX:o1');
+    const fresh: Listing = { ...olx, id: 'OLX:fresh1', title: 'PlayStation 5 Slim, nowa', price: 2100 };
+    context.service.manualSearchDetailed = async () => ({
+      listings: [olx as Listing, fresh],
+      sources: [],
+      details: { listings: new Map(), sources: new Map() },
+    });
+    const search = await callTool(context.service, 'scout_search', { query: 'ps5', sources: ['OLX'], format: 'compact' });
+    const byId = new Map(search.listings.map((row: any) => [row.id, row]));
+    const stored = byId.get('OLX:o1') as any;
+    assert.equal(stored.duplicateCount, 2);
+    assert.deepEqual({ ...stored.duplicateCheapest, seenAt: undefined }, { id: 'Vinted:v1', source: 'Vinted', price: 1800, url: 'https://example.test/v1', seenAt: undefined, note: VINTED_FEES_NOTE });
+    const unstored = byId.get('OLX:fresh1') as any;
+    assert.equal(unstored.duplicateCount, 0);
+    assert.equal(unstored.duplicateCheapest, null);
+  } finally { context.close(); }
+});
