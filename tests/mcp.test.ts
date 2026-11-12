@@ -138,6 +138,35 @@ test('scout_listings defaults to a compact page and scout_queue_scan surfaces se
   } finally { context.close(); }
 });
 
+test('scout_listings qualifiesOnly keeps the listings whose last score would alert', async () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at)
+      VALUES ('cpu-watch', 'CPU watch', 'cpu', '["OLX"]', 1, ?, ?, ?)`).run(now, now, now);
+    const insertListing = context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    const link = context.db.prepare(`INSERT INTO watch_listings (watch_id, listing_id, typical_pln, typical_source, qualifies, first_seen_at, last_seen_at)
+      VALUES ('cpu-watch', ?, 1000, 'own-history', ?, ?, ?)`);
+    // Rows from before the score columns existed have NULL and do not qualify.
+    for (const [id, price, qualifies] of [['deal', 700, 1], ['fair', 980, 0], ['unscored', 600, null]] as const) {
+      const { lastInsertRowid } = insertListing.run('OLX', id, `CPU ${id}`, price, `https://www.olx.pl/d/oferta/${id}`, now, now);
+      link.run(lastInsertRowid, qualifies, now, now);
+    }
+    const { server, client } = await connectedClient(context.service);
+    try {
+      const tool = (await client.listTools()).tools.find((entry) => entry.name === 'scout_listings')!;
+      assert.equal((tool.inputSchema.properties as Record<string, { type?: string }>).qualifiesOnly?.type, 'boolean');
+      const ids = async (args: Record<string, unknown>) => (JSON.parse(toolText(await client.callTool({ name: 'scout_listings', arguments: args }) as never)).listings as Array<{ listingId: string }>).map((item) => item.listingId).sort();
+      assert.deepEqual(await ids({}), ['deal', 'fair', 'unscored']);
+      assert.deepEqual(await ids({ qualifiesOnly: false }), ['deal', 'fair', 'unscored']);
+      assert.deepEqual(await ids({ qualifiesOnly: true }), ['deal']);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});
+
 test('scout_deals answers Strong+ deals right now with no arguments, and scout_listings filters by tier and discount', async () => {
   const context = fixture();
   try {

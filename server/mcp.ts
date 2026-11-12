@@ -147,6 +147,7 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       sort: z.enum(['newest', 'strongest', 'price', 'discount']).optional().default('newest').describe('discount: furthest below typical first; rows without a typical last.'),
       decision: z.enum(['buy', 'watch', 'pass']).optional(),
       visibility: z.enum(['visible', 'hidden', 'all']).optional().default('visible'),
+      qualifiesOnly: z.boolean().optional().describe('Only listings that would alert: a deal score that passes the watch\'s alert gate and minimum saving, or a target-price hit, at the last scan. Very strong+ deals are also checked against their description before alerting, so ones the check rejected are left out.'),
       minTier: dealTier.optional().describe('Deal strength at least Strong (3), Very strong (4) or Exceptional (5).'),
       minDiscount: z.number().min(0).max(100).optional().describe('At least this percent below the typical price; rows without a typical are left out.'),
       variantKey: variantKey.optional(),
