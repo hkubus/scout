@@ -6871,11 +6871,14 @@ function storedScore(score: ScoreResult, withTypical: boolean): [number | null, 
  * "Would Scout alert?" for a feed row (aliases wl, l, w), as storeListing
  * decides it: a qualifying score that clears the watch's minimum saving, or
  * a price at or below its target. Both rules are read here rather than
- * stored, so editing them needs no rescore. Hidden listings, AI-filtered
- * ones and the description check before Very strong+ alerts are separate.
+ * stored, so editing them needs no rescore. A Very strong+ deal whose
+ * description check rejected it never alerts, so it is left out; one not
+ * checked yet stays in, since the check runs when it would alert. Hidden
+ * listings and AI-filtered ones are separate filters.
  */
-const QUALIFIES_SQL = `((wl.qualifies = 1 AND (w.min_saving_pln IS NULL OR w.min_saving_pln <= 0 OR wl.typical_pln - l.price_pln >= w.min_saving_pln))
-  OR (w.target_price_pln > 0 AND l.price_pln > 0 AND l.price_pln <= w.target_price_pln))`;
+const QUALIFIES_SQL = `(((wl.qualifies = 1 AND (w.min_saving_pln IS NULL OR w.min_saving_pln <= 0 OR wl.typical_pln - l.price_pln >= w.min_saving_pln))
+  OR (w.target_price_pln > 0 AND l.price_pln > 0 AND l.price_pln <= w.target_price_pln))
+  AND NOT (COALESCE(wl.deal_strength, 1) >= 4 AND COALESCE(l.ai_description_verification_status, '') = 'reject'))`;
 
 export function sellerTypeFromRow(value: unknown): SellerType | null {
   return value === 'private' || value === 'business' ? value : null;

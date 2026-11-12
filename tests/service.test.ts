@@ -4334,5 +4334,20 @@ test('storeListing keeps each listing\'s latest deal score, and qualifiesOnly li
     assert.deepEqual(qualifying(), ['deal', 'learning']);
     assert.deepEqual(qualifying({ q: 'deal' }), ['deal']);
     assert.equal(context.service.listingsPage({ qualifiesOnly: false }).pagination.total, 35);
+
+    // A Very strong+ deal the description check rejected never alerted;
+    // below Very strong there is no check, so a reject changes nothing.
+    const verdict = (status: string | null) => context.db.prepare("UPDATE listings SET ai_description_verification_status = ? WHERE listing_id = 'deal'").run(status);
+    const strength = (value: number) => context.db.prepare("UPDATE watch_listings SET deal_strength = ? WHERE watch_id = 'score-watch' AND listing_id = (SELECT id FROM listings WHERE listing_id = 'deal')").run(value);
+    strength(4);
+    verdict('reject');
+    assert.deepEqual(qualifying(), ['learning']);
+    verdict('pass');
+    assert.deepEqual(qualifying(), ['deal', 'learning']);
+    verdict(null);
+    assert.deepEqual(qualifying(), ['deal', 'learning'], 'not checked yet: the check runs when it would alert');
+    strength(3);
+    verdict('reject');
+    assert.deepEqual(qualifying(), ['deal', 'learning']);
   } finally { context.close(); }
 });
