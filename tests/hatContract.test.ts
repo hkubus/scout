@@ -27,7 +27,7 @@ const COMPACT_LISTING_KEYS = [
 ];
 const COMPACT_SOURCE_KEYS = [
   'source', 'status', 'errorKind', 'message', 'fetched', 'matched', 'returned', 'aiExcluded', 'aiUnknown',
-  'aiBudgetExhausted', 'truncated', 'pendingShipping', 'durationMs',
+  'aiBudgetExhausted', 'truncated', 'pendingShipping', 'durationMs', 'backoffUntil',
 ];
 
 function fixture(dependencies: ScoutServiceDependencies = {}) {
@@ -117,7 +117,7 @@ test('compact scout_search: stable keys, the documented values and one line of J
       assert.equal(typeof source.durationMs, 'number');
       assert.deepEqual({ ...source, durationMs: 0 }, {
         source: 'OLX', status: 'ok', errorKind: null, message: '1 matches', fetched: 1, matched: 1, returned: 1,
-        aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, truncated: false, pendingShipping: 0, durationMs: 0,
+        aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, truncated: false, pendingShipping: 0, durationMs: 0, backoffUntil: null,
       });
 
       // An OLX search narrowed to an owner type returns only that type.

@@ -339,7 +339,7 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
   });
 
   server.registerTool('scout_search', {
-    description: 'Live manual marketplace search (OLX, Allegro Lokalnie, Vinted) with deterministic and AI relevance filtering. Expensive: fetches live pages.',
+    description: 'Live manual marketplace search (OLX, Allegro Lokalnie, Vinted) with deterministic and AI relevance filtering. Expensive: fetches live pages. A marketplace paused after repeated failed scans is skipped and reported as an error unless ignoreBackoff is set.',
     inputSchema: {
       query: z.string().trim().min(1).max(240),
       sources: z.array(marketplace).min(1).max(3),
@@ -360,6 +360,8 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
         .describe('Jev reads each result: exclude hides near-certain matches; require-confirmed results come back with jevCheck "passed".'),
       scoreAgainst: z.string().trim().min(1).max(160).optional()
         .describe('"auto" or a watch id. Each result gets deal {typical, discountPercent, deviation, tier, label, qualifies, basis, variantKey, variantLabel}, scored against that watch\'s learned typical asking price exactly as its scan would; deal is null where the watch\'s own filters would not keep the result. "auto" picks the watch the query names (the scout_price_reference match); scoredAgainst says which, or is null when none matches. Compact rows carry deal too. Database only: no extra fetch or AI call.'),
+      ignoreBackoff: z.boolean().optional().default(false)
+        .describe('A marketplace that failed two or more scans in a row is paused for a while (5 min, doubling up to 6 h); searches skip it and report status "error", errorKind "backoff" (compact) and backoffUntil. true searches it anyway.'),
       format: z.enum(['full', 'compact']).optional().default('full')
         .describe('compact: smaller, stable rows with every key present (null when unknown): id "<Marketplace>:<listingId>", asking price in PLN, relevance, match kind, duplicateCount (0 when none) and duplicateCheapest (null when none) for results a scan already stored that are also listed on another marketplace; sources carry status ok|error with an errorKind and pipeline counts.'),
     },

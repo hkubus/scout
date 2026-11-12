@@ -185,6 +185,8 @@ export const MATCH_VISIBILITY_MS = 12 * 60 * 60_000;
  * client pages past it with `page` instead of losing results silently.
  */
 const MANUAL_SEARCH_RESULT_CAP = 200;
+/** Consecutive failed scans of a marketplace before its connector backs off. */
+const CONNECTOR_BACKOFF_AFTER_FAILURES = 2;
 /**
  * Manual-search Jev checks, per source per page: at most this many uncached
  * Jev calls, and detail-page fetches for at most this many listings whose
@@ -4800,6 +4802,19 @@ export class ScoutService {
     try {
       const tasks = input.sources.map(async (source) => {
       const started = Date.now();
+      // A marketplace that failed repeatedly is paused for scans; searches
+      // skip it too unless asked not to. Read-only: a search never records a
+      // connector run, so it can neither extend nor clear the pause.
+      const backoffUntil = input.ignoreBackoff ? null : this.activeConnectorBackoff(source);
+      if (backoffUntil) {
+        const status: SearchSourceStatus = {
+          source, status: 'error', count: 0, pendingShipping: 0, durationMs: 0,
+          message: `Skipped: connector backoff active until ${backoffUntil} after repeated failed scans`, backoffUntil,
+        };
+        details?.sources.set(source, { fetched: 0, matched: 0, aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, returned: 0, truncated: false, errorKind: 'backoff' });
+        this.emitSearchProgress(input.searchId, page, source, status, []);
+        return { listings: [] as Listing[], status };
+      }
       try {
         const fetched = await this.fetchSearchPages(source, input.query, { ...input, condition, olxCategoryId: input.olxCategory?.id ?? null, page });
         const deterministicFilters = { minPrice: input.minPrice, maxPrice: input.maxPrice, condition, sellerType: input.ownerType ?? null, excludeDamaged: condition === 'Used', shippingOnly: false };
@@ -7427,11 +7442,19 @@ export class ScoutService {
     return latest?.backoff_until && Date.parse(latest.backoff_until) > Date.now() ? latest.backoff_until : null;
   }
 
-  /** Backoff deadline for a failed run; doubles with each consecutive failed outcome, ignoring skips. */
-  private connectorBackoffAfterFailure(source: string, runId: number): string {
+  /**
+   * Backoff deadline for a failed run, or null when it is the first failure
+   * in a row: one blocked page or timeout on one watch must not pause the
+   * connector for every watch and search. From the second consecutive failed
+   * outcome it is 5 min, doubling with each further one up to 6 h; skipped
+   * rows neither break nor extend the streak.
+   */
+  private connectorBackoffAfterFailure(source: string, runId: number): string | null {
     const recent = this.stmt("SELECT status FROM connector_runs WHERE source = ? AND id != ? AND status IN ('ok', 'error') ORDER BY started_at DESC, id DESC LIMIT 8").all(source, runId) as Array<{ status: string }>;
     const streak = recent.findIndex((run) => run.status !== 'error');
-    return new Date(Date.now() + exponentialBackoff(streak === -1 ? recent.length : streak)).toISOString();
+    const failuresBefore = streak === -1 ? recent.length : streak;
+    if (failuresBefore + 1 < CONNECTOR_BACKOFF_AFTER_FAILURES) return null;
+    return new Date(Date.now() + exponentialBackoff(failuresBefore + 1 - CONNECTOR_BACKOFF_AFTER_FAILURES)).toISOString();
   }
 
   /**

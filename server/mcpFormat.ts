@@ -13,7 +13,8 @@ export const COMPACT_SEARCH_SCHEMA_VERSION = 1;
 export type SearchRelevance = 'relevant' | 'unknown' | 'not-checked';
 /** strict: every query term matched; relaxed: most terms matched; rescued: a Jev near-miss rescue. */
 export type SearchMatch = 'strict' | 'relaxed' | 'rescued';
-export type SearchErrorKind = 'timeout' | 'blocked' | 'http' | 'parse' | 'redirect' | 'session' | 'config' | 'unknown';
+/** backoff: skipped, since the connector is paused after repeated failed scans (ignoreBackoff searches it anyway). */
+export type SearchErrorKind = 'timeout' | 'blocked' | 'http' | 'parse' | 'redirect' | 'session' | 'config' | 'backoff' | 'unknown';
 
 export interface ManualSearchListingDetail {
   listingId: string;
@@ -120,6 +121,8 @@ export interface CompactSearchSource {
   truncated: boolean;
   pendingShipping: number;
   durationMs: number;
+  /** errorKind backoff: when the connector's pause ends (ISO); null otherwise. */
+  backoffUntil: string | null;
 }
 
 export interface CompactSearch {
@@ -149,6 +152,8 @@ export function searchErrorKind(error: unknown): SearchErrorKind {
   if (/session|access token|cookie/i.test(message)) return 'session';
   if (/\b(?:HTTP|returned)\s+\d{3}\b/i.test(message)) return 'http';
   if (/no usable markup|no supported listing|did not contain|not a valid PLN amount/i.test(message)) return 'parse';
+  // Scout's own skip message, for a status that reaches here without details.
+  if (/^Skipped: connector backoff/.test(message)) return 'backoff';
   return 'unknown';
 }
 
@@ -211,6 +216,7 @@ export function toCompactSearch(input: Pick<SearchFilters, 'query' | 'page' | 'o
         truncated: detail.truncated,
         pendingShipping: status.pendingShipping,
         durationMs: status.durationMs,
+        backoffUntil: status.backoffUntil ?? null,
       };
     }),
     scoredAgainst: result.scoredAgainst ?? null,

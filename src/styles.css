@@ -288,6 +288,8 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .search-source-status small { color: var(--muted); font-size: 10px; }
 .search-source-status--error { border-color: rgba(241, 90, 53, .32); background: rgba(241, 90, 53, .05); }
 .search-source-status--searching { border-style: dashed; }
+.search-source-status:has(.search-anyway) { grid-template-columns: auto 1fr auto auto; }
+.search-anyway { min-height: 0; padding: 4px 8px; font-size: 10px; white-space: nowrap; }
 .search-error { display: flex; align-items: center; gap: 9px; margin-top: 15px; padding: 12px 14px; border: 1px solid rgba(241, 90, 53, .35); border-radius: 8px; color: var(--orange); font-size: 12px; }
 .search-results { margin-top: 26px; }
 .search-table-wrap { width: 100%; overflow-x: auto; border-top: 1px solid var(--line); }

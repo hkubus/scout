@@ -723,6 +723,8 @@ export interface SearchFilters {
    * watch the query matches, anything else is a watch id. Database only.
    */
   scoreAgainst?: string | null;
+  /** Search marketplaces whose connector is backed off after repeated failed scans too. */
+  ignoreBackoff?: boolean;
 }
 
 /**
@@ -765,6 +767,11 @@ export interface SearchSourceStatus {
   pendingShipping: number;
   durationMs: number;
   message: string;
+  /**
+   * Only on a source skipped because its connector is backed off: when the
+   * pause ends (ISO). Its kind is `backoff` in the MCP search details.
+   */
+  backoffUntil?: string;
 }
 
 export interface ManualSearchResponse {

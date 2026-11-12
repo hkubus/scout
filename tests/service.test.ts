@@ -2324,22 +2324,26 @@ test('keeps connector backoff active across skipped runs and escalates it on the
     (context.service as any).fetchOlxApi = async () => { fetches += 1; return { status: 403, json: null }; };
     const row = () => context.db.prepare('SELECT * FROM watches WHERE id = ?').get('backoff-scan');
     const latestError = () => context.db.prepare("SELECT id, finished_at, backoff_until FROM connector_runs WHERE source = 'OLX' AND status = 'error' ORDER BY id DESC LIMIT 1").get() as { id: number; finished_at: string; backoff_until: string };
+    // One failure alone does not pause the connector; the second in a row does.
     await (context.service as any).runWatch(row(), { forceAll: true });
-    assert.equal(fetches, 1);
+    assert.equal(latestError().backoff_until, null);
+    await (context.service as any).runWatch(row(), { forceAll: true });
+    assert.equal(fetches, 2);
     // Two forced scans inside the window are skipped; the first skip row must
     // not clear the backoff for the second.
     await (context.service as any).runWatch(row(), { forceAll: true });
     await (context.service as any).runWatch(row(), { forceAll: true });
-    assert.equal(fetches, 1);
+    assert.equal(fetches, 2);
     assert.equal((context.db.prepare("SELECT COUNT(*) AS count FROM connector_runs WHERE source = 'OLX' AND status = 'skipped'").get() as { count: number }).count, 2);
     assert.equal(context.service.getConnectors().find((connector) => connector.name === 'OLX')?.status, 'Degraded');
     // Once the window lapses, the next failure doubles the delay: skipped rows
     // between the two failures do not reset the streak.
     const first = latestError();
     const firstDelay = Date.parse(first.backoff_until) - Date.parse(first.finished_at);
+    assert.ok(Math.abs(firstDelay - 5 * 60_000) < 1_000, `expected a 5 min first pause, got ${firstDelay}ms`);
     context.db.prepare('UPDATE connector_runs SET backoff_until = ? WHERE id = ?').run(new Date(Date.now() - 1_000).toISOString(), first.id);
     await (context.service as any).runWatch(row(), { forceAll: true });
-    assert.equal(fetches, 2);
+    assert.equal(fetches, 3);
     const second = latestError();
     const secondDelay = Date.parse(second.backoff_until) - Date.parse(second.finished_at);
     assert.ok(secondDelay >= firstDelay * 2 - 1_000, `expected ${secondDelay}ms to double ${firstDelay}ms`);
@@ -2466,11 +2470,10 @@ test('verifies missing research listings before ending them and leaves transient
     const transient = context.db.prepare("SELECT status, missing_scans FROM market_listings WHERE listing_id = '1002'").get() as { status: string; missing_scans: number };
     assert.equal(transient.status, 'active');
     assert.equal(transient.missing_scans, 2);
-    // A research failure backs the marketplace off like a watch failure; let
-    // the window lapse so the next scan reaches the connector.
+    // A research failure counts toward backoff like a watch failure, but one
+    // failure alone does not pause the marketplace, so the next scan reaches it.
     const failedRun = context.db.prepare("SELECT id, backoff_until FROM connector_runs WHERE source = 'OLX' AND status = 'error' ORDER BY id DESC LIMIT 1").get() as { id: number; backoff_until: string | null };
-    assert.ok(failedRun.backoff_until && Date.parse(failedRun.backoff_until) > Date.now());
-    context.db.prepare('UPDATE connector_runs SET backoff_until = ? WHERE id = ?').run(new Date(Date.now() - 1_000).toISOString(), failedRun.id);
+    assert.equal(failedRun.backoff_until, null);
     mode = 'live';
     await (context.service as any).runMarketWatch(row);
     const live = context.db.prepare("SELECT status, missing_scans, availability_status FROM market_listings WHERE listing_id = '1003'").get() as { status: string; missing_scans: number; availability_status: string };

@@ -55,3 +55,28 @@ test('scout_search describes the conditions it understands', async () => {
     context.close();
   }
 });
+
+test('scout_search reports a backed-off marketplace as a source error, not a failed call', async () => {
+  const context = searchFixture();
+  let fetches = 0;
+  (context.service as any).fetchOlxApi = async () => { fetches += 1; return olxPage([olxOffer('P-1', 'Steam Deck', 1500)]); };
+  const until = new Date(Date.now() + 60_000).toISOString();
+  context.db.prepare("INSERT INTO connector_runs (source, status, message, started_at, finished_at, backoff_until) VALUES ('OLX', 'error', 'x', ?, ?, ?)").run(new Date().toISOString(), new Date().toISOString(), until);
+  const { client, close } = await connectedClient(context.service);
+  try {
+    const tool = (await client.listTools()).tools.find((entry) => entry.name === 'scout_search')!;
+    assert.deepEqual((tool.inputSchema.properties as Record<string, unknown>).ignoreBackoff, { type: 'boolean', default: false, description: (tool.inputSchema.properties as any).ignoreBackoff.description });
+    const compact = await client.callTool({ name: 'scout_search', arguments: { query: 'steam deck', sources: ['OLX'], format: 'compact' } }) as { isError?: boolean };
+    assert.equal(compact.isError, undefined);
+    const payload = JSON.parse(toolText(compact));
+    assert.equal(payload.error, undefined);
+    assert.deepEqual([payload.sources[0].status, payload.sources[0].errorKind, payload.sources[0].backoffUntil], ['error', 'backoff', until]);
+    assert.equal(fetches, 0);
+    const anyway = JSON.parse(toolText(await client.callTool({ name: 'scout_search', arguments: { query: 'steam deck', sources: ['OLX'], ignoreBackoff: true, aiRelevance: false } })));
+    assert.equal(anyway.sources[0].status, 'ok');
+    assert.equal(fetches, 1);
+  } finally {
+    await close();
+    context.close();
+  }
+});
