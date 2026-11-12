@@ -2235,14 +2235,18 @@ export class ScoutService {
    * Starts the listing's description check, or joins the one already running
    * for it (a scan's or scout_verify_listing's), so they make one run.
    */
-  private sharedDescriptionVerification(candidate: DealNotificationCandidate, notifyContext?: ScanNotifyContext) {
+  private async sharedDescriptionVerification(candidate: DealNotificationCandidate, notifyContext?: ScanNotifyContext): Promise<DescriptionVerificationRun> {
     const key = `${candidate.listing.marketplace}:${candidate.listing.listingId}`;
-    const existing = this.descriptionVerificationInFlight.get(key);
-    if (existing) return existing.run;
+    const contextKey = descriptionVerificationContextKey(candidate);
+    let pending;
+    while ((pending = this.descriptionVerificationInFlight.get(key)) && pending.contextKey !== contextKey) {
+      await pending.run.catch(() => undefined);
+    }
+    if (pending) return pending.run;
     const run = this.runDescriptionVerification(candidate, notifyContext).finally(() => {
       if (this.descriptionVerificationInFlight.get(key)?.run === run) this.descriptionVerificationInFlight.delete(key);
     });
-    this.descriptionVerificationInFlight.set(key, { run, contextKey: descriptionVerificationContextKey(candidate) });
+    this.descriptionVerificationInFlight.set(key, { run, contextKey });
     return run;
   }
 
@@ -4625,12 +4629,9 @@ export class ScoutService {
   private async verifyInContext(candidate: DealNotificationCandidate): Promise<DescriptionVerificationRun> {
     const key = `${candidate.listing.marketplace}:${candidate.listing.listingId}`;
     const contextKey = descriptionVerificationContextKey(candidate);
-    let pending = this.descriptionVerificationInFlight.get(key);
+    const pending = this.descriptionVerificationInFlight.get(key);
     if (pending?.contextKey === contextKey) return pending.run;
     if (candidate.listing.marketplace === 'OLX') await this.readOlxOfferDescription(candidate.listing);
-    while ((pending = this.descriptionVerificationInFlight.get(key)) && pending.contextKey !== contextKey) {
-      await pending.run.catch(() => undefined);
-    }
     return this.sharedDescriptionVerification(candidate);
   }
 

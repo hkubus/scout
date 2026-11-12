@@ -398,3 +398,31 @@ test('joins a scan check in the same context and waits out one in another watch 
     context.close();
   }
 });
+
+test('a scan does not take the verdict of a tool check running in another watch context', async () => {
+  const restore = aiEnv();
+  const context = fixture();
+  try {
+    // The listing's own watch rejects it; the scoreAgainst watch the tool checks in passes it.
+    seedWatch(context.db, 'ps5', { query: 'ps5' });
+    seedWatch(context.db, 'consoles', { query: 'konsola' });
+    seedListing(context.db, 'Allegro Lokalnie', 'al-7', { watchId: 'ps5' });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    context.state.jev = async (jevContext) => {
+      if (jevContext.query === 'konsola') await gate;
+      return { decision: jevContext.query === 'konsola' ? 'pass' : 'reject', confidence: 0.95, unsure: false };
+    };
+    const tool = context.service.verifyListingForAgent('Allegro Lokalnie:al-7', { watchId: 'consoles' });
+    // The own watch's scan reaches the description check while the tool's check runs.
+    const scan = (context.service as any).verifyHighPriorityDeal(scanCandidate(context.db, 'Allegro Lokalnie', 'al-7', 'ps5'));
+    await new Promise((resolve) => setImmediate(resolve));
+    release();
+    assert.equal((await tool).status, 'pass');
+    assert.equal(await scan, false, 'the own watch rejects the listing, so its Very strong+ alert is held');
+    assert.deepEqual(context.calls.jev.map((call) => call.query), ['konsola', 'ps5']);
+  } finally {
+    restore();
+    context.close();
+  }
+});
