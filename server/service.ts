@@ -7231,11 +7231,25 @@ export class ScoutService {
     }
   }
 
+  /**
+   * flags_json and flags_version for the listings upserts: the stored quick
+   * flags from the title, the condition and, for OLX, the description its
+   * offers API returned with the search results. The upserts keep the stored
+   * condition when a sighting has none, so the flags read that one too;
+   * otherwise a re-sighting without a condition would drop `damaged` while
+   * the row still says Uszkodzone.
+   */
+  private listingFlagParams(listing: NormalizedListing): [string, number] {
+    const condition = listing.condition ?? (this.stmt('SELECT condition FROM listings WHERE marketplace = ? AND listing_id = ?')
+      .get(listing.marketplace, listing.listingId) as { condition: string | null } | undefined)?.condition ?? null;
+    return [flagsJson(storedListingFlags({ title: listing.title, condition, description: olxDetailHint(listing)?.description })), FLAGS_VERSION];
+  }
+
   private cacheShipping(listing: NormalizedListing) {
     if (listing.shippingAvailable === null) return;
     const checked = nowIso();
     // A new row gets its flags; an existing one keeps what its last store wrote.
-    this.stmt(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, flags_json, flags_version, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(marketplace, listing_id) DO UPDATE SET shipping_available = excluded.shipping_available, price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), last_seen_at = excluded.last_seen_at`).run(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable ? 1 : 0, listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0, ...listingFlagParams(listing), checked, checked);
+    this.stmt(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, flags_json, flags_version, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(marketplace, listing_id) DO UPDATE SET shipping_available = excluded.shipping_available, price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), last_seen_at = excluded.last_seen_at`).run(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable ? 1 : 0, listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0, ...this.listingFlagParams(listing), checked, checked);
   }
 
   private storeManualListing(listing: NormalizedListing) {
@@ -7247,7 +7261,7 @@ export class ScoutService {
       listing.shippingAvailable === null || listing.shippingAvailable === undefined ? null : listing.shippingAvailable ? 1 : 0,
       listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0,
       ...listingSignalParams(listing),
-      ...listingFlagParams(listing),
+      ...this.listingFlagParams(listing),
       observedAt, observedAt, observedAt,
     );
   }
@@ -7361,7 +7375,7 @@ export class ScoutService {
     const stored = this.stmt(`INSERT INTO listings (marketplace, listing_id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, posted_at, refreshed_at, promoted, seller_type, seller_id, flags_json, flags_version, availability_status, last_verified_at, first_seen_at, last_seen_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, ?)
       ON CONFLICT(marketplace, listing_id) DO UPDATE SET title = excluded.title, price_pln = excluded.price_pln, url = excluded.url, image_url = COALESCE(excluded.image_url, listings.image_url), condition = COALESCE(excluded.condition, listings.condition), location = COALESCE(excluded.location, listings.location), shipping_available = COALESCE(excluded.shipping_available, listings.shipping_available), price_negotiable = COALESCE(excluded.price_negotiable, listings.price_negotiable), posted_at = COALESCE(listings.posted_at, excluded.posted_at), refreshed_at = COALESCE(excluded.refreshed_at, listings.refreshed_at), promoted = COALESCE(excluded.promoted, listings.promoted), seller_type = COALESCE(excluded.seller_type, listings.seller_type), seller_id = COALESCE(excluded.seller_id, listings.seller_id), flags_json = excluded.flags_json, flags_version = excluded.flags_version, availability_status = 'live', ended_reason = NULL, last_verified_at = excluded.last_verified_at, last_seen_at = excluded.last_seen_at
-      RETURNING id`).get(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable === null ? null : listing.shippingAvailable ? 1 : 0, listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0, ...listingSignalParams(listing), ...listingFlagParams(listing), observedAt, observedAt, observedAt) as { id: number };
+      RETURNING id`).get(listing.marketplace, listing.listingId, listing.title, listing.price, listing.url, listing.imageUrl ?? null, listing.condition ?? null, listing.location ?? null, listing.shippingAvailable === null ? null : listing.shippingAvailable ? 1 : 0, listing.priceNegotiable === null || listing.priceNegotiable === undefined ? null : listing.priceNegotiable ? 1 : 0, ...listingSignalParams(listing), ...this.listingFlagParams(listing), observedAt, observedAt, observedAt) as { id: number };
     // A manual pick saved while this scan ran still wins over the scan's
     // view, and scoring uses whatever variant the row ends up with.
     const association = this.stmt(`INSERT INTO watch_listings (watch_id, listing_id, variant_key, variant_source, first_seen_at, last_seen_at)
@@ -7965,15 +7979,6 @@ function listingRowFlags(row: Record<string, any>) {
   const flags = stored ?? storedListingFlags({ title, condition: row.condition ?? null });
   const accessory = typeof row.watch_query === 'string' ? accessoryFlag(title, row.watch_query) : null;
   return accessory ? mergeFlags(flags, [accessory]) : flags;
-}
-
-/**
- * flags_json and flags_version for the listings upserts: the stored quick
- * flags from the title, condition and, for OLX, the description its offers
- * API returned with the search results.
- */
-function listingFlagParams(listing: NormalizedListing): [string, number] {
-  return [flagsJson(storedListingFlags({ title: listing.title, condition: listing.condition, description: olxDetailHint(listing)?.description })), FLAGS_VERSION];
 }
 
 /** posted_at, refreshed_at, promoted, seller_type for the listings upserts. */

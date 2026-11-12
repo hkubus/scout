@@ -131,7 +131,16 @@ The Search page and the iOS Search tab send `scoreAgainst: "auto"` (see [`scout_
 - `damaged`: the condition label says damaged (OLX's "Uszkodzone").
 - `locked`: an iCloud or activation lock, an FRP or Google account lock, or MDM.
 
-The rules read the title, the condition label and, on OLX, the description the offers API returns with the results. They skip negated, conditional and lifted mentions ("bez uszkodzeń", "uszkodzeń: brak", "jeśli nie działa", "blokada zdjęta"), damaged packaging, and optional swaps ("sprzedam lub zamienię", "możliwa zamiana"). A bare "konto Google" or "iCloud", and Vinted's "Zadowalający" grade, flag nothing. Flags read the seller's wording, so they can miss or misfire; they are hints, and like everything else here the price is an asking price. They do not change scoring: a for-parts listing's asking price still counts toward its watch's typical price.
+The rules read the title, the condition label and, on OLX, the description the offers API returns with the results. They skip:
+
+- negated, conditional and lifted mentions ("bez uszkodzeń", "uszkodzeń: brak", "jeśli nie działa", "blokada zdjęta", "usunięta blokada iCloud", "FRP brak");
+- "na części" meaning sold separately or taken apart ("nie sprzedaję na części", "możliwa sprzedaż na części", "rozłożony na części");
+- damage to the packaging or an extra rather than the item ("uszkodzone pudełko", "uszkodzony kabel", "szkło hartowane uszkodzone"), and a past repair ("oddany do naprawy baterii");
+- a 1:1 warranty replacement or exchange, and a part that is not original ("Ładowarka nie oryginalna");
+- optional swaps ("sprzedam lub zamienię", "możliwa zamiana"), and a shop title that both buys and sells ("Skup Sprzedaż");
+- a phone title that opens with its battery health or a free extra ("Bateria 100% iPhone 13", "Etui gratis!").
+
+A bare "konto Google" or "iCloud", and Vinted's "Zadowalający" grade, flag nothing. Flags read the seller's wording, so they can miss or misfire; they are hints, and like everything else here the price is an asking price. They do not change scoring: a for-parts listing's asking price still counts toward its watch's typical price.
 
 Each search result carries `flags`, a list of `{ flag, match, in }` (`in` is `title`, `condition` or `description`), only when it has some. Nothing is hidden unless you ask: `excludeFlags` (`POST /api/search` and `scout_search`, any of the seven) drops flagged results before the AI relevance check and Jev checks, so they cost no Jev call, and the source message adds "N hidden by flags". Stored listings keep the flags from their last scan, and feed and detail rows add `accessory` against their watch's query. The feed's `excludeFlags` (`GET /api/listings?excludeFlags=for_parts,swap`, `scout_listings` and `scout_deals`) filters stored flags in SQL, so totals and pages stay exact; it takes every flag but `accessory`, which depends on the query. Listings saved before quick flags get them in the background at startup; until then their rows show flags, but the feed filter keeps them.
 

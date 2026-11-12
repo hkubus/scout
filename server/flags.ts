@@ -68,11 +68,12 @@ const anyOf = (terms: string) => (token: string | undefined) => token !== undefi
 type Guard = (words: string[], start: number, end: number) => boolean;
 
 const isNegator = anyOf('bez|nie|brak|zero|0|nigdy|zadn*|no|not|never|without|non');
-const isGlue = anyOf('jest|sa|byl|byla|bylo|byly|zostal*|ma|mial|miala|is|was|are|were|been|be|has|have|had|ever');
-const isConjunction = anyOf('i|ani|oraz|ni|and|or|nor');
+const isGlue = anyOf('jest|sa|byl|byla|bylo|byly|zostal*|ma|mial|miala|posiada|posiadal*|is|was|are|were|been|be|has|have|had|ever');
+const isConjunction = anyOf('i|ani|oraz|ni|lub|albo|czy|and|or|nor');
 const isConditional = anyOf('jesli|jezeli|gdyby|gdy|czy|if|when|whether');
 const isLabelDenial = anyOf('brak|nie|none|no|0|zero|nic|zadn*');
-const isNotTheDevice = anyOf('pudelk*|opakowan*|karton*|box|etui|folia|folie|folii|plomb*|naklejk*|seal|packaging');
+/** Packaging and extras whose damage or copy says nothing about the item: "uszkodzony kabel", "szkło hartowane uszkodzone". */
+const isNotTheDevice = anyOf('pudelk*|opakowan*|karton*|box|etui|folia|folie|folii|plomb*|naklejk*|seal|packaging|kabel|kabl*|ladowark*|szklo|szkla|szkielk*|hartowan*|ochronn*|pasek|paska');
 const isSoftener = anyOf('lekko|minimalnie|delikatnie|troche|nieznacznie|kosmetycznie|slightly');
 
 /**
@@ -133,6 +134,15 @@ const after = (terms: string): Guard => {
   return (words, start) => matches(words[start - 1]);
 };
 
+/** One of the two words before the match, in the same clause, is one of `terms`: "usunięta blokada iCloud", "zdjęta blokada FRP". */
+const twoBefore = (terms: string): Guard => {
+  const matches = anyOf(terms);
+  return (words, start) => !isBoundary(words[start - 1]) && (matches(words[start - 1]) || (!isBoundary(words[start - 2]) && matches(words[start - 2])));
+};
+
+/** "nie sprzedaję na części": "nie" two words back, in the same clause. ("bez ładowarki, na części" is still for parts.) */
+const negatedTwoBack: Guard = (words, start) => !isBoundary(words[start - 1]) && anyOf('nie|not')(words[start - 2]);
+
 /** The next word (past a colon and one glue word) denies the match: "blokada iCloud zdjęta", "zamiany mnie nie interesują". */
 const deniedAfter = (terms: string): Guard => {
   const matches = anyOf(terms);
@@ -157,7 +167,27 @@ const DESCRIPTION = ['description'] as const;
 const STANDARD = [negatedBefore, labelDenied];
 /** Phrases that already start with "nie" can only be cancelled by a condition. */
 const NIE_PHRASE = [conditionalBefore, labelDenied];
-const LOCKED = [negatedInSentence(6), labelDenied, deniedAfter('zdjet*|usunie*|wylaczon*|wylogowan*|odblokowan*|nieaktywn*|removed|off|disabled|unlocked')];
+/** Words that say a lock is gone, before it ("usunięta blokada iCloud", "wolny od blokad") or after it ("blokada iCloud zdjęta"). */
+const LOCK_LIFTED = 'zdjet*|usunie*|wylaczon*|wylogowan*|odblokowan*|nieaktywn*|removed|off|disabled|unlocked';
+/**
+ * A denial right after the lock: "FRP brak", "Blokada iCloud nie.", "Blokady
+ * iCloud nie ma", "blokada nie jest aktywna". "nie została zdjęta" and "nie
+ * znam hasła" still mean locked, so "nie" denies only at the end of the
+ * clause or before a word that says the lock is absent.
+ */
+const lockDeniedAfter: Guard = (words, start, end) => {
+  if (deniedAfter(LOCK_LIFTED)(words, start, end)) return true;
+  let index = end;
+  if (words[index] === ':') index += 1;
+  if (isGlue(words[index])) index += 1;
+  if (!anyOf('brak|nie|none|no')(words[index])) return false;
+  const next = words[index + 1];
+  if (next === undefined || isBoundary(next)) return true;
+  if (words[index] !== 'nie') return false;
+  const absent = anyOf('ma|posiada|wystepuj*|stwierdz*|aktywn*|wlaczon*|zalozon*|ustawion*');
+  return absent(next) || (isGlue(next) && absent(words[index + 2]));
+};
+const LOCKED = [negatedInSentence(6), labelDenied, twoBefore(`${LOCK_LIFTED}|wolny|wolna|wolne|free`), lockDeniedAfter];
 const SWAP_DENIED = deniedAfter('nie|mozliw*|ewentualnie|tez|rowniez|possible|optional');
 const SWAP_OPTIONAL: Guard = (words, start) => {
   const optional = anyOf('lub|albo|ewentualnie|ew|ewent|mozliw*|rozwaz*|tez|rowniez|or|opcjonalnie|optional|possible|chetnie');
@@ -165,6 +195,21 @@ const SWAP_OPTIONAL: Guard = (words, start) => {
 };
 /** A swap word in a title that also sells is an optional swap ("Sprzedam/zamienię"). */
 const SELLS: Guard = (words) => words.some(anyOf('sprzedam|sprzedaz|sprzedaje|sprzedajemy|sprzedawany|sprzedawana|sell|selling|sale|fs'));
+const isPart = anyOf('pudelk*|opakowan*|karton*|box|etui|ladowark*|kabel|kabl*|bateri*|ekran*|wyswietlacz*|szybk*|czesci|zasilacz*|pasek|paski|folia|szklo|obudow*|plomb*');
+/** A part or extra right after the match, or up to three words before it in the same clause: "nie oryginalne pudełko", "Ładowarka nie oryginalna". */
+const partNamed: Guard = (words, start, end) => {
+  if (isPart(words[end]) || words[end] === 'sluchawki') return true;
+  for (let index = start - 1; index >= Math.max(0, start - 3); index -= 1) {
+    if (isBoundary(words[index])) return false;
+    if (isPart(words[index])) return true;
+  }
+  return false;
+};
+/** A replaced part earlier in the sentence: "Ekran wymieniony w serwisie, nie oryginalny". */
+const replacedInSentence: Guard = (words, start) => {
+  for (let index = start - 1; index >= 0 && words[index] !== '.'; index -= 1) if (anyOf('wymienion*|wymian*|replaced')(words[index])) return true;
+  return false;
+};
 
 const RULES: Rule[] = [
   // for_parts
@@ -173,12 +218,18 @@ const RULES: Rule[] = [
     ['for', 'parts'], ['parts', 'only'], ['spares', 'or', 'repair'], ['not', 'work*'], ['doesn', 't', 'work*'], ['faulty'],
     ['zbit*|pekniet*|spalon*|uszkodzon*', 'plyt*', 'glown*'],
   ].map((phrase): Rule => ({ flag: 'for_parts', phrase, fields: TEXT, guards: STANDARD })),
-  // "gwarancja na części" is a warranty on parts.
-  { flag: 'for_parts', phrase: ['na', 'czesci'], fields: TEXT, guards: [...STANDARD, after('gwarancj*|rabat*|znizk*')] },
+  // "gwarancja na części" is a warranty on parts; "rozłożony na części", "nie
+  // sprzedaję na części" and "możliwa sprzedaż na części" mean taken apart or
+  // sold separately.
+  {
+    flag: 'for_parts', phrase: ['na', 'czesci'], fields: TEXT,
+    guards: [...STANDARD, negatedTwoBack, after('gwarancj*|rabat*|znizk*|rozlozon*|rozebran*|rozdziel*|podziel*|dziel*'), twoBefore('mozliw*|ewentualn*|rowniez|tez')],
+  },
   { flag: 'for_parts', phrase: ['uszkodzon*'], fields: TEXT, guards: [...STANDARD, notTheDevice, softened] },
   { flag: 'for_parts', phrase: ['broken'], fields: TEXT, guards: [...STANDARD, notTheDevice] },
-  // "nie do naprawy" is for parts too; "nic do naprawy" and "zestaw do naprawy" are not.
-  { flag: 'for_parts', phrase: ['do', 'naprawy'], fields: TEXT, guards: [after('nic|zestaw*|narzedzi*|kit'), labelDenied] },
+  // "nie do naprawy" is for parts too; "nic do naprawy", "zestaw do naprawy" and
+  // "oddany do naprawy baterii" (a past repair) are not.
+  { flag: 'for_parts', phrase: ['do', 'naprawy'], fields: TEXT, guards: [after('nic|niczego|zestaw*|narzedzi*|kit|oddan*|oddal*|oddawan*'), labelDenied] },
   ...[
     ['nie', 'dziala*'], ['nie', 'wlacza*'], ['nie', 'uruchamia', 'sie'], ['nie', 'odpala'], ['nie', 'w', 'pelni', 'sprawn*'],
   ].map((phrase): Rule => ({ flag: 'for_parts', phrase, fields: TEXT, guards: NIE_PHRASE })),
@@ -192,8 +243,8 @@ const RULES: Rule[] = [
   // wanted_ad: the title only
   ...[
     ['kupie|kupimy|kupuje|kupujemy|skupuje|skupujemy|skup|poszukuje|wtb'], ['want', 'to', 'buy'],
-  ].map((phrase): Rule => ({ flag: 'wanted_ad', phrase, fields: TITLE, guards: [negatedBefore] })),
-  { flag: 'wanted_ad', phrase: ['szukam'], fields: TITLE, guards: [negatedBefore, deniedAfter('nowego|nowej|nowych|kupca|kupcow|chetnego|chetnych|nabywcy|domu|wlasciciela')] },
+  ].map((phrase): Rule => ({ flag: 'wanted_ad', phrase, fields: TITLE, guards: [negatedBefore, SELLS] })),
+  { flag: 'wanted_ad', phrase: ['szukam'], fields: TITLE, guards: [negatedBefore, SELLS, deniedAfter('nowego|nowej|nowych|kupca|kupcow|chetnego|chetnych|nabywcy|domu|wlasciciela')] },
   // swap: a swap word in the title, or a swap-only line in the description
   { flag: 'swap', phrase: ['zamienie|zamiana|zamiany|zamienimy|zamieni|swap'], fields: TITLE, guards: [...STANDARD, SWAP_DENIED, SWAP_OPTIONAL, SELLS, after('hot')] },
   // "Wymienię iPhone 12 na Samsunga"; a bare "wymienię" can be a repair ("wymienię ekran").
@@ -202,14 +253,13 @@ const RULES: Rule[] = [
     ['tylko|wylacznie|jedynie', 'zamian*'], ['tylko|wylacznie|jedynie', 'na', 'zamian*'], ['swap', 'only'], ['only', 'swap'],
   ].map((phrase): Rule => ({ flag: 'swap', phrase, fields: DESCRIPTION, guards: [negatedBefore] })),
   // replica
-  ...[
-    ['replik*|replica|podrobk*|fake|falsyfikat'], ['1', ':', '1'],
-  ].map((phrase): Rule => ({ flag: 'replica', phrase, fields: TEXT, guards: STANDARD })),
+  { flag: 'replica', phrase: ['replik*|replica|podrobk*|fake|falsyfikat'], fields: TEXT, guards: STANDARD },
+  // "po wymianie 1:1" is a warranty replacement, "zamiana 1:1" an even exchange.
+  { flag: 'replica', phrase: ['1', ':', '1'], fields: TEXT, guards: [...STANDARD, twoBefore('wymian*|zamian*|wymieni*|zamieni*|gwarancyjn*')] },
   { flag: 'replica', phrase: ['kopia|kopie'], fields: TEXT, guards: [...STANDARD, deniedAfter('faktury|paragonu|dowodu|zapasow*|gwarancji|rachunku|umowy|dokument*|zakupu')] },
-  {
-    flag: 'replica', phrase: ['nie', 'oryginal*|oryginaln*'], fields: TEXT,
-    guards: [conditionalBefore, (words, _start, end) => anyOf('pudelk*|opakowan*|karton*|box|etui|ladowark*|kabel|kabl*|bateri*|ekran*|wyswietlacz*|szybk*|czesci|zasilacz*|pasek|paski|folia|szklo|obudow*|sluchawki|plomb*')(words[end])],
-  },
+  // "nie oryginalne pudełko", "Ładowarka nie oryginalna" and "Ekran wymieniony
+  // w serwisie, nie oryginalny" describe a part or extra, not the item.
+  { flag: 'replica', phrase: ['nie', 'oryginal*|oryginaln*'], fields: TEXT, guards: [conditionalBefore, partNamed, replacedInSentence] },
 ];
 
 /** Every start index of `phrase` in `words`. */
@@ -242,6 +292,20 @@ const ACCESSORY_GROUPS = [
 /** Leading words skipped before the accessory noun: "2x", "Oryginalne", "Nowe". */
 const isLeadingFiller = anyOf('x|szt|oryginal*|original*|nowe|nowy|nowa|new|silikon*|skorzan*|magnetyczn*|pancern*|ochronn*|premium');
 const isFor = anyOf('do|for|pod|dla');
+const isUnit = anyOf('w|h|m|mm|cm|mah|wh|v|a|gb|tb|mb|cali|inch|in|d|x|pin|szt');
+/**
+ * The leading accessory word describes the item or comes with it rather
+ * than being it: punctuation ("Etui gratis!", "Bateria: 89%"), "gratis", "w
+ * zestawie", or a bare number such as battery health ("Bateria 100% iPhone
+ * 13"). A number with a unit ("Ładowarka 20W", "Szkło 9H") is the
+ * accessory's own spec.
+ */
+function leadDescribesItem(words: string[], next: number) {
+  const word = words[next];
+  if (word === undefined) return false;
+  if (isBoundary(word) || anyOf('gratis|w|zestaw*|komplet*|free|included')(word)) return true;
+  return /^\d+$/.test(word) && !isUnit(words[next + 1]);
+}
 const isQueryStopword = anyOf('do|na|w|we|z|ze|i|oraz|dla|od|po|za|o|a|u|the|for|with|and|to|of|in|on');
 
 /** An accessory the query did not ask for: the title leads with one, or names the product only after "do". */
@@ -253,7 +317,7 @@ function accessory(titleWords: string[], query: string) {
   while (index < 3 && index < titleWords.length && (isLeadingFiller(titleWords[index]) || isBoundary(titleWords[index]) || /^\d+$/.test(titleWords[index]))) index += 1;
   const lead = titleWords[index];
   const group = lead === undefined ? undefined : ACCESSORY_GROUPS.find((candidate) => termMatches(candidate, lead));
-  if (group && !queryGroups.has(group)) return lead!;
+  if (group && !queryGroups.has(group) && !leadDescribesItem(titleWords, index + 1)) return lead!;
   // "Futerał skórzany do iPhone 13": the product only appears as what the item is for.
   if (queryGroups.size) return null;
   const product = queryWords.find((word) => !isQueryStopword(word) && !/^\d+$/.test(word)) ?? queryWords[0];

@@ -1749,6 +1749,49 @@ test('manual search rows carry quick flags from title, condition and the OLX des
     const none = await search({ excludeFlags: ['damaged', 'for_parts'], maxPrice: 1000 });
     assert.deepEqual(none.listings, []);
     assert.equal(none.sources[0].message, 'No matching listings · 2 hidden by flags');
+
+    // A later sighting without a condition keeps the stored one, and with it damaged.
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'FLAG-DMG', url: 'https://www.olx.pl/d/oferta/flag-dmg', title: 'GPU RTX 3060', created_time: fresh, params: [price(650)] },
+    ], metadata: { visible_total_count: 1 } } });
+    assert.equal((await search()).listings.length, 1);
+    const resighted = context.db.prepare("SELECT condition, price_pln, flags_json FROM listings WHERE listing_id = 'FLAG-DMG'").get() as { condition: string; price_pln: number; flags_json: string };
+    assert.deepEqual([resighted.condition, resighted.price_pln], ['Uszkodzone', 650]);
+    assert.deepEqual(JSON.parse(resighted.flags_json), [{ flag: 'damaged', match: 'uszkodzone', in: 'condition' }]);
+  } finally { context.close(); }
+});
+
+test('a watch scan stores quick flags and rewrites them when the listing changes', async () => {
+  const context = fixture();
+  try {
+    seedWatch(context.db, 'flag-scan', { query: 'gpu' });
+    const fresh = new Date().toISOString();
+    const offer = { title: 'GPU RTX 3070 na części', description: 'Karta nie włącza się.', state: 'Uszkodzone' as string | null };
+    const service = context.service as any;
+    service.fetchPublicPage = async () => { throw new Error('no detail page fetch expected'); };
+    service.fetchOlxApi = async () => ({ status: 200, json: { data: [{
+      id: 'SCAN-1', url: 'https://www.olx.pl/d/oferta/scan-1', title: offer.title, description: offer.description, created_time: fresh,
+      params: [{ key: 'price', value: { value: 900, currency: 'PLN', negotiable: false } }, ...(offer.state ? [{ key: 'state', value: { label: offer.state } }] : [])],
+    }], metadata: { visible_total_count: 1 } } });
+    // Re-running the originally loaded row keeps the source due.
+    const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('flag-scan');
+    const stored = () => context.db.prepare("SELECT flags_json, flags_version FROM listings WHERE listing_id = 'SCAN-1'").get() as { flags_json: string; flags_version: number };
+    const kept = () => context.service.listingsPage({ excludeFlags: ['for_parts'] }).pagination.total;
+
+    await service.runWatch(row);
+    assert.deepEqual(JSON.parse(stored().flags_json), [
+      { flag: 'for_parts', match: 'na czesci', in: 'title' },
+      { flag: 'damaged', match: 'uszkodzone', in: 'condition' },
+    ]);
+    assert.equal(stored().flags_version, FLAGS_VERSION);
+    assert.equal(kept(), 0);
+
+    // The seller retitles it and drops the damage: the next scan's store clears the flags.
+    Object.assign(offer, { title: 'GPU RTX 3070', description: 'Działa bez zarzutu.', state: 'Używane' });
+    await service.runWatch(row);
+    assert.equal(stored().flags_json, '[]');
+    assert.equal(kept(), 1);
+    assert.equal(context.service.listingsPage({}).listings[0].flags, undefined);
   } finally { context.close(); }
 });
 

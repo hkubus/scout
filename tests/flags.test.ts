@@ -41,6 +41,20 @@ const cases: Array<[string, ListingFlagInput, string[]]> = [
   ['nic nie działa', { title: 'Tablet', description: 'Nic nie działa.' }, ['for_parts']],
   ['gwarancja na części', { title: 'Laptop', description: 'Gwarancja na części i robociznę.' }, []],
   ['nie, działa', { title: 'Konsola', description: 'Czy coś nie gra? Nie, działa.' }, []],
+  // Review of #54: "na części" meaning separately or taken apart, damaged extras, and denials.
+  ['nie sprzedaję na części', { title: 'Zestaw', description: 'Zestaw kompletny. Nie sprzedaję na części.' }, []],
+  ['nie rozdzielam na części', { title: 'Zestaw', description: 'Komplet, nie rozdzielam na części.' }, []],
+  ['możliwa sprzedaż na części', { title: 'Komputer gamingowy RTX 3080 i7, możliwa sprzedaż na części' }, []],
+  ['rozłożony na części', { title: 'LEGO 42115', description: 'Zestaw LEGO 42115 rozłożony na części, kompletny, z instrukcją.' }, []],
+  ['bez ładowarki na części', { title: 'iPhone 11 bez ładowarki na części' }, ['for_parts']],
+  ['nie działa na części', { title: 'iPhone 11 nie działa na części' }, ['for_parts']],
+  ['sprzedam na części', { title: 'iPhone 11', description: 'Sprzedam na części, płyta padła.' }, ['for_parts']],
+  ['uszkodzony kabel in the set', { title: 'iPhone 13', description: 'Telefon sprawny. W zestawie ładowarka (uszkodzony kabel).' }, []],
+  ['szkło hartowane uszkodzone', { title: 'iPhone 13', description: 'Szkło hartowane uszkodzone, ekran pod spodem idealny.' }, []],
+  ['brak martwych lub uszkodzonych pikseli', { title: 'Monitor', description: 'Ekran bez rys, brak martwych lub uszkodzonych pikseli.' }, []],
+  ['nie posiada uszkodzonych elementów', { title: 'Konsola', description: 'Konsola nie posiada uszkodzonych elementów.' }, []],
+  ['oddany do naprawy baterii', { title: 'iPhone 13', description: 'Telefon był raz oddany do naprawy baterii w serwisie Apple.' }, []],
+  ['nie wymaga niczego do naprawy', { title: 'Laptop', description: 'Nie wymaga niczego do naprawy.' }, []],
   // damaged
   ['condition Uszkodzone', { title: 'iPhone 13', condition: 'Uszkodzone' }, ['damaged']],
   ['condition Uszkodzony (Allegro Lokalnie)', { title: 'iPhone 13', condition: 'Uszkodzony' }, ['damaged']],
@@ -61,6 +75,19 @@ const cases: Array<[string, ListingFlagInput, string[]]> = [
   ['blokada iCloud zdjęta', { title: 'iPhone 13', description: 'Blokada iCloud zdjęta, telefon czysty.' }, []],
   ['iCloud wylogowany', { title: 'iPhone 13', description: 'iCloud wylogowany, konto Google usunięte.' }, []],
   ['blokada iCloud: brak', { title: 'iPhone 13', description: 'Blokada iCloud: brak' }, []],
+  // Review of #54: a lock named as removed or absent.
+  ['wolny od blokad iCloud', { title: 'iPhone 13', description: 'Telefon wolny od blokad iCloud i simlocka.' }, []],
+  ['usunięta blokada iCloud', { title: 'iPhone 13', description: 'Usunięta blokada iCloud, telefon gotowy do użycia.' }, []],
+  ['zdjęta blokada FRP', { title: 'Samsung A52', description: 'Zdjęta blokada FRP, konto Google wylogowane.' }, []],
+  ['wyłączona blokada aktywacji', { title: 'Apple Watch', description: 'Wyłączona blokada aktywacji.' }, []],
+  ['FRP brak', { title: 'Samsung A52', description: 'Konto Google usunięte, FRP brak.' }, []],
+  ['blokada iCloud nie', { title: 'iPhone 13', description: 'Blokada iCloud nie.' }, []],
+  ['blokady iCloud nie ma', { title: 'iPhone 13', description: 'Blokady iCloud nie ma, simlocka też nie.' }, []],
+  ['blokada iCloud nie została zdjęta', { title: 'iPhone 11', description: 'Blokada iCloud nie została zdjęta.' }, ['locked']],
+  ['iCloud zablokowany, nie znam hasła', { title: 'iPhone 11', description: 'iCloud zablokowany nie znam hasła.' }, ['locked']],
+  ['konto usunięte, FRP aktywne', { title: 'Samsung A52', description: 'Konto usunięte, FRP aktywne.' }, ['locked']],
+  ['FRP brak dostępu', { title: 'Samsung A52', description: 'Blokada FRP brak dostępu do konta.' }, ['locked']],
+  ['z blokadą FRP na koncie poprzedniego właściciela', { title: 'Samsung A52', description: 'Telefon z blokadą FRP na koncie poprzedniego właściciela.' }, ['locked']],
   // wanted_ad
   ['Kupię iPhone 13', { title: 'Kupię iPhone 13' }, ['wanted_ad']],
   ['szukam', { title: 'Szukam PS5 Digital' }, ['wanted_ad']],
@@ -69,6 +96,7 @@ const cases: Array<[string, ListingFlagInput, string[]]> = [
   ['WTB', { title: 'WTB RTX 4090' }, ['wanted_ad']],
   ['szukam nowego właściciela', { title: 'Lego Technic szukam nowego właściciela' }, []],
   ['kupię only in the description', { title: 'iPhone 13', description: 'Kupię też iPhone 14.' }, []],
+  ['skup in a shop title that also sells', { title: 'iPhone 13 128GB Gwarancja Skup Sprzedaż' }, []],
   // swap
   ['zamienię na PS5', { title: 'Xbox Series X zamienię na PS5' }, ['swap']],
   ['zamiana', { title: 'PS4 Pro zamiana' }, ['swap']],
@@ -96,6 +124,13 @@ const cases: Array<[string, ListingFlagInput, string[]]> = [
   ['oryginał, nie podróbka', { title: 'AirPods Pro', description: 'Oryginał, nie podróbka.' }, []],
   ['żadna podróbka ani replika', { title: 'AirPods Pro', description: 'Żadna podróbka ani replika.' }, []],
   ['kopia paragonu', { title: 'iPhone 13', description: 'Dołączam kopię paragonu.' }, []],
+  // Review of #54: a 1:1 replacement or exchange, and a non-original part.
+  ['po wymianie 1:1', { title: 'iPhone 13', description: 'Telefon po wymianie 1:1 w serwisie Apple, nowy egzemplarz.' }, []],
+  ['wymiana gwarancyjna 1:1', { title: 'iPhone 13', description: 'Wymiana gwarancyjna 1:1, nowy egzemplarz.' }, []],
+  ['zamiana 1:1', { title: 'iPhone 13', description: 'Interesuje mnie zamiana 1:1 na Pixela.' }, []],
+  ['ładowarka nie oryginalna', { title: 'iPhone 13', description: 'Ładowarka nie oryginalna, telefon oryginalny.' }, []],
+  ['ekran wymieniony, nie oryginalny', { title: 'iPhone 13', description: 'Ekran wymieniony w serwisie, nie oryginalny.' }, []],
+  ['iPhone, nie oryginał', { title: 'iPhone 13', description: 'Telefon nie oryginał, ale działa.' }, ['replica']],
   // accessory
   ['Etui iPhone 13 for iphone 13', { title: 'Etui iPhone 13', query: 'iphone 13' }, ['accessory']],
   ['Etui iPhone 13 for etui iphone 13', { title: 'Etui iPhone 13', query: 'etui iphone 13' }, []],
@@ -110,6 +145,14 @@ const cases: Array<[string, ListingFlagInput, string[]]> = [
   ['no query, no accessory', { title: 'Etui iPhone 13' }, []],
   ['Xbox is not a box', { title: 'Xbox One S', query: 'xbox' }, []],
   ['Foliowany is not foil', { title: 'Foliowany iPhone 13', query: 'iphone 13' }, []],
+  // Review of #54: a phone title that opens with its battery health or a free extra.
+  ['Bateria 100% iPhone 13', { title: 'Bateria 100% iPhone 13 128GB', query: 'iphone 13' }, []],
+  ['Bateria: 89%', { title: 'Bateria: 89% iPhone 12', query: 'iphone 12' }, []],
+  ['Etui gratis!', { title: 'Etui gratis! iPhone 13 128GB', query: 'iphone 13' }, []],
+  ['Etui w zestawie', { title: 'Etui w zestawie, iPhone 13 128GB', query: 'iphone 13' }, []],
+  ['Ładowarka 20W Apple', { title: 'Ładowarka 20W Apple USB-C', query: 'iphone 13' }, ['accessory']],
+  ['Szkło 9H iPhone 13', { title: 'Szkło 9H iPhone 13', query: 'iphone 13' }, ['accessory']],
+  ['Bateria 3110 mAh iPhone 13', { title: 'Bateria 3110 mAh iPhone 13', query: 'iphone 13' }, ['accessory']],
   // several at once, in LISTING_FLAGS order
   ['several flags', { title: 'Kupię iPhone na części', condition: 'Uszkodzone', description: 'Blokada iCloud.' }, ['for_parts', 'wanted_ad', 'damaged', 'locked']],
 ];
