@@ -2,6 +2,7 @@ import { memo, type ReactNode } from "react";
 import { ExternalLink, Eye, EyeOff, RefreshCw, Search } from "lucide-react";
 import { marketplaceColors } from "./data";
 import { listingRowKey, sameListingFields } from "./listingRows";
+import { crossPostChip } from "./listingSignals";
 import type { Listing } from "./types";
 import { dealTierLabel, decisionLabels, discountDisplay, formatPln, listingAgeLabel, ListingThumbnail } from "./ui";
 
@@ -145,12 +146,15 @@ function NetCell({ listing }: { listing: Listing }) {
 
 /**
  * At most two short chips after the subtitle: the triage decision first, then
- * the state or signal that matters most. Age has its own column.
+ * the state or signal that matters most (a cheaper copy elsewhere ranks right
+ * after the target). Age has its own column.
  */
 function ListingChips({ listing }: { listing: Listing }) {
   const chips: ReactNode[] = [];
   if (listing.decision) chips.push(<em key="decision" className={`decision-chip decision-chip--${listing.decision}`}>{decisionLabels[listing.decision]}</em>);
   if (listing.targetHit) chips.push(<em key="target" className="decision-chip decision-chip--target" title="At or below the watch's target price">Target</em>);
+  const crossPost = crossPostChip(listing);
+  if (crossPost) chips.push(<em key="cross-post" className={`decision-chip decision-chip--cross-post${crossPost.cheaper ? " decision-chip--cross-post-cheaper" : ""}`} title={crossPost.detail}>{crossPost.text}</em>);
   if (listing.hidden) chips.push(<em key="hidden" className="decision-chip decision-chip--hidden" title="Manually hidden from the overview and alerts"><EyeOff size={11} />Hidden</em>);
   if (listing.aiFiltered) chips.push(<em key="ai" className="decision-chip decision-chip--ai-filtered" title="Hidden by AI relevance filtering">Filtered by AI</em>);
   if (listing.variantLabel) chips.push(<em key="variant" className="decision-chip decision-chip--variant" title={`Scored against the “${listing.variantLabel}” model typical, not the watch-wide blend${listing.variantSource === "jev" ? " · placed by AI" : listing.variantSource === "manual" ? " · set manually" : ""}`}>{listing.variantLabel}</em>);

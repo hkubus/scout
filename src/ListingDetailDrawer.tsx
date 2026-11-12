@@ -16,11 +16,13 @@ import {
 import { api } from "./api";
 import { watchPresetFromListing, type WatchPreset } from "./presets";
 import { PriceSparkline } from "./PriceSparkline";
+import { marketplaceColors } from "./data";
 import { listingAge } from "./listingSignals";
 import { DEFAULT_FEE_PRESETS, FLIP_CHANNELS, saleFee, type FeePresets, type FlipChannel } from "./profit";
 import { dayMonth, formatDate } from "./format";
 import { decisionLabels, discountDisplay, formatPln, ListingThumbnail } from "./ui";
 import type {
+  DuplicateListing,
   Flip,
   Listing,
   ListingDecision,
@@ -277,6 +279,7 @@ export default function ListingDetailDrawer({
           </div>
           {facts.length ? <p className="drawer-facts">{facts.join(" · ")}</p> : null}
           {verificationStatus && verificationStatus !== "not-configured" ? <VerificationLine status={verificationStatus} /> : null}
+          {detail.duplicates?.length ? <CrossPosts copies={detail.duplicates} price={currentListing.price} /> : null}
 
           <div className="decision-grid" role="group" aria-label="Decision">
             {(["buy", "watch", "pass"] as ListingDecision[]).map((option) => {
@@ -462,6 +465,42 @@ export default function ListingDetailDrawer({
         </div>
       </aside>
     </div>
+  );
+}
+
+/** Likely copies of this item on other marketplaces, cheapest first, with what each costs against this one. */
+function CrossPosts({ copies, price }: { copies: DuplicateListing[]; price: number }) {
+  return (
+    <section className="drawer-section cross-posts" aria-label="Possibly also listed on other marketplaces">
+      <div className="drawer-section-heading">
+        <h3>Possibly also listed</h3>
+        <span className="drawer-muted">{copies.length === 1 ? "1 copy" : `${copies.length} copies`} on other marketplaces</span>
+      </div>
+      <ul className="cross-post-list">
+        {copies.map((copy) => {
+          const difference = Math.round(copy.price - price);
+          return (
+            <li key={copy.key}>
+              <a href={copy.url} target="_blank" rel="noopener noreferrer" title={`Open on ${copy.marketplace}: ${copy.title}`}>
+                <i style={{ background: marketplaceColors[copy.marketplace] }} aria-hidden="true" />
+                <span className="cross-post-copy">
+                  <strong>{copy.marketplace}</strong>
+                  <span>{copy.title}</span>
+                </span>
+                <span className="cross-post-price">
+                  <strong>{formatPln(copy.price)}</strong>
+                  <small className={difference < 0 ? "result-positive" : "drawer-muted"}>
+                    {difference === 0 ? "same price" : `${difference < 0 ? "−" : "+"}${formatPln(Math.abs(difference))}`} · seen {formatDate(dayMonth, copy.observedAt)}
+                  </small>
+                </span>
+                <ExternalLink size={14} aria-hidden="true" />
+              </a>
+            </li>
+          );
+        })}
+      </ul>
+      <p className="drawer-section-copy">Matched by title, price, condition and place. Marketplaces host photos separately, so Scout can't compare them: check it is the same item before buying.</p>
+    </section>
   );
 }
 
