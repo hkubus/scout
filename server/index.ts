@@ -19,6 +19,7 @@ import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimi
 import { FlipStore, MAX_FLIP_PHOTO_BYTES, MAX_FLIP_PHOTOS } from './flips';
 import { FLIP_CHANNELS, LISTING_CHANNELS, LISTING_CONDITIONS, PARCEL_SIZES } from '../src/profit';
 import { dashboardTopParam, ScoutService, ServiceError } from './service';
+import { LISTING_VERIFICATION_FILTERS } from './deals';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 import { VERIFICATION_CHECKS_MAX, VERIFICATION_CHECK_MAX_CHARS } from './ai';
 
@@ -347,11 +348,16 @@ app.get('/api/listings', async (request, reply) => {
     watchId: z.string().trim().min(1).max(160).optional(),
     page: z.coerce.number().int().min(1).optional().default(1),
     pageSize: z.coerce.number().int().min(1).max(500).optional().default(200),
-    sort: z.enum(['newest', 'strongest', 'price']).optional().default('newest'),
+    sort: z.enum(['newest', 'strongest', 'price', 'discount']).optional().default('newest'),
     decision: z.enum(['buy', 'watch', 'pass', 'none']).optional(),
     visibility: z.enum(['visible', 'hidden', 'all']).optional().default('visible'),
     minStrength: z.coerce.number().int().min(1).max(5).optional(),
     aiFiltered: z.enum(['exclude', 'include', 'only']).optional(),
+    minDiscount: z.coerce.number().min(0).max(100).optional(),
+    variantKey: z.string().trim().min(1).max(64).optional(),
+    minPrice: z.coerce.number().nonnegative().optional(),
+    maxPrice: z.coerce.number().nonnegative().optional(),
+    verification: z.enum(LISTING_VERIFICATION_FILTERS).optional(),
   }).strict().safeParse(request.query);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid listing filters' });
   const query = parsed.data;
@@ -366,6 +372,11 @@ app.get('/api/listings', async (request, reply) => {
     visibility: query.visibility,
     minStrength: query.minStrength,
     aiFiltered: query.aiFiltered,
+    minDiscount: query.minDiscount,
+    variantKey: query.variantKey,
+    minPrice: query.minPrice,
+    maxPrice: query.maxPrice,
+    verification: query.verification,
   });
   return { listings: page.listings, pagination: page.pagination };
 });
