@@ -80,3 +80,28 @@ test('scout_search reports a backed-off marketplace as a source error, not a fai
     context.close();
   }
 });
+
+test('scout_search advertises typoVariants off by default, with its cost', async () => {
+  const context = searchFixture();
+  const queries: string[] = [];
+  (context.service as any).fetchOlxApi = async (url: string) => {
+    const query = String(new URL(url).searchParams.get('query'));
+    queries.push(query);
+    return olxPage(query === 'iphon 13' ? [olxOffer('V-2', 'Iphon 13', 900)] : query === 'iphone 13' ? [olxOffer('V-1', 'iPhone 13', 1500)] : []);
+  };
+  const { client, close } = await connectedClient(context.service);
+  try {
+    const tool = (await client.listTools()).tools.find((entry) => entry.name === 'scout_search')!;
+    const schema = (tool.inputSchema.properties as Record<string, any>).typoVariants;
+    assert.deepEqual({ ...schema, description: '' }, { type: 'boolean', default: false, description: '' });
+    assert.match(schema.description, /2 extra page fetches per marketplace/);
+    assert.match(schema.description, /never "relevant"/);
+    const compact = JSON.parse(toolText(await client.callTool({ name: 'scout_search', arguments: { query: 'iphone 13', sources: ['OLX'], typoVariants: true, aiRelevance: false, format: 'compact' } })));
+    assert.deepEqual(compact.typoVariants, ['iphon 13', 'iphoen 13']);
+    assert.deepEqual(compact.listings.map((listing: { matchedVia: string }) => listing.matchedVia), ['typo:iphon 13', 'query']);
+    assert.equal(queries.length, 3);
+  } finally {
+    await close();
+    context.close();
+  }
+});

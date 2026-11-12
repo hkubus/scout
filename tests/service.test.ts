@@ -2528,7 +2528,7 @@ test('toggling typo variants on a research watch starts a new immutable series',
     const versions = context.db.prepare('SELECT id, typo_variants, closed_at FROM market_watch_versions WHERE market_watch_id = ? ORDER BY created_at').all('typo-watch') as Array<{ id: string; typo_variants: number; closed_at: string | null }>;
     assert.equal(versions.length, 2);
     assert.equal(versions[0].typo_variants, 0);
-    assert.equal(versions[1].typo_variants, 1);
+    assert.equal(versions[1].typo_variants, 2);
     assert.ok(versions[0].closed_at);
     assert.equal((context.db.prepare("SELECT status FROM market_listings WHERE listing_id = 'typo-series-listing'").get() as { status: string }).status, 'superseded');
     const watch = context.service.marketResearch().watches.find((item) => item.id === 'typo-watch')!;

@@ -122,6 +122,11 @@ export interface Listing {
   jevCheck?: "passed" | "unconfirmed" | "unchecked";
   /** Failed or unconfirmed checks, or why the listing was not checked. */
   jevCheckNote?: string;
+  /**
+   * Manual search with typoVariants only: `query` for a row the query's own
+   * page returned, `typo:<spelling>` for one only a misspelled search found.
+   */
+  matchedVia?: string;
   listingId?: string;
   decision?: ListingDecision | null;
   note?: string;
@@ -725,6 +730,23 @@ export interface SearchFilters {
   scoreAgainst?: string | null;
   /** Search marketplaces whose connector is backed off after repeated failed scans too. */
   ignoreBackoff?: boolean;
+  /**
+   * Page 1 only: also search a few misspellings of the query on each
+   * marketplace whose own page loaded, for listings that misspell the product.
+   */
+  typoVariants?: boolean;
+}
+
+/** One misspelled search a manual search with typoVariants ran on a marketplace. */
+export interface SearchTypoVariantStatus {
+  query: string;
+  status: "ok" | "error";
+  /** Rows the misspelled search returned. */
+  fetched: number;
+  /** Rows the query's own page did not have that passed the search's filters (before AI relevance). */
+  matched: number;
+  /** Why the search failed; only on an error. */
+  message?: string;
 }
 
 /**
@@ -772,6 +794,11 @@ export interface SearchSourceStatus {
    * pause ends (ISO). Its kind is `backoff` in the MCP search details.
    */
   backoffUntil?: string;
+  /**
+   * Only with typoVariants, on a marketplace whose own page loaded: each
+   * misspelled search run on it. One failing never fails the marketplace.
+   */
+  variants?: SearchTypoVariantStatus[];
 }
 
 export interface ManualSearchResponse {
@@ -779,6 +806,8 @@ export interface ManualSearchResponse {
   sources: SearchSourceStatus[];
   /** Only when scoreAgainst was sent: the watch used, or null when "auto" matched none. */
   scoredAgainst?: SearchScoredAgainst | null;
+  /** Only when typoVariants was sent: the misspellings searched; empty past page 1 or when no word qualifies. */
+  typoVariants?: string[];
 }
 
 /** Probable-sale estimate band — never a confirmed/completed-sale price. */

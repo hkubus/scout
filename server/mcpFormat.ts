@@ -20,13 +20,13 @@ export interface ManualSearchListingDetail {
   listingId: string;
   relevance: SearchRelevance;
   match: SearchMatch;
-  /** `query` today; typo variants would report `typo:<spelling>`. */
+  /** `query`, or `typo:<spelling>` for a row only a typoVariants search found. */
   matchedVia: string;
   flags: string[];
 }
 
 export interface ManualSearchSourceDetail {
-  /** Listings the marketplace returned for the page. */
+  /** Listings the marketplace returned for the page, plus new ones its typoVariants searches returned. */
   fetched: number;
   /** Listings that passed the deterministic filters, plus rescued near-misses. */
   matched: number;
@@ -123,6 +123,17 @@ export interface CompactSearchSource {
   durationMs: number;
   /** errorKind backoff: when the connector's pause ends (ISO); null otherwise. */
   backoffUntil: string | null;
+  /** With typoVariants, on a source whose own page loaded: each misspelled search; null otherwise. */
+  variants: CompactSearchVariant[] | null;
+}
+
+export interface CompactSearchVariant {
+  query: string;
+  status: 'ok' | 'error';
+  fetched: number;
+  /** New rows (not on the query's own page) that passed the filters, before AI relevance. */
+  matched: number;
+  message: string | null;
 }
 
 export interface CompactSearch {
@@ -134,6 +145,8 @@ export interface CompactSearch {
   sources: CompactSearchSource[];
   /** With scoreAgainst: the watch the results were scored against; null when none was used. */
   scoredAgainst: SearchScoredAgainst | null;
+  /** With typoVariants: the misspellings searched (empty past page 1 or when no word qualifies); null when not asked. */
+  typoVariants: string[] | null;
 }
 
 /**
@@ -217,8 +230,10 @@ export function toCompactSearch(input: Pick<SearchFilters, 'query' | 'page' | 'o
         pendingShipping: status.pendingShipping,
         durationMs: status.durationMs,
         backoffUntil: status.backoffUntil ?? null,
+        variants: status.variants?.map((variant) => ({ query: variant.query, status: variant.status, fetched: variant.fetched, matched: variant.matched, message: variant.message ?? null })) ?? null,
       };
     }),
     scoredAgainst: result.scoredAgainst ?? null,
+    typoVariants: result.typoVariants ?? null,
   };
 }

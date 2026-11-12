@@ -27,7 +27,7 @@ const COMPACT_LISTING_KEYS = [
 ];
 const COMPACT_SOURCE_KEYS = [
   'source', 'status', 'errorKind', 'message', 'fetched', 'matched', 'returned', 'aiExcluded', 'aiUnknown',
-  'aiBudgetExhausted', 'truncated', 'pendingShipping', 'durationMs', 'backoffUntil',
+  'aiBudgetExhausted', 'truncated', 'pendingShipping', 'durationMs', 'backoffUntil', 'variants',
 ];
 
 function fixture(dependencies: ScoutServiceDependencies = {}) {
@@ -97,7 +97,7 @@ test('compact scout_search: stable keys, the documented values and one line of J
       assert.ok(!text.includes('\n'), 'compact output has no newline');
       const payload = JSON.parse(text);
       assertHatContract(payload);
-      assert.deepEqual(Object.keys(payload), ['schemaVersion', 'format', 'query', 'page', 'listings', 'sources', 'scoredAgainst']);
+      assert.deepEqual(Object.keys(payload), ['schemaVersion', 'format', 'query', 'page', 'listings', 'sources', 'scoredAgainst', 'typoVariants']);
       assert.equal(payload.query, '13 128gb');
       assert.equal(payload.page, 1);
       // The fixture's second offer is free and never parsed.
@@ -117,7 +117,7 @@ test('compact scout_search: stable keys, the documented values and one line of J
       assert.equal(typeof source.durationMs, 'number');
       assert.deepEqual({ ...source, durationMs: 0 }, {
         source: 'OLX', status: 'ok', errorKind: null, message: '1 matches', fetched: 1, matched: 1, returned: 1,
-        aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, truncated: false, pendingShipping: 0, durationMs: 0, backoffUntil: null,
+        aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, truncated: false, pendingShipping: 0, durationMs: 0, backoffUntil: null, variants: null,
       });
 
       // An OLX search narrowed to an owner type returns only that type.
