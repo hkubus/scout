@@ -31,6 +31,7 @@ test('normalizes titles: folds Polish letters, drops filler and joins capacities
   // Inflected forms share a stem; model words and short words stay whole.
   assert.deepEqual(normalizeTitleForMatch('napęd napędem czarny czarna biały białe'), ['naped', 'czarn', 'bial']);
   assert.deepEqual(normalizeTitleForMatch('Galaxy S23 Ultra mini slim'), ['galax', 's', '23', 'ultra', 'mini', 'slim']);
+  assert.deepEqual(normalizeTitleForMatch('Pixel 7a, Legion 5i, Galaxy S23+, PS5 + pad'), ['pixel', '7a', 'legion', '5i', 'galax', 's', '23', 'plus', 'ps', '5', 'pad']);
 });
 
 test('matches the same item cross-posted with the same or a paraphrased title', () => {
@@ -78,6 +79,13 @@ test('does not match near-misses', () => {
     ['other city', listing('OLX', 'Konsola Sony PlayStation 5 Slim', 1900, { location: 'Mazowieckie, Warszawa, Wola' }), listing('Allegro Lokalnie', 'Konsola Sony PlayStation 5 Slim', 1900, { location: 'Gdańsk' })],
     ['too few words', listing('OLX', 'iPhone 13', 1500), listing('Vinted', 'iPhone 13', 1500)],
     ['different item, shared brand words', listing('OLX', 'Buty Nike Air Max 90 białe 42', 300), listing('Vinted', 'Buty Nike Air Force 1 białe 42', 300)],
+    ['letter after the model number', listing('OLX', 'Google Pixel 7a 128GB szary', 1200), listing('Vinted', 'Google Pixel 7 128GB szary', 1200)],
+    ['Polish-word letter after the model number', listing('OLX', 'Laptop Lenovo Legion 5i RTX 3060', 3500), listing('Allegro Lokalnie', 'Laptop Lenovo Legion 5 RTX 3060', 3500)],
+    ['plus sign', listing('OLX', 'Samsung Galaxy S23+ 256GB czarny', 2500), listing('Vinted', 'Samsung Galaxy S23 256GB czarny', 2500)],
+    ['other letter size', listing('OLX', 'Kurtka zimowa The North Face rozmiar M', 400), listing('Vinted', 'Kurtka zimowa The North Face rozmiar L', 400)],
+    ['other letter size, XS', listing('Allegro Lokalnie', 'Sukienka Zara midi plisowana S', 80), listing('Vinted', 'Sukienka Zara midi plisowana XS', 80)],
+    ['other English colour', listing('OLX', 'iPhone 13 128GB Midnight bateria', 1500), listing('Vinted', 'iPhone 13 128GB Starlight bateria', 1500)],
+    ['other colour, longer title', listing('OLX', 'iPhone 13 128GB czarny', 1500), listing('Vinted', 'iPhone 13 128GB biały bateria 89%', 1500)],
   ];
   for (const [name, a, b] of cases) assert.ok(duplicateSimilarity(a, b) < DUPLICATE_SIMILARITY, `${name}: ${duplicateSimilarity(a, b)}`);
 });

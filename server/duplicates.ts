@@ -82,9 +82,13 @@ const REGIONS = new Set([
   'zachodniopomorskie', 'polska', 'poland',
 ]);
 
-/** Lowercase, strip diacritics (including ł, which has no decomposition) and collapse everything else to single spaces. */
+/**
+ * Lowercase, strip diacritics (including ł, which has no decomposition) and
+ * collapse everything else to single spaces. A "+" ending a word is "plus"
+ * first, so "S23+" keeps its model word; "PS5 + pad" is left as it is.
+ */
 function foldText(value: string) {
-  return value.toLowerCase().replace(/ł/g, 'l').normalize('NFKD').replace(/\p{M}/gu, '').replace(/[^a-z0-9]+/g, ' ').trim();
+  return value.replace(/(?<=[\p{L}\p{N}])\+(?![\p{L}\p{N}])/gu, ' plus').toLowerCase().replace(/ł/g, 'l').normalize('NFKD').replace(/\p{M}/gu, '').replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
 /**
@@ -101,7 +105,9 @@ export function normalizeTitleForMatch(title: string): string[] {
     for (let index = 0; index < runs.length; index += 1) {
       const run = runs[index];
       const next = runs[index + 1];
-      if (/^\d/.test(run) && next !== undefined && GLUED_UNITS.has(next)) {
+      // A letter after a model number is part of it ("Pixel 7a", "Legion 5i"),
+      // not a separate word that may be filler; "120x60" stays three words.
+      if (/^\d/.test(run) && next !== undefined && (GLUED_UNITS.has(next) || (next.length === 1 && next !== 'x'))) {
         tokens.push(run + next);
         index += 1;
       } else {
@@ -174,7 +180,21 @@ function prepare(candidate: DuplicateCandidate): PreparedCandidate {
   };
 }
 
-const hasDigit = (token: string) => /\d/.test(token);
+/** Clothing letter sizes: "M" and "L" are different items, like two capacities. */
+const LETTER_SIZES = new Set(['xxs', 'xs', 's', 'm', 'l', 'xl', 'xxl', 'xxxl']);
+/** Colours, compared by stem as titles are ("czarny", "czarna"): a black one and a white one are two items. */
+const COLOURS = new Set([
+  'czarny', 'biały', 'szary', 'srebrny', 'złoty', 'niebieski', 'granatowy', 'czerwony', 'zielony', 'żółty', 'różowy',
+  'fioletowy', 'grafitowy', 'beżowy', 'brązowy', 'black', 'white', 'grey', 'gray', 'silver', 'gold', 'blue', 'red',
+  'green', 'pink', 'purple', 'midnight', 'starlight', 'graphite', 'beige', 'brown',
+].map((word) => stem(foldText(word))));
+
+/**
+ * A word that pins down which item it is: a number, a letter size or a
+ * colour. Vinted and Allegro rows often carry no location, so the place
+ * check can't tell two sizes or colours of one product apart.
+ */
+const isSpec = (token: string) => /\d/.test(token) || LETTER_SIZES.has(token) || COLOURS.has(token);
 
 function score(x: PreparedCandidate, y: PreparedCandidate) {
   if (x.marketplace === y.marketplace) return 0;
@@ -189,12 +209,13 @@ function score(x: PreparedCandidate, y: PreparedCandidate) {
   let xOnlySpec = false;
   for (const token of x.tokens) {
     if (y.tokenSet.has(token)) shared += 1;
-    else if (hasDigit(token)) xOnlySpec = true;
+    else if (isSpec(token)) xOnlySpec = true;
   }
   if (shared < DUPLICATE_MIN_SHARED_TOKENS) return 0;
-  // A number only one side names may just be left out ("iPhone 13" next to
-  // "iPhone 13 128GB"); a different number on each side is a different item.
-  if (xOnlySpec && y.tokens.some((token) => hasDigit(token) && !x.tokenSet.has(token))) return 0;
+  // A number, size or colour only one side names may just be left out
+  // ("iPhone 13" next to "iPhone 13 128GB"); a different one on each side is a
+  // different item.
+  if (xOnlySpec && y.tokens.some((token) => isSpec(token) && !x.tokenSet.has(token))) return 0;
   const jaccard = shared / (x.tokens.length + y.tokens.length - shared);
   const priceScore = 1 - gap / DUPLICATE_MAX_PRICE_GAP;
   const conditionScore = x.condition !== null && y.condition !== null ? 1 : 0.5;
