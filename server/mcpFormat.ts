@@ -13,19 +13,23 @@ export const COMPACT_SEARCH_SCHEMA_VERSION = 1;
 export type SearchRelevance = 'relevant' | 'unknown' | 'not-checked';
 /** strict: every query term matched; relaxed: most terms matched; rescued: a Jev near-miss rescue. */
 export type SearchMatch = 'strict' | 'relaxed' | 'rescued';
-export type SearchErrorKind = 'timeout' | 'blocked' | 'http' | 'parse' | 'redirect' | 'session' | 'config' | 'unknown';
+/**
+ * backoff: skipped, since the connector is paused after repeated failed scans (ignoreBackoff searches it anyway).
+ * deadline: not finished within the call's deadline; the search keeps running, so a repeat can return it.
+ */
+export type SearchErrorKind = 'timeout' | 'blocked' | 'http' | 'parse' | 'redirect' | 'session' | 'config' | 'backoff' | 'deadline' | 'unknown';
 
 export interface ManualSearchListingDetail {
   listingId: string;
   relevance: SearchRelevance;
   match: SearchMatch;
-  /** `query` today; typo variants would report `typo:<spelling>`. */
+  /** `query`, or `typo:<spelling>` for a row only a typoVariants search found. */
   matchedVia: string;
   flags: string[];
 }
 
 export interface ManualSearchSourceDetail {
-  /** Listings the marketplace returned for the page. */
+  /** Listings the marketplace returned for the page, plus new ones its typoVariants searches returned. */
   fetched: number;
   /** Listings that passed the deterministic filters, plus rescued near-misses. */
   matched: number;
@@ -120,6 +124,19 @@ export interface CompactSearchSource {
   truncated: boolean;
   pendingShipping: number;
   durationMs: number;
+  /** errorKind backoff: when the connector's pause ends (ISO); null otherwise. */
+  backoffUntil: string | null;
+  /** With typoVariants, on a source whose own page loaded: each misspelled search; null otherwise. */
+  variants: CompactSearchVariant[] | null;
+}
+
+export interface CompactSearchVariant {
+  query: string;
+  status: 'ok' | 'error';
+  fetched: number;
+  /** New rows (not on the query's own page) that passed the filters, before AI relevance. */
+  matched: number;
+  message: string | null;
 }
 
 export interface CompactSearch {
@@ -131,6 +148,12 @@ export interface CompactSearch {
   sources: CompactSearchSource[];
   /** With scoreAgainst: the watch the results were scored against; null when none was used. */
   scoredAgainst: SearchScoredAgainst | null;
+  /** With typoVariants: the misspellings searched (empty past page 1 or when no word qualifies); null when not asked. */
+  typoVariants: string[] | null;
+  /** True when a repeat was answered from the few-minute result cache. */
+  fromCache: boolean;
+  /** With fromCache: when the cached search finished; null otherwise. */
+  cachedAt: string | null;
 }
 
 /**
@@ -149,10 +172,14 @@ export function searchErrorKind(error: unknown): SearchErrorKind {
   if (/session|access token|cookie/i.test(message)) return 'session';
   if (/\b(?:HTTP|returned)\s+\d{3}\b/i.test(message)) return 'http';
   if (/no usable markup|no supported listing|did not contain|not a valid PLN amount/i.test(message)) return 'parse';
+  // Scout's own skip message, for a status that reaches here without details.
+  if (/^Skipped: connector backoff/.test(message)) return 'backoff';
+  if (/^Not finished within the \d+ s deadline/.test(message)) return 'deadline';
   return 'unknown';
 }
 
-const EMPTY_SOURCE: ManualSearchSourceDetail = { fetched: 0, matched: 0, aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, returned: 0, truncated: false, errorKind: null };
+/** A source that never got as far as fetching. */
+export const EMPTY_SEARCH_SOURCE: ManualSearchSourceDetail = { fetched: 0, matched: 0, aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, returned: 0, truncated: false, errorKind: null };
 
 function compactListing(listing: Listing, detail: ManualSearchListingDetail | undefined, ownerType: SearchFilters['ownerType']): CompactSearchListing {
   const listingId = detail?.listingId ?? listing.listingId ?? listing.id.slice(listing.id.indexOf(':') + 1);
@@ -195,7 +222,7 @@ export function toCompactSearch(input: Pick<SearchFilters, 'query' | 'page' | 'o
     page: Math.min(Math.max(Math.floor(input.page ?? 1), 1), 10),
     listings: result.listings.map((listing) => compactListing(listing, result.details.listings.get(listing.id), input.ownerType)),
     sources: result.sources.map((status) => {
-      const detail = result.details.sources.get(status.source) ?? EMPTY_SOURCE;
+      const detail = result.details.sources.get(status.source) ?? EMPTY_SEARCH_SOURCE;
       const failed = status.status === 'error';
       return {
         source: status.source,
@@ -211,8 +238,13 @@ export function toCompactSearch(input: Pick<SearchFilters, 'query' | 'page' | 'o
         truncated: detail.truncated,
         pendingShipping: status.pendingShipping,
         durationMs: status.durationMs,
+        backoffUntil: status.backoffUntil ?? null,
+        variants: status.variants?.map((variant) => ({ query: variant.query, status: variant.status, fetched: variant.fetched, matched: variant.matched, message: variant.message ?? null })) ?? null,
       };
     }),
     scoredAgainst: result.scoredAgainst ?? null,
+    typoVariants: result.typoVariants ?? null,
+    fromCache: result.fromCache === true,
+    cachedAt: result.cachedAt ?? null,
   };
 }

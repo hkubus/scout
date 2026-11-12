@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { pickVariantBatch, typoVariants } from '../server/typos';
+import { legacyTypoVariants, pickVariantBatch, typoVariantPairs, typoVariants } from '../server/typos';
 
 test('produces deterministic, capped variants that never repeat the original or each other', () => {
   const first = typoVariants('playstation 5 console');
@@ -47,4 +47,33 @@ test('rotation covers the whole variant set over consecutive scans without excee
   assert.deepEqual(pickVariantBatch(variants, 0, 0), []);
   // Negative or fractional ordinals still resolve deterministically.
   assert.deepEqual(pickVariantBatch(variants, -5, 2), pickVariantBatch(variants, 0, 2));
+});
+
+test('puts the realistic misspelling first and never touches digits', () => {
+  assert.deepEqual(typoVariants('iphone 13', { max: 2 }), ['iphon 13', 'iphoen 13']);
+  for (const variant of typoVariants('iphone 13 128gb rtx3080', { max: 10 })) {
+    assert.match(variant, / 13 128gb rtx3080$/);
+  }
+  assert.deepEqual(typoVariants('ps5 slim'), []);
+  // Five letters are enough.
+  assert.equal(typoVariants('canon r6')[0], 'cano r6');
+  assert.deepEqual(typoVariants('macbook', { max: 2 }), ['macboo', 'macbok']);
+});
+
+test('joins a short word onto its neighbour', () => {
+  assert.ok(typoVariants('play station 5').includes('playstation 5'));
+  assert.deepEqual(typoVariants('air pods'), ['airpods']);
+  assert.deepEqual(typoVariantPairs('play station 5').find((variant) => variant.query === 'playstation 5'), { query: 'playstation 5', from: 'play station', to: 'playstation' });
+});
+
+test('spreads the picks across words and records what each changed', () => {
+  const pairs = typoVariantPairs('nintendo switch oled', { max: 2 });
+  assert.deepEqual(pairs.map((pair) => pair.from), ['nintendo', 'switch']);
+  assert.deepEqual(pairs[0], { query: 'nintend switch oled', from: 'nintendo', to: 'nintend' });
+  assert.deepEqual(typoVariantPairs('nintendo switch oled'), typoVariantPairs('nintendo switch oled'));
+});
+
+test('keeps the legacy generator for research versions saved before the rewrite', () => {
+  assert.deepEqual(legacyTypoVariants('iphone 13'), ['pihone 13', 'ihpone 13', 'ipohne 13']);
+  assert.deepEqual(legacyTypoVariants('canon r6'), []);
 });

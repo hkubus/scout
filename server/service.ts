@@ -17,8 +17,10 @@ import { InboxError, MarketplaceInbox, hasRefreshToken, isSessionRenewalRequest,
 import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { Limiter, mapPool } from './limiter';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, ownRobustScale, percentile, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
-import { pickVariantBatch, typoVariants } from './typos';
-import { compactDuplicateNote, searchErrorKind, type ManualSearchDetailedResponse, type ManualSearchDetails } from './mcpFormat';
+import { legacyTypoVariants, pickVariantBatch, typoVariantPairs, type TypoVariant } from './typos';
+import { isDamagedLabel, normalizeRequestedCondition } from './searchCondition';
+import { EMPTY_SEARCH_SOURCE, compactDuplicateNote, searchErrorKind, type ManualSearchDetailedResponse, type ManualSearchDetails, type ManualSearchListingDetail, type ManualSearchSourceDetail } from './mcpFormat';
+import { SearchCache, SearchQueueTimeoutError, SearchRuns, SearchStoppedError, manualSearchKey, searchScope, type SearchRunHandle, type SearchRunSettings } from './searchRuns';
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
 import { matchQuality, matchQuery, type MatchCandidate, type QueryMatch } from './queryMatch';
 import { conditionClass, daysListed, groupOutcomes, MIN_OUTCOME_AGREED, priceDrops, shareOfAsking, titleSimilarity, type OutcomeRow } from './negotiation';
@@ -28,7 +30,7 @@ import type { ListingVerificationFilter } from './deals';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { DUPLICATE_FEED_DAYS, DUPLICATE_WINDOW_DAYS, findDuplicatePairs } from './duplicates';
 import { summarizeAnalytics, type AnalyticsRow } from './analytics';
-import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, DuplicateListing, ListingLiveCheck, ListingNegotiation, Relist, NegotiationFigures, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, AgentFlip, AgentFlips, ConversationResult, InboxResult, AgentListingVerification } from '../src/types';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SearchTypoVariantStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, DuplicateListing, ListingLiveCheck, ListingNegotiation, Relist, NegotiationFigures, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, AgentFlip, AgentFlips, ConversationResult, InboxResult, AgentListingVerification } from '../src/types';
 import { estimatedNetAtTypical, flipCost, flipNet, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, suggestedListingPrice, type FeePresets } from '../src/profit';
 import { vintedFeesNote } from '../src/listingSignals';
 import { compareStrongest } from '../src/listingRows';
@@ -53,6 +55,8 @@ type RelevanceFilterResult = {
   statuses?: Map<NormalizedListing, 'relevant' | 'unknown'>;
   /** Kept as unknown because the per-pass AI budget ran out. */
   budgetExhausted?: number;
+  /** Kept as unknown because the AI call itself failed (an error, not a judgment). */
+  errors?: number;
 };
 
 type DealNotificationCandidate = {
@@ -184,6 +188,8 @@ export const MATCH_VISIBILITY_MS = 12 * 60 * 60_000;
  * client pages past it with `page` instead of losing results silently.
  */
 const MANUAL_SEARCH_RESULT_CAP = 200;
+/** Consecutive failed scans of a marketplace before its connector backs off. */
+const CONNECTOR_BACKOFF_AFTER_FAILURES = 2;
 /**
  * Manual-search Jev checks, per source per page: at most this many uncached
  * Jev calls, and detail-page fetches for at most this many listings whose
@@ -196,6 +202,14 @@ const NIGHT_END_HOUR = 8;
 const MAX_RESEARCH_DETAIL_CHECKS = 100;
 /** Extra per-source searches a typo-variant scan may fetch (each still one page). */
 const TYPO_VARIANTS_PER_SCAN = 2;
+/**
+ * `typo_variants` on a research criteria version: 1 is the spelling set saved
+ * before the generator rewrite (legacy spellings, rows held to the original
+ * query), kept so an existing series stays comparable; versions saved since
+ * store 2 (current spellings, typo rows held to their own spelling).
+ */
+const RESEARCH_TYPO_LEGACY = 1;
+const RESEARCH_TYPO_CURRENT = 2;
 /** Jev variant assignments a grouped watch may request per scan and source. */
 const VARIANT_JEV_BUDGET = 10;
 /**
@@ -300,6 +314,130 @@ function jevCheckConcurrency() {
   return Math.min(configured, MAX_JEV_CHECK_CONCURRENCY);
 }
 
+/**
+ * AI calls in flight across the whole process (SCOUT_JEV_GLOBAL_CONCURRENCY,
+ * default 16, 1 to 64). Each pass keeps its own pool size, so without this
+ * three searches over three marketplaces could hold 54 calls at once.
+ */
+const DEFAULT_AI_GLOBAL_CONCURRENCY = 16;
+const MAX_AI_GLOBAL_CONCURRENCY = 64;
+function aiGlobalConcurrency() {
+  const configured = Number.parseInt(process.env.SCOUT_JEV_GLOBAL_CONCURRENCY ?? '', 10);
+  if (!Number.isFinite(configured) || configured < 1) return DEFAULT_AI_GLOBAL_CONCURRENCY;
+  return Math.min(configured, MAX_AI_GLOBAL_CONCURRENCY);
+}
+
+/**
+ * One AI function behind the shared limiter. A manual search's calls go
+ * first and, once the search is stopped, stop waiting (the caller's
+ * fail-open handling turns that into "unknown"). Wrapping the leaf functions
+ * covers every call site at once; they never call each other, so the
+ * limiter cannot deadlock.
+ */
+function behindLimiter<Args extends unknown[], Result>(limiter: Limiter, fn: (...args: Args) => Promise<Result>): (...args: Args) => Promise<Result> {
+  return (...args) => {
+    const scope = searchScope.getStore();
+    return limiter.run(() => fn(...args), { signal: scope?.signal, priority: scope?.priority });
+  };
+}
+
+/**
+ * Misspelled searches a manual search with typoVariants runs per marketplace,
+ * on page 1. SCOUT_SEARCH_TYPO_VARIANTS sets it (0 to 3); 0 turns the extra
+ * fetches off while the input is still accepted.
+ */
+const DEFAULT_SEARCH_TYPO_VARIANTS = 2;
+const MAX_SEARCH_TYPO_VARIANTS = 3;
+function searchTypoVariantCount() {
+  const configured = Number.parseInt(process.env.SCOUT_SEARCH_TYPO_VARIANTS ?? '', 10);
+  if (!Number.isFinite(configured)) return DEFAULT_SEARCH_TYPO_VARIANTS;
+  return Math.min(Math.max(configured, 0), MAX_SEARCH_TYPO_VARIANTS);
+}
+
+/**
+ * How long a marketplace waits for its misspelled searches once its own page
+ * answered (SCOUT_SEARCH_TYPO_WAIT_MS, 100 ms to 30 s, default 8 s). A page
+ * 1 fetch normally takes a second or two; a slower one is reported as a
+ * failed variant, so one hanging request cannot hold the marketplace past
+ * its caller's deadline. The request itself still runs to its own timeout.
+ */
+const DEFAULT_SEARCH_TYPO_WAIT_MS = 8_000;
+function searchTypoWaitMs() {
+  const configured = Number.parseInt(process.env.SCOUT_SEARCH_TYPO_WAIT_MS ?? '', 10);
+  if (!Number.isFinite(configured)) return DEFAULT_SEARCH_TYPO_WAIT_MS;
+  return Math.min(Math.max(configured, 100), 30_000);
+}
+
+/** The 1-based marketplace page a manual search asks for (1 to 10). */
+function manualSearchPage(input: Pick<SearchFilters, 'page'>) {
+  return Math.min(Math.max(Math.floor(input.page ?? 1), 1), 10);
+}
+
+/** One marketplace's share of a manual search, reported as soon as it finishes. */
+interface ManualSearchPart {
+  listings: Listing[];
+  status: SearchSourceStatus;
+  detail: ManualSearchSourceDetail;
+  listingDetails: Array<[string, ManualSearchListingDetail]>;
+  /**
+   * Whether a repeat may be answered with this part: false for an error, or
+   * when a misspelled search, the AI relevance check or the Jev checks failed
+   * and a fresh run could do better. A backoff skip is cacheable (until the
+   * pause ends): searching again would skip it just the same.
+   */
+  cacheable: boolean;
+}
+
+/** Repeats of a finished manual search are answered from memory this long (SCOUT_SEARCH_CACHE_MS, 0 turns it off). */
+function searchCacheMs() {
+  const configured = Number.parseInt(process.env.SCOUT_SEARCH_CACHE_MS ?? '', 10);
+  return Number.isFinite(configured) ? Math.max(configured, 0) : 3 * 60_000;
+}
+const SEARCH_CACHE_ENTRIES = 50;
+
+/** A marketplace a manual search's deadline cut off. */
+function deadlinePart(source: Marketplace, elapsedMs: number, deadlineMs: number): ManualSearchPart {
+  return {
+    listings: [],
+    status: {
+      source, status: 'error', count: 0, pendingShipping: 0, durationMs: elapsedMs,
+      message: `Not finished within the ${Math.round(deadlineMs / 1000)} s deadline; the search keeps running for a while, so repeating it shortly can return this marketplace too`,
+    },
+    detail: { ...EMPTY_SEARCH_SOURCE, errorKind: 'deadline' },
+    listingDetails: [],
+    cacheable: false,
+  };
+}
+
+export interface ManualSearchOptions {
+  /** Aborted when the client goes away: the call stops waiting, and a search no one else waits for stops. */
+  signal?: AbortSignal;
+}
+
+/** Manual searches allowed to run at once; more wait for a slot. */
+const MANUAL_SEARCH_SLOTS = 3;
+/**
+ * How long a manual search may take, the wait for a slot included
+ * (SCOUT_SEARCH_DEADLINE_MS, 5 to 120 s). 45 s fits behind nginx's 60 s
+ * default proxy timeout and inside the apps' 90 s.
+ */
+const DEFAULT_SEARCH_DEADLINE_MS = 45_000;
+const MIN_SEARCH_DEADLINE_MS = 5_000;
+const MAX_SEARCH_DEADLINE_MS = 120_000;
+function searchDeadlineMs(requested?: number | null) {
+  const configured = Number.parseInt(process.env.SCOUT_SEARCH_DEADLINE_MS ?? '', 10);
+  const value = requested ?? (Number.isFinite(configured) ? configured : DEFAULT_SEARCH_DEADLINE_MS);
+  return Math.min(Math.max(Math.floor(value), MIN_SEARCH_DEADLINE_MS), MAX_SEARCH_DEADLINE_MS);
+}
+/**
+ * How long a search keeps running after its callers' deadlines, so a repeat
+ * can join it (SCOUT_SEARCH_MAX_MS, default 120 s, at least the longest deadline).
+ */
+function searchMaxRunMs() {
+  const configured = Number.parseInt(process.env.SCOUT_SEARCH_MAX_MS ?? '', 10);
+  return Number.isFinite(configured) ? Math.max(configured, MAX_SEARCH_DEADLINE_MS) : MAX_SEARCH_DEADLINE_MS;
+}
+
 /** A new deal watch, with every default already filled in. */
 export interface WatchPatch {
   name?: string; query?: string; terms?: string; excluded?: string; sources?: Marketplace[];
@@ -368,6 +506,8 @@ export interface ScoutServiceDependencies {
   inboxFetch?: (url: string, init: RequestInit) => Promise<Response>;
   publicExposureWarning?: boolean;
   authEnabled?: boolean;
+  /** Manual-search queue settings (tests shrink them); defaults come from the environment. */
+  manualSearch?: Partial<SearchRunSettings>;
 }
 
 function inboxServiceError(error: unknown) {
@@ -788,26 +928,32 @@ export class ScoutService {
   private readonly publicExposureWarning: boolean;
   private readonly authEnabled: boolean;
   private readonly schedulerOwner = `scheduler-${process.pid}-${randomBytes(8).toString('hex')}`;
-  private activeManualSearches = 0;
   private logSequence = 0;
   private readonly logBuffer: LogEntry[] = [];
+  private readonly searchRuns: SearchRuns<ManualSearchPart, ManualSearchPart[]>;
+  private readonly searchDeadlineDefaultMs: number;
+  private readonly searchCache = new SearchCache<ManualSearchPart[]>({ ttlMs: searchCacheMs(), entries: SEARCH_CACHE_ENTRIES });
 
   constructor(db: Database, emit: (event: string, payload: unknown) => void, dependencies: ScoutServiceDependencies = {}) {
     this.db = db;
     this.emit = emit;
-    this.classifyListingRelevance = dependencies.classifyListingRelevance ?? classifyListingRelevanceWithDeepSeek;
-    this.verifyListingDescription = dependencies.verifyListingDescription ?? verifyListingDescriptionWithDeepSeek;
-    this.jevRelevance = dependencies.classifyListingRelevanceWithJev ?? classifyListingRelevanceWithJev;
-    this.jevVerification = dependencies.verifyListingDescriptionWithJev ?? verifyListingDescriptionWithJev;
-    this.jevTermMatch = dependencies.classifyTermMatchWithJev ?? classifyTermMatchWithJev;
-    this.jevNegotiability = dependencies.classifyNegotiabilityWithJev ?? classifyNegotiabilityWithJev;
-    this.jevConditionMatch = dependencies.classifyConditionMatchWithJev ?? classifyConditionMatchWithJev;
-    this.jevVariant = dependencies.classifyWatchVariantWithJev ?? classifyWatchVariantWithJev;
-    this.jevChecks = dependencies.classifyChecksWithJev ?? classifyChecksWithJev;
+    this.searchRuns = new SearchRuns({ slots: MANUAL_SEARCH_SLOTS, deadlineMs: searchDeadlineMs(), maxRunMs: searchMaxRunMs(), ...dependencies.manualSearch });
+    this.searchDeadlineDefaultMs = dependencies.manualSearch?.deadlineMs ?? searchDeadlineMs();
+    // Per-listing AI calls from scans, searches and checks share one cap.
+    const ai = new Limiter(aiGlobalConcurrency());
+    this.classifyListingRelevance = behindLimiter(ai, dependencies.classifyListingRelevance ?? classifyListingRelevanceWithDeepSeek);
+    this.verifyListingDescription = behindLimiter(ai, dependencies.verifyListingDescription ?? verifyListingDescriptionWithDeepSeek);
+    this.jevRelevance = behindLimiter(ai, dependencies.classifyListingRelevanceWithJev ?? classifyListingRelevanceWithJev);
+    this.jevVerification = behindLimiter(ai, dependencies.verifyListingDescriptionWithJev ?? verifyListingDescriptionWithJev);
+    this.jevTermMatch = behindLimiter(ai, dependencies.classifyTermMatchWithJev ?? classifyTermMatchWithJev);
+    this.jevNegotiability = behindLimiter(ai, dependencies.classifyNegotiabilityWithJev ?? classifyNegotiabilityWithJev);
+    this.jevConditionMatch = behindLimiter(ai, dependencies.classifyConditionMatchWithJev ?? classifyConditionMatchWithJev);
+    this.jevVariant = behindLimiter(ai, dependencies.classifyWatchVariantWithJev ?? classifyWatchVariantWithJev);
+    this.jevChecks = behindLimiter(ai, dependencies.classifyChecksWithJev ?? classifyChecksWithJev);
     this.aiVariantSuggestions = dependencies.suggestVariantGroups ?? suggestVariantGroupsWithDeepSeek;
     this.aiResaleListing = dependencies.writeResaleListing ?? writeResaleListingWithDeepSeek;
-    this.visionRelevance = dependencies.classifyListingRelevanceWithVision ?? classifyListingRelevanceWithVision;
-    this.visionVerification = dependencies.verifyListingDescriptionWithVision ?? verifyListingDescriptionWithVision;
+    this.visionRelevance = behindLimiter(ai, dependencies.classifyListingRelevanceWithVision ?? classifyListingRelevanceWithVision);
+    this.visionVerification = behindLimiter(ai, dependencies.verifyListingDescriptionWithVision ?? verifyListingDescriptionWithVision);
     this.readPurchaseScreenshot = dependencies.readPurchaseScreenshot ?? readPurchaseScreenshotWithVision;
     this.detailHtml = dependencies.fetchListingDetailHtml ?? ((url, marketplace) => this.fetchPublicPage(url, marketplace));
     this.publicExposureWarning = dependencies.publicExposureWarning ?? false;
@@ -1524,6 +1670,7 @@ export class ScoutService {
     let aiCalls = 0;
     let skipped = 0;
     let budgetExhausted = 0;
+    let errors = 0;
     const pendingClassifications = new Map<string, Promise<{ relevant: boolean }>>();
     const pendingLive = new Map<string, Promise<{ relevant: boolean; status: 'relevant' | 'irrelevant' | 'unknown'; reason: string; error?: string }>>();
     // Relevance rows are collected while the AI calls are awaited and flushed
@@ -1637,9 +1784,11 @@ export class ScoutService {
             pendingLive.set(liveKey, decision);
           }
           const live = await decision;
+          if (live.error) errors += 1;
           persistRelevance(listing, inputHash, jevLive.jevModel, live.relevant, live.status, live.reason, live.error ?? null);
           return { listing, status: live.status };
         } catch (error) {
+          errors += 1;
           const message = (error instanceof Error ? error.message : 'Jev could not classify listing relevance').slice(0, 500);
           persistRelevance(listing, inputHash, jevLive.jevModel, true, 'unknown', 'Jev relevance check failed unexpectedly', message);
           return { listing, status: 'unknown' };
@@ -1658,6 +1807,7 @@ export class ScoutService {
         persistRelevance(listing, inputHash, activeModel, result.relevant, status, result.relevant ? 'AI classified listing as relevant' : 'AI classified listing as irrelevant');
         return { listing, status };
       } catch (error) {
+        errors += 1;
         const message = (error instanceof Error ? error.message : 'OpenRouter could not classify listing relevance').slice(0, 500);
         persistRelevance(listing, inputHash, activeModel, true, 'unknown', 'AI relevance check failed', message);
         if (jevShadow) this.shadowJevRelevance(context, inputHash, null, listing.imageUrl, jevShadow);
@@ -1680,6 +1830,7 @@ export class ScoutService {
       notConfigured: false,
       statuses: new Map(classified.flatMap((item) => item.status === 'irrelevant' ? [] : [[item.listing, item.status] as const])),
       budgetExhausted,
+      errors,
     };
   }
 
@@ -1696,16 +1847,19 @@ export class ScoutService {
     status: Map<NormalizedListing, { state: 'passed' | 'unconfirmed' | 'unchecked'; note: string }>;
     rejected: number;
     inactive: boolean;
+    /** Checks whose Jev call failed; their listings are left unchecked. */
+    failed: number;
   }> {
     const status = new Map<NormalizedListing, { state: 'passed' | 'unconfirmed' | 'unchecked'; note: string }>();
     const live = this.jevLiveConfig();
     if (!checks.length || !listings.length || !live) {
       if (checks.length) for (const listing of listings) status.set(listing, { state: 'unchecked', note: 'Jev checks need an OpenRouter key and Jev live mode' });
-      return { listings, status, rejected: 0, inactive: Boolean(checks.length && listings.length && !live) };
+      return { listings, status, rejected: 0, inactive: Boolean(checks.length && listings.length && !live), failed: 0 };
     }
     const checksKey = checks.map((check) => `${check.mode}:${check.text.toLowerCase()}`).sort();
     let jevCalls = 0;
     let detailFetches = 0;
+    let failed = 0;
     const outcomes = await mapPool(listings, jevCheckConcurrency(), async (listing): Promise<'rejected' | 'passed' | 'unconfirmed' | 'unchecked'> => {
       const inputHash = createHash('sha256').update(JSON.stringify({
         version: 1, marketplace: listing.marketplace, listingId: listing.listingId, title: listing.title, condition: listing.condition ?? null, checks: checksKey,
@@ -1742,6 +1896,7 @@ export class ScoutService {
         status.set(listing, { state: summary, note: issues.join(' · ') + (description ? '' : `${issues.length ? ' · ' : ''}Judged from the title only`) });
         return summary;
       } catch (error) {
+        failed += 1;
         status.set(listing, { state: 'unchecked', note: `Jev check failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 200) });
         return 'unchecked';
       }
@@ -1751,6 +1906,7 @@ export class ScoutService {
       status,
       rejected: outcomes.filter((outcome) => outcome === 'rejected').length,
       inactive: false,
+      failed,
     };
   }
 
@@ -1893,7 +2049,7 @@ export class ScoutService {
   private async fuzzyRescueForSearch(
     fetched: NormalizedListing[],
     search: { query: string; includedTerms: string; excludedTerms: string; condition?: string },
-    finalFilters: { minPrice?: number | null; maxPrice?: number | null; condition?: string; shippingOnly: boolean; sellerType?: SellerType | null; ignorePromoted?: boolean },
+    finalFilters: { minPrice?: number | null; maxPrice?: number | null; condition?: string; shippingOnly: boolean; sellerType?: SellerType | null; ignorePromoted?: boolean; excludeDamaged?: boolean },
     source: Marketplace,
     gate?: (listing: NormalizedListing) => boolean,
   ): Promise<NormalizedListing[]> {
@@ -4777,59 +4933,230 @@ export class ScoutService {
    * `manualSearch` plus per-listing and per-source side tables (relevance
    * verdict, match kind, pipeline counts, error kind) for compact MCP output.
    */
-  async manualSearchDetailed(input: SearchFilters): Promise<ManualSearchDetailedResponse> {
+  async manualSearchDetailed(input: SearchFilters, options: ManualSearchOptions = {}): Promise<ManualSearchDetailedResponse> {
     const details: ManualSearchDetails = { listings: new Map(), sources: new Map() };
-    const response = await this.manualSearch(input, details);
+    const response = await this.manualSearch(input, details, options);
     return { ...response, details };
   }
 
-  /** `details`, when given, is filled in place; the response itself is the same either way. */
-  async manualSearch(input: SearchFilters, details?: ManualSearchDetails): Promise<ManualSearchResponse> {
-    if (this.activeManualSearches >= 3) throw new ServiceError('Three manual searches are already running. Try again shortly.', 429);
+  /**
+   * `details`, when given, is filled in place; the response itself is the
+   * same either way. Up to three searches run at once; the rest wait for a
+   * slot until their deadline, and an identical search already running is
+   * joined rather than run twice. At the deadline (the wait included) the
+   * marketplaces that finished come back and the rest are errors of kind
+   * `deadline`; `options.signal` (the client went away) stops waiting. A
+   * search that finished cleanly answers its repeats from memory for a few
+   * minutes (`fromCache`, `cachedAt`) unless `refresh` asks for a fresh one.
+   */
+  async manualSearch(input: SearchFilters, details?: ManualSearchDetails, options: ManualSearchOptions = {}): Promise<ManualSearchResponse> {
     // Resolved before any fetch, so an unknown watch id costs no marketplace request.
     const scoring = this.searchScoring(input);
-    this.activeManualSearches += 1;
-    // The client pages through results; marketplaces cap their own page size.
-    const page = Math.min(Math.max(Math.floor(input.page ?? 1), 1), 10);
+    const page = manualSearchPage(input);
+    // Misspellings of the query ride along on page 1 only, most realistic first.
+    const typoPairs = input.typoVariants && page === 1 ? typoVariantPairs(input.query, { max: searchTypoVariantCount() }) : [];
+    const deadlineMs = input.deadlineMs == null ? this.searchDeadlineDefaultMs : searchDeadlineMs(input.deadlineMs);
+    const calledAt = Date.now();
+    // Stream each source to the client that asked, so a fast marketplace is
+    // visible while a slow one is still fetching. The response stays
+    // authoritative and reconciles anything the stream missed.
+    const progress = (part: ManualSearchPart) => this.emitSearchProgress(input.searchId, page, part.status.source, part.status, part.listings);
+    const key = manualSearchKey(input);
+    // Formats and side tables are built per call, so one entry serves the
+    // full and compact formats alike. A refresh skips it, but still joins an
+    // identical search already running: that one is fresh too.
+    const cached = input.refresh ? undefined : this.searchCache.get(key);
+    if (cached) {
+      const parts = structuredClone(cached.value);
+      for (const part of parts) progress(part);
+      return this.manualSearchResponse(input, parts, scoring, typoPairs, details, new Date(cached.storedAt).toISOString());
+    }
+    let parts: ManualSearchPart[];
     try {
-      const tasks = input.sources.map(async (source) => {
+      ({ result: parts } = await this.searchRuns.search(key, {
+        execute: async (run) => {
+          const finished = await this.runManualSearch(input, scoring, typoPairs, run);
+          // The run stores it, not a caller, so a search whose callers all
+          // passed their deadline still answers their repeat. A backoff skip
+          // is kept no longer than the pause it reports.
+          if (!run.stopped && finished.every((part) => part.cacheable)) {
+            const pauses = finished.map((part) => Date.parse(part.status.backoffUntil ?? '')).filter(Number.isFinite);
+            this.searchCache.set(key, structuredClone(finished), Math.min(...pauses));
+          }
+          return finished;
+        },
+        onPart: progress,
+        deadlineMs,
+        signal: options.signal,
+        partial: (finished) => input.sources.map((source) => finished.find((part) => part.status.source === source) ?? (() => {
+          const part = deadlinePart(source, Date.now() - calledAt, deadlineMs);
+          progress(part);
+          return part;
+        })()),
+      }));
+    } catch (error) {
+      if (error instanceof SearchQueueTimeoutError) throw new ServiceError(error.message, 429);
+      if (error instanceof SearchStoppedError) throw new ServiceError(error.message, 499);
+      throw error;
+    }
+    return this.manualSearchResponse(input, parts, scoring, typoPairs, details, null);
+  }
+
+  private manualSearchResponse(
+    input: SearchFilters,
+    parts: ManualSearchPart[],
+    scoring: ReturnType<ScoutService['searchScoring']>,
+    typoPairs: TypoVariant[],
+    details: ManualSearchDetails | undefined,
+    cachedAt: string | null,
+  ): ManualSearchResponse {
+    if (details) {
+      for (const part of parts) {
+        details.sources.set(part.status.source, part.detail);
+        for (const [key, detail] of part.listingDetails) details.listings.set(key, detail);
+      }
+    }
+    const unique = new Map<string, Listing>();
+    for (const listing of parts.flatMap((part) => part.listings)) unique.set(listing.id, listing);
+    return {
+      listings: [...unique.values()].sort((a, b) => a.price - b.price),
+      sources: parts.map((part) => part.status),
+      ...(scoring === undefined ? {} : { scoredAgainst: scoring?.scoredAgainst ?? null }),
+      ...(input.typoVariants ? { typoVariants: typoPairs.map((variant) => variant.query) } : {}),
+      // Only on a cache hit, so a fresh response keeps its old shape.
+      ...(cachedAt ? { fromCache: true as const, cachedAt } : {}),
+    };
+  }
+
+  /** One manual search's marketplaces, each reported to the run as it finishes. */
+  private async runManualSearch(
+    input: SearchFilters,
+    scoring: ReturnType<ScoutService['searchScoring']>,
+    typoPairs: TypoVariant[],
+    run: SearchRunHandle<ManualSearchPart>,
+  ): Promise<ManualSearchPart[]> {
+    // The client pages through results; marketplaces cap their own page size.
+    const page = manualSearchPage(input);
+    // Free text from agents ("używany", "na części"): one known condition, or
+    // any condition with a note rather than an empty page.
+    const requested = normalizeRequestedCondition(input.condition);
+    const condition = requested.condition;
+    const conditionNote = requested.recognized ? '' : ` · condition "${String(input.condition).trim()}" not recognised, showing any condition`;
+    const listingKey = (listing: NormalizedListing) => `${listing.marketplace}:${listing.listingId}`;
+    const report = (part: ManualSearchPart) => { run.report(part); return part; };
+    const tasks = input.sources.map(async (source): Promise<ManualSearchPart> => {
       const started = Date.now();
+      // A marketplace that failed repeatedly is paused for scans; searches
+      // skip it too unless asked not to. Read-only: a search never records a
+      // connector run, so it can neither extend nor clear the pause.
+      const backoffUntil = input.ignoreBackoff ? null : this.activeConnectorBackoff(source);
+      if (backoffUntil) {
+        const status: SearchSourceStatus = {
+          source, status: 'error', count: 0, pendingShipping: 0, durationMs: 0,
+          message: `Skipped: connector backoff active until ${backoffUntil} after repeated failed scans`, backoffUntil,
+        };
+        return report({ listings: [], status, detail: { ...EMPTY_SEARCH_SOURCE, errorKind: 'backoff' }, listingDetails: [], cacheable: true });
+      }
       try {
-        const fetched = await this.fetchSearchPages(source, input.query, { ...input, olxCategoryId: input.olxCategory?.id ?? null, page });
-        const deterministicFilters = { minPrice: input.minPrice, maxPrice: input.maxPrice, condition: input.condition, sellerType: input.ownerType ?? null, shippingOnly: false };
-        const comparable = filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters);
+        const searchOptions = { ...input, condition, olxCategoryId: input.olxCategory?.id ?? null, page };
+        // A stopped run (every caller gone, its slot needed, or out of time)
+        // starts no further phase; the error part reaches no one.
+        run.checkpoint();
+        const fetched = await this.fetchSearchPages(source, input.query, searchOptions);
+        // Typo variants start only once the marketplace answered the query's
+        // own page, so a blocked one is never asked again; each misspelled
+        // search fails on its own. A row the main page (or an earlier
+        // variant) already returned stays the main page's.
+        const typoRows: NormalizedListing[] = [];
+        const foundByTypo = new Map<string, TypoVariant>();
+        const variantStatuses: SearchTypoVariantStatus[] = [];
+        if (typoPairs.length) {
+          run.checkpoint();
+          const waitMs = searchTypoWaitMs();
+          let waitTimer: ReturnType<typeof setTimeout> | undefined;
+          const waited = new Promise<'late'>((resolve) => { waitTimer = setTimeout(() => resolve('late'), waitMs); });
+          const pages = await Promise.all(typoPairs.map(async (variant) => {
+            const page = this.fetchSearchPages(source, variant.query, searchOptions).then(
+              (rows) => ({ variant, rows, error: null as string | null }),
+              (error) => ({ variant, rows: [] as NormalizedListing[], error: error instanceof Error ? error.message : 'Search failed' }),
+            );
+            const answer = await Promise.race([page, waited]);
+            return answer === 'late'
+              ? { variant, rows: [] as NormalizedListing[], error: `No answer within ${Math.round(waitMs / 100) / 10} s; left out so the marketplace is not held up` }
+              : answer;
+          })).finally(() => clearTimeout(waitTimer));
+          const seen = new Set(fetched.map(listingKey));
+          for (const { variant, rows, error } of pages) {
+            for (const listing of rows) {
+              const key = listingKey(listing);
+              if (seen.has(key)) continue;
+              seen.add(key);
+              foundByTypo.set(key, variant);
+              typoRows.push(listing);
+            }
+            variantStatuses.push({ query: variant.query, status: error ? 'error' : 'ok', fetched: rows.length, matched: 0, ...(error ? { message: error } : {}) });
+          }
+        }
+        const typoOf = (listing: NormalizedListing) => foundByTypo.get(listingKey(listing));
+        const deterministicFilters = { minPrice: input.minPrice, maxPrice: input.maxPrice, condition, sellerType: input.ownerType ?? null, excludeDamaged: condition === 'Used', shippingOnly: false };
+        const strict = filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters);
+        // When no listing matches every query word, fall back to those that
+        // match most of them (never for typed included terms) instead of an
+        // empty page. The relaxed pass reads the whole page: the strict set is
+        // empty by then, so filtering it again could never add a row.
+        const relaxedMatch = !strict.length && Boolean(fetched.length);
+        const comparable = relaxedMatch
+          ? filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, relaxTerms: true })
+          : strict;
+        const relaxedNote = relaxedMatch && comparable.length ? ' · matched most query words' : '';
+        // Typo-only rows are held to the query or the misspelling that found
+        // them, never relaxed, and kept apart so every main-page result is
+        // exactly what it would be without typo variants.
+        const typoComparable = typoRows.length ? filterTypoRows(typoRows, typoOf, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters) : [];
         // Cache-first like watch scans: only a few cold listings fetch an item
         // page per search; the rest surface as pending delivery checks.
-        if (input.shippingOnly) await this.enrichShipping(comparable, source);
+        run.checkpoint();
+        if (input.shippingOnly) await this.enrichShipping(typoComparable.length ? [...comparable, ...typoComparable] : comparable, source);
         let filtered = filterListings(comparable, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, shippingOnly: input.shippingOnly, relaxTerms: true });
+        const typoFiltered = typoComparable.length ? filterTypoRows(typoComparable, typoOf, input.query, input.terms ?? '', input.excluded ?? '', { ...deterministicFilters, shippingOnly: input.shippingOnly }) : [];
+        for (const status of variantStatuses) status.matched = typoFiltered.filter((listing) => typoOf(listing)?.query === status.query).length;
         // P1/P3 near-miss rescue: deterministic substring misses that pass
         // everything else get one bounded Jev judgment each. Fail-closed:
-        // any failure keeps the deterministic set.
+        // any failure keeps the deterministic set. Turning AI relevance off
+        // skips it too, and rows the relaxed pass already kept cost nothing.
         const rescuedKeys = new Set<string>();
-        try {
-          const rescued = await this.fuzzyRescueForSearch(fetched, {
-            query: input.query, includedTerms: input.terms ?? '', excludedTerms: input.excluded ?? '', condition: input.condition,
-          }, { ...deterministicFilters, shippingOnly: Boolean(input.shippingOnly) }, source);
-          if (rescued.length) {
-            const seen = new Set(filtered.map((listing) => `${listing.marketplace}:${listing.listingId}`));
-            for (const listing of rescued) {
-              const key = `${listing.marketplace}:${listing.listingId}`;
-              if (!seen.has(key)) {
-                seen.add(key);
-                rescuedKeys.add(key);
-                filtered.push(listing);
+        run.checkpoint();
+        if (input.aiRelevance !== false) {
+          try {
+            const kept = new Set(comparable.map((listing) => `${listing.marketplace}:${listing.listingId}`));
+            const rescued = await this.fuzzyRescueForSearch(fetched.filter((listing) => !kept.has(`${listing.marketplace}:${listing.listingId}`)), {
+              query: input.query, includedTerms: input.terms ?? '', excludedTerms: input.excluded ?? '', condition,
+            }, { ...deterministicFilters, shippingOnly: Boolean(input.shippingOnly) }, source);
+            if (rescued.length) {
+              const seen = new Set(filtered.map((listing) => `${listing.marketplace}:${listing.listingId}`));
+              for (const listing of rescued) {
+                const key = `${listing.marketplace}:${listing.listingId}`;
+                if (!seen.has(key)) {
+                  seen.add(key);
+                  rescuedKeys.add(key);
+                  filtered.push(listing);
+                }
               }
             }
+          } catch {
+            // Rescue is recall-only; any failure keeps the deterministic set.
           }
-        } catch {
-          // Rescue is recall-only; any failure keeps the deterministic set.
         }
+        // Typo rows join after every main-page row, rescued ones included, so
+        // they are the first left unjudged when the AI budget runs out.
+        filtered.push(...typoFiltered);
         // Same AI relevance gate as watch scans (Jev live, DeepSeek legacy),
         // but the search form can opt out per search (aiRelevance: false) to
         // skip the Jev round trips entirely. Fail-open, so unknown/
         // not-configured keeps the deterministic set. An unexpected throw
         // (e.g. cache/transaction failure) must not turn a good deterministic
         // result into a user-visible search error.
+        run.checkpoint();
         let relevant = filtered;
         let relevanceNote = '';
         let relevanceResult: RelevanceFilterResult | null = null;
@@ -4858,14 +5185,20 @@ export class ScoutService {
         let checkStatus = new Map<NormalizedListing, { state: 'passed' | 'unconfirmed' | 'unchecked'; note: string }>();
         let checksNote = '';
         let hiddenByChecks = 0;
+        // Set when the pass threw or any single Jev call failed: a retry may
+        // judge those listings, so the result must not be cached.
+        let checksFailed = false;
         if (checks.length) {
+          run.checkpoint();
           try {
             const checked = await this.applySearchChecks(capped, checks);
             capped = checked.listings;
             checkStatus = checked.status;
             hiddenByChecks = checked.rejected;
+            checksFailed = checked.failed > 0;
             checksNote = checked.inactive ? ' · Jev checks inactive' : checked.rejected ? ` · ${checked.rejected} hidden by Jev checks` : '';
           } catch (error) {
+            checksFailed = true;
             this.log('error', 'watch', `Manual search Jev checks skipped: ${error instanceof Error ? error.message : String(error)}`.slice(0, 500));
           }
         }
@@ -4874,7 +5207,11 @@ export class ScoutService {
         this.transaction(() => {
           for (const listing of capped) this.storeManualListing(listing);
         });
-        const pendingShipping = input.shippingOnly ? comparable.filter((listing) => listing.shippingAvailable === null).length : 0;
+        const pendingShipping = input.shippingOnly ? [...comparable, ...typoComparable].filter((listing) => listing.shippingAvailable === null).length : 0;
+        const matchedVia = (listing: NormalizedListing) => {
+          const variant = typoOf(listing);
+          return variant ? `typo:${variant.query}` : 'query';
+        };
         const listings = capped.map((listing): Listing => ({
           id: `${listing.marketplace}:${listing.listingId}`, title: listing.title,
           subtitle: [listing.condition, listing.location].filter(Boolean).join(' · '), marketplace: listing.marketplace,
@@ -4884,32 +5221,38 @@ export class ScoutService {
           postedAt: listing.postedAt ?? null, refreshedAt: listing.refreshedAt ?? null, promoted: listing.promoted ?? null, sellerType: listing.sellerType ?? null,
           ...(scoring ? { deal: this.searchDeal(scoring, listing) } : {}),
           ...(checkStatus.has(listing) ? { jevCheck: checkStatus.get(listing)!.state, jevCheckNote: checkStatus.get(listing)!.note } : {}),
+          ...(input.typoVariants ? { matchedVia: matchedVia(listing) } : {}),
         }));
         const matches = relevant.length - hiddenByChecks;
+        const viaTypo = foundByTypo.size ? relevant.filter((listing) => typoOf(listing)).length : 0;
+        const typoNote = viaTypo ? ` · ${viaTypo} via typo variants` : '';
         const status: SearchSourceStatus = {
           source, status: 'ok', count: matches, pendingShipping, durationMs: Date.now() - started,
-          message: matches
-            ? `${matches} matches${relevanceNote}${checksNote}${truncated ? ` · showing the first ${MANUAL_SEARCH_RESULT_CAP}` : ''}`
-            : 'No matching listings',
+          message: `${matches
+            ? `${matches} matches${relaxedNote}${typoNote}${relevanceNote}${checksNote}${truncated ? ` · showing the first ${MANUAL_SEARCH_RESULT_CAP}` : ''}`
+            : 'No matching listings'}${conditionNote}`,
+          ...(input.typoVariants ? { variants: variantStatuses } : {}),
         };
-        if (details) {
-          // Strict means every query term matched; a kept row that is neither
-          // strict nor rescued came through the relaxed (most-terms) pass.
-          const strictKeys = new Set(filterListings(fetched, input.query, input.terms ?? '', input.excluded ?? '', deterministicFilters)
-            .map((listing) => `${listing.marketplace}:${listing.listingId}`));
-          for (const listing of capped) {
-            const key = `${listing.marketplace}:${listing.listingId}`;
-            details.listings.set(key, {
-              listingId: listing.listingId,
-              // A check that threw kept the listing without a verdict, as the budget running out does.
-              relevance: relevanceResult?.statuses?.get(listing) ?? (relevanceFailed ? 'unknown' : 'not-checked'),
-              match: rescuedKeys.has(key) ? 'rescued' : strictKeys.has(key) ? 'strict' : 'relaxed',
-              matchedVia: 'query',
-              flags: [],
-            });
-          }
-          details.sources.set(source, {
-            fetched: fetched.length,
+        // Strict means every query term matched; a kept row that is neither
+        // strict nor rescued came through the relaxed (most-terms) pass.
+        // A typo row matched every word of the query or of its own spelling.
+        const strictKeys = new Set([...strict, ...typoFiltered].map(listingKey));
+        const listingDetails = capped.map((listing): [string, ManualSearchListingDetail] => {
+          const key = listingKey(listing);
+          return [key, {
+            listingId: listing.listingId,
+            // A check that threw kept the listing without a verdict, as the budget running out does.
+            relevance: relevanceResult?.statuses?.get(listing) ?? (relevanceFailed ? 'unknown' : 'not-checked'),
+            match: rescuedKeys.has(key) ? 'rescued' : strictKeys.has(key) ? 'strict' : 'relaxed',
+            matchedVia: matchedVia(listing),
+            flags: [],
+          }];
+        });
+        return report({
+          listings,
+          status,
+          detail: {
+            fetched: fetched.length + typoRows.length,
             matched: filtered.length,
             aiExcluded: relevanceResult?.excluded ?? 0,
             aiUnknown: relevanceResult?.unknown ?? 0,
@@ -4917,32 +5260,17 @@ export class ScoutService {
             returned: listings.length,
             truncated,
             errorKind: null,
-          });
-        }
-        // Stream this source to the originating client so a fast marketplace is
-        // visible while a slow one is still fetching. The HTTP response below
-        // stays authoritative and reconciles anything the stream missed.
-        this.emitSearchProgress(input.searchId, page, source, status, listings);
-        return { listings, status };
+          },
+          listingDetails,
+          cacheable: !relevanceFailed && !(relevanceResult?.errors) && !checksFailed && variantStatuses.every((variant) => variant.status === 'ok'),
+        });
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Search failed';
         const status: SearchSourceStatus = { source, status: 'error', count: 0, pendingShipping: 0, durationMs: Date.now() - started, message };
-        details?.sources.set(source, { fetched: 0, matched: 0, aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, returned: 0, truncated: false, errorKind: searchErrorKind(error) });
-        this.emitSearchProgress(input.searchId, page, source, status, []);
-        return { listings: [] as Listing[], status };
+        return report({ listings: [], status, detail: { ...EMPTY_SEARCH_SOURCE, errorKind: searchErrorKind(error) }, listingDetails: [], cacheable: false });
       }
-      });
-      const results = await Promise.all(tasks);
-      const unique = new Map<string, Listing>();
-      for (const listing of results.flatMap((result) => result.listings)) unique.set(listing.id, listing);
-      return {
-        listings: [...unique.values()].sort((a, b) => a.price - b.price),
-        sources: results.map((result) => result.status),
-        ...(scoring === undefined ? {} : { scoredAgainst: scoring?.scoredAgainst ?? null }),
-      };
-    } finally {
-      this.activeManualSearches -= 1;
-    }
+    });
+    return Promise.all(tasks);
   }
 
   /**
@@ -5244,8 +5572,8 @@ export class ScoutService {
     const versionId = `${input.id}:v1`;
     const olxCategory = olxCategoryToJson(input.olxCategory);
     this.transaction(() => {
-      this.stmt('INSERT INTO market_watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, interval_hours, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, enabled, active_version_id, next_scan_at, last_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?)').run(input.id, input.name, input.query, input.terms, input.excluded, NO_LOCATION_FILTER, input.condition, JSON.stringify(input.sources), input.intervalHours, input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, input.typoVariants ? 1 : 0, olxCategory, versionId, now, now, now);
-      this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, input.id, input.query, input.terms, input.excluded, NO_LOCATION_FILTER, input.condition, JSON.stringify(input.sources), input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, input.typoVariants ? 1 : 0, olxCategory, now);
+      this.stmt('INSERT INTO market_watches (id, name, query, included_terms, excluded_terms, location, condition, sources_json, interval_hours, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, enabled, active_version_id, next_scan_at, last_scan_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?)').run(input.id, input.name, input.query, input.terms, input.excluded, NO_LOCATION_FILTER, input.condition, JSON.stringify(input.sources), input.intervalHours, input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, input.typoVariants ? RESEARCH_TYPO_CURRENT : 0, olxCategory, versionId, now, now, now);
+      this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, input.id, input.query, input.terms, input.excluded, NO_LOCATION_FILTER, input.condition, JSON.stringify(input.sources), input.minPrice, input.maxPrice, input.shippingOnly ? 1 : 0, input.typoVariants ? RESEARCH_TYPO_CURRENT : 0, olxCategory, now);
     });
     this.emit('market-watch', { refresh: true, id: input.id });
     return this.marketResearch().watches.find((watch) => watch.id === input.id)!;
@@ -5295,10 +5623,10 @@ export class ScoutService {
         if (changed) {
           const versionId = `${id}:v${Date.now()}-${randomBytes(3).toString('hex')}`;
           if (row.active_version_id) this.stmt('UPDATE market_watch_versions SET closed_at = ? WHERE id = ? AND closed_at IS NULL').run(now, row.active_version_id);
-          this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, id, next.query, next.terms, next.excluded, NO_LOCATION_FILTER, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, next.typoVariants ? 1 : 0, next.olxCategory, now);
+          this.stmt('INSERT INTO market_watch_versions (id, market_watch_id, query, included_terms, excluded_terms, location, condition, sources_json, min_price_pln, max_price_pln, shipping_only, typo_variants, olx_category_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(versionId, id, next.query, next.terms, next.excluded, NO_LOCATION_FILTER, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, next.typoVariants ? RESEARCH_TYPO_CURRENT : 0, next.olxCategory, now);
           this.stmt("UPDATE market_listings SET status = 'superseded', ended_at = COALESCE(ended_at, ?), ended_reason = COALESCE(ended_reason, 'Research criteria changed') WHERE market_watch_id = ? AND (version_id = ? OR version_id IS NULL) AND status <> 'superseded'").run(now, id, row.active_version_id ?? currentVersion.id);
           directFields.push('query = ?', 'included_terms = ?', 'excluded_terms = ?', 'location = ?', 'condition = ?', 'sources_json = ?', 'min_price_pln = ?', 'max_price_pln = ?', 'shipping_only = ?', 'typo_variants = ?', 'olx_category_json = ?', 'active_version_id = ?', 'next_scan_at = ?');
-          directValues.push(next.query, next.terms, next.excluded, NO_LOCATION_FILTER, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, next.typoVariants ? 1 : 0, next.olxCategory, versionId, now);
+          directValues.push(next.query, next.terms, next.excluded, NO_LOCATION_FILTER, next.condition, JSON.stringify(next.sources), next.minPrice, next.maxPrice, next.shippingOnly ? 1 : 0, next.typoVariants ? RESEARCH_TYPO_CURRENT : 0, next.olxCategory, versionId, now);
         }
       }
       if (!directFields.length) throw new ServiceError('No supported fields', 400);
@@ -5345,20 +5673,39 @@ export class ScoutService {
           const mainListings = await this.fetchSearchPages(source, row.query, searchFilters, onPath);
           // Typo variants come from the immutable criteria version, like every
           // other research criterion, and append one page per variant query.
-          const variantQueries = version.typo_variants
-            ? pickVariantBatch(typoVariants(String(version.query ?? row.query)), scanOrdinal(), TYPO_VARIANTS_PER_SCAN)
-            : [];
+          // A legacy version keeps its old spellings and holds every row to the
+          // original query; a current one holds typo-only rows to the
+          // misspelling that found them, as watch scans do.
+          const variantQuery = String(version.query ?? row.query);
+          const typoMode = Number(version.typo_variants ?? 0);
+          const variantBatch: TypoVariant[] = typoMode >= RESEARCH_TYPO_CURRENT
+            ? pickVariantBatch(typoVariantPairs(variantQuery), scanOrdinal(), TYPO_VARIANTS_PER_SCAN)
+            : typoMode === RESEARCH_TYPO_LEGACY
+              ? pickVariantBatch(legacyTypoVariants(variantQuery), scanOrdinal(), TYPO_VARIANTS_PER_SCAN).map((query) => ({ query, from: '', to: '' }))
+              : [];
+          const listingKey = (listing: NormalizedListing) => `${listing.marketplace}:${listing.listingId}`;
+          const fetched = [...new Map(mainListings.map((listing) => [listingKey(listing), listing])).values()];
+          const foundByTypo = new Map<string, TypoVariant>();
+          const seenKeys = new Set(fetched.map(listingKey));
           const variantFetches: string[] = [];
-          for (const variantQuery of variantQueries) {
-            variantFetches.push(`"${variantQuery}"`);
-            mainListings.push(...await this.fetchSearchPages(source, variantQuery, searchFilters, onPath));
+          for (const variant of variantBatch) {
+            variantFetches.push(`"${variant.query}"`);
+            for (const listing of await this.fetchSearchPages(source, variant.query, searchFilters, onPath)) {
+              const key = listingKey(listing);
+              if (seenKeys.has(key)) continue;
+              seenKeys.add(key);
+              if (typoMode >= RESEARCH_TYPO_CURRENT) foundByTypo.set(key, variant);
+              fetched.push(listing);
+            }
           }
-          const fetched = [...new Map(mainListings.map((listing) => [`${listing.marketplace}:${listing.listingId}`, listing])).values()];
           this.log('info', 'research', `${row.name} · ${source}: query-search${variantFetches.length ? ` + typo-variants (${variantFetches.join(', ')})` : ''} → ${paths.join(' → ') || 'no fetch'} · fetched=${fetched.length}`);
           const filters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, shippingOnly: false };
-          const comparable = filterListings(fetched, row.query, row.included_terms ?? '', row.excluded_terms ?? '', filters);
+          const filterScan = (rows: NormalizedListing[], scanFilters: ListingFilters) => foundByTypo.size
+            ? filterTypoRows(rows, (listing) => foundByTypo.get(listingKey(listing)), row.query, row.included_terms ?? '', row.excluded_terms ?? '', scanFilters)
+            : filterListings(rows, row.query, row.included_terms ?? '', row.excluded_terms ?? '', scanFilters);
+          const comparable = filterScan(fetched, filters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
-          const filtered = filterListings(comparable, row.query, row.included_terms ?? '', row.excluded_terms ?? '', { ...filters, shippingOnly: Boolean(row.shipping_only) });
+          const filtered = filterScan(comparable, { ...filters, shippingOnly: Boolean(row.shipping_only) });
           const observedAt = nowIso();
           const seen = new Set(filtered.map((listing) => listing.listingId));
           const active = this.stmt("SELECT id, listing_id, url, missing_scans FROM market_listings WHERE market_watch_id = ? AND version_id = ? AND marketplace = ? AND status = 'active'").all(row.id, version.id, source) as Array<{ id: number; listing_id: string; url: string; missing_scans: number }>;
@@ -6152,20 +6499,34 @@ export class ScoutService {
             : await this.fetchSearchPages(source, row.query, searchFilters, onPath);
           // Typo variants append at most one page per variant query after the
           // main page; exact-URL watches pin their own searches instead.
-          const variantQueries = matchingExact.length || !row.typo_variants
+          const variantBatch = matchingExact.length || !row.typo_variants
             ? []
-            : pickVariantBatch(typoVariants(String(row.query)), scanOrdinal(), TYPO_VARIANTS_PER_SCAN);
+            : pickVariantBatch(typoVariantPairs(String(row.query)), scanOrdinal(), TYPO_VARIANTS_PER_SCAN);
+          const listingKey = (listing: NormalizedListing) => `${listing.marketplace}:${listing.listingId}`;
+          const fetched = [...new Map(mainListings.map((listing) => [listingKey(listing), listing])).values()];
+          // A row only a variant page returned remembers the misspelling that
+          // found it; the main page wins a row both returned.
+          const foundByTypo = new Map<string, TypoVariant>();
+          const seenKeys = new Set(fetched.map(listingKey));
           const variantFetches: string[] = [];
-          for (const variantQuery of variantQueries) {
-            variantFetches.push(`"${variantQuery}"`);
-            mainListings.push(...await this.fetchSearchPages(source, variantQuery, searchFilters, onPath));
+          for (const variant of variantBatch) {
+            variantFetches.push(`"${variant.query}"`);
+            for (const listing of await this.fetchSearchPages(source, variant.query, searchFilters, onPath)) {
+              const key = listingKey(listing);
+              if (seenKeys.has(key)) continue;
+              seenKeys.add(key);
+              foundByTypo.set(key, variant);
+              fetched.push(listing);
+            }
           }
-          const fetched = [...new Map(mainListings.map((listing) => [`${listing.marketplace}:${listing.listingId}`, listing])).values()];
           this.log('info', 'watch', `${row.name} · ${source}: ${matchingExact.length ? `exact-urls (${matchingExact.length})` : 'query-search'}${variantFetches.length ? ` + typo-variants (${variantFetches.join(', ')})` : ''} → ${paths.join(' → ') || 'no fetch'} · fetched=${fetched.length}`);
           const deterministicFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, sellerType: sellerTypeFromRow(row.seller_type), ignorePromoted: Boolean(row.ignore_promoted), shippingOnly: false };
-          const comparable = filterListings(fetched, row.query, row.included_terms, row.excluded_terms, deterministicFilters);
+          const filterScan = (rows: NormalizedListing[], filters: ListingFilters) => foundByTypo.size
+            ? filterTypoRows(rows, (listing) => foundByTypo.get(listingKey(listing)), row.query, row.included_terms ?? '', row.excluded_terms ?? '', filters)
+            : filterListings(rows, row.query, row.included_terms, row.excluded_terms, filters);
+          const comparable = filterScan(fetched, deterministicFilters);
           if (row.shipping_only) await this.enrichShipping(comparable, source);
-          let filtered = filterListings(comparable, row.query, row.included_terms, row.excluded_terms, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) });
+          let filtered = filterScan(comparable, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) });
           // Per-variant baselines and first-observation queries are computed
           // once per scan, before the AI passes: both the fuzzy rescue and the
           // relevance pass need the same scoring to decide which listings are
@@ -6182,8 +6543,12 @@ export class ScoutService {
             return score.qualifies || (dealStrength ?? 0) >= 4 || listingHitsTarget(row, listing.price);
           };
           try {
-            if (!matchingExact.length) {
-              const rescued = await this.fuzzyRescueForSearch(fetched, {
+            // The watch's AI relevance switch covers the rescue too, as it does on manual search.
+            if (!matchingExact.length && (row.ai_relevance === undefined || Boolean(row.ai_relevance))) {
+              // A typo row kept by its own spelling is no near-miss to rescue.
+              const comparableKeys = new Set(comparable.map(listingKey));
+              const rescuePool = foundByTypo.size ? fetched.filter((listing) => !comparableKeys.has(listingKey(listing))) : fetched;
+              const rescued = await this.fuzzyRescueForSearch(rescuePool, {
                 query: row.query, includedTerms: row.included_terms ?? '', excludedTerms: row.excluded_terms ?? '', condition: row.condition,
               }, { ...deterministicFilters, shippingOnly: Boolean(row.shipping_only) }, source, strongEnough);
               if (rescued.length) {
@@ -6297,12 +6662,14 @@ export class ScoutService {
     const key = segments.join('/');
     let pending = this.olxPathCache.get(key);
     if (!pending) {
-      pending = resolveOlxSearchPath(segments, async (path) => {
+      // Shared by every scan and search that asks, so it runs outside the
+      // asking search's scope: stopping that search must not fail the rest.
+      pending = searchScope.exit(() => resolveOlxSearchPath(segments, async (path) => {
         const { status, json } = await this.fetchOlxApi(buildOlxFriendlyLinksUrl(path));
         if (status === 404) return null;
         if (status < 200 || status >= 300) throw new Error(`OLX path lookup returned HTTP ${status}`);
         return parseOlxFriendlyLinks(json);
-      });
+      }));
       pending.catch((error) => { if (!(error instanceof SearchConfigError)) this.olxPathCache.delete(key); });
       this.olxPathCache.set(key, pending);
     }
@@ -6340,7 +6707,11 @@ export class ScoutService {
       limiter = new Limiter(MARKETPLACE_REQUEST_CONCURRENCY);
       this.marketplaceLimiters.set(marketplace, limiter);
     }
-    return limiter.run(task);
+    // A manual search's requests go ahead of waiting scan, detail and
+    // enrichment work; once it is stopped, those still waiting are dropped
+    // instead of firing later.
+    const scope = searchScope.getStore();
+    return limiter.run(task, { signal: scope?.signal, priority: scope?.priority });
   }
 
   private fetchOlxApi(url: string) { return this.marketplaceRequest('OLX', () => this.requestOlxApi(url)); }
@@ -7408,11 +7779,19 @@ export class ScoutService {
     return latest?.backoff_until && Date.parse(latest.backoff_until) > Date.now() ? latest.backoff_until : null;
   }
 
-  /** Backoff deadline for a failed run; doubles with each consecutive failed outcome, ignoring skips. */
-  private connectorBackoffAfterFailure(source: string, runId: number): string {
+  /**
+   * Backoff deadline for a failed run, or null when it is the first failure
+   * in a row: one blocked page or timeout on one watch must not pause the
+   * connector for every watch and search. From the second consecutive failed
+   * outcome it is 5 min, doubling with each further one up to 6 h; skipped
+   * rows neither break nor extend the streak.
+   */
+  private connectorBackoffAfterFailure(source: string, runId: number): string | null {
     const recent = this.stmt("SELECT status FROM connector_runs WHERE source = ? AND id != ? AND status IN ('ok', 'error') ORDER BY started_at DESC, id DESC LIMIT 8").all(source, runId) as Array<{ status: string }>;
     const streak = recent.findIndex((run) => run.status !== 'error');
-    return new Date(Date.now() + exponentialBackoff(streak === -1 ? recent.length : streak)).toISOString();
+    const failuresBefore = streak === -1 ? recent.length : streak;
+    if (failuresBefore + 1 < CONNECTOR_BACKOFF_AFTER_FAILURES) return null;
+    return new Date(Date.now() + exponentialBackoff(failuresBefore + 1 - CONNECTOR_BACKOFF_AFTER_FAILURES)).toISOString();
   }
 
   /**
@@ -7534,6 +7913,11 @@ export type ListingFilters = {
    * dropping the whole page. Never relaxes user-typed included/excluded terms.
    */
   relaxTerms?: boolean;
+  /**
+   * Manual search only: drop listings whose condition says damaged or for
+   * parts, so a search for used items does not return broken ones.
+   */
+  excludeDamaged?: boolean;
 };
 
 const CONDITION_ALIASES: Record<string, string[]> = {
@@ -7547,6 +7931,7 @@ function matchesRequestedCondition(requestedCondition: string, listingCondition:
   const isNew = /(^| )(new|nowe|nowy|nowa)( |$)/.test(listingCondition);
   if (requestedCondition === 'new') return isNew;
   if (requestedCondition === 'used') return Boolean(listingCondition) && !isNew;
+  if (requestedCondition === 'damaged') return isDamagedLabel(listingCondition);
   return (CONDITION_ALIASES[requestedCondition.replace(/\s+$/, '')] ?? [requestedCondition]).some((alias) => listingCondition.includes(alias));
 }
 
@@ -7573,7 +7958,8 @@ function evaluateDeterministic(
   const shippingOk = !options.shippingOnly || listing.marketplace === 'Vinted' || listing.shippingAvailable === true;
   const sellerOk = (!options.sellerType || !listing.sellerType || listing.sellerType === options.sellerType)
     && (!options.ignorePromoted || listing.promoted !== true);
-  return { termOk, conditionOk, priceOk, shippingOk, sellerOk };
+  const damagedOk = !options.excludeDamaged || !isDamagedLabel(condition);
+  return { termOk, conditionOk, priceOk, shippingOk, sellerOk, damagedOk };
 }
 
 export function filterListings(listings: NormalizedListing[], query: string, includedRaw: string, excludedRaw: string, filters: ListingFilters | boolean = {}) {
@@ -7586,13 +7972,57 @@ export function filterListings(listings: NormalizedListing[], query: string, inc
     const title = normalizeFilterText(listing.title);
     const condition = normalizeFilterText(listing.condition ?? '');
     const evaluated = evaluateDeterministic(listing, title, condition, included, excluded, requestedCondition, options, relaxed);
-    return evaluated.termOk && evaluated.conditionOk && evaluated.priceOk && evaluated.shippingOk && evaluated.sellerOk;
+    return evaluated.termOk && evaluated.conditionOk && evaluated.priceOk && evaluated.shippingOk && evaluated.sellerOk && evaluated.damagedOk;
   });
   const strict = evaluate(false);
   // Only manual search opts into the relaxed retry, and never when the user
   // typed explicit included terms (those are a hard requirement).
   if (strict.length || !options.relaxTerms || explicitTerms) return strict;
   return evaluate(true);
+}
+
+/**
+ * Typed included terms with the typo variant's misspelling swapped in, so a
+ * row found by "iphon 13" is held to "iphon" where the user typed "iphone".
+ * A term without the corrected word stays as typed.
+ */
+export function rewriteTypoTerms(includedRaw: string, variant: TypoVariant) {
+  const from = normalizeFilterText(variant.from);
+  const to = normalizeFilterText(variant.to);
+  if (!from || !includedRaw.trim()) return includedRaw;
+  return includedRaw.split(',').map((term) => {
+    const normalized = ` ${normalizeFilterText(term)} `;
+    return normalized.includes(` ${from} `) ? normalized.replace(` ${from} `, ` ${to} `).trim() : term;
+  }).join(',');
+}
+
+/**
+ * filterListings for a scan that also fetched typo-variant pages. A row only
+ * a variant page returned is kept when it matches the original query or the
+ * misspelling it was found by; every other row is held to the original query
+ * alone. Plain substring matching against the original query drops "Iphon 13"
+ * for "iphone 13", which is the row the variant exists to find.
+ */
+export function filterTypoRows(
+  listings: NormalizedListing[],
+  variantOf: (listing: NormalizedListing) => TypoVariant | undefined,
+  query: string,
+  includedRaw: string,
+  excludedRaw: string,
+  filters: ListingFilters,
+) {
+  const kept = new Set(filterListings(listings, query, includedRaw, excludedRaw, filters));
+  const byVariant = new Map<TypoVariant, NormalizedListing[]>();
+  for (const listing of listings) {
+    if (kept.has(listing)) continue;
+    const variant = variantOf(listing);
+    if (!variant) continue;
+    byVariant.set(variant, [...(byVariant.get(variant) ?? []), listing]);
+  }
+  for (const [variant, group] of byVariant) {
+    for (const listing of filterListings(group, variant.query, rewriteTypoTerms(includedRaw, variant), excludedRaw, { ...filters, relaxTerms: false })) kept.add(listing);
+  }
+  return listings.filter((listing) => kept.has(listing));
 }
 
 /**
@@ -7619,7 +8049,8 @@ export function findFuzzyRescueCandidates(
     const title = normalizeFilterText(listing.title);
     const condition = normalizeFilterText(listing.condition ?? '');
     const evaluated = evaluateDeterministic(listing, title, condition, included, excluded, requestedCondition, options);
-    if (!evaluated.priceOk || !evaluated.shippingOk || !evaluated.sellerOk) continue;
+    // A damaged listing on a used search is a hard drop, so no Jev call is spent on it.
+    if (!evaluated.priceOk || !evaluated.shippingOk || !evaluated.sellerOk || !evaluated.damagedOk) continue;
     if (!evaluated.termOk && evaluated.conditionOk && hasTermFilter) termCandidates.push(listing);
     else if (!evaluated.conditionOk && evaluated.termOk && hasConditionFilter) conditionCandidates.push(listing);
   }

@@ -70,6 +70,8 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
   const searchSequence = useRef(0);
   const searchController = useRef<AbortController | null>(null);
   const searchIdRef = useRef("");
+  // Load more keeps the "Search anyway" choice of the search it continues.
+  const ignoreBackoffRef = useRef(false);
   const numericMin = minPrice === "" ? null : Number(minPrice);
   const numericMax = maxPrice === "" ? null : Number(maxPrice);
   const validPrices =
@@ -123,9 +125,15 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
     return unsubscribe;
   }, []);
 
-  const submit = async (event: FormEvent) => {
+  const submit = (event: FormEvent) => {
     event.preventDefault();
+    void runSearch(false);
+  };
+
+  // ignoreBackoff also searches marketplaces paused after repeated failed scans.
+  const runSearch = async (ignoreBackoff: boolean) => {
     if (!query.trim() || !sources.length || !validPrices) return;
+    ignoreBackoffRef.current = ignoreBackoff;
     searchController.current?.abort();
     const controller = new AbortController();
     searchController.current = controller;
@@ -143,7 +151,7 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
     setExhausted(false);
     setSourceStatuses(sources.map((source): SearchSourceStatus => ({ source, status: "searching", count: 0, pendingShipping: 0, durationMs: 0, message: "Searching…" })));
     try {
-      const result = await api.search({ ...buildFilters(1), searchId }, controller.signal);
+      const result = await api.search({ ...buildFilters(1), searchId, ...(ignoreBackoff ? { ignoreBackoff } : {}) }, controller.signal);
       if (sequence !== searchSequence.current || controller.signal.aborted) return;
       // The response reconciles the streamed rows; unchanged ones keep their identity and skip.
       setListings((current) => reuseUnchangedListings(current, result.listings));
@@ -165,7 +173,7 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
     setLoadingMore(true);
     setError(null);
     try {
-      const result = await api.search(buildFilters(nextPage));
+      const result = await api.search({ ...buildFilters(nextPage), ...(ignoreBackoffRef.current ? { ignoreBackoff: true } : {}) });
       setListings((current) => mergeListings(current, result.listings));
       // Keep the first page's per-source counts; only surface new failures.
       setSourceStatuses((current) => current.map((item) => {
@@ -331,12 +339,19 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
               <div>
                 <strong>{status.source}</strong>
                 <span>
-                  {status.message}
+                  {status.backoffUntil
+                    ? `Paused after failed scans until ${new Date(status.backoffUntil).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+                    : status.message}
                   {status.pendingShipping
                     ? ` · ${status.pendingShipping} delivery checks pending`
                     : ""}
                 </span>
               </div>
+              {status.backoffUntil && !loading ? (
+                <button type="button" className="outline-button search-anyway" onClick={() => void runSearch(true)}>
+                  Search anyway
+                </button>
+              ) : null}
               <small>
                 {status.status === "searching"
                   ? "…"

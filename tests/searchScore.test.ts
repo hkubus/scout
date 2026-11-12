@@ -236,8 +236,8 @@ test('an unknown or archived watch fails before any marketplace fetch', async ()
     await assert.rejects(search(context.service, 'rtx 3080', { scoreAgainst: 'missing' }), /Watch not found/);
     await assert.rejects(search(context.service, 'rtx 3080', { scoreAgainst: 'old' }), /Watch not found/);
     assert.equal(calls.count, 0);
-    // The busy counter was not left raised by the failures.
-    assert.equal((context.service as any).activeManualSearches, 0);
+    // The failures never took a search slot.
+    assert.deepEqual((context.service as any).searchRuns.load, { running: 0, queued: 0 });
     // Archived watches are not auto candidates either.
     assert.equal((await search(context.service, 'rtx 3080', { scoreAgainst: 'auto' })).scoredAgainst, null);
   } finally { context.close(); }

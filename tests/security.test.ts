@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from '../server/security';
+import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, mcpRateClass, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from '../server/security';
 
 test('detects loopback and public listening addresses', () => {
   assert.equal(isPubliclyBoundHost('127.0.0.1'), false);
@@ -75,4 +75,31 @@ test('flags browser cross-site requests but lets header-less clients through', (
   assert.equal(isCrossSiteBrowserRequest({ 'sec-fetch-site': 'cross-site' }, own), true);
   assert.equal(isCrossSiteBrowserRequest({ origin: 'https://evil.example' }, own), true);
   assert.equal(isCrossSiteBrowserRequest({ origin: 'null' }, own), true);
+});
+
+test('an /mcp POST is live only when it calls a live marketplace tool', () => {
+  const call = (name: string) => ({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: {} } });
+  const cases: Array<[string, unknown, 'live' | 'general']> = [
+    ['scout_search', call('scout_search'), 'live'],
+    ['scout_olx_categories', call('scout_olx_categories'), 'live'],
+    ['scout_queue_scan', call('scout_queue_scan'), 'live'],
+    ['scout_market_scan', call('scout_market_scan'), 'live'],
+    ['scout_market_watch_create', call('scout_market_watch_create'), 'live'],
+    ['scout_verify_listing', call('scout_verify_listing'), 'live'],
+    ['a database-only tool', call('scout_listings'), 'general'],
+    ['scout_listing_detail from the database', call('scout_listing_detail'), 'general'],
+    ['scout_listing_detail with live', { ...call('scout_listing_detail'), params: { name: 'scout_listing_detail', arguments: { id: 'OLX:1', live: true } } }, 'live'],
+    ['scout_listing_detail with sellerListings', { ...call('scout_listing_detail'), params: { name: 'scout_listing_detail', arguments: { id: 'OLX:1', sellerListings: true } } }, 'live'],
+    ['scout_listing_detail with live false', { ...call('scout_listing_detail'), params: { name: 'scout_listing_detail', arguments: { id: 'OLX:1', live: false } } }, 'general'],
+    ['initialize', { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }, 'general'],
+    ['tools/list', { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }, 'general'],
+    ['a notification', { jsonrpc: '2.0', method: 'notifications/initialized' }, 'general'],
+    ['a batch with one live call', [call('scout_listings'), call('scout_search')], 'live'],
+    ['a batch without one', [call('scout_listings'), call('scout_watches')], 'general'],
+    ['a tool name only in the arguments', { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'scout_listings', arguments: { name: 'scout_search' } } }, 'general'],
+    ['no body', undefined, 'general'],
+    ['null', null, 'general'],
+    ['a string', 'scout_search', 'general'],
+  ];
+  for (const [label, body, expected] of cases) assert.equal(mcpRateClass(body), expected, label);
 });

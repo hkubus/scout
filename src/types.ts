@@ -122,6 +122,11 @@ export interface Listing {
   jevCheck?: "passed" | "unconfirmed" | "unchecked";
   /** Failed or unconfirmed checks, or why the listing was not checked. */
   jevCheckNote?: string;
+  /**
+   * Manual search with typoVariants only: `query` for a row the query's own
+   * page returned, `typo:<spelling>` for one only a misspelled search found.
+   */
+  matchedVia?: string;
   listingId?: string;
   decision?: ListingDecision | null;
   note?: string;
@@ -723,6 +728,33 @@ export interface SearchFilters {
    * watch the query matches, anything else is a watch id. Database only.
    */
   scoreAgainst?: string | null;
+  /** Search marketplaces whose connector is backed off after repeated failed scans too. */
+  ignoreBackoff?: boolean;
+  /**
+   * Page 1 only: also search a few misspellings of the query on each
+   * marketplace whose own page loaded, for listings that misspell the product.
+   */
+  typoVariants?: boolean;
+  /**
+   * Answer within this many ms (5000-120000; the server default otherwise),
+   * the wait for a free search slot included. Marketplaces not finished by
+   * then come back as errors; the search keeps running for a repeat to join.
+   */
+  deadlineMs?: number;
+  /** Skip the few-minute result cache (an identical search already running is still joined). */
+  refresh?: boolean;
+}
+
+/** One misspelled search a manual search with typoVariants ran on a marketplace. */
+export interface SearchTypoVariantStatus {
+  query: string;
+  status: "ok" | "error";
+  /** Rows the misspelled search returned. */
+  fetched: number;
+  /** Rows the query's own page did not have that passed the search's filters (before AI relevance). */
+  matched: number;
+  /** Why the search failed; only on an error. */
+  message?: string;
 }
 
 /**
@@ -765,6 +797,16 @@ export interface SearchSourceStatus {
   pendingShipping: number;
   durationMs: number;
   message: string;
+  /**
+   * Only on a source skipped because its connector is backed off: when the
+   * pause ends (ISO). Its kind is `backoff` in the MCP search details.
+   */
+  backoffUntil?: string;
+  /**
+   * Only with typoVariants, on a marketplace whose own page loaded: each
+   * misspelled search run on it. One failing never fails the marketplace.
+   */
+  variants?: SearchTypoVariantStatus[];
 }
 
 export interface ManualSearchResponse {
@@ -772,6 +814,12 @@ export interface ManualSearchResponse {
   sources: SearchSourceStatus[];
   /** Only when scoreAgainst was sent: the watch used, or null when "auto" matched none. */
   scoredAgainst?: SearchScoredAgainst | null;
+  /** Only when typoVariants was sent: the misspellings searched; empty past page 1 or when no word qualifies. */
+  typoVariants?: string[];
+  /** Only on a repeat answered from the few-minute result cache (send refresh to skip it). */
+  fromCache?: true;
+  /** With fromCache: when the search that produced the result finished. */
+  cachedAt?: string;
 }
 
 /** Probable-sale estimate band — never a confirmed/completed-sale price. */

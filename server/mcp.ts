@@ -339,7 +339,7 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
   });
 
   server.registerTool('scout_search', {
-    description: 'Live manual marketplace search (OLX, Allegro Lokalnie, Vinted) with deterministic and AI relevance filtering. Expensive: fetches live pages.',
+    description: 'Live manual marketplace search (OLX, Allegro Lokalnie, Vinted) with deterministic and AI relevance filtering. Expensive: fetches live pages. A marketplace paused after repeated failed scans is skipped and reported as an error unless ignoreBackoff is set. typoVariants also searches a couple of misspellings of the query. Up to three searches run at once and the rest wait their turn within deadlineMs; repeats within 3 min come from a cache unless refresh is set.',
     inputSchema: {
       query: z.string().trim().min(1).max(240),
       sources: z.array(marketplace).min(1).max(3),
@@ -348,7 +348,8 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       minPrice: z.number().nonnegative().nullable().optional(),
       maxPrice: z.number().positive().nullable().optional(),
       shippingOnly: z.boolean().optional().default(false),
-      condition: z.string().max(80).optional().default('Any'),
+      condition: z.string().max(80).optional().default('Any')
+        .describe('Any, New, Used (leaves out damaged listings), Damaged, or a grade (like new / very good / good); Polish forms such as "używany" or "na części" work too. Anything else searches any condition, and each source\'s message says so.'),
       ownerType: z.enum(['private', 'business']).nullable().optional(),
       olxCategoryId: z.number().int().positive().optional().describe('OLX only: search one category; ids come from scout_olx_categories.'),
       page: z.number().int().min(1).max(10).optional().default(1),
@@ -359,19 +360,30 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
         .describe('Jev reads each result: exclude hides near-certain matches; require-confirmed results come back with jevCheck "passed".'),
       scoreAgainst: z.string().trim().min(1).max(160).optional()
         .describe('"auto" or a watch id. Each result gets deal {typical, discountPercent, deviation, tier, label, qualifies, basis, variantKey, variantLabel}, scored against that watch\'s learned typical asking price exactly as its scan would; deal is null where the watch\'s own filters would not keep the result. "auto" picks the watch the query names (the scout_price_reference match); scoredAgainst says which, or is null when none matches. Compact rows carry deal too. Database only: no extra fetch or AI call.'),
+      ignoreBackoff: z.boolean().optional().default(false)
+        .describe('A marketplace that failed two or more scans in a row is paused for a while (5 min, doubling up to 6 h); searches skip it and report status "error", errorKind "backoff" (compact) and backoffUntil. true searches it anyway.'),
+      typoVariants: z.boolean().optional().default(false)
+        .describe('Page 1 only: also search up to 2 misspellings of the query (iphone 13 → iphon 13, play station → playstation) on each marketplace whose own page loaded, for listings that misspell the product. Costs up to 2 extra page fetches per marketplace. Each result gets matchedVia "query" or "typo:<spelling>", each source its variants, and typoVariants lists the spellings tried. matchedVia "typo:<spelling>" is the spelling whose search found the row, not proof its title is misspelled: marketplaces match loosely, so many are spelled correctly. Typo rows are AI-checked after every main-page row, inside the same 40-check budget per marketplace: when the budget runs out they are the first left unjudged (relevance "unknown"), and a typo row is "relevant" only when the check judged it. Set it on the first search for a product, not on later pages or rewordings.'),
+      deadlineMs: z.number().int().min(5000).max(120000).optional()
+        .describe('Answer within this many ms (default 45000), the wait for a free search slot included. Up to three searches run at once and the rest wait their turn. A marketplace not finished by then comes back as an error with errorKind "deadline" (compact); the search keeps running for a while, so repeating the same call shortly returns it. Still waiting for a slot at the deadline: the call fails as busy.'),
+      refresh: z.boolean().optional().default(false)
+        .describe('A search that finished with every marketplace answering is kept for 3 min, and an identical call (format, deadlineMs and refresh aside) gets it back with fromCache true and cachedAt, at no fetch or AI cost. true skips it and searches again.'),
       format: z.enum(['full', 'compact']).optional().default('full')
         .describe('compact: smaller, stable rows with every key present (null when unknown): id "<Marketplace>:<listingId>", asking price in PLN, relevance, match kind, duplicateCount (0 when none) and duplicateCheapest (null when none) for results a scan already stored that are also listed on another marketplace; sources carry status ok|error with an errorKind and pipeline counts.'),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
-  }, async ({ olxCategoryId, format, ...input }) => {
+  }, async ({ olxCategoryId, format, ...input }, extra) => {
+    if (input.minPrice != null && input.maxPrice != null && input.minPrice > input.maxPrice) return toolError(new ServiceError('Minimum price cannot exceed maximum price'));
     try {
-      const filters = { ...input, olxCategory: olxCategoryId ? { id: olxCategoryId, label: String(olxCategoryId), path: '' } : null };
+      const filters = { ...input, sources: [...new Set(input.sources)], olxCategory: olxCategoryId ? { id: olxCategoryId, label: String(olxCategoryId), path: '' } : null };
+      // Aborted when the client cancels the call or its connection closes.
+      const options = { signal: extra.signal };
       if (format === 'compact') {
-        const result = await service.manualSearchDetailed(filters);
+        const result = await service.manualSearchDetailed(filters, options);
         service.withDuplicates(result.listings);
         return text(toCompactSearch(filters, result));
       }
-      return text(await service.manualSearch(filters));
+      return text(await service.manualSearch(filters, undefined, options));
     } catch (error) { return toolError(error); }
   });
 
