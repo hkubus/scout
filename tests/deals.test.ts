@@ -125,8 +125,9 @@ test('filters the feed by tier, discount, variant, price and verification, and s
     assert.deepEqual(pages.map((page) => page.pagination.hasNext), [true, true, true, false]);
     assert.deepEqual(ids({ sort: 'discount', minStrength: 4 }), ['exc', 'legacy-ready', 'pro-1', 'very', 'passed', 'legacy-learning']);
 
-    // The deal order: strength, then discount, then newest.
-    assert.deepEqual(ids({ sort: 'deal', minStrength: 3 }), ['exc', 'legacy-ready', 'legacy-learning', 'pro-1', 'very', 'passed', 'strong', 'kept', 'other-1']);
+    // The deal order: strength, then untriaged before Buy/Maybe/Pass, then
+    // discount, then newest. `kept` (Buy, 12% off) follows `other-1` (10%).
+    assert.deepEqual(ids({ sort: 'deal', minStrength: 3 }), ['exc', 'legacy-ready', 'legacy-learning', 'pro-1', 'very', 'passed', 'strong', 'other-1', 'kept']);
 
     assert.deepEqual(sorted({ variantKey: 'pro' }), ['pro-1']);
     assert.deepEqual(sorted({ variantKey: '__other__' }), ['other-1']);
@@ -169,17 +170,17 @@ test('Strong+ matches the dashboard count, and scout_deals answers it best first
     assert.equal(deals.schemaVersion, 1);
     assert.equal(deals.minTier, 'strong');
     assert.equal(deals.freshHours, 12);
-    assert.deepEqual(deals.deals.map((deal) => deal.listingId), ['exc', 'legacy-ready', 'legacy-learning', 'pro-1', 'strong', 'kept', 'other-1']);
+    assert.deepEqual(deals.deals.map((deal) => deal.listingId), ['exc', 'legacy-ready', 'legacy-learning', 'pro-1', 'strong', 'other-1', 'kept']);
     assert.equal(deals.total, 7);
     assert.match(deals.notes.join(' '), /Asking prices/);
 
     const byTier = Object.fromEntries(DEAL_TIERS.map((minTier) => [minTier, dealsForAgent(context.service, { minTier }).deals.map((deal) => deal.listingId)]));
     assert.deepEqual(byTier, {
-      strong: ['exc', 'legacy-ready', 'legacy-learning', 'pro-1', 'strong', 'kept', 'other-1'],
+      strong: ['exc', 'legacy-ready', 'legacy-learning', 'pro-1', 'strong', 'other-1', 'kept'],
       'very-strong': ['exc', 'legacy-ready', 'legacy-learning', 'pro-1'],
       exceptional: ['exc', 'legacy-ready', 'legacy-learning'],
     });
-    assert.deepEqual(dealsForAgent(context.service, { includeRejected: true }).deals.map((deal) => deal.listingId), ['exc', 'legacy-ready', 'legacy-learning', 'pro-1', 'very', 'strong', 'kept', 'other-1']);
+    assert.deepEqual(dealsForAgent(context.service, { includeRejected: true }).deals.map((deal) => deal.listingId), ['exc', 'legacy-ready', 'legacy-learning', 'pro-1', 'very', 'strong', 'other-1', 'kept']);
     assert.deepEqual(dealsForAgent(context.service, { marketplace: 'Vinted', includeRejected: true }).deals.map((deal) => deal.listingId), ['very', 'kept']);
     assert.deepEqual(dealsForAgent(context.service, { watchId: 'deal-learning' }).deals.map((deal) => deal.listingId), ['legacy-learning', 'pro-1', 'other-1']);
     assert.deepEqual(dealsForAgent(context.service, { variantKey: 'pro' }).deals.map((deal) => deal.listingId), ['pro-1']);
@@ -206,6 +207,56 @@ test('Strong+ matches the dashboard count, and scout_deals answers it best first
     assert.deepEqual([pro.variantKey, pro.variant, pro.discountPercent, pro.tier], ['pro', '13 Pro', 23.1, 'very-strong']);
     assert.equal(deals.deals.find((deal) => deal.listingId === 'kept')?.decision, 'buy');
   } finally { context.close(); }
+});
+
+test('Overview\'s Top deals request is listingsPage in the deal order, the order Overview used to sort itself', async () => {
+  // The URL the web client builds for Overview, read as GET /api/listings reads it.
+  const requested: string[] = [];
+  const globals = globalThis as Record<string, unknown>;
+  const saved = { window: globals.window, fetch: globals.fetch };
+  Object.assign(globals, {
+    window: globalThis,
+    fetch: async (url: string) => {
+      requested.push(url);
+      return new Response(JSON.stringify({ listings: [], pagination: { page: 1, pageSize: 25, total: 0, hasNext: false } }), { status: 200 });
+    },
+  });
+  const context = fixture();
+  try {
+    const { api, topDealsQuery, TOP_DEALS } = await import('../src/api');
+    seed(context.db, ROWS);
+    // Overview's own ranking before it asked the server, kept as the reference:
+    // Strong+, not hidden, passed or AI-filtered; strength, untriaged first,
+    // deepest discount, newest first seen.
+    const feed = context.service.listingsPage({ visibility: 'all', aiFiltered: 'include', pageSize: 500 }).listings;
+    const overviewOrder = (marketplace?: string) => feed
+      .filter((listing) => !listing.hidden && !listing.aiFiltered && listing.decision !== 'pass' && listing.dealStrength >= 3 && (!marketplace || listing.marketplace === marketplace))
+      .sort((a, b) => (b.dealStrength - a.dealStrength)
+        || ((a.decision ? 1 : 0) - (b.decision ? 1 : 0))
+        || ((a.belowTypical ?? 0) - (b.belowTypical ?? 0))
+        || ((Date.parse(b.firstSeenAt ?? b.observedAt) || 0) - (Date.parse(a.firstSeenAt ?? a.observedAt) || 0)))
+      .map((listing) => listing.listingId);
+
+    for (const marketplace of [undefined, 'OLX', 'Vinted'] as const) {
+      requested.length = 0;
+      await api.listings(topDealsQuery(marketplace));
+      assert.equal(requested.length, 1);
+      const url = new URL(requested[0], 'http://scout.test');
+      assert.equal(url.pathname, '/api/listings');
+      assert.deepEqual(Object.fromEntries(url.searchParams), {
+        pageSize: String(TOP_DEALS + 5), sort: 'deal', visibility: 'visible', minStrength: '3', aiFiltered: 'exclude', excludePassed: 'true',
+        ...(marketplace ? { marketplace } : {}),
+      });
+      // The route passes each filter through to listingsPage, coerced.
+      const page = context.service.listingsPage({ sort: 'deal', minStrength: 3, visibility: 'visible', aiFiltered: 'exclude', excludePassed: true, pageSize: TOP_DEALS + 5, ...(marketplace ? { marketplace } : {}) });
+      assert.deepEqual(page.listings.map((listing) => listing.listingId), overviewOrder(marketplace), marketplace ?? 'All');
+      assert.equal(page.pagination.total, overviewOrder(marketplace).length);
+    }
+    assert.deepEqual(overviewOrder(), ['exc', 'legacy-ready', 'legacy-learning', 'pro-1', 'very', 'strong', 'other-1', 'kept']);
+  } finally {
+    context.close();
+    Object.assign(globals, saved);
+  }
 });
 
 test('compact rows give a signed discount and mark hidden rows', () => {

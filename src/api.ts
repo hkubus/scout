@@ -75,6 +75,25 @@ async function request<T>(path: string, init?: RequestInit, timeoutMs?: number):
   return init?.signal ? abortable(pending, init.signal) : pending;
 }
 
+/** How many deals Overview shows; the rest are one click away in Listings. */
+export const TOP_DEALS = 20;
+
+/**
+ * Overview's Top deals request: Strong+ rows that are not hidden, passed or
+ * filtered by AI, best first in the server's deal order (strength, untriaged
+ * first, discount, newest), plus 5 spare rows so one hidden or passed on
+ * Overview is backfilled at once. `total` counts every match.
+ */
+export const topDealsQuery = (marketplace?: Marketplace) => ({
+  sort: 'deal',
+  minStrength: 3,
+  visibility: 'visible',
+  aiFiltered: 'exclude',
+  excludePassed: true,
+  pageSize: TOP_DEALS + 5,
+  ...(marketplace ? { marketplace } : {}),
+} as const);
+
 const json = (method: string, body?: unknown): RequestInit => body === undefined
   ? { method }
   : { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) };
@@ -88,9 +107,10 @@ export const api = {
   oauthAuthorization: (search: string) => request<{ clientName: string; redirectOrigin: string }>(`/api/oauth/authorize${search}`),
   connectedApps: () => request<{ apps: ConnectedApp[] }>('/api/connected-apps'),
   disconnectApp: (id: number) => request<{ ok: true }>(`/api/connected-apps/${id}`, { method: 'DELETE' }),
-  dashboard: (signal?: AbortSignal) => request<DashboardData>('/api/dashboard', { signal }),
+  /** The web app's form: no feed rows (Overview pages its Top deals through `listings(topDealsQuery())`). */
+  dashboard: (signal?: AbortSignal) => request<DashboardData>('/api/dashboard?listings=none', { signal }),
   connectors: (signal?: AbortSignal) => request<{ connectors: Connector[] }>('/api/connectors', { signal }),
-  listings: (options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string; sort?: 'newest' | 'strongest' | 'price'; decision?: ListingDecision | 'none'; visibility?: 'visible' | 'hidden' | 'all'; minStrength?: number; aiFiltered?: 'exclude' | 'include' | 'only' } = {}, signal?: AbortSignal) => {
+  listings: (options: { page?: number; pageSize?: number; marketplace?: Marketplace; q?: string; watchId?: string; sort?: 'newest' | 'strongest' | 'price' | 'deal'; decision?: ListingDecision | 'none'; visibility?: 'visible' | 'hidden' | 'all'; minStrength?: number; aiFiltered?: 'exclude' | 'include' | 'only'; excludePassed?: boolean } = {}, signal?: AbortSignal) => {
     const params = new URLSearchParams();
     if (options.page !== undefined) params.set('page', String(options.page));
     if (options.pageSize !== undefined) params.set('pageSize', String(options.pageSize));
@@ -102,6 +122,7 @@ export const api = {
     if (options.visibility) params.set('visibility', options.visibility);
     if (options.minStrength && options.minStrength > 1) params.set('minStrength', String(options.minStrength));
     if (options.aiFiltered) params.set('aiFiltered', options.aiFiltered);
+    if (options.excludePassed) params.set('excludePassed', 'true');
     return request<{ listings: DashboardData['listings']; pagination: { page: number; pageSize: number; total: number; hasNext: boolean } }>(`/api/listings${params.toString() ? `?${params}` : ''}`, { signal });
   },
   watches: (includeArchived = false, signal?: AbortSignal) => request<{ watches: Watch[] }>(`/api/watches?includeArchived=${includeArchived ? 'true' : 'false'}`, { signal }),

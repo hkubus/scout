@@ -958,6 +958,8 @@ export interface DashboardStats {
   watching: number;
   newToday: number;
   strongDeals: number;
+  /** Fresh feed rows AI relevance filtering judged irrelevant, hidden ones included (Overview's "N filtered by AI", Listings' AI view). */
+  aiFiltered: number;
 }
 
 export interface ConnectorRun {

@@ -8,7 +8,7 @@ import { SESSION_CHECK_URLS, classifySessionCheck, parseMarketplaceStorageState 
 import { DeepSeekError } from '../server/ai';
 import { listingDescriptionVerificationInputHash, listingRelevanceInputHash } from '../server/ai';
 import { VisionError } from '../server/vision';
-import { ScoutService, ServiceError, dashboardTopParam, decryptSecret, olxCategoryFromJson, olxCategoryToJson, encryptSecret, escapeDiscordMarkdown, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
+import { ScoutService, ServiceError, dashboardListingsParam, dashboardTopParam, decryptSecret, olxCategoryFromJson, olxCategoryToJson, encryptSecret, escapeDiscordMarkdown, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
 import { OTHER_VARIANT_KEY } from '../server/variants';
 import { compareStrongest } from '../src/listingRows';
 import { scoreDeal } from '../server/scoring';
@@ -58,7 +58,7 @@ function seedWatch(db: any, id: string, overrides: Record<string, unknown> = {})
 test('starts with truthful empty dashboard data and unconfigured notifications', () => {
   const context = fixture();
   try {
-    assert.deepEqual(context.service.dashboard().stats, { watching: 0, newToday: 0, strongDeals: 0 });
+    assert.deepEqual(context.service.dashboard().stats, { watching: 0, newToday: 0, strongDeals: 0, aiFiltered: 0 });
     assert.equal(context.service.dashboard().watches.length, 0);
     assert.equal(context.service.settings().webhookConfigured, false);
     assert.equal(context.service.notifications().length, 0);
@@ -113,6 +113,75 @@ test('serves the widget dashboard form with the widget ordering and unchanged st
     assert.equal(dashboardTopParam('1'), 1);
     assert.equal(dashboardTopParam('50'), 50);
     for (const value of [undefined, '', '0', '51', '1.5', '-1', ' 6', '6a', '1e1', '100', ['6'], 6]) assert.equal(dashboardTopParam(value), undefined);
+  } finally { context.close(); }
+});
+
+test('the web dashboard form leaves the feed out, and every form counts the visible feed in SQL', () => {
+  const context = fixture();
+  try {
+    seedWatchStatsScenario(context.db);
+    const fresh = new Date().toISOString();
+    const midnight = new Date();
+    midnight.setHours(0, 0, 0, 0);
+    context.db.prepare(`UPDATE watch_listings SET last_seen_at = ?, deal_strength = (id % 6), deal_label = 'Deal',
+      first_seen_at = CASE WHEN id % 2 = 0 THEN ? ELSE first_seen_at END`).run(fresh, fresh);
+    // Posted after midnight, before it, or never (first seen decides).
+    context.db.prepare('UPDATE listings SET posted_at = CASE id % 3 WHEN 0 THEN ? WHEN 1 THEN ? ELSE NULL END')
+      .run(new Date(midnight.getTime() + 60_000).toISOString(), new Date(midnight.getTime() - 60_000).toISOString());
+    const actions = context.db.prepare('INSERT INTO listing_actions (marketplace, listing_id, decision, note, hidden, updated_at) VALUES (?, ?, ?, ?, ?, ?)');
+    const picks = context.db.prepare('SELECT marketplace, listing_id FROM listings ORDER BY id').all() as Array<{ marketplace: string; listing_id: string }>;
+    picks.forEach((listing, index) => {
+      if (index % 7 === 0) actions.run(listing.marketplace, listing.listing_id, 'pass', '', 0, fresh);
+      else if (index % 5 === 0) actions.run(listing.marketplace, listing.listing_id, null, '', 1, fresh);
+    });
+
+    const full = context.service.dashboard();
+    // The counters the dashboard used to count from its rows, over the whole visible feed.
+    const feed = context.service.listingsPage({ visibility: 'visible', aiFiltered: 'include', pageSize: 500 }).listings;
+    const kept = feed.filter((listing) => !listing.aiFiltered);
+    assert.deepEqual(full.stats, {
+      watching: full.watches.filter((watch) => watch.enabled).length,
+      newToday: kept.filter((listing) => Date.parse(listing.postedAt ?? listing.firstSeenAt ?? listing.observedAt) >= midnight.getTime()).length,
+      strongDeals: kept.filter((listing) => listing.dealStrength >= 3).length,
+      aiFiltered: context.service.listingsPage({ visibility: 'all', aiFiltered: 'only', pageSize: 500 }).listings.length,
+    });
+    // Listings' AI view shows hidden rows too, and so does its counter.
+    assert.ok(full.stats.aiFiltered > feed.length - kept.length, 'the scenario hides an AI-filtered row');
+    assert.ok(full.stats.newToday > 0 && full.stats.newToday < kept.length);
+    assert.ok(full.stats.strongDeals > 0 && full.stats.aiFiltered > 0);
+    // Each equals the total of the list it opens.
+    assert.equal(full.stats.strongDeals, context.service.listingsPage({ visibility: 'visible', minStrength: 3 }).pagination.total);
+    assert.equal(full.stats.aiFiltered, context.service.listingsPage({ visibility: 'all', aiFiltered: 'only' }).pagination.total);
+
+    // ?listings=none: the same dashboard without its rows; the widget's top wins.
+    assert.deepEqual(context.service.dashboard({ listings: 'none' }), { ...full, listings: [] });
+    assert.deepEqual(context.service.dashboard({ top: 6, listings: 'none' }), context.service.dashboard({ top: 6 }));
+    assert.equal(dashboardListingsParam('none'), 'none');
+    for (const value of [undefined, '', 'None', 'all', ' none', ['none'], 0]) assert.equal(dashboardListingsParam(value), undefined);
+  } finally { context.close(); }
+});
+
+test('dashboard counters count the whole fresh feed, not only the newest 500 rows it carries', () => {
+  const context = fixture();
+  try {
+    seedWatch(context.db, 'many');
+    const insertListing = context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id');
+    const insertLink = context.db.prepare('INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at, deal_strength, deal_label) VALUES (?, ?, ?, ?, ?, ?)');
+    context.db.exec('BEGIN');
+    for (let index = 0; index < 520; index += 1) {
+      // The 20 oldest are the strongest.
+      const seen = new Date(Date.now() - (index + 1) * 60_000).toISOString();
+      const { id } = insertListing.get('OLX', `many-${index}`, `CPU ${index}`, 100, `https://example.test/many-${index}`, seen, seen) as { id: number };
+      insertLink.run('many', id, seen, seen, index >= 500 ? 5 : 3, index >= 500 ? 'Exceptional' : 'Strong');
+    }
+    context.db.exec('COMMIT');
+    const full = context.service.dashboard();
+    assert.equal(full.listings.length, 500);
+    assert.equal(full.stats.strongDeals, 520);
+    // Overview ranks the whole feed too, so the 20 oldest lead.
+    const top = context.service.listingsPage({ sort: 'deal', minStrength: 3, visibility: 'visible', excludePassed: true, pageSize: 20 });
+    assert.equal(top.pagination.total, 520);
+    assert.ok(top.listings.every((listing) => listing.dealStrength === 5));
   } finally { context.close(); }
 });
 
@@ -216,7 +285,8 @@ test('keeps dashboard database work bounded as watch count grows', () => {
     });
     const service = new ScoutService(measuredDb, () => {});
     assert.equal(service.dashboard().watches.length, 40);
-    assert.ok(prepareCalls <= 12, `expected bounded dashboard queries, received ${prepareCalls}`);
+    // 11 before; the three feed counters are listingsPage totals (a count and a one-row page each).
+    assert.ok(prepareCalls <= 17, `expected bounded dashboard queries, received ${prepareCalls}`);
   } finally { context.close(); }
 });
 

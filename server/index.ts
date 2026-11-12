@@ -19,7 +19,7 @@ import { CONSENT_PATH, isConnectedAppToken, isOAuthRoute, mcpChallenge, OAuthSto
 import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, mcpRateClass, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
 import { FlipStore, MAX_FLIP_PHOTO_BYTES, MAX_FLIP_PHOTOS } from './flips';
 import { FLIP_CHANNELS, LISTING_CHANNELS, LISTING_CONDITIONS, PARCEL_SIZES } from '../src/profit';
-import { dashboardTopParam, ScoutService, ServiceError } from './service';
+import { dashboardListingsParam, dashboardTopParam, ScoutService, ServiceError } from './service';
 import { LISTING_VERIFICATION_FILTERS } from './deals';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 import { VERIFICATION_CHECKS_MAX, VERIFICATION_CHECK_MAX_CHARS } from './ai';
@@ -341,9 +341,11 @@ app.post('/api/auth/logout-all', async (request, reply) => {
   return reply.header('set-cookie', clearedSessionCookie(isSecureRequest(request))).send({ ok: true });
 });
 app.get('/api/dashboard', async (request) => {
-  // ?top=N (1-50) is the widget's compact form; anything else is ignored and
-  // the full dashboard is returned unchanged.
-  return service.dashboard({ top: dashboardTopParam((request.query as Record<string, unknown> | undefined)?.top) });
+  // ?top=N (1-50) is the widget's compact form and ?listings=none the web
+  // app's (no feed rows); anything else is ignored and the full dashboard is
+  // returned.
+  const query = request.query as Record<string, unknown> | undefined;
+  return service.dashboard({ top: dashboardTopParam(query?.top), listings: dashboardListingsParam(query?.listings) });
 });
 app.get('/api/listings', async (request, reply) => {
   const parsed = z.object({
@@ -352,12 +354,14 @@ app.get('/api/listings', async (request, reply) => {
     watchId: z.string().trim().min(1).max(160).optional(),
     page: z.coerce.number().int().min(1).optional().default(1),
     pageSize: z.coerce.number().int().min(1).max(500).optional().default(200),
-    sort: z.enum(['newest', 'strongest', 'price', 'discount']).optional().default('newest'),
+    // deal is Overview's Top deals order.
+    sort: z.enum(['newest', 'strongest', 'price', 'discount', 'deal']).optional().default('newest'),
     decision: z.enum(['buy', 'watch', 'pass', 'none']).optional(),
     visibility: z.enum(['visible', 'hidden', 'all']).optional().default('visible'),
     minStrength: z.coerce.number().int().min(1).max(5).optional(),
     aiFiltered: z.enum(['exclude', 'include', 'only']).optional(),
     qualifiesOnly: z.string().regex(/^(?:true|false)$/i).transform((value) => value.toLowerCase() === 'true').optional(),
+    excludePassed: z.string().regex(/^(?:true|false)$/i).transform((value) => value.toLowerCase() === 'true').optional(),
     minDiscount: z.coerce.number().min(0).max(100).optional(),
     variantKey: z.string().trim().min(1).max(64).optional(),
     minPrice: z.coerce.number().nonnegative().optional(),
@@ -378,6 +382,7 @@ app.get('/api/listings', async (request, reply) => {
     minStrength: query.minStrength,
     aiFiltered: query.aiFiltered,
     qualifiesOnly: query.qualifiesOnly,
+    excludePassed: query.excludePassed,
     minDiscount: query.minDiscount,
     variantKey: query.variantKey,
     minPrice: query.minPrice,
