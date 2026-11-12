@@ -745,7 +745,7 @@ final class MarketTests: XCTestCase {
     private let client = ScoutClient(baseURL: DemoTransport.baseURL, transport: DemoTransport())
 
     func testDecodesARealResearchWatch() throws {
-        let json = #"{"watches":[{"id":"m1","name":"Deck","query":"deck","terms":"","excluded":"","location":"Polska","condition":"Any","sources":["OLX"],"intervalHours":24,"minPrice":null,"maxPrice":null,"shippingOnly":false,"typoVariants":false,"enabled":true,"nextScan":"in 3h","lastScan":"Never","totalListings":0,"activeListings":0,"endedListings":0,"estimatedMedianPrice":null,"saleBand":null,"activeVersionId":"v1"}],"listings":[],"aggregates":{"overallMedianPrice":null,"endedCount":0,"activeCount":0,"saleBand":null},"pagination":{"page":1,"pageSize":50,"total":0,"hasNext":false}}"#
+        let json = #"{"watches":[{"id":"m1","name":"Deck","query":"deck","terms":"","excluded":"","location":"Polska","condition":"Any","sources":["OLX"],"intervalHours":24,"minPrice":null,"maxPrice":null,"shippingOnly":false,"typoVariants":false,"enabled":true,"nextScan":"in 3h","lastScan":"Never","totalListings":0,"activeListings":0,"endedListings":0,"saleBand":null,"activeVersionId":"v1"}],"listings":[],"aggregates":{"overallMedianPrice":null,"endedCount":0,"activeCount":0,"saleBand":null},"pagination":{"page":1,"pageSize":50,"total":0,"hasNext":false}}"#
         let data = try JSONDecoder().decode(MarketResearchData.self, from: Data(json.utf8))
         XCTAssertEqual(data.watches.first?.intervalHours, 24)
     }

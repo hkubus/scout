@@ -13,19 +13,19 @@ enum DemoMarket {
                 id: "market-deck", name: "Steam Deck OLED market", query: "steam deck oled", terms: "oled", excluded: "broken, parts",
                 location: "Polska", condition: "Any", sources: [.olx, .allegroLokalnie], intervalHours: 24, minPrice: 1200, maxPrice: 4000,
                 shippingOnly: false, typoVariants: false, enabled: true, nextScan: "in 9h", lastScan: "15h ago",
-                totalListings: 146, activeListings: 38, endedListings: 97, estimatedMedianPrice: 2740, saleBand: band(2590, eligible: 61), activeVersionId: "v3"
+                totalListings: 146, activeListings: 38, endedListings: 97, saleBand: band(2590, eligible: 61), activeVersionId: "v3"
             ),
             MarketWatch(
                 id: "market-xm5", name: "Sony WH-1000XM5 market", query: "sony wh-1000xm5", terms: "xm5", excluded: "fake, replica",
                 location: "Polska", condition: "Any", sources: Marketplace.all, intervalHours: 24, minPrice: nil, maxPrice: nil,
                 shippingOnly: true, typoVariants: true, enabled: true, nextScan: "in 3h", lastScan: "21h ago",
-                totalListings: 211, activeListings: 54, endedListings: 140, estimatedMedianPrice: 1090, saleBand: band(990, eligible: 88), activeVersionId: "v1"
+                totalListings: 211, activeListings: 54, endedListings: 140, saleBand: band(990, eligible: 88), activeVersionId: "v1"
             ),
             MarketWatch(
                 id: "market-lego", name: "LEGO Rivendell market", query: "lego 10316", terms: "10316", excluded: "instrukcja",
                 location: "Polska", condition: "New", sources: [.olx, .allegroLokalnie], intervalHours: 48, minPrice: nil, maxPrice: nil,
                 shippingOnly: false, typoVariants: false, enabled: false, nextScan: "paused", lastScan: "3d ago",
-                totalListings: 42, activeListings: 11, endedListings: 24, estimatedMedianPrice: 1690, saleBand: band(1590, eligible: 9), activeVersionId: "v1"
+                totalListings: 42, activeListings: 11, endedListings: 24, saleBand: band(1590, eligible: 9), activeVersionId: "v1"
             ),
         ]
     }
@@ -60,7 +60,7 @@ enum DemoMarket {
 
     static func trend(for watch: MarketWatch, days: Int) -> MarketWatchTrend {
         let base: WatchAnalytics = DemoTransport.fixture("watch-analytics")
-        let scale = (watch.estimatedMedianPrice ?? 2740) / 2740
+        let scale = (watch.saleBand?.median ?? 2590) / 2590
         let points = base.points.suffix(days).map { point -> WatchAnalyticsPoint in
             var scaled = point
             scaled.medianPrice = point.medianPrice.map { ($0 * scale).rounded() }
