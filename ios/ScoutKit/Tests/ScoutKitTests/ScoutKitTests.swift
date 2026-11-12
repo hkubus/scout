@@ -199,6 +199,25 @@ final class SearchTests: XCTestCase {
         XCTAssertEqual(body?["sources"] as? [String], ["OLX"])
         XCTAssertEqual(body?["maxPrice"] as? Double, 900)
         XCTAssertNil(body?["minPrice"])
+        XCTAssertNil(body?["scoreAgainst"], "left out unless asked for")
+        var scored = filters
+        scored.scoreAgainst = "auto"
+        let scoredBody = try JSONSerialization.jsonObject(with: JSONEncoder().encode(scored)) as? [String: Any]
+        XCTAssertEqual(scoredBody?["scoreAgainst"] as? String, "auto")
+    }
+
+    func testDecodesResultsPricedAgainstAWatch() throws {
+        let listing = #"{"id":"OLX:1","title":"iPhone 13 Pro","subtitle":"","marketplace":"OLX","price":1900,"typical":null,"belowTypical":null,"observed":"just now","observedAt":"2026-11-11T10:00:00.000Z","dealStrength":1,"dealLabel":"Watch","image":"","url":"https://www.olx.pl/d/oferta/1","watch":"Manual search","shippingAvailable":null"#
+        let json = #"{"listings":["# + listing + #","deal":{"typical":2600,"discountPercent":26.9,"deviation":5.12,"tier":5,"label":"Exceptional","qualifies":true,"basis":"own-history","variantKey":"pro","variantLabel":"13 Pro"}},"#
+            + listing.replacingOccurrences(of: "OLX:1", with: "OLX:2") + #","deal":null}],"sources":[],"scoredAgainst":{"watchId":"w1","name":"iPhone 13","match":"exact","notes":["Asking prices, not completed sales."]}}"#
+        let response = try JSONDecoder().decode(ManualSearchResponse.self, from: Data(json.utf8))
+        XCTAssertEqual(response.scoredAgainst?.name, "iPhone 13")
+        XCTAssertEqual(response.listings.first?.deal?.label, .exceptional)
+        XCTAssertEqual(response.listings.first?.deal?.typical, 2600)
+        XCTAssertEqual(response.listings.first?.deal?.isBelowTypical, true)
+        XCTAssertNil(response.listings.last?.deal)
+        let plain = try JSONDecoder().decode(ManualSearchResponse.self, from: Data(#"{"listings":[],"sources":[]}"#.utf8))
+        XCTAssertNil(plain.scoredAgainst, "older servers send neither field")
     }
 
     func testMergesResultsByIDCheapestFirst() throws {

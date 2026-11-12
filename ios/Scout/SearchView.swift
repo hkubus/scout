@@ -13,6 +13,8 @@ struct SearchView: View {
     @State private var lastRequest: SearchFilters?
     @State private var results: [Listing] = []
     @State private var statuses: [SearchSourceStatus] = []
+    /// The watch whose typical priced the results, when the query names one.
+    @State private var scoredAgainst: SearchScoredAgainst?
     @State private var searchID: String?
     @State private var searching = false
     @State private var loadingMore = false
@@ -142,7 +144,7 @@ struct SearchView: View {
                     .disabled(loadingMore)
                 }
             } header: {
-                Text(verbatim: "\(results.count) \(results.count == 1 ? "result" : "results")\(searching ? " so far…" : "") · lowest price first")
+                Text(verbatim: "\(results.count) \(results.count == 1 ? "result" : "results")\(searching ? " so far…" : "") · lowest price first\(scoredNote)")
             }
         }
     }
@@ -158,6 +160,12 @@ struct SearchView: View {
                 ContentUnavailableView("Search marketplaces", systemImage: "magnifyingglass", description: Text("Search OLX, Allegro Lokalnie, and Vinted right now without creating a watch or touching its price history."))
             }
         }
+    }
+
+    /// Names the watch whose typical priced the results.
+    private var scoredNote: String {
+        guard let scoredAgainst else { return "" }
+        return " · vs “\(scoredAgainst.name)”"
     }
 
     private var recents: [String] {
@@ -189,6 +197,8 @@ struct SearchView: View {
     private func startSearch() {
         var request = filters
         request.aiRelevance = aiRelevance
+        // Database only: prices each result against the watch the query names.
+        request.scoreAgainst = "auto"
         request.page = 1
         guard request.hasValidPriceRange else {
             error = "Enter a valid price range; the minimum cannot exceed the maximum."
@@ -203,6 +213,7 @@ struct SearchView: View {
         searching = true
         error = nil
         results = []
+        scoredAgainst = nil
         page = 1
         exhausted = false
         statuses = request.sources.map(SearchSourceStatus.searching)
@@ -212,6 +223,7 @@ struct SearchView: View {
                 guard searchID == id else { return }
                 results = [Listing]().mergingSearchResults(response.listings)
                 statuses = response.sources
+                scoredAgainst = response.scoredAgainst
                 exhausted = response.listings.isEmpty
             } catch {
                 guard searchID == id, !error.isCancellation else { return }
@@ -304,6 +316,12 @@ private struct SearchResultRow: View {
                     Text(Format.pln(listing.price))
                         .font(.headline)
                         .monospacedDigit()
+                    // Against the matched watch's typical; only a real discount shows.
+                    if let deal = listing.deal, deal.isBelowTypical, let percent = deal.discountPercent {
+                        Text("−\(Int(percent.rounded()))%")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle((deal.tier ?? 1) >= 3 ? (deal.label ?? .watch).color : .primary)
+                    }
                     if let negotiability {
                         Text(negotiability)
                             .font(.caption)
