@@ -82,7 +82,7 @@ a { color: inherit; }
 .collapse-button { border: 0; background: transparent; color: var(--muted); display: grid; place-items: center; width: 32px; height: 32px; border-radius: 7px; }
 .collapse-button:hover { background: var(--surface-muted); color: var(--text); }
 .sidebar--collapsed .sidebar-footer { justify-content: center; padding-left: 0; padding-right: 0; }
-.main-content { flex: 1; min-width: 0; margin-left: 252px; padding: 26px 28px 42px; transition: margin-left .22s ease; }
+.main-content { flex: 1; min-width: 0; margin-left: 252px; padding: 26px 28px 42px; }
 .main-content--wide { margin-left: 82px; }
 .mobile-bar, .sidebar-scrim { display: none; }
 .offline-banner { max-width: 1240px; margin: 0 auto 18px; padding: 11px 14px; border: 1px solid rgba(241, 90, 53, .35); border-radius: 8px; background: rgba(241, 90, 53, .08); color: var(--text); font-size: 12px; line-height: 1.5; }
