@@ -592,6 +592,10 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .analytics-footnote { margin: 18px 0 0; color: var(--muted); font-size: 11px; }
 .analytics-note { display: flex; align-items: flex-start; gap: 8px; margin-top: 14px; padding: 10px 11px; border-radius: 7px; background: var(--blue-soft); color: var(--muted); font-size: 10px; line-height: 1.5; }
 .analytics-note svg { flex: 0 0 auto; margin-top: 1px; color: var(--blue); }
+.analytics-negotiation-headline { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 6px; margin: 14px 0 0; color: var(--text); font-size: 12px; }
+.analytics-negotiation-headline strong { color: var(--text-strong); font-size: 20px; letter-spacing: -.35px; }
+.analytics-negotiation-headline small { color: var(--muted); font-size: 11px; }
+.analytics-negotiation-headline--counts strong { font-size: 14px; letter-spacing: 0; }
 .analytics-toolbar-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
 .analytics-funnel { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; margin-top: 16px; }
 .analytics-funnel div { min-width: 0; display: grid; gap: 5px; padding: 9px 8px; border-radius: 6px; background: var(--surface-muted); }

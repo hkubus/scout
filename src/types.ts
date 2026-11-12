@@ -380,6 +380,8 @@ export interface WatchAnalytics {
   medianChangePercent: number | null;
   points: WatchAnalyticsPoint[];
   sources: WatchAnalyticsSource[];
+  /** This watch's recorded negotiations (its `watches` lists are empty); null with none. Only on the HTTP route. */
+  negotiations?: NegotiationFigures | null;
 }
 
 /** Scout's typical price for one watch bucket or research series (scout_price_reference). */
@@ -439,12 +441,22 @@ export interface OutcomeShare {
 
 export interface RoleOutcomes extends OutcomeShare {
   marketplaces: Partial<Record<Marketplace, OutcomeShare>>;
-  /** Watches among this query's matches that have outcomes. */
+  /** Watches with outcomes: in scout_price_reference, among the query's matches; in analytics, all of them, most agreed first. */
   watches: Array<OutcomeShare & { id: string; name: string; marketplaces: Partial<Record<Marketplace, OutcomeShare>> }>;
 }
 
 /** Recorded outcomes by role; a role with none is left out. */
 export type PriceReferenceOutcomes = Partial<Record<NegotiationRole, RoleOutcomes>>;
+
+/**
+ * Recorded outcomes for the analytics screens: all time, never part of any
+ * asking-price figure. Shares are computed as in scout_price_reference; the
+ * screens show a group's share only once it has `minAgreed` agreed
+ * negotiations, and its counts below that.
+ */
+export interface NegotiationFigures extends PriceReferenceOutcomes {
+  minAgreed: number;
+}
 
 /** scout_record_outcome's reply: the stored outcome. */
 export interface RecordedOutcome {
@@ -671,6 +683,12 @@ export interface AnalyticsData {
   marketplaceComparison: AnalyticsMarketplaceRow[];
   triage: AnalyticsTriage;
   aiQuality: AnalyticsAiQuality;
+  /**
+   * Recorded negotiations under the watch and marketplace filters, all time.
+   * Null until one is recorded; with none matching the filters, no role.
+   * Always on the HTTP route; scout_analytics only when asked.
+   */
+  negotiations?: NegotiationFigures | null;
 }
 
 export interface SearchFilters {

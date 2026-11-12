@@ -1359,3 +1359,59 @@ final class ImageSizingTests: XCTestCase {
         XCTAssertEqual(ImageSizing.maxPixelSize(width: 0, height: 0, pixels: 0, fill: false), 1)
     }
 }
+
+final class NegotiationFiguresTests: XCTestCase {
+    /// As the server sends it, plus a marketplace this build doesn't know.
+    private let figuresJSON = #"""
+    {"minAgreed":3,"buy":{"negotiations":11,"agreed":10,"shareOfAsking":0.9,
+      "marketplaces":{"Vinted":{"negotiations":2,"agreed":2,"shareOfAsking":0.65},"Kleinanzeigen":{"negotiations":1,"agreed":1,"shareOfAsking":0.8},"OLX":{"negotiations":7,"agreed":6,"shareOfAsking":0.9},"Allegro Lokalnie":{"negotiations":1,"agreed":1,"shareOfAsking":1}},
+      "watches":[{"id":"gpus","name":"RTX 3080","negotiations":5,"agreed":4,"shareOfAsking":0.85,"marketplaces":{"Vinted":{"negotiations":1,"agreed":1,"shareOfAsking":0.7},"OLX":{"negotiations":4,"agreed":3,"shareOfAsking":0.9}}},
+                 {"id":"phones","name":"iPhone 13","negotiations":2,"agreed":2,"shareOfAsking":0.85,"marketplaces":{"OLX":{"negotiations":2,"agreed":2,"shareOfAsking":0.85}}}]}}
+    """#
+
+    private func analyticsJSON(negotiations: String?) -> String {
+        #"{"rangeDays":30,"watchId":null,"marketplace":null,"generatedAt":"2026-11-12T10:00:00.000Z","#
+            + #""overview":{"trackedListings":0,"newListings":0,"strongDeals":0,"medianDiscountPercent":null,"scanRuns":0,"scanSuccessRate":null},"#
+            + #""trend":[],"discountDistribution":[],"watchLeaderboard":[],"marketplaceComparison":[],"#
+            + #""triage":{"buy":0,"watch":0,"pass":0,"none":0},"aiQuality":{"relevanceJudged":0,"relevancePassRate":null,"shadowJudged":0,"shadowAgreementRate":null}"#
+            + (negotiations.map { #","negotiations":\#($0)"# } ?? "") + "}"
+    }
+
+    func testDecodesAnalyticsWithOrWithoutNegotiations() throws {
+        let decode = { (json: String) in try JSONDecoder().decode(AnalyticsData.self, from: Data(json.utf8)) }
+        XCTAssertNil(try decode(analyticsJSON(negotiations: nil)).negotiations, "older servers")
+        XCTAssertNil(try decode(analyticsJSON(negotiations: "null")).negotiations, "none recorded")
+        let empty = try XCTUnwrap(try decode(analyticsJSON(negotiations: #"{"minAgreed":3}"#)).negotiations)
+        XCTAssertTrue(empty.roles.isEmpty, "none match the filters")
+        let figures = try XCTUnwrap(try decode(analyticsJSON(negotiations: figuresJSON)).negotiations)
+        XCTAssertEqual(figures.minAgreed, 3)
+        XCTAssertEqual(figures.roles.map(\.role), [.buy])
+        XCTAssertEqual(figures.buy?.watches.map(\.name), ["RTX 3080", "iPhone 13"])
+        XCTAssertEqual(figures.buy?.marketplaces["Kleinanzeigen"], OutcomeShare(negotiations: 1, agreed: 1, shareOfAsking: 0.8))
+    }
+
+    func testDecodesWatchAnalyticsWithOrWithoutNegotiations() throws {
+        let base: WatchAnalytics = DemoTransport.fixture("watch-analytics")
+        XCTAssertNil(base.negotiations)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(base)) as? [String: Any])
+        object["negotiations"] = try JSONSerialization.jsonObject(with: Data(#"{"minAgreed":3,"sell":{"negotiations":1,"agreed":1,"shareOfAsking":0.95,"marketplaces":{"OLX":{"negotiations":1,"agreed":1,"shareOfAsking":0.95}},"watches":[]}}"#.utf8))
+        let decoded = try JSONDecoder().decode(WatchAnalytics.self, from: JSONSerialization.data(withJSONObject: object))
+        let figures = try XCTUnwrap(decoded.negotiations)
+        XCTAssertNil(figures.buy)
+        XCTAssertEqual(figures.roles.map(\.role), [.sell])
+        XCTAssertEqual(figures.sell?.marketplaceShares.map(\.marketplace), [.olx])
+    }
+
+    func testOrdersMarketplacesAndShowsAShareOnlyFromTheMinimum() throws {
+        let figures = try JSONDecoder().decode(NegotiationFigures.self, from: Data(figuresJSON.utf8))
+        let buy = try XCTUnwrap(figures.buy)
+        // Marketplace.all order, then unknown ones by name.
+        XCTAssertEqual(buy.marketplaceShares.map(\.marketplace.rawValue), ["OLX", "Allegro Lokalnie", "Vinted", "Kleinanzeigen"])
+        XCTAssertEqual(buy.watches[0].marketplaceShares.map(\.marketplace), [.olx, .vinted])
+        XCTAssertEqual(buy.total.shownShare(minAgreed: figures.minAgreed), 0.9)
+        // Two agreed carry a share, but the screens wait for three.
+        XCTAssertEqual(buy.watches[1].shareOfAsking, 0.85)
+        XCTAssertNil(buy.watches[1].total.shownShare(minAgreed: figures.minAgreed))
+        XCTAssertNil(OutcomeShare(negotiations: 4, agreed: 0, shareOfAsking: nil).shownShare(minAgreed: 0))
+    }
+}

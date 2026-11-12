@@ -21,14 +21,14 @@ import { pickVariantBatch, typoVariants } from './typos';
 import { compactDuplicateNote, searchErrorKind, type ManualSearchDetailedResponse, type ManualSearchDetails } from './mcpFormat';
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
 import { matchQuality, matchQuery, type MatchCandidate, type QueryMatch } from './queryMatch';
-import { conditionClass, daysListed, outcomeShare, priceDrops, shareOfAsking, titleSimilarity } from './negotiation';
+import { conditionClass, daysListed, groupOutcomes, MIN_OUTCOME_AGREED, priceDrops, shareOfAsking, titleSimilarity, type OutcomeRow } from './negotiation';
 import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assignVariant, finalizeVariantSuggestions, parseVariantGroups, suggestVariantGroupsFromTitles, variantLabelFor, type VariantGroup, type VariantSample } from './variants';
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import type { ListingVerificationFilter } from './deals';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { DUPLICATE_FEED_DAYS, DUPLICATE_WINDOW_DAYS, findDuplicatePairs } from './duplicates';
 import { summarizeAnalytics, type AnalyticsRow } from './analytics';
-import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, DuplicateListing, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes, AgentFlip, AgentFlips, ConversationResult, InboxResult, AgentListingVerification } from '../src/types';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, DuplicateListing, ListingLiveCheck, ListingNegotiation, Relist, NegotiationFigures, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, AgentFlip, AgentFlips, ConversationResult, InboxResult, AgentListingVerification } from '../src/types';
 import { estimatedNetAtTypical, flipCost, flipNet, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, suggestedListingPrice, type FeePresets } from '../src/profit';
 import { vintedFeesNote } from '../src/listingSignals';
 import { compareStrongest } from '../src/listingRows';
@@ -3432,7 +3432,11 @@ export class ScoutService {
     return this.listingDetail(listingKey, watchId);
   }
 
-  watchAnalytics(id: string, rangeDays = 30): WatchAnalytics {
+  /**
+   * One watch's price analytics. `negotiations` adds the watch's recorded
+   * negotiation figures for the web and iOS screens; MCP leaves it out.
+   */
+  watchAnalytics(id: string, rangeDays = 30, options: { negotiations?: boolean } = {}): WatchAnalytics {
     const row = this.stmt('SELECT id, name, shipping_only, min_price_pln, max_price_pln FROM watches WHERE id = ?').get(id) as WatchRow | undefined;
     if (!row) throw new ServiceError('Watch not found', 404);
     const days = Math.max(7, Math.min(180, Math.floor(rangeDays)));
@@ -3523,6 +3527,7 @@ export class ScoutService {
       medianChangePercent,
       points,
       sources,
+      ...(options.negotiations ? { negotiations: this.negotiationFigures({ watchId: id, watchOnly: true }) } : {}),
     };
   }
 
@@ -3616,35 +3621,46 @@ export class ScoutService {
     return { query: input.query, best, matches, outcomes, notes };
   }
 
+  /** Every recorded negotiation, for the outcome figures. */
+  private outcomeRows(): OutcomeRow[] {
+    return (this.stmt('SELECT marketplace, watch_id, role, outcome, asking_price_pln, final_price_pln FROM negotiation_outcomes').all() as Array<Record<string, any>>)
+      .map((row) => ({
+        marketplace: String(row.marketplace), watchId: row.watch_id === null ? null : String(row.watch_id), role: String(row.role), outcome: String(row.outcome),
+        asking: Number(row.asking_price_pln), price: row.final_price_pln === null ? null : Number(row.final_price_pln),
+      }));
+  }
+
   /**
    * The operator's recorded negotiations, by role: overall, per marketplace,
    * and per matched watch. Null until one is recorded.
    */
   private negotiationOutcomes(watches: Array<{ id: string; name: string }>): PriceReferenceOutcomes | null {
-    const rows = (this.stmt('SELECT marketplace, watch_id, role, outcome, asking_price_pln, final_price_pln FROM negotiation_outcomes').all() as Array<Record<string, any>>)
-      .map((row) => ({
-        marketplace: String(row.marketplace), watchId: row.watch_id === null ? null : String(row.watch_id), role: String(row.role), outcome: String(row.outcome),
-        asking: Number(row.asking_price_pln), price: row.final_price_pln === null ? null : Number(row.final_price_pln),
-      }));
-    if (!rows.length) return null;
-    type Row = (typeof rows)[number];
-    const byMarketplace = (items: Row[]) => Object.fromEntries(marketplaces
-      .filter((source) => items.some((item) => item.marketplace === source))
-      .map((source) => [source, outcomeShare(items.filter((item) => item.marketplace === source))])) as RoleOutcomes['marketplaces'];
-    const result: PriceReferenceOutcomes = {};
-    for (const role of ['buy', 'sell'] as const) {
-      const own = rows.filter((row) => row.role === role);
-      if (!own.length) continue;
-      result[role] = {
-        ...outcomeShare(own),
-        marketplaces: byMarketplace(own),
-        watches: watches.flatMap((watch) => {
-          const items = own.filter((item) => item.watchId === watch.id);
-          return items.length ? [{ id: watch.id, name: watch.name, ...outcomeShare(items), marketplaces: byMarketplace(items) }] : [];
-        }),
-      };
+    const rows = this.outcomeRows();
+    return rows.length ? groupOutcomes(rows, watches, marketplaces) : null;
+  }
+
+  /**
+   * The outcome figures the Analytics page and a watch's analytics show: all
+   * time, narrowed by the page's watch and marketplace filters. Null until an
+   * outcome is recorded (for one watch, until that watch has one); with
+   * outcomes but none matching the filters it carries no role. Every watch
+   * with outcomes is listed by name, archived ones too, with the most agreed
+   * first; a watch's own figures list none, since the totals are its own.
+   */
+  private negotiationFigures(filter: { watchId?: string | null; marketplace?: Marketplace | null; watchOnly?: boolean }): NegotiationFigures | null {
+    const all = this.outcomeRows();
+    const rows = all.filter((row) => (!filter.watchId || row.watchId === filter.watchId) && (!filter.marketplace || row.marketplace === filter.marketplace));
+    if (!all.length || (filter.watchOnly && !rows.length)) return null;
+    const ids = filter.watchOnly ? [] : Array.from(new Set(rows.flatMap((row) => row.watchId === null ? [] : [row.watchId])));
+    const watches = ids.length
+      ? (this.stmt('SELECT id, name FROM watches WHERE id IN (SELECT value FROM json_each(?))').all(JSON.stringify(ids)) as Array<{ id: string; name: string }>)
+        .map((watch) => ({ id: String(watch.id), name: String(watch.name) }))
+      : [];
+    const grouped = groupOutcomes(rows, watches, marketplaces);
+    for (const role of Object.values(grouped)) {
+      role.watches.sort((a, b) => b.agreed - a.agreed || b.negotiations - a.negotiations || a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
     }
-    return result;
+    return { minAgreed: MIN_OUTCOME_AGREED, ...grouped };
   }
 
   /**
@@ -3930,9 +3946,10 @@ export class ScoutService {
    * Cross-watch analytics for the Analytics page. Deal metrics come from
    * daily-deduped `observations` (asking price vs learned baseline); triage
    * and AI-quality sections are operational signals that are not watch-scoped,
-   * so they honor only the range and marketplace filters.
+   * so they honor only the range and marketplace filters. `negotiations` adds
+   * the recorded negotiation figures, which are all time and ignore the range.
    */
-  analytics(options: { days?: number; watchId?: string; marketplace?: Marketplace } = {}): AnalyticsData {
+  analytics(options: { days?: number; watchId?: string; marketplace?: Marketplace; negotiations?: boolean } = {}): AnalyticsData {
     const days = Math.max(7, Math.min(180, Math.floor(options.days ?? 30)));
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60_000).toISOString();
     const watchId = options.watchId ?? null;
@@ -4046,6 +4063,7 @@ export class ScoutService {
       marketplaceComparison,
       triage,
       aiQuality,
+      ...(options.negotiations ? { negotiations: this.negotiationFigures({ watchId, marketplace }) } : {}),
     };
   }
 

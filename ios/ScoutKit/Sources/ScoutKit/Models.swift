@@ -327,6 +327,9 @@ public struct WatchAnalytics: Codable, Hashable, Sendable {
     public var medianChangePercent: Double?
     public var points: [WatchAnalyticsPoint]
     public var sources: [WatchAnalyticsSource]
+    /// This watch's recorded negotiations, all time. Nil with none, and on
+    /// older servers.
+    public var negotiations: NegotiationFigures?
 }
 
 /// An app let in over OAuth from its own settings (e.g. Hatbot). Its token
