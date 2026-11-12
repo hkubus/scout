@@ -150,6 +150,10 @@ export interface CompactSearch {
   scoredAgainst: SearchScoredAgainst | null;
   /** With typoVariants: the misspellings searched (empty past page 1 or when no word qualifies); null when not asked. */
   typoVariants: string[] | null;
+  /** True when a repeat was answered from the few-minute result cache. */
+  fromCache: boolean;
+  /** With fromCache: when the cached search finished; null otherwise. */
+  cachedAt: string | null;
 }
 
 /**
@@ -240,5 +244,7 @@ export function toCompactSearch(input: Pick<SearchFilters, 'query' | 'page' | 'o
     }),
     scoredAgainst: result.scoredAgainst ?? null,
     typoVariants: result.typoVariants ?? null,
+    fromCache: result.fromCache === true,
+    cachedAt: result.cachedAt ?? null,
   };
 }

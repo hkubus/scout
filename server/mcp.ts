@@ -339,7 +339,7 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
   });
 
   server.registerTool('scout_search', {
-    description: 'Live manual marketplace search (OLX, Allegro Lokalnie, Vinted) with deterministic and AI relevance filtering. Expensive: fetches live pages. A marketplace paused after repeated failed scans is skipped and reported as an error unless ignoreBackoff is set. typoVariants also searches a couple of misspellings of the query.',
+    description: 'Live manual marketplace search (OLX, Allegro Lokalnie, Vinted) with deterministic and AI relevance filtering. Expensive: fetches live pages. A marketplace paused after repeated failed scans is skipped and reported as an error unless ignoreBackoff is set. typoVariants also searches a couple of misspellings of the query. Up to three searches run at once and the rest wait their turn within deadlineMs; repeats within 3 min come from a cache unless refresh is set.',
     inputSchema: {
       query: z.string().trim().min(1).max(240),
       sources: z.array(marketplace).min(1).max(3),
@@ -366,6 +366,8 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
         .describe('Page 1 only: also search up to 2 misspellings of the query (iphone 13 → iphon 13, play station → playstation) on each marketplace whose own page loaded, for listings that misspell the product. Costs up to 2 extra page fetches per marketplace. Each result gets matchedVia "query" or "typo:<spelling>", each source its variants, and typoVariants lists the spellings tried. Typo rows join the AI relevance check after every main-page row, inside the same 40-check budget per marketplace, so on a cold search they are the rows left unjudged: relevance "unknown" (compact), never "relevant". Set it on the first search for a product, not on later pages or rewordings.'),
       deadlineMs: z.number().int().min(5000).max(120000).optional()
         .describe('Answer within this many ms (default 45000), the wait for a free search slot included. Up to three searches run at once and the rest wait their turn. A marketplace not finished by then comes back as an error with errorKind "deadline" (compact); the search keeps running for a while, so repeating the same call shortly returns it. Still waiting for a slot at the deadline: the call fails as busy.'),
+      refresh: z.boolean().optional().default(false)
+        .describe('A search that finished with every marketplace answering is kept for 3 min, and an identical call (format, deadlineMs and refresh aside) gets it back with fromCache true and cachedAt, at no fetch or AI cost. true skips it and searches again.'),
       format: z.enum(['full', 'compact']).optional().default('full')
         .describe('compact: smaller, stable rows with every key present (null when unknown): id "<Marketplace>:<listingId>", asking price in PLN, relevance, match kind, duplicateCount (0 when none) and duplicateCheapest (null when none) for results a scan already stored that are also listed on another marketplace; sources carry status ok|error with an errorKind and pipeline counts.'),
     },

@@ -106,7 +106,7 @@ test('scout_search advertises typoVariants off by default, with its cost', async
   }
 });
 
-test('scout_search takes a deadline, the wait for a slot included', async () => {
+test('scout_search takes a deadline (the wait for a slot included) and a cache bypass', async () => {
   const context = searchFixture();
   const { client, close } = await connectedClient(context.service);
   try {
@@ -117,6 +117,9 @@ test('scout_search takes a deadline, the wait for a slot included', async () => 
     assert.equal((tool.inputSchema.required as string[]).includes('deadlineMs'), false);
     const refused = await client.callTool({ name: 'scout_search', arguments: { query: 'x', sources: ['OLX'], deadlineMs: 1000 } });
     assert.equal(refused.isError, true);
+    const refresh = (tool.inputSchema.properties as Record<string, any>).refresh;
+    assert.deepEqual({ ...refresh, description: '' }, { type: 'boolean', default: false, description: '' });
+    assert.match(refresh.description, /fromCache/);
   } finally {
     await close();
     context.close();

@@ -20,7 +20,7 @@ import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStre
 import { legacyTypoVariants, pickVariantBatch, typoVariantPairs, type TypoVariant } from './typos';
 import { isDamagedLabel, normalizeRequestedCondition } from './searchCondition';
 import { EMPTY_SEARCH_SOURCE, compactDuplicateNote, searchErrorKind, type ManualSearchDetailedResponse, type ManualSearchDetails, type ManualSearchListingDetail, type ManualSearchSourceDetail } from './mcpFormat';
-import { SearchQueueTimeoutError, SearchRuns, SearchStoppedError, manualSearchKey, searchScope, type SearchRunHandle, type SearchRunSettings } from './searchRuns';
+import { SearchCache, SearchQueueTimeoutError, SearchRuns, SearchStoppedError, manualSearchKey, searchScope, type SearchRunHandle, type SearchRunSettings } from './searchRuns';
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
 import { matchQuality, matchQuery, type MatchCandidate, type QueryMatch } from './queryMatch';
 import { conditionClass, daysListed, groupOutcomes, MIN_OUTCOME_AGREED, priceDrops, shareOfAsking, titleSimilarity, type OutcomeRow } from './negotiation';
@@ -336,7 +336,21 @@ interface ManualSearchPart {
   status: SearchSourceStatus;
   detail: ManualSearchSourceDetail;
   listingDetails: Array<[string, ManualSearchListingDetail]>;
+  /**
+   * Whether a repeat may be answered with this part: false for an error, or
+   * when a misspelled search, the AI relevance check or the Jev checks failed
+   * and a fresh run could do better. A backoff skip is cacheable (until the
+   * pause ends): searching again would skip it just the same.
+   */
+  cacheable: boolean;
 }
+
+/** Repeats of a finished manual search are answered from memory this long (SCOUT_SEARCH_CACHE_MS, 0 turns it off). */
+function searchCacheMs() {
+  const configured = Number.parseInt(process.env.SCOUT_SEARCH_CACHE_MS ?? '', 10);
+  return Number.isFinite(configured) ? Math.max(configured, 0) : 3 * 60_000;
+}
+const SEARCH_CACHE_ENTRIES = 50;
 
 /** A marketplace a manual search's deadline cut off. */
 function deadlinePart(source: Marketplace, elapsedMs: number, deadlineMs: number): ManualSearchPart {
@@ -348,6 +362,7 @@ function deadlinePart(source: Marketplace, elapsedMs: number, deadlineMs: number
     },
     detail: { ...EMPTY_SEARCH_SOURCE, errorKind: 'deadline' },
     listingDetails: [],
+    cacheable: false,
   };
 }
 
@@ -874,6 +889,7 @@ export class ScoutService {
   private readonly logBuffer: LogEntry[] = [];
   private readonly searchRuns: SearchRuns<ManualSearchPart, ManualSearchPart[]>;
   private readonly searchDeadlineDefaultMs: number;
+  private readonly searchCache = new SearchCache<ManualSearchPart[]>({ ttlMs: searchCacheMs(), entries: SEARCH_CACHE_ENTRIES });
 
   constructor(db: Database, emit: (event: string, payload: unknown) => void, dependencies: ScoutServiceDependencies = {}) {
     this.db = db;
@@ -4874,7 +4890,9 @@ export class ScoutService {
    * slot until their deadline, and an identical search already running is
    * joined rather than run twice. At the deadline (the wait included) the
    * marketplaces that finished come back and the rest are errors of kind
-   * `deadline`; `options.signal` (the client went away) stops waiting.
+   * `deadline`; `options.signal` (the client went away) stops waiting. A
+   * search that finished cleanly answers its repeats from memory for a few
+   * minutes (`fromCache`, `cachedAt`) unless `refresh` asks for a fresh one.
    */
   async manualSearch(input: SearchFilters, details?: ManualSearchDetails, options: ManualSearchOptions = {}): Promise<ManualSearchResponse> {
     // Resolved before any fetch, so an unknown watch id costs no marketplace request.
@@ -4888,10 +4906,30 @@ export class ScoutService {
     // visible while a slow one is still fetching. The response stays
     // authoritative and reconciles anything the stream missed.
     const progress = (part: ManualSearchPart) => this.emitSearchProgress(input.searchId, page, part.status.source, part.status, part.listings);
+    const key = manualSearchKey(input);
+    // Formats and side tables are built per call, so one entry serves the
+    // full and compact formats alike. A refresh skips it, but still joins an
+    // identical search already running: that one is fresh too.
+    const cached = input.refresh ? undefined : this.searchCache.get(key);
+    if (cached) {
+      const parts = structuredClone(cached.value);
+      for (const part of parts) progress(part);
+      return this.manualSearchResponse(input, parts, scoring, typoPairs, details, new Date(cached.storedAt).toISOString());
+    }
     let parts: ManualSearchPart[];
     try {
-      ({ result: parts } = await this.searchRuns.search(manualSearchKey(input), {
-        execute: (run) => this.runManualSearch(input, scoring, typoPairs, run),
+      ({ result: parts } = await this.searchRuns.search(key, {
+        execute: async (run) => {
+          const finished = await this.runManualSearch(input, scoring, typoPairs, run);
+          // The run stores it, not a caller, so a search whose callers all
+          // passed their deadline still answers their repeat. A backoff skip
+          // is kept no longer than the pause it reports.
+          if (!run.stopped && finished.every((part) => part.cacheable)) {
+            const pauses = finished.map((part) => Date.parse(part.status.backoffUntil ?? '')).filter(Number.isFinite);
+            this.searchCache.set(key, structuredClone(finished), Math.min(...pauses));
+          }
+          return finished;
+        },
         onPart: progress,
         deadlineMs,
         signal: options.signal,
@@ -4906,6 +4944,17 @@ export class ScoutService {
       if (error instanceof SearchStoppedError) throw new ServiceError(error.message, 499);
       throw error;
     }
+    return this.manualSearchResponse(input, parts, scoring, typoPairs, details, null);
+  }
+
+  private manualSearchResponse(
+    input: SearchFilters,
+    parts: ManualSearchPart[],
+    scoring: ReturnType<ScoutService['searchScoring']>,
+    typoPairs: TypoVariant[],
+    details: ManualSearchDetails | undefined,
+    cachedAt: string | null,
+  ): ManualSearchResponse {
     if (details) {
       for (const part of parts) {
         details.sources.set(part.status.source, part.detail);
@@ -4919,6 +4968,8 @@ export class ScoutService {
       sources: parts.map((part) => part.status),
       ...(scoring === undefined ? {} : { scoredAgainst: scoring?.scoredAgainst ?? null }),
       ...(input.typoVariants ? { typoVariants: typoPairs.map((variant) => variant.query) } : {}),
+      // Only on a cache hit, so a fresh response keeps its old shape.
+      ...(cachedAt ? { fromCache: true as const, cachedAt } : {}),
     };
   }
 
@@ -4949,7 +5000,7 @@ export class ScoutService {
           source, status: 'error', count: 0, pendingShipping: 0, durationMs: 0,
           message: `Skipped: connector backoff active until ${backoffUntil} after repeated failed scans`, backoffUntil,
         };
-        return report({ listings: [], status, detail: { ...EMPTY_SEARCH_SOURCE, errorKind: 'backoff' }, listingDetails: [] });
+        return report({ listings: [], status, detail: { ...EMPTY_SEARCH_SOURCE, errorKind: 'backoff' }, listingDetails: [], cacheable: true });
       }
       try {
         const searchOptions = { ...input, condition, olxCategoryId: input.olxCategory?.id ?? null, page };
@@ -5073,6 +5124,7 @@ export class ScoutService {
         let checkStatus = new Map<NormalizedListing, { state: 'passed' | 'unconfirmed' | 'unchecked'; note: string }>();
         let checksNote = '';
         let hiddenByChecks = 0;
+        let checksFailed = false;
         if (checks.length) {
           run.checkpoint();
           try {
@@ -5082,6 +5134,7 @@ export class ScoutService {
             hiddenByChecks = checked.rejected;
             checksNote = checked.inactive ? ' · Jev checks inactive' : checked.rejected ? ` · ${checked.rejected} hidden by Jev checks` : '';
           } catch (error) {
+            checksFailed = true;
             this.log('error', 'watch', `Manual search Jev checks skipped: ${error instanceof Error ? error.message : String(error)}`.slice(0, 500));
           }
         }
@@ -5145,11 +5198,12 @@ export class ScoutService {
             errorKind: null,
           },
           listingDetails,
+          cacheable: !relevanceFailed && !checksFailed && variantStatuses.every((variant) => variant.status === 'ok'),
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Search failed';
         const status: SearchSourceStatus = { source, status: 'error', count: 0, pendingShipping: 0, durationMs: Date.now() - started, message };
-        return report({ listings: [], status, detail: { ...EMPTY_SEARCH_SOURCE, errorKind: searchErrorKind(error) }, listingDetails: [] });
+        return report({ listings: [], status, detail: { ...EMPTY_SEARCH_SOURCE, errorKind: searchErrorKind(error) }, listingDetails: [], cacheable: false });
       }
     });
     return Promise.all(tasks);

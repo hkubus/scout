@@ -90,6 +90,58 @@ export class SearchStoppedError extends Error {
   }
 }
 
+export interface SearchCacheSettings {
+  /** How long a stored result answers repeats; 0 turns the cache off. */
+  ttlMs: number;
+  /** Results kept at most; the least recently used goes first. */
+  entries: number;
+}
+
+export interface CachedSearch<Value> {
+  value: Value;
+  /** When the search that produced it finished (ms since the epoch). */
+  storedAt: number;
+}
+
+/**
+ * Finished searches, answered again from memory for a short while so a
+ * repeat (an agent paging back, a retry after a deadline) costs no fetch,
+ * no slot and no AI call. Keyed like runs, by manualSearchKey.
+ */
+export class SearchCache<Value> {
+  private readonly entries = new Map<string, CachedSearch<Value> & { expiresAt: number }>();
+
+  constructor(private readonly settings: SearchCacheSettings) {}
+
+  get size() {
+    return this.entries.size;
+  }
+
+  get(key: string): CachedSearch<Value> | undefined {
+    const entry = this.entries.get(key);
+    if (!entry) return undefined;
+    // Re-inserted on every hit, so Map order is least recently used first.
+    this.entries.delete(key);
+    if (entry.expiresAt <= Date.now()) return undefined;
+    this.entries.set(key, entry);
+    return { value: entry.value, storedAt: entry.storedAt };
+  }
+
+  /** Stores a result for the TTL, or until `notAfter` (ms) when that is sooner. */
+  set(key: string, value: Value, notAfter = Number.POSITIVE_INFINITY) {
+    if (this.settings.ttlMs <= 0 || this.settings.entries <= 0) return;
+    const storedAt = Date.now();
+    const expiresAt = Math.min(storedAt + this.settings.ttlMs, notAfter);
+    this.entries.delete(key);
+    if (expiresAt <= storedAt) return;
+    this.entries.set(key, { value, storedAt, expiresAt });
+    for (const oldest of this.entries.keys()) {
+      if (this.entries.size <= this.settings.entries) break;
+      this.entries.delete(oldest);
+    }
+  }
+}
+
 export interface SearchRunSettings {
   /** Runs at once; more wait in FIFO order. */
   slots: number;
@@ -104,6 +156,8 @@ export interface SearchRunHandle<Part> {
   report(part: Part): void;
   /** Throws SearchStoppedError once the run has been stopped; call it before each phase. */
   checkpoint(): void;
+  /** Whether the run has been stopped; its result may then be missing work. */
+  readonly stopped: boolean;
 }
 
 export interface SearchCall<Part, Result> {
@@ -210,6 +264,7 @@ export class SearchRuns<Part, Result> {
       checkpoint: () => {
         if (run.controller.signal.aborted) throw run.controller.signal.reason instanceof Error ? run.controller.signal.reason : new SearchStoppedError('aborted');
       },
+      get stopped() { return run.controller.signal.aborted; },
     };
     run.result = (async () => {
       let limit: ReturnType<typeof setTimeout> | undefined;

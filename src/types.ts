@@ -741,6 +741,8 @@ export interface SearchFilters {
    * then come back as errors; the search keeps running for a repeat to join.
    */
   deadlineMs?: number;
+  /** Skip the few-minute result cache (an identical search already running is still joined). */
+  refresh?: boolean;
 }
 
 /** One misspelled search a manual search with typoVariants ran on a marketplace. */
@@ -814,6 +816,10 @@ export interface ManualSearchResponse {
   scoredAgainst?: SearchScoredAgainst | null;
   /** Only when typoVariants was sent: the misspellings searched; empty past page 1 or when no word qualifies. */
   typoVariants?: string[];
+  /** Only on a repeat answered from the few-minute result cache (send refresh to skip it). */
+  fromCache?: true;
+  /** With fromCache: when the search that produced the result finished. */
+  cachedAt?: string;
 }
 
 /** Probable-sale estimate band — never a confirmed/completed-sale price. */

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { olxOffer, olxPage, searchFixture, searchInput } from './searchFixture';
 import { searchErrorKind, toCompactSearch } from '../server/mcpFormat';
+import { SearchCache } from '../server/searchRuns';
 
 const vintedApi = JSON.parse(readFileSync(new URL('./fixtures-vinted-api.json', import.meta.url), 'utf8'));
 
@@ -200,6 +201,11 @@ test('at the deadline a caller gets the marketplaces that finished, and a repeat
     assert.deepEqual(full.sources.map((source) => [source.source, source.status]), [['OLX', 'ok'], ['Vinted', 'ok']]);
     assert.equal(full.details.sources.get('OLX')?.errorKind, null);
     assert.equal(olx.fetches.length, 1);
+    // The run, not a caller, filled the cache: later repeats cost nothing.
+    const later = await context.service.manualSearch(searchInput('lego technic', { aiRelevance: false, sources: ['OLX', 'Vinted'] }));
+    assert.equal(later.fromCache, true);
+    assert.deepEqual(later.listings, full.listings);
+    assert.equal(olx.fetches.length, 1);
   } finally { context.close(); }
 });
 
@@ -261,4 +267,126 @@ test('a search whose caller goes away stops, frees its slot and drops its waitin
     assert.equal((await stays).sources[0].status, 'ok');
     assert.deepEqual(requested, ['discman']);
   } finally { context.close(); }
+});
+
+test('a repeat within 3 min comes from the cache in either format; refresh and expiry search again', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-13T10:00:00.000Z') });
+  const context = searchFixture();
+  let fetches = 0;
+  (context.service as any).fetchOlxApi = async () => {
+    fetches += 1;
+    return olxPage([olxOffer(`C-${fetches}`, 'Steam Deck 512', 1500 + fetches)]);
+  };
+  try {
+    const input = (overrides: Record<string, unknown> = {}) => searchInput('steam deck', { aiRelevance: false, ...overrides });
+    const fresh = await context.service.manualSearchDetailed(input({ searchId: 'fresh' }));
+    assert.equal(fetches, 1);
+    assert.equal('fromCache' in fresh, false);
+    assert.equal(toCompactSearch({ query: 'steam deck' }, fresh).fromCache, false);
+
+    t.mock.timers.tick(60_000);
+    // Another format, deadline and spacing: the same search.
+    const hit = await context.service.manualSearchDetailed(input({ query: ' steam  deck', searchId: 'hit', deadlineMs: 9000 }));
+    assert.equal(fetches, 1);
+    assert.equal(hit.fromCache, true);
+    assert.equal(hit.cachedAt, '2026-11-13T10:00:00.000Z');
+    assert.deepEqual(hit.listings, fresh.listings);
+    assert.deepEqual(hit.sources, fresh.sources);
+    // #40's side tables come back too.
+    assert.deepEqual([...hit.details.sources], [...fresh.details.sources]);
+    assert.deepEqual([...hit.details.listings], [...fresh.details.listings]);
+    const compact = toCompactSearch({ query: 'steam deck' }, hit);
+    assert.equal(compact.fromCache, true);
+    assert.equal(compact.cachedAt, '2026-11-13T10:00:00.000Z');
+    assert.equal(compact.listings[0].relevance, 'not-checked');
+    // The caller's stream gets every marketplace at once.
+    assert.deepEqual(context.events.filter((entry) => entry.event === 'search' && entry.payload.searchId === 'hit').map((entry) => entry.payload.source), ['OLX']);
+    // Changing what was returned is not shared.
+    hit.listings[0].title = 'edited';
+    assert.equal((await context.service.manualSearch(input())).listings[0].title, 'Steam Deck 512');
+
+    const refreshed = await context.service.manualSearch(input({ refresh: true }));
+    assert.equal(fetches, 2);
+    assert.equal('fromCache' in refreshed, false);
+    assert.equal(refreshed.listings[0].price, 1502);
+    // The refresh replaced the entry.
+    assert.equal((await context.service.manualSearch(input())).listings[0].price, 1502);
+    assert.equal(fetches, 2);
+
+    t.mock.timers.tick(3 * 60_000 + 1);
+    const expired = await context.service.manualSearch(input());
+    assert.equal(fetches, 3);
+    assert.equal('fromCache' in expired, false);
+    // A different search is a different entry.
+    await context.service.manualSearch(input({ maxPrice: 2000 }));
+    assert.equal(fetches, 4);
+  } finally { context.close(); }
+});
+
+test('only clean results are cached; a backoff skip is, until its pause ends', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-13T10:00:00.000Z') });
+  const context = searchFixture();
+  const fetched: string[] = [];
+  let failOlx = true;
+  (context.service as any).fetchOlxApi = async (url: string) => {
+    const query = String(new URL(url).searchParams.get('query'));
+    fetched.push(query);
+    if (failOlx || query === 'iphon 13') throw new Error('OLX offers API returned HTTP 503');
+    return olxPage([olxOffer('E-1', 'iPhone 13', 1500)]);
+  };
+  vintedFixture(context.service);
+  try {
+    // A marketplace error: the next call searches again.
+    await context.service.manualSearch(searchInput('iphone 13', { aiRelevance: false }));
+    await context.service.manualSearch(searchInput('iphone 13', { aiRelevance: false }));
+    assert.equal(fetched.length, 2);
+    // A failed misspelled search leaves its marketplace ok, but is not kept either.
+    failOlx = false;
+    fetched.length = 0;
+    const typo = { aiRelevance: false, typoVariants: true };
+    const first = await context.service.manualSearchDetailed(searchInput('iphone 13', typo));
+    assert.equal(first.sources[0].status, 'ok');
+    assert.equal(first.sources[0].variants?.[0].status, 'error');
+    await context.service.manualSearch(searchInput('iphone 13', typo));
+    assert.equal(fetched.filter((query) => query === 'iphone 13').length, 2);
+
+    // A paused Vinted beside a clean OLX: kept, until the pause ends.
+    const until = new Date(Date.now() + 60_000).toISOString();
+    context.db.prepare('INSERT INTO connector_runs (source, status, message, started_at, finished_at, backoff_until) VALUES (?, ?, ?, ?, ?, ?)')
+      .run('Vinted', 'error', 'error', new Date().toISOString(), new Date().toISOString(), until);
+    fetched.length = 0;
+    const both = { aiRelevance: false, sources: ['OLX', 'Vinted'] };
+    const skipped = await context.service.manualSearchDetailed(searchInput('iphone 13', both));
+    assert.equal(skipped.details.sources.get('Vinted')?.errorKind, 'backoff');
+    const hit = await context.service.manualSearchDetailed(searchInput('iphone 13', both));
+    assert.equal(hit.fromCache, true);
+    assert.equal(hit.details.sources.get('Vinted')?.errorKind, 'backoff');
+    assert.equal(fetched.length, 1);
+    t.mock.timers.tick(60_000);
+    const after = await context.service.manualSearch(searchInput('iphone 13', both));
+    assert.equal('fromCache' in after, false);
+    assert.equal(fetched.length, 2);
+    assert.equal(after.sources.find((source) => source.source === 'Vinted')?.status, 'ok');
+  } finally { context.close(); }
+});
+
+test('the result cache drops the least recently used entry and expired ones', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 0 });
+  const cache = new SearchCache<string>({ ttlMs: 1000, entries: 2 });
+  cache.set('a', 'A');
+  cache.set('b', 'B');
+  assert.equal(cache.get('a')?.value, 'A');
+  cache.set('c', 'C');
+  assert.equal(cache.get('b'), undefined);
+  assert.equal(cache.get('a')?.value, 'A');
+  cache.set('d', 'D', 500);
+  t.mock.timers.tick(500);
+  assert.equal(cache.get('d'), undefined);
+  assert.equal(cache.get('a')?.value, 'A');
+  t.mock.timers.tick(500);
+  assert.equal(cache.get('a'), undefined);
+  assert.equal(cache.size, 0);
+  const off = new SearchCache<string>({ ttlMs: 0, entries: 50 });
+  off.set('a', 'A');
+  assert.equal(off.get('a'), undefined);
 });

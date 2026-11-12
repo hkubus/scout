@@ -612,6 +612,8 @@ const searchInput = z.object({
   ignoreBackoff: z.boolean().optional().default(false),
   // Answer within this many ms, the wait for a search slot included.
   deadlineMs: z.number().int().min(5000).max(120000).optional(),
+  // Skip the few-minute result cache.
+  refresh: z.boolean().optional().default(false),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
 
 // Flip ledger. Calendar dates only: the operator's own bookkeeping days.

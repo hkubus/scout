@@ -97,7 +97,9 @@ test('compact scout_search: stable keys, the documented values and one line of J
       assert.ok(!text.includes('\n'), 'compact output has no newline');
       const payload = JSON.parse(text);
       assertHatContract(payload);
-      assert.deepEqual(Object.keys(payload), ['schemaVersion', 'format', 'query', 'page', 'listings', 'sources', 'scoredAgainst', 'typoVariants']);
+      assert.deepEqual(Object.keys(payload), ['schemaVersion', 'format', 'query', 'page', 'listings', 'sources', 'scoredAgainst', 'typoVariants', 'fromCache', 'cachedAt']);
+      assert.equal(payload.fromCache, false);
+      assert.equal(payload.cachedAt, null);
       assert.equal(payload.query, '13 128gb');
       assert.equal(payload.page, 1);
       // The fixture's second offer is free and never parsed.
