@@ -249,6 +249,19 @@ export interface Watch {
   variants: WatchVariantStat[];
   /** How many Exceptional/Very strong/Strong findings this watch currently has. */
   dealCounts: WatchDealCounts;
+  /**
+   * The watch-wide typical asking price its latest scan scored listings
+   * against. Only set on a watch without model variants (those carry one per
+   * variant in `variants`); null until a scan has scored against a typical.
+   */
+  typical?: number | null;
+  /** Where `typical` comes from: own asking prices, or the reference research series' probable-sale band while the watch is still learning. */
+  typicalSource?: 'own-history' | 'reference-band' | null;
+  /** Middle half of the prices behind `typical` (the band's for a reference-band typical); null with fewer than 4 prices. */
+  p25?: number | null;
+  p75?: number | null;
+  /** A listing's deviation is (typical − price) / robustScale: about 1.48 × the median absolute deviation, at least 3.5% of the typical. */
+  robustScale?: number | null;
   referenceMarketWatchId: string | null;
   minPrice: number | null;
   maxPrice: number | null;

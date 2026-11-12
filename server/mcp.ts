@@ -129,7 +129,7 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
   });
 
   server.registerTool('scout_watches', {
-    description: 'List deal watches with learned baselines, readiness, per-variant progress, and Strong+ finding counts.',
+    description: 'List deal watches with readiness, Strong+ finding counts and typical asking prices (not sale prices). A watch without model variants has typical, p25/p75 and robustScale (deviation = (typical - price) / robustScale); one with variants has a typical per variant in variants.',
     inputSchema: { includeArchived: z.boolean().optional().default(false).describe('Include archived watches.') },
     annotations: { readOnlyHint: true },
   }, async ({ includeArchived }) => {

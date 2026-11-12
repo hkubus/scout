@@ -50,6 +50,14 @@ struct WatchDetailView: View {
                         Text("\(watch.samples) of \(watch.targetSamples) samples over \(Int(watch.observationHours)) h")
                     }
                 }
+                if let typical = watch.typical {
+                    LabeledContent {
+                        Text(Format.pln(typical) + (watch.typicalSource == "reference-band" ? " (research)" : "")).monospacedDigit()
+                    } label: {
+                        Text("Typical asking price")
+                        Text("What deals are measured against")
+                    }
+                }
                 if let analytics {
                     if let median = analytics.current.medianPrice {
                         LabeledContent("Median asking price") {

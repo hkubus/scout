@@ -86,6 +86,8 @@ Settings supports Discord webhooks and ntfy topics. Each channel has its own min
 
 An alert needs a ready baseline (30 comparable samples and 6 hours of watch history), an 18%+ discount below the learned median, and — for discounts between 18% and 20% — a robust price-deviation score of at least 3.1 (scaled by watch sensitivity). A **Very strong** discount (20%+ below the median) alerts as soon as the watch is ready even when the watch's own price spread fails that deviation test, so a heterogeneous search cannot keep silencing genuine discounts forever. Higher-priority deals are still subject to the description-verification safeguard below.
 
+For a watch without model variants, the watch card, the iOS watch screen and the API (`typical`, `p25`, `p75`, `robustScale` on each watch from `GET /api/watches` and `scout_watches`) show the typical asking price its latest scan scored against and the middle half of the prices behind it. `robustScale` is the deviation score's denominator, about 1.48 × the median absolute deviation and at least 3.5% of the typical: deviation = (typical − price) / robustScale. A watch with variants has a typical per variant instead.
+
 Each watch can also set two alert rules of its own:
 
 - **Target price:** a listing at or below it alerts at once, even while the watch is still learning. It goes to every configured channel, whatever that channel's minimum priority or digest setting, with a "Target price hit" title. The feed marks such listings with a **Target** chip.

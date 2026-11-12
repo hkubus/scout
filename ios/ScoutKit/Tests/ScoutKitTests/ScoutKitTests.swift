@@ -690,6 +690,23 @@ final class AlertRuleTests: XCTestCase {
         XCTAssertNil(older.minSaving)
     }
 
+    func testDecodesWatchTypicalFiguresPresentAbsentOrNull() throws {
+        let set = try watch(#","typical":1150,"typicalSource":"own-history","p25":1020,"p75":1260,"robustScale":185.33"#)
+        XCTAssertEqual(set.typical, 1150)
+        XCTAssertEqual(set.typicalSource, "own-history")
+        XCTAssertEqual(set.p25, 1020)
+        XCTAssertEqual(set.p75, 1260)
+        XCTAssertEqual(set.robustScale, 185.33)
+        let learning = try watch(#","typical":null,"typicalSource":null,"p25":null,"p75":null,"robustScale":null"#)
+        XCTAssertNil(learning.typical)
+        XCTAssertNil(learning.typicalSource)
+        XCTAssertNil(learning.robustScale)
+        let older = try watch("")
+        XCTAssertNil(older.typical)
+        XCTAssertNil(older.p25)
+        XCTAssertNil(older.p75)
+    }
+
     func testDecodesListingNetAndTargetPresentAbsentOrNull() throws {
         let set = try listing { $0["estimatedNet"] = -42; $0["targetHit"] = true }
         XCTAssertEqual(set.estimatedNet, -42)
