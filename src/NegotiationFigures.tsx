@@ -95,7 +95,7 @@ export function NegotiationOutcomesSection({ figures, showAllRow }: { figures: N
   return (
     <section className="analytics-section analytics-section--card">
       <div className="analytics-section-heading">
-        <h3>Your negotiations</h3>
+        <h3>Your negotiations · all time</h3>
         <Handshake size={16} />
       </div>
       {roles.length ? roles.map(([role, outcomes]) => (
@@ -113,7 +113,7 @@ export function NegotiationOutcomesSection({ figures, showAllRow }: { figures: N
 export function NegotiationOutcomesCard({ figures }: { figures: NegotiationFigures }) {
   return (
     <section className="analytics-section analytics-section--card">
-      <div className="analytics-section-heading"><h3>Your negotiations</h3><Handshake size={16} /></div>
+      <div className="analytics-section-heading"><h3>Your negotiations · all time</h3><Handshake size={16} /></div>
       {roleEntries(figures).map(([role, outcomes]) => (
         <div key={role}>
           <RoleHeadline role={role} outcomes={outcomes} minAgreed={figures.minAgreed} />

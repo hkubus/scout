@@ -42,7 +42,7 @@ struct NegotiationOutcomesSection: View {
                 }
             }
         } header: {
-            Text("Your negotiations")
+            Text("Your negotiations · all time")
         } footer: {
             Text("All time. Final prices from negotiations Hatbot recorded, as a share of the asking price; a share shows once a group has \(figures.minAgreed) agreed. They never feed typical prices.")
         }

@@ -307,7 +307,7 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       days: z.number().int().min(7).max(180).optional().default(30),
       watchId: z.string().min(1).max(160).optional(),
       marketplace: marketplace.optional(),
-      negotiations: z.boolean().optional().describe('Also return negotiations: your recorded outcomes under the watch and marketplace filters, all time, by role, marketplace and watch (shares as in scout_price_reference; Scout\'s screens show a share only from minAgreed agreed). Null until one is recorded.'),
+      negotiations: z.boolean().optional().describe('Also return negotiations: your recorded outcomes under the watch and marketplace filters, all time, by role, marketplace and watch. A group\'s shareOfAsking is the median over its agreed negotiations, even just one, as in scout_price_reference; Scout\'s screens show it only from minAgreed agreed, so treat a share below that as anecdotal. Null until one is recorded.'),
     },
     annotations: { readOnlyHint: true },
   }, async (input) => {
