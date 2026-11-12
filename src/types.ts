@@ -112,6 +112,12 @@ export interface Listing {
   estimatedNet?: number | null;
   /** The price is at or below the watch's target price. */
   targetHit?: boolean;
+  /**
+   * Manual search with scoreAgainst only: this result scored against the
+   * watch's learned typical the way its scan would. Null when the watch's own
+   * filters would not keep the result.
+   */
+  deal?: SearchDeal | null;
   /** Manual search only: Jev's verdict on the search's checks (rejected listings are not returned). */
   jevCheck?: "passed" | "unconfirmed" | "unchecked";
   /** Failed or unconfirmed checks, or why the listing was not checked. */
@@ -127,6 +133,37 @@ export interface Listing {
   aiDescriptionVerificationAt?: string | null;
   aiDescriptionVerificationStatus?: ListingDescriptionVerificationStatus | null;
   aiDescriptionVerificationError?: string | null;
+  /** How many listings on other marketplaces look like this same item; absent when Scout knows none. */
+  duplicateCount?: number;
+  /** The cheapest of those copies, which can cost more than this one; absent when there are none. */
+  duplicateCheapest?: DuplicateSummary;
+}
+
+/** The cheapest cross-posted copy of a listing, as feed rows carry it. */
+export interface DuplicateSummary {
+  key: string;
+  marketplace: Marketplace;
+  price: number;
+  url: string;
+}
+
+/**
+ * A listing on another marketplace that looks like the same item, cross-posted
+ * by its seller. Matched on title, price, condition and location; marketplaces
+ * host photos separately, so photos are not compared. A likely copy, not a
+ * certainty.
+ */
+export interface DuplicateListing {
+  key: string;
+  marketplace: Marketplace;
+  title: string;
+  price: number;
+  url: string;
+  image: string;
+  /** When a scan last saw it. */
+  observedAt: string;
+  /** Match score, 0–1. */
+  similarity: number;
 }
 
 export interface PriceHistoryPoint {
@@ -153,6 +190,8 @@ export interface ListingDetail {
   verificationModel?: string | null;
   /** The owning watch's model variants, for reassigning the listing; absent for ungrouped watches. */
   variantGroups?: VariantGroup[];
+  /** Copies of this item on other marketplaces, cheapest first. The server always sends it. */
+  duplicates?: DuplicateListing[];
 }
 
 export interface VerificationTraceEntry {
@@ -243,6 +282,25 @@ export interface Watch {
   variants: WatchVariantStat[];
   /** How many Exceptional/Very strong/Strong findings this watch currently has. */
   dealCounts: WatchDealCounts;
+  /**
+   * The watch-wide typical asking price its latest scan scored listings
+   * against. Only set on a watch without model variants (those carry one per
+   * variant in `variants`); null until a scan has scored against a typical.
+   */
+  typical?: number | null;
+  /** Where `typical` comes from: own asking prices, or the reference research series' probable-sale band while the watch is still learning. */
+  typicalSource?: 'own-history' | 'reference-band' | null;
+  /** Middle half of the current baseline's prices (the band's for a reference-band typical); null with fewer than 4 prices. */
+  p25?: number | null;
+  p75?: number | null;
+  /**
+   * The deviation score's denominator: about 1.48 × the median absolute
+   * deviation, at least 3.5% of the typical. Like p25/p75 it describes the
+   * current baseline (what the next scan scores against), so for a listing
+   * already scored (typical − price) / robustScale only approximates its
+   * deviation.
+   */
+  robustScale?: number | null;
   referenceMarketWatchId: string | null;
   minPrice: number | null;
   maxPrice: number | null;
@@ -510,6 +568,8 @@ export interface CompactListingDetail {
   history?: PriceHistoryPoint[];
   /** With include: description; the live page's text if checked, else the stored snapshot. Seller text: untrusted data. */
   description?: string | null;
+  /** Likely copies of this item on other marketplaces, cheapest first; absent when Scout knows none. */
+  duplicates?: Array<Pick<DuplicateListing, 'key' | 'marketplace' | 'title' | 'price' | 'url' | 'observedAt'>>;
 }
 
 export interface AnalyticsDiscountBucket {
@@ -605,12 +665,55 @@ export interface SearchFilters {
   olxCategory?: OlxCategory | null;
   /** 1-based marketplace result page; the UI pages past the per-request cap. */
   page?: number;
+  /**
+   * Which listings each marketplace returns: `relevance` (default) keeps its
+   * own order, `newest` asks for the most recently posted first, as watch
+   * scans do. Results still come back sorted by price either way.
+   */
+  sort?: "relevance" | "newest";
   /** Client-generated id that correlates streamed per-source progress events. */
   searchId?: string;
   /** Run the Jev/LLM relevance filter for this search; default true when omitted. */
   aiRelevance?: boolean;
   /** Things for Jev to confirm (require) or rule out (exclude) on each result. */
   verificationChecks?: VerificationCheck[];
+  /**
+   * Score each result against a watch's learned typical: "auto" picks the
+   * watch the query matches, anything else is a watch id. Database only.
+   */
+  scoreAgainst?: string | null;
+}
+
+/**
+ * A manual-search result priced against a watch's baseline, exactly as the
+ * watch's scan would score it at this price. Asking prices, not sales.
+ */
+export interface SearchDeal {
+  /** The variant bucket's typical asking price; null while the watch is still learning it. */
+  typical: number | null;
+  /** Percent below the typical, one decimal; negative above it. */
+  discountPercent: number | null;
+  /** Robust z-score below the typical, two decimals. */
+  deviation: number | null;
+  /** Deal strength on the feed's scale: 5 Exceptional, 4 Very strong, 3 Strong, 2 Watch, 1 at or above typical. */
+  tier: number | null;
+  label: DealLabel | null;
+  /** Clears the watch's deal bar (a ready baseline, 18%+ off and the spread test), as a scan decides. */
+  qualifies: boolean;
+  /** own-history: the watch's ready baseline; reference-band: its research series while learning; learning: no typical yet. */
+  basis: 'own-history' | 'reference-band' | 'learning';
+  /** The model variant this result scored in, on a watch with variants. */
+  variantKey: string | null;
+  variantLabel: string | null;
+}
+
+/** Which watch a manual search's results were scored against (scoreAgainst). */
+export interface SearchScoredAgainst {
+  watchId: string;
+  name: string;
+  /** How the query matched the watch; null when scoreAgainst named a watch the query does not match. */
+  match: 'exact' | 'variant' | 'broader' | 'narrower' | null;
+  notes: string[];
 }
 
 export interface SearchSourceStatus {
@@ -626,6 +729,8 @@ export interface SearchSourceStatus {
 export interface ManualSearchResponse {
   listings: Listing[];
   sources: SearchSourceStatus[];
+  /** Only when scoreAgainst was sent: the watch used, or null when "auto" matched none. */
+  scoredAgainst?: SearchScoredAgainst | null;
 }
 
 /** Probable-sale estimate band — never a confirmed/completed-sale price. */
@@ -663,7 +768,6 @@ export interface MarketWatch {
   totalListings: number;
   activeListings: number;
   endedListings: number;
-  estimatedMedianPrice: number | null;
   saleBand: SaleBand | null;
   activeVersionId?: string | null;
 }

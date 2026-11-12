@@ -1,12 +1,15 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { ScoutDebug } from './debug';
+import { toCompactSearch } from './mcpFormat';
 import type { FlipStore } from './flips';
 import type { ScoutService } from './service';
 import { ServiceError } from './service';
 import { randomUUID } from 'node:crypto';
 import { VERIFICATION_CHECKS_MAX, VERIFICATION_CHECK_MAX_CHARS } from './ai';
 import { FLIP_CHANNELS } from '../src/profit';
+import { DEAL_TIERS, DEAL_TIER_STRENGTH, DEALS_DEFAULT_LIMIT, DEALS_MAX_LIMIT, LISTING_VERIFICATION_FILTERS, compactListing, dealsForAgent } from './deals';
+import { MARKETPLACE_SEARCH_SORTS } from './marketplaces';
 
 export const MCP_DASHBOARD_LISTINGS = 20;
 
@@ -15,6 +18,8 @@ const sources = z.array(marketplace).min(1).max(3).refine((list) => new Set(list
 const olxCategory = z.object({ id: z.number().int().positive().max(1_000_000_000), label: z.string().trim().min(1).max(120), path: z.string().trim().max(240).regex(/^(?:[a-z0-9-]+(?:\/[a-z0-9-]+)*)?$/) });
 const verificationChecks = z.array(z.object({ text: z.string().trim().min(1).max(VERIFICATION_CHECK_MAX_CHARS), mode: z.enum(['require', 'exclude']) })).max(VERIFICATION_CHECKS_MAX);
 const watchId = z.string().trim().min(1).max(160);
+const variantKey = z.string().trim().min(1).max(64).describe('A model variant id of the watch (scout_watches); __other__ is its unmatched bucket.');
+const dealTier = z.enum(DEAL_TIERS);
 const flipChannel = z.enum(FLIP_CHANNELS);
 const flipDate = z.string().regex(/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/).describe('YYYY-MM-DD.');
 const flipAmount = z.number().nonnegative().max(10_000_000);
@@ -36,6 +41,7 @@ export const SCOUT_MCP_TOOL_NAMES = [
   'scout_dashboard',
   'scout_watches',
   'scout_listings',
+  'scout_deals',
   'scout_listing_detail',
   'scout_watch_analytics',
   'scout_analytics',
@@ -123,7 +129,7 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
   });
 
   server.registerTool('scout_watches', {
-    description: 'List deal watches with learned baselines, readiness, per-variant progress, and Strong+ finding counts.',
+    description: 'List deal watches with readiness, Strong+ finding counts and typical asking prices (not sale prices). A watch without model variants has typical (what its latest scan scored against), typicalSource (own-history, or reference-band while learning from its research series), and p25/p75 and robustScale, which describe its current baseline (what the next scan scores against): for a listing already scored, (typical - price) / robustScale only approximates its deviation. One with variants has a typical per variant in variants.',
     inputSchema: { includeArchived: z.boolean().optional().default(false).describe('Include archived watches.') },
     annotations: { readOnlyHint: true },
   }, async ({ includeArchived }) => {
@@ -131,20 +137,47 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
   });
 
   server.registerTool('scout_listings', {
-    description: 'Query the listings feed with the same filters as GET /api/listings. Defaults to a small page to keep context compact.',
+    description: 'Query the listings feed with the same filters as GET /api/listings. Defaults to a small page to keep context compact. For the best current deals in one call, use scout_deals.',
     inputSchema: {
       marketplace: marketplace.optional(),
       q: z.string().max(240).optional().describe('Case-insensitive substring over title, condition, and location.'),
       watchId: z.string().min(1).max(160).optional(),
       page: z.number().int().min(1).optional().default(1),
       pageSize: z.number().int().min(1).max(50).optional().default(20),
-      sort: z.enum(['newest', 'strongest', 'price']).optional().default('newest'),
+      sort: z.enum(['newest', 'strongest', 'price', 'discount']).optional().default('newest').describe('discount: furthest below typical first; rows without a typical last.'),
       decision: z.enum(['buy', 'watch', 'pass']).optional(),
       visibility: z.enum(['visible', 'hidden', 'all']).optional().default('visible'),
+      qualifiesOnly: z.boolean().optional().describe('Only listings that would alert: a deal score that passes the watch\'s alert gate and minimum saving, or a target-price hit, at the last scan. Very strong+ deals are also checked against their description before alerting, so ones the check rejected are left out.'),
+      minTier: dealTier.optional().describe('Deal strength at least Strong (3), Very strong (4) or Exceptional (5).'),
+      minDiscount: z.number().min(0).max(100).optional().describe('At least this percent below the typical price; rows without a typical are left out.'),
+      variantKey: variantKey.optional(),
+      minPrice: z.number().nonnegative().optional().describe('PLN.'),
+      maxPrice: z.number().nonnegative().optional().describe('PLN.'),
+      verification: z.enum(LISTING_VERIFICATION_FILTERS).optional().describe('AI description check status; none = never checked.'),
+      format: z.enum(['full', 'compact']).optional().describe('compact: short rows (id, price, typical, discountPercent, tier, estimatedNet, watch, variant, url, seenAt, verification...), as scout_deals returns. Default full.'),
     },
     annotations: { readOnlyHint: true },
+  }, async ({ minTier, format, ...input }) => {
+    try {
+      const page = service.listingsPage({ ...input, ...(minTier ? { minStrength: DEAL_TIER_STRENGTH[minTier] } : {}) });
+      return text(format === 'compact' ? { listings: page.listings.map(compactListing), pagination: page.pagination } : page);
+    } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_deals', {
+    description: 'Strong+ deals right now, best first: listings a watch scan saw in the last 12 h at deal strength Strong (3) or better (minTier raises it), leaving out ones you hid or passed, AI-irrelevant ones, and ones the AI description check rejected (unless includeRejected). Ordered by tier, then percent below typical, then newest, like Deals → Top deals. Each row has typical, discountPercent, tier and estimatedNet (resale at typical after the marketplace fee, less the price). total counts every match. Database only; asking prices, not sales.',
+    inputSchema: {
+      minTier: dealTier.optional().default('strong'),
+      marketplace: marketplace.optional(),
+      watchId: watchId.optional(),
+      variantKey: variantKey.optional(),
+      maxPrice: z.number().positive().optional().describe('PLN.'),
+      includeRejected: z.boolean().optional().default(false).describe('Keep listings the AI description check rejected.'),
+      limit: z.number().int().min(1).max(DEALS_MAX_LIMIT).optional().default(DEALS_DEFAULT_LIMIT),
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true },
   }, async (input) => {
-    try { return text(service.listingsPage(input)); } catch (error) { return toolError(error); }
+    try { return text(dealsForAgent(service, input)); } catch (error) { return toolError(error); }
   });
 
   server.registerTool('scout_listing_detail', {
@@ -306,13 +339,23 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       ownerType: z.enum(['private', 'business']).nullable().optional(),
       olxCategoryId: z.number().int().positive().optional().describe('OLX only: search one category; ids come from scout_olx_categories.'),
       page: z.number().int().min(1).max(10).optional().default(1),
+      sort: z.enum(MARKETPLACE_SEARCH_SORTS).optional().default('relevance')
+        .describe('Which listings each marketplace returns: relevance keeps its own ranking; newest asks for the most recently posted first, as watch scans do, to catch fresh underpriced ones. Allegro Lokalnie lists newest first either way. Results still come back sorted by price.'),
       aiRelevance: z.boolean().optional().default(true),
       verificationChecks: z.array(z.object({ text: z.string().trim().min(1).max(120), mode: z.enum(['require', 'exclude']) })).max(8).optional()
         .describe('Jev reads each result: exclude hides near-certain matches; require-confirmed results come back with jevCheck "passed".'),
+      scoreAgainst: z.string().trim().min(1).max(160).optional()
+        .describe('"auto" or a watch id. Each result gets deal {typical, discountPercent, deviation, tier, label, qualifies, basis, variantKey, variantLabel}, scored against that watch\'s learned typical asking price exactly as its scan would; deal is null where the watch\'s own filters would not keep the result. "auto" picks the watch the query names (the scout_price_reference match); scoredAgainst says which, or is null when none matches. Compact rows carry deal too. Database only: no extra fetch or AI call.'),
+      format: z.enum(['full', 'compact']).optional().default('full')
+        .describe('compact: smaller, stable rows with every key present (null when unknown): id "<Marketplace>:<listingId>", asking price in PLN, relevance, match kind; sources carry status ok|error with an errorKind and pipeline counts.'),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
-  }, async ({ olxCategoryId, ...input }) => {
-    try { return text(await service.manualSearch({ ...input, olxCategory: olxCategoryId ? { id: olxCategoryId, label: String(olxCategoryId), path: '' } : null })); } catch (error) { return toolError(error); }
+  }, async ({ olxCategoryId, format, ...input }) => {
+    try {
+      const filters = { ...input, olxCategory: olxCategoryId ? { id: olxCategoryId, label: String(olxCategoryId), path: '' } : null };
+      if (format === 'compact') return text(toCompactSearch(filters, await service.manualSearchDetailed(filters)));
+      return text(await service.manualSearch(filters));
+    } catch (error) { return toolError(error); }
   });
 
   server.registerTool('scout_olx_categories', {

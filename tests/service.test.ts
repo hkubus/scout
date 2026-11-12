@@ -11,6 +11,8 @@ import { VisionError } from '../server/vision';
 import { ScoutService, ServiceError, dashboardTopParam, decryptSecret, olxCategoryFromJson, olxCategoryToJson, encryptSecret, escapeDiscordMarkdown, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
 import { OTHER_VARIANT_KEY } from '../server/variants';
 import { compareStrongest } from '../src/listingRows';
+import { scoreDeal } from '../server/scoring';
+import { legacyAnalyticsSections } from './legacyAnalytics';
 
 // Pin the legacy DeepSeek path for pre-existing tests: live Jev is the
 // production default whenever a key is available, but these tests assert
@@ -1768,7 +1770,8 @@ function seedWatchStatsScenario(db: any) {
   link.run();
 }
 
-function captureRows(db: any, marker: string) {
+/** Records what the marked statement's all() returns; `hidden` statement methods read as undefined (an older node:sqlite). */
+function captureRows(db: any, marker: string, hidden: string[] = []) {
   const captured: unknown[][] = [];
   const proxy = new Proxy(db, {
     get(target, property) {
@@ -1777,6 +1780,7 @@ function captureRows(db: any, marker: string) {
         if (!sql.includes(marker)) return statement;
         return new Proxy(statement, {
           get(inner, key) {
+            if (typeof key === 'string' && hidden.includes(key)) return undefined;
             if (key === 'all') return (...params: unknown[]) => { const rows = inner.all(...params); captured.push(rows); return rows; };
             const value = Reflect.get(inner, key);
             return typeof value === 'function' ? value.bind(inner) : value;
@@ -1848,12 +1852,14 @@ test('listing detail price history matches the unsplit history query', () => {
   } finally { context.close(); }
 });
 
-test('association-driven analytics rows match the observation-driven query in order', () => {
+test('association-driven analytics rows and sections match the observation-driven query and per-section helpers', () => {
   const context = fixture();
   try {
     seedWatchStatsScenario(context.db);
-    const { proxy, captured } = captureRows(context.db, 'CROSS JOIN observations o INDEXED BY observations_watch_listing ON o.watch_id = wl.watch_id AND o.listing_id = wl.listing_id\n      WHERE');
-    const service = new ScoutService(proxy, () => {});
+    // Baselines on some observations and listings, so discounts and strong deals are not all empty.
+    context.db.prepare('UPDATE observations SET baseline_pln = 150 + (id % 9) * 45 WHERE id % 4 <> 0').run();
+    context.db.prepare('UPDATE listings SET typical_pln = 120 + (id % 5) * 70 WHERE id % 3 <> 0').run();
+    const marker = 'CROSS JOIN observations o INDEXED BY observations_watch_listing ON o.watch_id = wl.watch_id AND o.listing_id = wl.listing_id\n      WHERE';
     const legacy = (options: { days: number; watchId?: string; marketplace?: string }) => {
       const predicates = [
         'w.archived_at IS NULL',
@@ -1872,16 +1878,32 @@ test('association-driven analytics rows match the observation-driven query in or
         JOIN watches w ON w.id = o.watch_id
         JOIN watch_listings wl ON wl.watch_id = o.watch_id AND wl.listing_id = o.listing_id
         WHERE ${predicates.join(' AND ')}
-        GROUP BY day, o.watch_id, o.listing_id`).all(...params);
+        GROUP BY day, o.watch_id, o.listing_id`).all(...params) as Array<Record<string, any>>;
     };
-    for (const options of [{ days: 30 }, { days: 7 }, { days: 30, watchId: 'stats-bounded' }, { days: 30, marketplace: 'OLX' as const }, { days: 30, watchId: 'stats-shipping', marketplace: 'Vinted' as const }]) {
-      captured.length = 0;
-      service.analytics(options);
-      assert.equal(captured.length, 1);
-      const expected = legacy(options);
-      assert.ok(expected.length > 0 || options.marketplace === 'Vinted');
-      // Same rows, same order; the bare columns come from the MAX(observed_at) row.
-      assert.deepEqual((captured[0] as any[]).map((row) => ({ ...row })), (expected as any[]).map((row) => ({ ...row })));
+    // Without setReturnArrays (Node before 22.16) the service maps the row objects instead.
+    for (const hidden of [[], ['setReturnArrays']]) {
+      const { proxy, captured } = captureRows(context.db, marker, hidden);
+      const service = new ScoutService(proxy, () => {});
+      for (const options of [{ days: 30 }, { days: 7 }, { days: 30, watchId: 'stats-bounded' }, { days: 30, marketplace: 'OLX' as const }, { days: 30, watchId: 'stats-shipping', marketplace: 'Vinted' as const }]) {
+        captured.length = 0;
+        const analytics = service.analytics(options);
+        assert.equal(captured.length, 1);
+        const expected = legacy(options);
+        assert.ok(expected.length > 0 || options.marketplace === 'Vinted');
+        // Same rows, same order and columns; the bare columns come from the MAX(observed_at) row.
+        const rows = (captured[0] as any[]).map((row) => (hidden.length ? Object.values(row) : [...row]));
+        assert.deepEqual(rows, expected.map((row) => Object.values(row)));
+        const sections = legacyAnalyticsSections(expected, new Date(Date.now() - options.days * 24 * 60 * 60_000).toISOString());
+        if (!options.marketplace) assert.ok(sections.overview.strongDeals > 0 && sections.overview.medianDiscountPercent !== null);
+        const { scanRuns: _runs, scanSuccessRate: _rate, ...overview } = analytics.overview;
+        assert.equal(JSON.stringify({
+          overview,
+          trend: analytics.trend,
+          discountDistribution: analytics.discountDistribution,
+          watchLeaderboard: analytics.watchLeaderboard,
+          marketplaceDeals: analytics.marketplaceComparison.map(({ scanRuns: _r, scanSuccessRate: _s, averageLatencyMs: _l, ...row }) => row),
+        }), JSON.stringify(sections));
+      }
     }
   } finally { context.close(); }
 });
@@ -2068,7 +2090,7 @@ test('keeps market research separate and reports ended-listing price estimates',
     const research = context.service.marketResearch();
     const { saleBand, ...marketWatch } = research.watches[0];
     assert.deepEqual(marketWatch, {
-      id: 'market-watch', name: 'GPU market', query: 'rtx 4070', terms: '12gb', excluded: 'parts', location: 'Polska', condition: 'New', sources: ['OLX', 'Vinted'], intervalHours: 24, minPrice: 1000, maxPrice: 2500, shippingOnly: true, typoVariants: false, olxCategory: null, enabled: true, nextScan: 'due now', lastScan: 'just now', totalListings: 3, activeListings: 1, endedListings: 2, estimatedMedianPrice: 2200,
+      id: 'market-watch', name: 'GPU market', query: 'rtx 4070', terms: '12gb', excluded: 'parts', location: 'Polska', condition: 'New', sources: ['OLX', 'Vinted'], intervalHours: 24, minPrice: 1000, maxPrice: 2500, shippingOnly: true, typoVariants: false, olxCategory: null, enabled: true, nextScan: 'due now', lastScan: 'just now', totalListings: 3, activeListings: 1, endedListings: 2,
     });
     // Both ended rows lack a verified ended reason, so the band stays open.
     assert.deepEqual({ ...saleBand, computedAt: null }, { p25: null, median: null, p75: null, sampleCount: 2, eligibleCount: 0, excludedStale: 0, windowDays: 90, computedAt: null });
@@ -2076,7 +2098,6 @@ test('keeps market research separate and reports ended-listing price estimates',
     assert.equal(research.watches[0].totalListings, 3);
     assert.equal(research.watches[0].activeListings, 1);
     assert.equal(research.watches[0].endedListings, 2);
-    assert.equal(research.watches[0].estimatedMedianPrice, 2200);
     assert.equal(research.listings.find((item) => item.listingId === 'ended-1')?.observations, 1);
     context.service.deleteMarketWatch('market-watch');
     assert.equal((context.db.prepare('SELECT COUNT(*) AS count FROM market_listings').get() as { count: number }).count, 0);
@@ -2122,7 +2143,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals', '030_perf_indexes', '031_flips', '032_flip_listings', '033_verification_checks', '033_watch_alert_targets', '034_flip_ready_to_list', '034_listing_seller', '035_connected_apps', '035_negotiation_outcomes', '036_shared_sessions', '037_marketplace_session_checks']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals', '030_perf_indexes', '031_flips', '032_flip_listings', '033_verification_checks', '033_watch_alert_targets', '034_flip_ready_to_list', '034_listing_seller', '035_connected_apps', '035_negotiation_outcomes', '036_shared_sessions', '037_marketplace_session_checks', '038_watch_listing_scores', '039_listing_duplicates']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -2479,6 +2500,10 @@ test('creates immutable research series and computes aggregates across the full 
     const insert = context.db.prepare(`INSERT INTO market_listings (market_watch_id, version_id, marketplace, listing_id, title, url, first_price_pln, last_price_pln, lowest_price_pln, first_seen_at, last_seen_at, status, missing_scans)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ended', 3)`);
     for (let price = 1; price <= 401; price += 1) insert.run('median-watch', 'median-watch:v1', 'OLX', `median-${price}`, 'CPU', `https://www.olx.pl/d/oferta/median-${price}`, price, price, price, now, now);
+    // Another watch's ended price counts only in the unscoped aggregate.
+    context.service.createMarketWatch({ id: 'other-watch', name: 'Other', query: 'gpu', terms: '', excluded: '', condition: 'Any', sources: ['OLX'], intervalHours: 24, minPrice: null, maxPrice: null, shippingOnly: false, typoVariants: false });
+    insert.run('other-watch', 'other-watch:v1', 'OLX', 'other-1', 'GPU', 'https://www.olx.pl/d/oferta/other-1', 9000, 9000, 9000, now, now);
+    assert.equal(context.service.marketResearch().aggregates?.overallMedianPrice, 201.5);
     const research = context.service.marketResearch({ page: 2, pageSize: 100, watchId: 'median-watch' });
     assert.equal(research.aggregates?.overallMedianPrice, 201);
     assert.deepEqual(research.pagination, { page: 2, pageSize: 100, total: 401, hasNext: true });
@@ -2612,7 +2637,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 42);
+    assert.equal(after.migrations.count, 44);
   } finally { context.close(); }
 });
 
@@ -3903,6 +3928,15 @@ test('moves a listing to a variant manually, re-scores it, and keeps the pick ac
     assert.equal(moved.listing.typical, 2600);
     assert.equal(moved.listing.dealLabel, 'Exceptional');
     assert.deepEqual(moved.variantGroups?.map((group) => group.id), ['mini', 'base', 'pro']);
+    // The stored score follows the move: scored against 13 Pro, it would alert.
+    const storedScore = () => ({ ...context.db.prepare("SELECT wl.discount_percent, wl.deviation, wl.confidence, wl.qualifies FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE wl.watch_id = 'manual-variant-watch' AND l.listing_id = 'iPhone-13-0'").get() as Record<string, unknown> });
+    const rescored = (variant: string) => {
+      const watchRow = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('manual-variant-watch');
+      const { score } = (context.service as any).variantDealScore(watchRow, 1900, (context.service as any).watchBaselines(watchRow), variant, null);
+      return { discount_percent: score.discountPercent, deviation: score.deviation, confidence: score.confidence, qualifies: score.qualifies ? 1 : 0 };
+    };
+    assert.deepEqual(storedScore(), rescored('pro'));
+    assert.equal(storedScore().qualifies, 1);
 
     // A scan that sees the listing again, and a variant edit, both keep the manual pick.
     (context.service as any).processDealCandidates = async () => {};
@@ -3918,6 +3952,8 @@ test('moves a listing to a variant manually, re-scores it, and keeps the pick ac
     // Back to automatic: the rules put it in the base variant again.
     const automatic = context.service.setListingVariant('manual-variant-watch', key, null);
     assert.deepEqual([automatic.listing.variantKey, automatic.listing.variantSource, automatic.listing.typical], ['base', 'rule', 2000]);
+    assert.deepEqual(storedScore(), rescored('base'));
+    assert.equal(storedScore().qualifies, 0);
 
     // A manual pick whose variant is removed falls back to the rules.
     context.service.setListingVariant('manual-variant-watch', key, 'pro');
@@ -4299,4 +4335,71 @@ test('target prices alert while learning on every channel, and the minimum savin
     globalThis.fetch = originalFetch;
     context.close();
   }
+});
+
+test('storeListing keeps each listing\'s latest deal score, and qualifiesOnly lists what would alert', () => {
+  const context = fixture();
+  try {
+    seedWatch(context.db, 'score-watch');
+    const service = context.service as any;
+    const row = () => context.db.prepare('SELECT * FROM watches WHERE id = ?').get('score-watch');
+    const listing = (id: string, price: number) => ({ marketplace: 'OLX' as const, listingId: id, title: `CPU ${id}`, price, currency: 'PLN' as const, url: `https://www.olx.pl/d/oferta/cpu-${id}`, observedAt: new Date().toISOString() });
+    const store = (id: string, price: number) => service.storeListing(row(), listing(id, price), service.createScan('score-watch', 'watch', 'OLX'), service.watchBaselines(row()));
+    const stored = (id: string) => ({ ...context.db.prepare(`SELECT wl.discount_percent, wl.deviation, wl.confidence, wl.qualifies FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id
+      WHERE wl.watch_id = 'score-watch' AND l.listing_id = ?`).get(id) as Record<string, unknown> });
+    const columns = (score: ReturnType<typeof scoreDeal>) => ({ discount_percent: score.discountPercent, deviation: score.deviation, confidence: score.confidence, qualifies: score.qualifies ? 1 : 0 });
+    const qualifying = (options: { q?: string } = {}) => context.service.listingsPage({ qualifiesOnly: true, ...options }).listings.map((item) => item.listingId).sort();
+    const base = Array.from({ length: 32 }, (_, index) => 990 + (index % 5) * 5);
+
+    // Learning: five prices give scoreDeal a median, but no typical is
+    // stored yet, so discount and deviation stay empty like the feed's.
+    base.slice(0, 5).forEach((price, index) => store(`base-${index}`, price));
+    const learning = scoreDeal(base.slice(0, 5), 500, { observedHours: 0 });
+    assert.ok(learning.discountPercent! > 0);
+    store('learning', 500);
+    assert.deepEqual(stored('learning'), { ...columns(learning), discount_percent: null, deviation: null });
+    assert.deepEqual(stored('learning'), { discount_percent: null, deviation: null, confidence: 10, qualifies: 0 });
+
+    // Ready: the stored values are exactly scoreDeal's on the same baseline.
+    base.slice(5).forEach((price, index) => store(`base-${index + 5}`, price));
+    context.db.prepare('UPDATE observations SET observed_at = ? WHERE watch_id = ?').run(new Date(Date.now() - 8 * 60 * 60_000).toISOString(), 'score-watch');
+    const prices = [...base, 500];
+    const expected = new Map<string, ReturnType<typeof scoreDeal>>();
+    for (const [id, price] of [['deal', 670], ['fair', 980]] as const) {
+      expected.set(id, scoreDeal(prices, price, { observedHours: 8 }));
+      store(id, price);
+      prices.push(price);
+      assert.deepEqual(stored(id), columns(expected.get(id)!), id);
+    }
+    assert.deepEqual([expected.get('deal')!.qualifies, expected.get('fair')!.qualifies], [true, false]);
+    assert.equal(stored('deal').confidence, 100);
+
+    // The watch's alert rules are applied when reading. 'learning' was
+    // scored while the watch learned, so only a target hit lists it before
+    // its next scan.
+    assert.deepEqual(qualifying(), ['deal']);
+    context.db.prepare('UPDATE watches SET min_saving_pln = 400 WHERE id = ?').run('score-watch');
+    assert.deepEqual(qualifying(), [], '330 zł saved is under the 400 zł floor');
+    context.db.prepare('UPDATE watches SET target_price_pln = 600 WHERE id = ?').run('score-watch');
+    assert.deepEqual(qualifying(), ['learning'], 'target hits ignore the floor');
+    context.db.prepare('UPDATE watches SET min_saving_pln = 300 WHERE id = ?').run('score-watch');
+    assert.deepEqual(qualifying(), ['deal', 'learning']);
+    assert.deepEqual(qualifying({ q: 'deal' }), ['deal']);
+    assert.equal(context.service.listingsPage({ qualifiesOnly: false }).pagination.total, 35);
+
+    // A Very strong+ deal the description check rejected never alerted;
+    // below Very strong there is no check, so a reject changes nothing.
+    const verdict = (status: string | null) => context.db.prepare("UPDATE listings SET ai_description_verification_status = ? WHERE listing_id = 'deal'").run(status);
+    const strength = (value: number) => context.db.prepare("UPDATE watch_listings SET deal_strength = ? WHERE watch_id = 'score-watch' AND listing_id = (SELECT id FROM listings WHERE listing_id = 'deal')").run(value);
+    strength(4);
+    verdict('reject');
+    assert.deepEqual(qualifying(), ['learning']);
+    verdict('pass');
+    assert.deepEqual(qualifying(), ['deal', 'learning']);
+    verdict(null);
+    assert.deepEqual(qualifying(), ['deal', 'learning'], 'not checked yet: the check runs when it would alert');
+    strength(3);
+    verdict('reject');
+    assert.deepEqual(qualifying(), ['deal', 'learning']);
+  } finally { context.close(); }
 });

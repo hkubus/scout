@@ -229,6 +229,24 @@ function WatchRow({
               );
             })}
           </div>
+        ) : typeof watch.typical === "number" ? (
+          <div className="watch-variants" aria-label="Typical asking price">
+            <span
+              className={`variant-chip ${watch.typicalSource === "reference-band" ? "" : "variant-chip--ready"}`}
+              title={watch.typicalSource === "reference-band"
+                ? "From the watch's research series while its own typical is learning"
+                : "The asking price deals are measured against"}
+            >
+              <strong>Typical</strong>
+              <small>{formatPln(watch.typical)}{watch.typicalSource === "reference-band" ? " (research)" : ""}</small>
+            </span>
+            {typeof watch.p25 === "number" && typeof watch.p75 === "number" ? (
+              <span className="variant-chip" title="Half of the asking prices behind the typical fall in this range">
+                <strong>Middle half</strong>
+                <small>{watch.p25.toLocaleString("pl-PL")}–{formatPln(watch.p75)}</small>
+              </span>
+            ) : null}
+          </div>
         ) : null}
       </div>
       <div className="watch-actions">

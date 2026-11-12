@@ -107,6 +107,9 @@ public struct Listing: Codable, Hashable, Sendable {
     public var estimatedNet: Double?
     /// The price is at or below the watch's target price. Missing on older servers.
     public var targetHit: Bool?
+    /// Manual search with `scoreAgainst` only: this result priced against the
+    /// matched watch's typical. Nil outside the watch's filters or on older servers.
+    public var deal: SearchDeal?
 
     /// Unique per row in watch-scoped lists, where `id` can repeat.
     public var rowID: String { associationId ?? id }
@@ -220,6 +223,21 @@ public struct Watch: Codable, Hashable, Sendable, Identifiable {
     public var variantGroups: [VariantGroup]
     public var variants: [WatchVariantStat]
     public var dealCounts: WatchDealCounts
+    /// PLN. The typical asking price the latest scan scored against. Only on
+    /// a watch without model variants (one with variants has a typical per
+    /// variant); nil until scored, and missing on older servers.
+    public var typical: Double?
+    /// `own-history`, or `reference-band` (the research series' band while
+    /// the watch is learning). Missing on older servers.
+    public var typicalSource: String?
+    /// PLN. Middle half of the current baseline's prices (the band's for a
+    /// `reference-band` typical).
+    public var p25: Double?
+    public var p75: Double?
+    /// PLN. The deviation score's denominator, from the current baseline
+    /// (what the next scan scores against); for a listing already scored,
+    /// (typical − price) / robustScale only approximates its deviation.
+    public var robustScale: Double?
     public var referenceMarketWatchId: String?
     public var minPrice: Double?
     public var maxPrice: Double?
@@ -491,6 +509,9 @@ public struct SearchFilters: Codable, Hashable, Sendable {
     /// Correlates the streamed `search` progress events with this request.
     public var searchId: String?
     public var aiRelevance: Bool
+    /// `"auto"` or a watch id: price each result against that watch's learned
+    /// typical. Older servers ignore it.
+    public var scoreAgainst: String?
 
     public init(
         query: String = "",
@@ -506,7 +527,8 @@ public struct SearchFilters: Codable, Hashable, Sendable {
         page: Int = 1,
         searchId: String? = nil,
         aiRelevance: Bool = true,
-        olxCategory: OlxCategory? = nil
+        olxCategory: OlxCategory? = nil,
+        scoreAgainst: String? = nil
     ) {
         self.query = query
         self.terms = terms
@@ -522,6 +544,7 @@ public struct SearchFilters: Codable, Hashable, Sendable {
         self.searchId = searchId
         self.aiRelevance = aiRelevance
         self.olxCategory = olxCategory
+        self.scoreAgainst = scoreAgainst
     }
 
     /// The price range the server accepts: both bounds optional, minimum ≥ 0,
@@ -577,6 +600,52 @@ public struct SearchSourceStatus: Codable, Hashable, Sendable {
 public struct ManualSearchResponse: Codable, Hashable, Sendable {
     public var listings: [Listing]
     public var sources: [SearchSourceStatus]
+    /// The watch the results were priced against; nil when none matched,
+    /// when `scoreAgainst` was not sent, or on older servers.
+    public var scoredAgainst: SearchScoredAgainst? = nil
+}
+
+/// A manual-search result priced against a watch's baseline, as the watch's
+/// scan would score it. Asking prices, not sales.
+public struct SearchDeal: Codable, Hashable, Sendable {
+    /// Nil while the watch is still learning its typical.
+    public var typical: Double?
+    /// Percent below the typical; negative above it.
+    public var discountPercent: Double?
+    public var deviation: Double?
+    /// The feed's deal strength: 5 Exceptional … 2 Watch, 1 at or above typical.
+    public var tier: Int?
+    public var label: DealLabel?
+    /// Clears the watch's deal bar, as a scan decides.
+    public var qualifies: Bool
+    /// `own-history`, `reference-band` or `learning`.
+    public var basis: String
+    public var variantKey: String?
+    public var variantLabel: String?
+
+    public init(typical: Double?, discountPercent: Double?, deviation: Double?, tier: Int?, label: DealLabel?, qualifies: Bool, basis: String, variantKey: String? = nil, variantLabel: String? = nil) {
+        self.typical = typical
+        self.discountPercent = discountPercent
+        self.deviation = deviation
+        self.tier = tier
+        self.label = label
+        self.qualifies = qualifies
+        self.basis = basis
+        self.variantKey = variantKey
+        self.variantLabel = variantLabel
+    }
+
+    /// Below a known typical by enough to show as a whole percent.
+    public var isBelowTypical: Bool { typical != nil && (discountPercent ?? 0) >= 0.5 }
+}
+
+/// Which watch a manual search was priced against.
+public struct SearchScoredAgainst: Codable, Hashable, Sendable {
+    public var watchId: String
+    public var name: String
+    /// `exact`, `variant`, `broader` or `narrower`; nil when a named watch does not match the query.
+    public var match: String?
+    public var notes: [String]
 }
 
 /// Payload of the `search` server-sent event: one marketplace finished.

@@ -217,7 +217,7 @@ public actor DemoTransport: HTTPTransport {
                 location: draft.location, condition: draft.condition, sources: draft.sources, intervalHours: draft.intervalHours,
                 minPrice: draft.minPrice, maxPrice: draft.maxPrice, shippingOnly: draft.shippingOnly, typoVariants: draft.typoVariants,
                 enabled: true, nextScan: "due now", lastScan: "Never", totalListings: 0, activeListings: 0, endedListings: 0,
-                estimatedMedianPrice: nil, saleBand: nil, activeVersionId: nil, olxCategory: draft.olxCategory
+                saleBand: nil, activeVersionId: nil, olxCategory: draft.olxCategory
             )
             marketWatches.insert(watch, at: 0)
             return try respond(["watch": watch], status: 201)

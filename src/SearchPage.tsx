@@ -7,9 +7,9 @@ import { listingRowKey, reuseUnchangedListings, sameListingFields } from "./list
 import type { WatchPreset } from "./presets";
 import { OlxCategoryPicker } from "./OlxCategoryPicker";
 import { listingAge } from "./listingSignals";
-import { formatPln, ListingThumbnail, PageHeader } from "./ui";
+import { discountDisplay, formatPln, ListingThumbnail, PageHeader } from "./ui";
 import { VerificationChecksEditor, cleanVerificationChecks } from "./VerificationChecksEditor";
-import type { Listing, Marketplace, OlxCategory, SearchFilters, SearchSourceStatus, VerificationCheck } from "./types";
+import type { Listing, Marketplace, OlxCategory, SearchFilters, SearchScoredAgainst, SearchSourceStatus, VerificationCheck } from "./types";
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
@@ -56,6 +56,8 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
     "Vinted",
   ]);
   const [listings, setListings] = useState<Listing[]>([]);
+  // The watch whose typical priced the results ("auto" match), if any.
+  const [scoredAgainst, setScoredAgainst] = useState<SearchScoredAgainst | null>(null);
   const [sourceStatuses, setSourceStatuses] = useState<SearchSourceStatus[]>(
     [],
   );
@@ -88,6 +90,8 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
     page: targetPage,
     aiRelevance,
     verificationChecks: cleanVerificationChecks(verificationChecks),
+    // Database only: prices each result against the watch the query names.
+    scoreAgainst: "auto",
   });
   // Counted on the collapsed Filters button, so hidden filters are never a surprise.
   const activeFilters = [minPrice, maxPrice, terms.trim(), excluded.trim()].filter(Boolean).length
@@ -133,6 +137,7 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
     setError(null);
     setSearched(true);
     setListings([]);
+    setScoredAgainst(null);
     setSearchedChecks(cleanVerificationChecks(verificationChecks));
     setPage(1);
     setExhausted(false);
@@ -143,6 +148,7 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
       // The response reconciles the streamed rows; unchanged ones keep their identity and skip.
       setListings((current) => reuseUnchangedListings(current, result.listings));
       setSourceStatuses(result.sources);
+      setScoredAgainst(result.scoredAgainst ?? null);
       setExhausted(result.listings.length === 0);
     } catch (searchError) {
       if (sequence !== searchSequence.current || controller.signal.aborted) return;
@@ -372,6 +378,11 @@ export default memo(function SearchPage({ onSelectListing, onSaveWatch }: { onSe
             </div>
           ) : null}
         </div>
+        {scoredAgainst && visibleListings.length ? (
+          <p className="search-scored-note">
+            Compared with the typical asking price your “{scoredAgainst.name}” watch has learned, scored the way its scans score listings.
+          </p>
+        ) : null}
         {visibleListings.length ? (
           <SearchResultsTable listings={visibleListings} onSelect={onSelectListing} />
         ) : loading ? (
@@ -445,6 +456,7 @@ const SearchResultRow = memo(function SearchResultRow({ listing, onSelect }: Sea
       </div>
       <div className="price-cell search-price-cell" role="cell">
         <strong>{formatPln(listing.price)}</strong>
+        <SearchDeal listing={listing} />
         <PriceNegotiability listing={listing} />
       </div>
       <span
@@ -486,6 +498,20 @@ function SignalChips({ listing }: { listing: Listing }) {
       {listing.jevCheck === "unconfirmed" ? <em className="decision-chip decision-chip--jev-unconfirmed" title={listing.jevCheckNote}>Unconfirmed</em> : null}
       {listing.jevCheck === "unchecked" ? <em className="decision-chip decision-chip--jev-unconfirmed" title={listing.jevCheckNote}>Not checked</em> : null}
     </>
+  );
+}
+
+/** The result against the matched watch's typical; nothing outside the watch or while it learns. */
+function SearchDeal({ listing }: { listing: Listing }) {
+  const deal = listing.deal;
+  if (!deal || deal.typical === null || deal.discountPercent === null) return null;
+  const discount = discountDisplay({ price: listing.price, typical: deal.typical, belowTypical: -Math.max(0, deal.discountPercent), dealStrength: deal.tier ?? 1 });
+  const source = deal.basis === "reference-band" ? "its research series, while the watch learns its own" : "the watch's own history";
+  const title = `${deal.label ?? "Watch"} · typical ${formatPln(deal.typical)}${deal.variantLabel ? ` for ${deal.variantLabel}` : ""}, from ${source}. Asking prices, not sales.`;
+  return (
+    <span className="search-deal" title={title}>
+      <strong className={`discount-cell discount-cell--${discount.tone}`}>{discount.text}</strong> vs typical{deal.basis === "reference-band" ? <sup>*</sup> : null}
+    </span>
   );
 }
 

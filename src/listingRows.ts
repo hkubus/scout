@@ -1,4 +1,4 @@
-import type { Listing } from "./types";
+import type { DuplicateSummary, Listing } from "./types";
 
 /** The row identity ListingTable keys by (one listing can appear once per watch). */
 export const listingRowKey = (listing: Listing) => listing.associationId ?? listing.id;
@@ -19,17 +19,23 @@ export function compareStrongest(a: StrongestFields, b: StrongestFields) {
   return a.observedAt === b.observedAt ? 0 : a.observedAt > b.observedAt ? -1 : 1;
 }
 
+/** The cheapest cross-posted copy is a small flat object, so it compares by its fields. */
+const sameDuplicateSummary = (a: DuplicateSummary | undefined, b: DuplicateSummary | undefined) =>
+  a === b || (a !== undefined && b !== undefined && a.key === b.key && a.marketplace === b.marketplace && a.price === b.price && a.url === b.url);
+
 /**
- * Flat field-by-field comparison. List payloads carry only primitives per row;
- * a nested value (e.g. a verification object) compares by reference, so a
- * fresh one counts as a change and the row simply re-renders.
+ * Flat field-by-field comparison. List payloads carry only primitives per row,
+ * apart from the cheapest-copy summary; another nested value (e.g. a
+ * verification object) compares by reference, so a fresh one counts as a
+ * change and the row simply re-renders.
  */
 export function sameListingFields(a: Listing, b: Listing) {
   if (a === b) return true;
   const aKeys = Object.keys(a) as Array<keyof Listing>;
   if (aKeys.length !== Object.keys(b).length) return false;
   for (const key of aKeys) {
-    if (a[key] !== b[key] || !(key in b)) return false;
+    if (!(key in b)) return false;
+    if (key === "duplicateCheapest" ? !sameDuplicateSummary(a.duplicateCheapest, b.duplicateCheapest) : a[key] !== b[key]) return false;
   }
   return true;
 }

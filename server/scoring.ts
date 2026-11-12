@@ -97,7 +97,7 @@ export function scoreDealFromStats(stats: PriceStats, price: number, options: Sc
   const typical = override ?? stats.median;
   if (typical === null || price <= 0) return { typical, mad: null, deviation: null, discountPercent: null, confidence: 0, isReady: false, qualifies: false };
   const mad = pooled?.spreadRatio != null ? pooled.spreadRatio * typical : ownMad(stats, typical);
-  const robustScale = Math.max(mad * 1.4826, typical * 0.035, 1);
+  const robustScale = robustScaleFor(mad, typical);
   const deviation = (typical - price) / robustScale;
   const discountPercent = ((typical - price) / typical) * 100;
   const sampleReadiness = Math.min(1, usablePrices.length / minSamples, pooled ? pooled.samples / BASELINE_MIN_SAMPLES : 1);
@@ -143,6 +143,20 @@ export function dealStrength(price: number, typical: number | null): number | nu
   if (percent <= 0) return 1;
   const index = percent * Math.sqrt(typical / DEAL_STRENGTH_REFERENCE_PLN);
   return DEAL_STRENGTH_TIERS.find((tier) => index >= tier.index && percent >= tier.minPercent)?.strength ?? 2;
+}
+
+/**
+ * The deviation denominator: the MAD scaled to a normal σ (× 1.4826), floored
+ * at 3.5% of the typical and 1 zł so a tight baseline cannot turn a few złoty
+ * into a large deviation.
+ */
+export function robustScaleFor(mad: number, typical: number) {
+  return Math.max(mad * 1.4826, typical * 0.035, 1);
+}
+
+/** robustScaleFor a bucket's own spread around `typical`, as an ungrouped watch scores. */
+export function ownRobustScale(stats: PriceStats, typical: number) {
+  return robustScaleFor(ownMad(stats, typical), typical);
 }
 
 function ownMad(stats: PriceStats, typical: number) {
