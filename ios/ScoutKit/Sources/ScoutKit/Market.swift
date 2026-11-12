@@ -37,7 +37,6 @@ public struct MarketWatch: Codable, Hashable, Sendable, Identifiable {
     public var totalListings: Int
     public var activeListings: Int
     public var endedListings: Int
-    public var estimatedMedianPrice: Double?
     public var saleBand: SaleBand?
     public var activeVersionId: String?
     /// Part of the research criteria: changing it starts a new series.
