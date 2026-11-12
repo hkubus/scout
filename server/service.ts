@@ -26,8 +26,9 @@ import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assi
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import type { ListingVerificationFilter } from './deals';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
-import { dealOverview, discountDistribution, marketplaceDeals, trendPoints, watchLeaderboard, type AnalyticsObservation } from './analytics';
-import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes, AgentFlip, AgentFlips, ConversationResult, InboxResult } from '../src/types';
+import { DUPLICATE_WINDOW_DAYS, findDuplicatePairs } from './duplicates';
+import { summarizeAnalytics, type AnalyticsRow } from './analytics';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, DuplicateListing, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes, AgentFlip, AgentFlips, ConversationResult, InboxResult } from '../src/types';
 import { estimatedNetAtTypical, flipCost, flipNet, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, suggestedListingPrice, type FeePresets } from '../src/profit';
 import type { SearchDeal, SearchScoredAgainst } from '../src/types';
 import type { MatchKind } from './queryMatch';
@@ -204,6 +205,14 @@ const RELIST_TITLE_SIMILARITY = 0.6;
 const LIVE_DESCRIPTION_CHARS = 2_000;
 /** Compact detail's price history keeps the latest points. */
 const COMPACT_HISTORY_POINTS = 30;
+/**
+ * How often the scheduler rebuilds cross-marketplace duplicate pairs. Hourly
+ * rather than daily, so a cheaper copy shows while a deal is still up.
+ */
+const DUPLICATE_REFRESH_MS = 60 * 60_000;
+/** Duplicate matching compares at most this many recently seen listings. */
+const DUPLICATE_POOL_LIMIT = 20_000;
+const DUPLICATE_REFRESH_SETTING = 'last_duplicate_refresh';
 /** Bounded per-scan capture of preserved listing copies (description + downloaded images). */
 const SNAPSHOT_CAPTURES_PER_SCAN = 8;
 const SNAPSHOT_MAX_IMAGES = 12;
@@ -3906,24 +3915,25 @@ export class ScoutService {
     const params: unknown[] = [cutoff];
     if (watchId) { predicates.push('w.id = ?'); params.push(watchId); }
     if (marketplace) { predicates.push('l.marketplace = ?'); params.push(marketplace); }
-    const rows = this.stmt(`SELECT date(o.observed_at) AS day, o.listing_id AS listing_id, o.watch_id AS watch_id, w.name AS watch_name, l.marketplace AS marketplace, o.price_pln AS price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at, wl.first_seen_at AS first_seen_at
+    // Columns in AnalyticsRow order.
+    const statement = this.stmt(`SELECT date(o.observed_at) AS day, o.listing_id AS listing_id, o.watch_id AS watch_id, w.name AS watch_name, l.marketplace AS marketplace, o.price_pln AS price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at, wl.first_seen_at AS first_seen_at
       FROM watches w
       JOIN watch_listings wl ON wl.watch_id = w.id
       JOIN listings l ON l.id = wl.listing_id
       CROSS JOIN observations o INDEXED BY observations_watch_listing ON o.watch_id = wl.watch_id AND o.listing_id = wl.listing_id
       WHERE ${predicates.join(' AND ')}
-      GROUP BY day, o.watch_id, o.listing_id`).all(...params) as Array<Record<string, any>>;
-    const observations: AnalyticsObservation[] = rows.map((row) => ({
-      day: String(row.day),
-      listingId: Number(row.listing_id),
-      watchId: String(row.watch_id),
-      watchName: String(row.watch_name),
-      marketplace: row.marketplace as Marketplace,
-      price: Number(row.price_pln),
-      typical: row.typical_pln === null || row.typical_pln === undefined ? null : Number(row.typical_pln),
-      observedAt: String(row.observed_at),
-      firstSeenAt: String(row.first_seen_at),
-    }));
+      GROUP BY day, o.watch_id, o.listing_id`);
+    // Positional rows: a 180-day range is ~100k rows, and node:sqlite's row
+    // objects hold over twice the heap of arrays and are slower to read.
+    // setReturnArrays arrived in Node 22.16 and 24; older 22.x maps the objects.
+    let rows: AnalyticsRow[];
+    if (typeof statement.setReturnArrays === 'function') {
+      statement.setReturnArrays(true);
+      rows = statement.all(...params);
+    } else {
+      rows = (statement.all(...params) as Array<Record<string, unknown>>).map((row): AnalyticsRow => [row.day, row.listing_id, row.watch_id, row.watch_name, row.marketplace, row.price_pln, row.typical_pln, row.observed_at, row.first_seen_at]);
+    }
+    const deals = summarizeAnalytics(rows, cutoff);
 
     const scanPredicates = ["watch_kind = 'watch'", 'started_at >= ?'];
     const scanParams: unknown[] = [cutoff];
@@ -3945,7 +3955,7 @@ export class ScoutService {
         averageMs: row.average_ms === null || row.average_ms === undefined ? null : Number(row.average_ms),
       });
     }
-    const marketplaceComparison: AnalyticsMarketplaceRow[] = marketplaceDeals(observations).map((row) => {
+    const marketplaceComparison: AnalyticsMarketplaceRow[] = deals.marketplaceDeals.map((row) => {
       const scan = scanByMarketplace.get(row.marketplace);
       return {
         ...row,
@@ -3980,7 +3990,7 @@ export class ScoutService {
     };
 
     const overview: AnalyticsOverview = {
-      ...dealOverview(observations, cutoff),
+      ...deals.overview,
       scanRuns,
       scanSuccessRate: scanRuns > 0 ? (scansCompleted / scanRuns) * 100 : null,
     };
@@ -3991,9 +4001,9 @@ export class ScoutService {
       marketplace,
       generatedAt: nowIso(),
       overview,
-      trend: trendPoints(observations),
-      discountDistribution: discountDistribution(observations),
-      watchLeaderboard: watchLeaderboard(observations),
+      trend: deals.trend,
+      discountDistribution: deals.discountDistribution,
+      watchLeaderboard: deals.watchLeaderboard,
       marketplaceComparison,
       triage,
       aiQuality,
@@ -4104,7 +4114,7 @@ export class ScoutService {
       WHERE ${where}
       ORDER BY ${orderBy} LIMIT ? OFFSET ?`).all(...params, ...orderParams, pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
     const feePresets = this.feePresets();
-    const listings = rows.map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100, watches.get(row.watch_id)?.variantGroups ?? [], feePresets));
+    const listings = this.withDuplicates(rows.map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100, watches.get(row.watch_id)?.variantGroups ?? [], feePresets)));
     return { listings, pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
   }
 
@@ -4200,7 +4210,116 @@ export class ScoutService {
       verificationInputHash,
       verificationModel,
       ...(watch?.variantGroups.length ? { variantGroups: watch.variantGroups } : {}),
+      duplicates: this.duplicatesByKey([[marketplace, listingId]]).get(`${marketplace}:${listingId}`) ?? [],
     };
+  }
+
+  /**
+   * Listings on other marketplaces that look like the same item, per
+   * "<marketplace>:<listingId>" key, cheapest first. Copies verified gone are
+   * left out. One query for any number of keys.
+   */
+  private duplicatesByKey(keys: Array<[string, string]>) {
+    const byKey = new Map<string, DuplicateListing[]>();
+    const unique = [...new Map(keys.map((key) => [`${key[0]}:${key[1]}`, key])).values()];
+    if (!unique.length) return byKey;
+    const side = (self: 'a' | 'b', other: 'a' | 'b') => `SELECT s.marketplace AS self_marketplace, s.listing_id AS self_listing_id, o.marketplace, o.listing_id, o.title, o.price_pln, o.url, o.image_url, o.last_seen_at, p.similarity
+      FROM json_each(?) k
+      JOIN listings s ON s.marketplace = json_extract(k.value, '$[0]') AND s.listing_id = json_extract(k.value, '$[1]')
+      JOIN listing_duplicate_pairs p ON p.listing_id_${self} = s.id
+      JOIN listings o ON o.id = p.listing_id_${other}
+      WHERE COALESCE(o.availability_status, 'live') != 'terminal'`;
+    const json = JSON.stringify(unique);
+    const rows = this.stmt(`${side('a', 'b')} UNION ALL ${side('b', 'a')}`).all(json, json) as Array<Record<string, any>>;
+    for (const row of rows) {
+      const key = `${row.self_marketplace}:${row.self_listing_id}`;
+      const copies = byKey.get(key) ?? [];
+      copies.push({
+        key: `${row.marketplace}:${row.listing_id}`,
+        marketplace: row.marketplace,
+        title: String(row.title),
+        price: Number(row.price_pln),
+        url: String(row.url),
+        image: row.image_url || '',
+        observedAt: String(row.last_seen_at),
+        similarity: Math.round(Number(row.similarity) * 100) / 100,
+      });
+      byKey.set(key, copies);
+    }
+    for (const copies of byKey.values()) copies.sort((a, b) => a.price - b.price || b.similarity - a.similarity || a.key.localeCompare(b.key));
+    return byKey;
+  }
+
+  /** Feed rows with the count and cheapest of their cross-posted copies; rows without copies stay as they are. */
+  private withDuplicates(listings: Listing[]) {
+    const copies = this.duplicatesByKey(listings.map((listing) => [listing.marketplace, listing.listingId ?? '']));
+    for (const listing of listings) {
+      const found = copies.get(`${listing.marketplace}:${listing.listingId}`);
+      if (!found?.length) continue;
+      const cheapest = found[0];
+      listing.duplicateCount = found.length;
+      listing.duplicateCheapest = { key: cheapest.key, marketplace: cheapest.marketplace, price: cheapest.price, url: cheapest.url };
+    }
+    return listings;
+  }
+
+  private refreshDuplicatePairsIfDue() {
+    const last = this.getSetting(DUPLICATE_REFRESH_SETTING);
+    if (last && Date.now() - Date.parse(last) < DUPLICATE_REFRESH_MS) return;
+    // Stamped first, so a refresh that keeps failing waits for the next slot
+    // instead of running on every scheduler tick.
+    this.setSetting(DUPLICATE_REFRESH_SETTING, nowIso());
+    this.refreshDuplicatePairs();
+  }
+
+  /**
+   * Rebuild listing_duplicate_pairs from the listings scans saw in the last
+   * DUPLICATE_WINDOW_DAYS days (server/duplicates.ts). Pairs whose listings
+   * aged out, went terminal or stopped matching are removed. Emits `watch`
+   * when any pair changed, so open feeds refetch their badges.
+   */
+  refreshDuplicatePairs(now = Date.now()) {
+    const cutoff = new Date(now - DUPLICATE_WINDOW_DAYS * 24 * 60 * 60_000).toISOString();
+    const rows = this.stmt(`SELECT id, marketplace, title, price_pln, condition, location FROM listings
+      WHERE last_seen_at >= ? AND price_pln > 0 AND COALESCE(availability_status, 'live') != 'terminal'
+      ORDER BY last_seen_at DESC, id DESC LIMIT ?`).all(cutoff, DUPLICATE_POOL_LIMIT) as Array<Record<string, any>>;
+    const pairs = findDuplicatePairs(rows.map((row) => ({
+      id: Number(row.id),
+      marketplace: String(row.marketplace),
+      title: String(row.title),
+      price: Number(row.price_pln),
+      condition: row.condition ?? null,
+      location: row.location ?? null,
+    })));
+    const createdAt = new Date(now).toISOString();
+    const result = this.transaction(() => {
+      const existing = new Map((this.stmt('SELECT listing_id_a, listing_id_b, similarity FROM listing_duplicate_pairs').all() as Array<{ listing_id_a: number; listing_id_b: number; similarity: number }>)
+        .map((row) => [`${row.listing_id_a}:${row.listing_id_b}`, Number(row.similarity)]));
+      const found = new Set<string>();
+      let added = 0;
+      for (const pair of pairs) {
+        const key = `${pair.a}:${pair.b}`;
+        const similarity = Math.round(pair.similarity * 1000) / 1000;
+        found.add(key);
+        const previous = existing.get(key);
+        if (previous === undefined) {
+          this.stmt('INSERT INTO listing_duplicate_pairs (listing_id_a, listing_id_b, similarity, created_at) VALUES (?, ?, ?, ?)').run(pair.a, pair.b, similarity, createdAt);
+          added += 1;
+        } else if (previous !== similarity) {
+          this.stmt('UPDATE listing_duplicate_pairs SET similarity = ? WHERE listing_id_a = ? AND listing_id_b = ?').run(similarity, pair.a, pair.b);
+        }
+      }
+      let removed = 0;
+      for (const key of existing.keys()) {
+        if (found.has(key)) continue;
+        const [a, b] = key.split(':').map(Number);
+        this.stmt('DELETE FROM listing_duplicate_pairs WHERE listing_id_a = ? AND listing_id_b = ?').run(a, b);
+        removed += 1;
+      }
+      return { pairs: pairs.length, added, removed, compared: rows.length };
+    });
+    if (result.added || result.removed) this.emit('watch', { duplicates: result.pairs });
+    return result;
   }
 
   /**
@@ -4318,6 +4437,9 @@ export class ScoutService {
     if (include.has('history')) result.history = detail.history.slice(-COMPACT_HISTORY_POINTS);
     if (include.has('description')) {
       result.description = (live?.description ?? detail.descriptionSnapshot?.description ?? null)?.slice(0, LIVE_DESCRIPTION_CHARS) ?? null;
+    }
+    if (detail.duplicates?.length) {
+      result.duplicates = detail.duplicates.map((copy) => ({ key: copy.key, marketplace: copy.marketplace, title: copy.title.slice(0, COMPARABLE_TITLE_CHARS), price: copy.price, url: copy.url, observedAt: copy.observedAt }));
     }
     return result;
   }
@@ -5756,6 +5878,11 @@ export class ScoutService {
       this.pruneRetention();
     } catch (error) {
       this.logBackgroundError('Retention pruning', error);
+    }
+    try {
+      this.refreshDuplicatePairsIfDue();
+    } catch (error) {
+      this.logBackgroundError('Cross-marketplace duplicates', error);
     }
     this.background('Notification retries', this.processNotificationRetries());
     this.background('Daily digest', this.processDailyDigest());
