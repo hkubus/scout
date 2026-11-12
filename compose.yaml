@@ -43,6 +43,11 @@ services:
       timeout: 5s
       start_period: 15s
       retries: 3
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   chromium:
     # Browserless v2 (maintained Chromium). Bump the tag and digest together.
@@ -67,6 +72,11 @@ services:
       timeout: 5s
       start_period: 20s
       retries: 5
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   scout-data:
