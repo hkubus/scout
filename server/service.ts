@@ -7,7 +7,7 @@ import { connect as connectHttp2, type SecureClientSessionOptions } from 'node:h
 import { brotliDecompressSync, gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
 import type { Browser, BrowserContext, Page } from 'playwright-core';
 import { buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
-import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseOfferPage, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, type SellerType, parseOlxCategoryFacets, type ListingDetailResult, type SellerListingsPage, allegroSellerProfileUrl, olxSellerListingsUrl, parseAllegroSellerProfile, parseOlxSellerListings, parseVintedWardrobe, vintedWardrobeUrl, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult, olxDetailHint } from './marketplaces';
+import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseOfferPage, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, type SellerType, parseOlxCategoryFacets, type ListingDetailResult, type SellerListingsPage, allegroSellerProfileUrl, olxSellerListingsUrl, parseAllegroSellerProfile, parseOlxSellerListings, parseVintedWardrobe, vintedWardrobeUrl, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult, olxDetailHint, setOlxDetailHint } from './marketplaces';
 import { MarketplaceSessionValidationError, SESSION_CHECK_URLS, classifySessionCheck, parseMarketplaceStorageState, type MarketplaceStorageState, type SessionCheckOutcome } from './marketplace-sessions';
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, writeResaleListingWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseVerificationChecks, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type VerificationCheck } from './ai';
 import { DEFAULT_JEV_MODEL, JevError, classifyConditionMatchWithJev, classifyListingRelevanceWithJev, classifyNegotiabilityWithJev, classifyTermMatchWithJev, classifyChecksWithJev, classifyWatchVariantWithJev, summarizeCheckResults, checkIssue, verifyListingDescriptionWithJev, type JevRelevanceJudgment, type JevVerificationJudgment } from './jev';
@@ -28,7 +28,7 @@ import type { ListingVerificationFilter } from './deals';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
 import { DUPLICATE_WINDOW_DAYS, findDuplicatePairs } from './duplicates';
 import { summarizeAnalytics, type AnalyticsRow } from './analytics';
-import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, DuplicateListing, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes, AgentFlip, AgentFlips, ConversationResult, InboxResult } from '../src/types';
+import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, DuplicateListing, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes, AgentFlip, AgentFlips, ConversationResult, InboxResult, AgentListingVerification } from '../src/types';
 import { estimatedNetAtTypical, flipCost, flipNet, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, suggestedListingPrice, type FeePresets } from '../src/profit';
 import { compareStrongest } from '../src/listingRows';
 import type { SearchDeal, SearchScoredAgainst } from '../src/types';
@@ -76,6 +76,31 @@ type DealNotificationCandidate = {
   variantKey?: string | null;
   variantLabel?: string | null;
 };
+
+/**
+ * One description-check run: whether the deal may alert, and whether the
+ * verdict came from one already stored (no AI call ran for it).
+ */
+type DescriptionVerificationRun = { allowed: boolean; reused: boolean };
+
+/** The description check's input for a candidate and its page's description; its hash keys every verdict cache. */
+function descriptionVerificationContext(candidate: DealNotificationCandidate, description: string | null): ListingDescriptionVerificationContext {
+  return {
+    marketplace: candidate.listing.marketplace,
+    title: candidate.listing.title,
+    condition: candidate.listing.condition,
+    description,
+    query: candidate.query?.trim() ? candidate.query : null,
+    includedTerms: candidate.includedTerms?.trim() ? candidate.includedTerms : null,
+    excludedTerms: candidate.excludedTerms?.trim() ? candidate.excludedTerms : null,
+    checks: candidate.verificationChecks?.length ? candidate.verificationChecks : null,
+  };
+}
+
+/** Which watch context a check runs in: everything in its input but the description. */
+function descriptionVerificationContextKey(candidate: DealNotificationCandidate) {
+  return listingDescriptionVerificationInputHash(descriptionVerificationContext(candidate, null));
+}
 
 /**
  * Per-variant price history for one scan. The window query returns the latest
@@ -739,7 +764,8 @@ export class ScoutService {
   private db: Database;
   private emit: (event: string, payload: unknown) => void;
   private running = new Set<string>();
-  private descriptionVerificationInFlight = new Map<string, Promise<boolean>>();
+  /** The running description check per listing, and the watch context (contextKey) it checks in. */
+  private descriptionVerificationInFlight = new Map<string, { run: Promise<DescriptionVerificationRun>; contextKey: string }>();
   private lastSchedulerTickAt: string | null = null;
   private digestRunning = false;
   private readonly classifyListingRelevance: typeof classifyListingRelevanceWithDeepSeek;
@@ -2047,6 +2073,10 @@ export class ScoutService {
   }
 
   private async verifyHighPriorityDealOnce(candidate: DealNotificationCandidate, notifyContext?: ScanNotifyContext): Promise<boolean> {
+    return (await this.runDescriptionVerification(candidate, notifyContext)).allowed;
+  }
+
+  private async runDescriptionVerification(candidate: DealNotificationCandidate, notifyContext?: ScanNotifyContext): Promise<DescriptionVerificationRun> {
     const marketplace = candidate.listing.marketplace;
     const listingId = candidate.listing.listingId;
     const config = notifyContext?.deepSeek ?? this.deepSeekConfig();
@@ -2061,7 +2091,7 @@ export class ScoutService {
         this.updateListingDetailSnapshot(snapshot?.id ?? null, 'not-configured', null);
         this.saveDescriptionVerification({ marketplace, listingId, status: 'not-configured' });
       });
-      return true;
+      return { allowed: true, reused: false };
     }
 
     let description: string | null;
@@ -2095,23 +2125,14 @@ export class ScoutService {
         this.saveDescriptionVerification({ marketplace, listingId, status: 'unknown', model: activeModel, error: message });
       });
       this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: 'unknown' });
-      return false;
+      return { allowed: false, reused: false };
     }
 
-    const context: ListingDescriptionVerificationContext = {
-      marketplace,
-      title: candidate.listing.title,
-      condition: candidate.listing.condition,
-      description,
-      query: candidate.query?.trim() ? candidate.query : null,
-      includedTerms: candidate.includedTerms?.trim() ? candidate.includedTerms : null,
-      excludedTerms: candidate.excludedTerms?.trim() ? candidate.excludedTerms : null,
-      checks: candidate.verificationChecks?.length ? candidate.verificationChecks : null,
-    };
+    const context = descriptionVerificationContext(candidate, description);
     const inputHash = listingDescriptionVerificationInputHash(context);
     // Everything up to the fresh AI call is synchronous, so the snapshot and
     // any cached decision are written in one transaction.
-    type CachedOutcome = { done: true; allowed: boolean; emit: ListingDescriptionVerificationStatus | null } | { done: false; snapshotId: number | null };
+    type CachedOutcome = { done: true; allowed: boolean; reused: boolean; emit: ListingDescriptionVerificationStatus | null } | { done: false; snapshotId: number | null };
     const outcome = this.transaction((): CachedOutcome => {
       const snapshot = this.captureListingDetailSnapshot(candidate, description);
       const row = this.stmt(`SELECT ai_description_verification_json, ai_description_verification_input_hash,
@@ -2122,7 +2143,7 @@ export class ScoutService {
       if (cached && row?.ai_description_verification_input_hash === inputHash && row.ai_description_verification_model === activeModel) {
         this.updateListingDetailSnapshot(snapshot?.id ?? null, cached.decision, inputHash);
         this.saveDescriptionVerification({ marketplace, listingId, status: cached.decision, verification: cached, inputHash, model: activeModel });
-        return { done: true, allowed: cached.decision === 'pass', emit: null };
+        return { done: true, allowed: cached.decision === 'pass', reused: true, emit: null };
       }
       if (row?.ai_description_verification_error && row.ai_description_verification_input_hash === inputHash
         && row.ai_description_verification_model === activeModel && row.ai_description_verification_at
@@ -2130,7 +2151,7 @@ export class ScoutService {
         const status: ListingDescriptionVerificationStatus = row.ai_description_verification_status === 'fallback' ? 'fallback' : 'unknown';
         this.updateListingDetailSnapshot(snapshot?.id ?? null, status, inputHash);
         this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: activeModel, error: row.ai_description_verification_error });
-        return { done: true, allowed: status === 'fallback', emit: null };
+        return { done: true, allowed: status === 'fallback', reused: true, emit: null };
       }
 
       if (!description) {
@@ -2143,7 +2164,7 @@ export class ScoutService {
         };
         this.updateListingDetailSnapshot(snapshot?.id ?? null, unknown.decision, inputHash);
         this.saveDescriptionVerification({ marketplace, listingId, status: unknown.decision, verification: unknown, inputHash, model: activeModel });
-        return { done: true, allowed: false, emit: unknown.decision };
+        return { done: true, allowed: false, reused: false, emit: unknown.decision };
       }
 
       // Cross-listing reuse is keyed by input hash, which omits the gallery
@@ -2159,7 +2180,7 @@ export class ScoutService {
       if (shared) {
         this.updateListingDetailSnapshot(snapshot?.id ?? null, shared.decision, inputHash);
         this.saveDescriptionVerification({ marketplace, listingId, status: shared.decision, verification: shared, inputHash, model: activeModel });
-        return { done: true, allowed: shared.decision === 'pass', emit: null };
+        return { done: true, allowed: shared.decision === 'pass', reused: true, emit: null };
       }
       // A fresh AI call follows: the snapshot shows pending while it runs.
       if (snapshot?.id) this.stmt("UPDATE listing_detail_snapshots SET verification_status = 'pending' WHERE id = ? AND verification_status IS NOT 'pending'").run(snapshot.id);
@@ -2167,7 +2188,7 @@ export class ScoutService {
     });
     if (outcome.done) {
       if (outcome.emit) this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: outcome.emit });
-      return outcome.allowed;
+      return { allowed: outcome.allowed, reused: outcome.reused };
     }
     const snapshot = outcome.snapshotId === null ? null : { id: outcome.snapshotId };
 
@@ -2190,7 +2211,7 @@ export class ScoutService {
       this.updateListingDetailSnapshot(snapshot?.id ?? null, verification.decision, inputHash);
       this.saveDescriptionVerification({ marketplace, listingId, status: verification.decision, verification, inputHash, model: activeModel });
       this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: verification.decision });
-      return verification.decision === 'pass';
+      return { allowed: verification.decision === 'pass', reused: false };
     } catch (error) {
       const message = (error instanceof Error ? error.message : 'OpenRouter could not verify the listing description').slice(0, 500);
       // Only genuine provider outages keep the historical fail-open alert. A
@@ -2202,19 +2223,27 @@ export class ScoutService {
       this.updateListingDetailSnapshot(snapshot?.id ?? null, status, inputHash);
       this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: activeModel, error: message });
       this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status });
-      return status === 'fallback';
+      return { allowed: status === 'fallback', reused: false };
     }
   }
 
   private verifyHighPriorityDeal(candidate: DealNotificationCandidate, notifyContext?: ScanNotifyContext) {
+    return this.sharedDescriptionVerification(candidate, notifyContext).then((run) => run.allowed);
+  }
+
+  /**
+   * Starts the listing's description check, or joins the one already running
+   * for it (a scan's or scout_verify_listing's), so they make one run.
+   */
+  private sharedDescriptionVerification(candidate: DealNotificationCandidate, notifyContext?: ScanNotifyContext) {
     const key = `${candidate.listing.marketplace}:${candidate.listing.listingId}`;
     const existing = this.descriptionVerificationInFlight.get(key);
-    if (existing) return existing;
-    const verification = this.verifyHighPriorityDealOnce(candidate, notifyContext).finally(() => {
-      if (this.descriptionVerificationInFlight.get(key) === verification) this.descriptionVerificationInFlight.delete(key);
+    if (existing) return existing.run;
+    const run = this.runDescriptionVerification(candidate, notifyContext).finally(() => {
+      if (this.descriptionVerificationInFlight.get(key)?.run === run) this.descriptionVerificationInFlight.delete(key);
     });
-    this.descriptionVerificationInFlight.set(key, verification);
-    return verification;
+    this.descriptionVerificationInFlight.set(key, { run, contextKey: descriptionVerificationContextKey(candidate) });
+    return run;
   }
 
   /**
@@ -2229,19 +2258,29 @@ export class ScoutService {
     const jevLive = this.jevLiveConfig();
     const apiKey = jevLive ? jevLive.apiKey : config.apiKey;
     if (!apiKey) return false;
-    const activeModel = jevLive ? jevLive.jevModel : config.model;
     const { listing } = candidate;
-    const row = this.stmt(`SELECT id, ai_description_verification_model AS model, ai_description_verification_status AS status,
-      ai_description_verification_error AS error, ai_description_verification_at AS at
-      FROM listings WHERE marketplace = ? AND listing_id = ?`).get(listing.marketplace, listing.listingId) as { id?: number; model?: string | null; status?: string | null; error?: string | null; at?: string | null } | undefined;
-    if (!row?.id || row.model !== activeModel || row.error) return false;
-    if (row.status !== 'pass' && row.status !== 'reject' && row.status !== 'unknown') return false;
-    const verifiedAt = row.at ? Date.parse(row.at) : Number.NaN;
-    if (!Number.isFinite(verifiedAt) || Date.now() - verifiedAt >= DESCRIPTION_VERIFICATION_FRESH_MS) return false;
+    const verdict = this.freshStoredVerdict(listing, jevLive ? jevLive.jevModel : config.model);
+    if (!verdict) return false;
     return Boolean(this.stmt(`SELECT 1 AS found FROM listing_detail_snapshots
       WHERE listing_id = ? AND title = ? AND price_pln = ? AND url = ? AND condition IS ? AND location IS ? LIMIT 1`).get(
-      row.id, listing.title, listing.price, listing.url, listing.condition ?? null, listing.location ?? null,
+      verdict.id, listing.title, listing.price, listing.url, listing.condition ?? null, listing.location ?? null,
     ));
+  }
+
+  /**
+   * The listing's stored verdict when it is finished (pass, reject, or
+   * unknown for a page without a description; not an error), from the
+   * active model, and younger than DESCRIPTION_VERIFICATION_FRESH_MS.
+   */
+  private freshStoredVerdict(listing: NormalizedListing, activeModel: string) {
+    const row = this.stmt(`SELECT id, ai_description_verification_model AS model, ai_description_verification_status AS status,
+      ai_description_verification_error AS error, ai_description_verification_at AS at, ai_description_verification_input_hash AS input_hash
+      FROM listings WHERE marketplace = ? AND listing_id = ?`).get(listing.marketplace, listing.listingId) as { id?: number; model?: string | null; status?: string | null; error?: string | null; at?: string | null; input_hash?: string | null } | undefined;
+    if (!row?.id || row.model !== activeModel || row.error) return null;
+    if (row.status !== 'pass' && row.status !== 'reject' && row.status !== 'unknown') return null;
+    const verifiedAt = row.at ? Date.parse(row.at) : Number.NaN;
+    if (!Number.isFinite(verifiedAt) || Date.now() - verifiedAt >= DESCRIPTION_VERIFICATION_FRESH_MS) return null;
+    return { id: Number(row.id), inputHash: row.input_hash ?? null };
   }
 
   /** Read once per scan — see ScanNotifyContext. */
@@ -4475,6 +4514,138 @@ export class ScoutService {
       return { source: 'marketplace', total: others, items };
     } catch (error) {
       return { source: 'marketplace', total: null, items: [], error: (error instanceof Error ? error.message : 'Seller listings request failed').slice(0, 240) };
+    }
+  }
+
+  /**
+   * scout_verify_listing: the Very strong+ description check, run now on one
+   * stored listing in a watch's context: the given watch (also one the
+   * listing is not in, such as the watch a scout_search was scored against),
+   * else the watch that saw it most recently, else none (the generic check).
+   * The candidate is the one a scan builds, so both share the verdict cache:
+   * a fresh verdict for the listing's current state comes back with no
+   * request, and a run stores exactly what a scan's check stores.
+   */
+  async verifyListingForAgent(key: string, options: { watchId?: string | null } = {}): Promise<AgentListingVerification> {
+    const { marketplace, listingId } = parseListingKey(key);
+    const row = this.stmt(`SELECT id, title, price_pln, url, image_url, condition, location, shipping_available, price_negotiable, last_seen_at
+      FROM listings WHERE marketplace = ? AND listing_id = ?`).get(marketplace, listingId) as Record<string, any> | undefined;
+    if (!row) throw new ServiceError('Listing detail is not available yet', 404);
+    const watchColumns = 'w.id, w.name, w.query, w.included_terms, w.excluded_terms, w.verification_checks_json';
+    const requested = options.watchId?.trim() || null;
+    const watch = (requested !== null
+      ? this.stmt(`SELECT ${watchColumns} FROM watches w WHERE w.id = ?`).get(requested)
+      : this.stmt(`SELECT ${watchColumns} FROM watch_listings wl JOIN watches w ON w.id = wl.watch_id
+        WHERE wl.listing_id = ? ORDER BY wl.last_seen_at DESC LIMIT 1`).get(row.id)) as WatchRow | undefined;
+    if (requested !== null && !watch) throw new ServiceError('Watch not found', 404);
+    const config = this.deepSeekConfig();
+    const jevLive = this.jevLiveConfig();
+    // Unlike a scan, which records not-configured and alerts unchecked, an
+    // on-demand check without a key has nothing to run and writes nothing.
+    if (!(jevLive ? jevLive.apiKey : config.apiKey)) throw new ServiceError('OpenRouter is not configured. Add an API key in Settings or set SCOUT_OPENROUTER_API_KEY.', 409);
+    const activeModel = jevLive ? jevLive.jevModel : config.model;
+
+    const candidate: DealNotificationCandidate = {
+      watchId: watch ? String(watch.id) : '',
+      listing: {
+        marketplace,
+        listingId,
+        title: String(row.title),
+        price: Number(row.price_pln),
+        currency: 'PLN',
+        url: String(row.url),
+        imageUrl: row.image_url ?? undefined,
+        condition: row.condition ?? undefined,
+        location: row.location ?? undefined,
+        shippingAvailable: row.shipping_available === null || row.shipping_available === undefined ? null : Boolean(row.shipping_available),
+        priceNegotiable: row.price_negotiable === null || row.price_negotiable === undefined ? null : Boolean(row.price_negotiable),
+        observedAt: String(row.last_seen_at),
+      },
+      typical: null,
+      discountPercent: null,
+      confidence: 0,
+      requiresDescriptionVerification: true,
+      // As storeListing builds a scan's candidate, so the input hashes match.
+      ...(watch ? {
+        query: String(watch.query ?? ''),
+        includedTerms: String(watch.included_terms ?? ''),
+        excludedTerms: String(watch.excluded_terms ?? ''),
+        verificationChecks: parseVerificationChecks(watch.verification_checks_json),
+      } : {}),
+    };
+    const reused = this.storedVerdictIsCurrent(candidate, activeModel) || (await this.verifyInContext(candidate)).reused;
+
+    const stored = this.stmt(`SELECT ai_description_verification_json AS json, ai_description_verification_status AS status,
+      ai_description_verification_model AS model, ai_description_verification_at AS at, ai_description_verification_error AS error
+      FROM listings WHERE id = ?`).get(row.id) as { json?: string | null; status?: string | null; model?: string | null; at?: string | null; error?: string | null } | undefined;
+    const verification = parseStoredListingDescriptionVerification(stored?.json);
+    return {
+      key: `${marketplace}:${listingId}`,
+      watch: watch ? { id: String(watch.id), name: String(watch.name) } : null,
+      status: (stored?.status ?? null) as ListingDescriptionVerificationStatus | null,
+      verification: verification ? {
+        decision: verification.decision,
+        confidence: verification.confidence,
+        summary: verification.summary,
+        issues: verification.issues,
+        evidence: verification.evidence,
+      } : null,
+      checks: candidate.verificationChecks ?? [],
+      model: stored?.model ?? null,
+      verifiedAt: stored?.at ?? null,
+      error: stored?.error ?? null,
+      reused,
+    };
+  }
+
+  /**
+   * True when the stored verdict is the one this context would get now: a
+   * fresh finished verdict whose input hash is the hash of this context with
+   * the latest description captured for the listing's current state.
+   */
+  private storedVerdictIsCurrent(candidate: DealNotificationCandidate, activeModel: string) {
+    const verdict = this.freshStoredVerdict(candidate.listing, activeModel);
+    if (!verdict?.inputHash) return false;
+    const { listing } = candidate;
+    const snapshot = this.stmt(`SELECT description FROM listing_detail_snapshots
+      WHERE listing_id = ? AND title = ? AND price_pln = ? AND url = ? AND condition IS ? AND location IS ?
+      ORDER BY captured_at DESC, id DESC LIMIT 1`).get(
+      verdict.id, listing.title, listing.price, listing.url, listing.condition ?? null, listing.location ?? null,
+    ) as { description?: string | null } | undefined;
+    if (!snapshot) return false;
+    return listingDescriptionVerificationInputHash(descriptionVerificationContext(candidate, snapshot.description ?? null)) === verdict.inputHash;
+  }
+
+  /**
+   * Runs the description check in the candidate's context. It joins a check
+   * already running in the same context; one running in another watch's
+   * context (a scan) is waited out first, so the answer is never another
+   * watch's verdict.
+   */
+  private async verifyInContext(candidate: DealNotificationCandidate): Promise<DescriptionVerificationRun> {
+    const key = `${candidate.listing.marketplace}:${candidate.listing.listingId}`;
+    const contextKey = descriptionVerificationContextKey(candidate);
+    let pending = this.descriptionVerificationInFlight.get(key);
+    if (pending?.contextKey === contextKey) return pending.run;
+    if (candidate.listing.marketplace === 'OLX') await this.readOlxOfferDescription(candidate.listing);
+    while ((pending = this.descriptionVerificationInFlight.get(key)) && pending.contextKey !== contextKey) {
+      await pending.run.catch(() => undefined);
+    }
+    return this.sharedDescriptionVerification(candidate);
+  }
+
+  /**
+   * An OLX scan checks the description the offers API returned, so a listing
+   * rebuilt from storage reads it from the API too (one request): the input
+   * hash then matches the scan's. If that fails, the check reads the page.
+   */
+  private async readOlxOfferDescription(listing: NormalizedListing) {
+    try {
+      const detail = await this.createConnectorAdapter('OLX').fetchDetail(listing.url, { listingId: listing.listingId });
+      const hint = detail.listing ? olxDetailHint(detail.listing) : undefined;
+      if (hint?.description) setOlxDetailHint(listing, hint);
+    } catch {
+      // The offer page stands in.
     }
   }
 

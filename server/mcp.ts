@@ -43,6 +43,7 @@ export const SCOUT_MCP_TOOL_NAMES = [
   'scout_listings',
   'scout_deals',
   'scout_listing_detail',
+  'scout_verify_listing',
   'scout_watch_analytics',
   'scout_analytics',
   'scout_market_research',
@@ -193,6 +194,17 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ key, ...options }) => {
     try { return text(await service.listingDetailForAgent(key, options)); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool('scout_verify_listing', {
+    description: 'Run the description check that gates Scout\'s Very strong+ alerts on one stored listing now: Jev looks for damage, parts-only, repair, missing parts or an account lock, plus the watch\'s Jev checks, and an unsure or failed Jev answer goes to the vision model with up to 3 photos. status is pass, reject, unknown, or fallback (AI provider outage). Context: watchId when given, also a watch the listing is not in (such as the scoreAgainst watch of a scout_search find), else the watch that saw it most recently, else the generic check (watch null). Cost: a finished verdict under 6 h old for the unchanged listing comes back with no request and no AI call (reused: true); otherwise one listing request and at most 3 AI calls (Jev; vision only when needed; Jev\'s negotiable-price read when that is unknown). Writes the verdict and a description snapshot exactly as a scan does, and later scans reuse them. A listing keeps one verdict, the latest: a reject holds its alerts and leaves it out of scout_deals, scout_comparables, and scout_listings qualifiesOnly results at Very strong+. Sends no alert. Needs an OpenRouter key.',
+    inputSchema: {
+      key: z.string().min(3).max(500).describe('<Marketplace>:<listingId> of a stored listing: a watch find or a scout_search result.'),
+      watchId: watchId.optional().describe('Check against this watch\'s query, terms and Jev checks, even when the listing is not in it. Default: the watch that saw the listing most recently.'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async ({ key, watchId: requested }) => {
+    try { return text(await service.verifyListingForAgent(key, { watchId: requested })); } catch (error) { return toolError(error); }
   });
 
   server.registerTool('scout_price_reference', {

@@ -1222,6 +1222,11 @@ export function olxDetailHint(listing: NormalizedListing): OlxDetailHint | undef
   return olxDetailHints.get(listing);
 }
 
+/** Gives a listing rebuilt from storage the hint of a fresh offers-API read of the same offer. */
+export function setOlxDetailHint(listing: NormalizedListing, hint: OlxDetailHint) {
+  olxDetailHints.set(listing, hint);
+}
+
 function parseOlxOffer(offer: unknown): NormalizedListing | null {
   if (!isRecord(offer)) return null;
   const listingId = offer.id === undefined || offer.id === null ? '' : String(offer.id).trim();

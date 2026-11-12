@@ -43,11 +43,18 @@ test('exposes the documented Scout tool surface', async () => {
       const listed = await client.listTools();
       assert.deepEqual(listed.tools.map((tool) => tool.name).sort(), [...SCOUT_MCP_TOOL_NAMES].sort());
       // Hatbot's contract: every read tool says so; only these write.
-      const writers = new Set(['scout_queue_scan', 'scout_watch_create', 'scout_watch_update', 'scout_market_watch_create', 'scout_market_watch_update', 'scout_market_scan', 'scout_listing_action', 'scout_record_outcome']);
+      const writers = new Set(['scout_queue_scan', 'scout_watch_create', 'scout_watch_update', 'scout_market_watch_create', 'scout_market_watch_update', 'scout_market_scan', 'scout_listing_action', 'scout_record_outcome', 'scout_verify_listing']);
       for (const tool of listed.tools) assert.equal(tool.annotations?.readOnlyHint, !writers.has(tool.name), tool.name);
       for (const tool of listed.tools) if (!writers.has(tool.name)) assert.equal(tool.annotations?.destructiveHint, undefined, tool.name);
       const deals = listed.tools.find((tool) => tool.name === 'scout_deals')!;
       assert.deepEqual(deals.annotations, { readOnlyHint: true, idempotentHint: true });
+      // It stores the verdict scans reuse, so it is not read-only, but a
+      // repeat call within six hours changes nothing.
+      const verify = listed.tools.find((tool) => tool.name === 'scout_verify_listing')!;
+      assert.deepEqual(verify.annotations, { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true });
+      assert.deepEqual(Object.keys(verify.inputSchema.properties ?? {}).sort(), ['key', 'watchId']);
+      assert.deepEqual(verify.inputSchema.required, ['key']);
+      assert.match(String(verify.description), /scout_deals.*scout_comparables.*qualifiesOnly/);
       const listingsSchema = listed.tools.find((tool) => tool.name === 'scout_listings')!.inputSchema.properties as Record<string, { enum?: string[] }>;
       assert.deepEqual(listingsSchema.sort.enum, ['newest', 'strongest', 'price', 'discount']);
       assert.deepEqual(listingsSchema.format.enum, ['full', 'compact']);
@@ -590,6 +597,37 @@ test('scout_session_status reports each stored session without its cookies', asy
   } finally { context.close(); }
 });
 
+test('scout_verify_listing reports refusals as tool errors', async () => {
+  const context = fixture();
+  const keyVariables = ['SCOUT_OPENROUTER_API_KEY', 'OPENROUTER_API_KEY', 'SCOUT_DEEPSEEK_API_KEY'] as const;
+  const previous = keyVariables.map((name) => process.env[name]);
+  for (const name of keyVariables) delete process.env[name];
+  try {
+    const now = new Date().toISOString();
+    context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run('OLX', '501', 'PS5 console', 1500, 'https://www.olx.pl/d/oferta/ps5-CID99-ID501.html', now, now);
+    const { server, client } = await connectedClient(context.service);
+    try {
+      const call = async (args: Record<string, unknown>) => {
+        const result = await client.callTool({ name: 'scout_verify_listing', arguments: args }) as { isError?: boolean; content: Array<{ type: string; text?: string }> };
+        assert.equal(result.isError, true);
+        return JSON.parse(toolText(result));
+      };
+      assert.deepEqual(await call({ key: 'OLX:missing' }), { error: 'Listing detail is not available yet' });
+      assert.deepEqual(await call({ key: 'OLX:501', watchId: 'missing' }), { error: 'Watch not found' });
+      assert.deepEqual(await call({ key: 'OLX:501' }), { error: 'OpenRouter is not configured. Add an API key in Settings or set SCOUT_OPENROUTER_API_KEY.' });
+      const stored = context.db.prepare("SELECT ai_description_verification_status AS status FROM listings WHERE listing_id = '501'").get() as { status: string | null };
+      assert.equal(stored.status, null);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally {
+    keyVariables.forEach((name, index) => { if (previous[index] !== undefined) process.env[name] = previous[index]; });
+    context.close();
+  }
+});
+
 // Hatbot's MCP plugin (apps/brain/src/plugins/mcp/index.ts, moneyKind) makes
 // a tool whose name or description reads as a payment or a purchase always
 // ask the owner. A copy of its patterns, so the listing tools never trip them.
@@ -605,7 +643,8 @@ test('the listing tools use no money or selling words in their names and descrip
     try {
       const { tools } = await client.listTools();
       assert.ok(SCOUT_MCP_SESSION_TOOL_NAMES.every((name) => tools.some((tool) => tool.name === name)));
-      for (const tool of tools.filter((item) => ([...SCOUT_MCP_LISTING_TOOL_NAMES, ...SCOUT_MCP_SESSION_TOOL_NAMES] as readonly string[]).includes(item.name))) {
+      // scout_verify_listing too, so the plugin's money-word rule never makes it always ask.
+      for (const tool of tools.filter((item) => ([...SCOUT_MCP_LISTING_TOOL_NAMES, ...SCOUT_MCP_SESSION_TOOL_NAMES, 'scout_verify_listing'] as readonly string[]).includes(item.name))) {
         const words = tool.name.replace(/[_.-]+/g, ' ');
         const parameters = Object.values((tool.inputSchema.properties ?? {}) as Record<string, { description?: string }>).map((property) => property.description ?? '').join(' ');
         for (const text of [`${words} ${tool.description}`, parameters]) {
