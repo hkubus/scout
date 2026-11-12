@@ -277,6 +277,14 @@ test('scout_search takes scoreAgainst over MCP and stays read-only and free of m
     assert.equal(payload.listings.find((listing) => listing.id === 'OLX:S-CASE')?.deal, null);
     const plain = JSON.parse((await call({})).content[0].text) as ManualSearchResponse;
     assert.ok(!('scoredAgainst' in plain) && plain.listings.every((listing) => !('deal' in listing)));
+    // Compact rows carry the same deal; every key stays present without scoreAgainst.
+    const compact = JSON.parse((await call({ scoreAgainst: 'auto', format: 'compact' })).content[0].text);
+    assert.equal(compact.scoredAgainst?.watchId, 'iphone-watch');
+    assert.deepEqual(compact.listings.find((listing: any) => listing.id === 'OLX:S-PRO')?.deal, payload.listings.find((listing) => listing.id === 'OLX:S-PRO')?.deal);
+    assert.equal(compact.listings.find((listing: any) => listing.id === 'OLX:S-CASE')?.deal, null);
+    const compactPlain = JSON.parse((await call({ format: 'compact' })).content[0].text);
+    assert.equal(compactPlain.scoredAgainst, null);
+    assert.ok(compactPlain.listings.length > 0 && compactPlain.listings.every((listing: any) => listing.deal === null));
     const missing = await call({ scoreAgainst: 'missing' });
     assert.equal(missing.isError, true);
     assert.deepEqual(JSON.parse(missing.content[0].text), { error: 'Watch not found' });

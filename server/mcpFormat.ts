@@ -1,4 +1,4 @@
-import type { Listing, ManualSearchResponse, SearchFilters } from '../src/types';
+import type { Listing, ManualSearchResponse, SearchDeal, SearchFilters, SearchScoredAgainst } from '../src/types';
 import { SearchConfigError, type Marketplace } from './marketplaces';
 
 /**
@@ -71,6 +71,8 @@ export interface CompactSearchListing {
   flags: string[];
   jevCheck: 'passed' | 'unconfirmed' | 'unchecked' | null;
   jevCheckNote: string | null;
+  /** With scoreAgainst: the result priced against the watch, as in the full format; null when not scored. */
+  deal: SearchDeal | null;
 }
 
 export interface CompactSearchSource {
@@ -97,6 +99,8 @@ export interface CompactSearch {
   page: number;
   listings: CompactSearchListing[];
   sources: CompactSearchSource[];
+  /** With scoreAgainst: the watch the results were scored against; null when none was used. */
+  scoredAgainst: SearchScoredAgainst | null;
 }
 
 /**
@@ -146,6 +150,7 @@ function compactListing(listing: Listing, detail: ManualSearchListingDetail | un
     flags: detail?.flags ?? [],
     jevCheck: listing.jevCheck ?? null,
     jevCheckNote: listing.jevCheckNote ?? null,
+    deal: listing.deal ?? null,
   };
 }
 
@@ -176,5 +181,6 @@ export function toCompactSearch(input: Pick<SearchFilters, 'query' | 'page' | 'o
         durationMs: status.durationMs,
       };
     }),
+    scoredAgainst: result.scoredAgainst ?? null,
   };
 }
