@@ -2869,9 +2869,11 @@ export class ScoutService {
   /**
    * Watch-wide figures for watches without model variants. `typical` is the
    * value the latest scan stored, exactly as `variants[].typical` is per
-   * variant. The spread comes from the baseline that scan scored against
-   * (watchBaselines: each listing's newest in-range price, newest 400
-   * listings), read for all such watches in one association-driven query
+   * variant. The spread comes from the watch's current baseline, the one the
+   * next scan scores against (watchBaselines: each listing's newest in-range
+   * price, newest 400 listings). It includes the latest scan's own listings,
+   * so for a listing already scored it only approximates the scale that
+   * scan used. Read for all such watches in one association-driven query
    * with one index seek per listing. A reference-band typical takes its
    * p25/p75 from the research series' band, since its own prices are still
    * too few; robustScale always uses own prices, as scoring does.
@@ -4121,7 +4123,7 @@ export class ScoutService {
       ORDER BY CASE WHEN wl.id IS NOT NULL THEN 0 ELSE 1 END, wl.last_seen_at DESC LIMIT 1`).get(watchId ?? null, watchId ?? null, marketplace, listingId, watchId ?? null, watchId ?? null) as Record<string, any> | undefined;
     if (!row) throw new ServiceError('Listing detail is not available yet', 404);
     // Only the associated watch's readiness and groups are needed.
-    const watch = row.watch_id != null ? this.watchById(String(row.watch_id)) : undefined;
+    const watch = row.watch_id != null ? this.watches(true, String(row.watch_id), false)[0] : undefined;
     const listing = this.listingFromRow(row, watch?.readiness === 100, watch?.variantGroups ?? []);
     // Split instead of '(? IS NULL OR watch_id = ?)' so the watch-scoped read
     // seeks observations_watch_listing. The unscoped form is exact because
@@ -5332,7 +5334,8 @@ export class ScoutService {
    */
   dashboard(options: { top?: number } = {}): DashboardData {
     const top = typeof options.top === 'number' && Number.isInteger(options.top) && options.top >= 1 && options.top <= 50 ? options.top : null;
-    const watches = this.getWatches();
+    // The widget (top set) only needs the watches for its deals, not their figures.
+    const watches = top === null ? this.getWatches() : this.watches(false, undefined, false);
     const listings = this.getListings(watches, true);
     const today = new Date();
     today.setHours(0, 0, 0, 0);

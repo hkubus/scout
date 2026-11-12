@@ -230,10 +230,13 @@ public struct Watch: Codable, Hashable, Sendable, Identifiable {
     /// `own-history`, or `reference-band` (the research series' band while
     /// the watch is learning). Missing on older servers.
     public var typicalSource: String?
-    /// PLN. Middle half of the prices behind `typical`.
+    /// PLN. Middle half of the current baseline's prices (the band's for a
+    /// `reference-band` typical).
     public var p25: Double?
     public var p75: Double?
-    /// PLN. A listing's deviation is (typical − price) / robustScale.
+    /// PLN. The deviation score's denominator, from the current baseline
+    /// (what the next scan scores against); for a listing already scored,
+    /// (typical − price) / robustScale only approximates its deviation.
     public var robustScale: Double?
     public var referenceMarketWatchId: String?
     public var minPrice: Double?

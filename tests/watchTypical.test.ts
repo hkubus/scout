@@ -85,7 +85,13 @@ test('the spread uses the same listings and prices a scan scores against', () =>
     // group would move the quartiles and the scale if it leaked in.
     const prices = Array.from({ length: 510 }, (_, index) => (index < 100 ? 2800 : index >= 500 ? 2900 : 900 + (index % 40) * 10));
     const ids = observe(context.db, 'deck', prices);
-    const reject = context.db.prepare(`INSERT INTO listing_relevance (watch_id, marketplace, listing_id, input_hash, model, relevant, reason, relevance_status, checked_at)
+    // The watch is shipping-only: 20 newer OLX listings without shipping
+    // stay out, or they would also push the oldest counted prices past the cap.
+    context.db.prepare('UPDATE watches SET shipping_only = 1 WHERE id = ?').run('deck');
+    context.db.prepare("UPDATE listings SET shipping_available = 1 WHERE listing_id LIKE 'deck-%'").run();
+    observe(context.db, 'deck', Array(20).fill(2700), 8, 'pickup');
+    context.db.prepare("UPDATE listings SET shipping_available = 0 WHERE listing_id LIKE 'pickup-%'").run();
+    const reject =context.db.prepare(`INSERT INTO listing_relevance (watch_id, marketplace, listing_id, input_hash, model, relevant, reason, relevance_status, checked_at)
       VALUES ('deck', 'OLX', ?, 'x', 'test', 0, '', 'irrelevant', ?)`);
     for (let index = 0; index < 100; index += 1) reject.run(`deck-${index}`, hoursAgo(1));
     // A newer out-of-range price leaves a listing on its last in-range price.
@@ -118,7 +124,9 @@ test('a reference-band typical takes its middle half from the research band', as
     (context.service as any).fetchOlxApi = olxResult('learning-deal', 240);
     await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('learning'));
 
-    // robustScale still comes from own prices, as scoring computes it: |240 - 300| × 1.4826.
+    // robustScale still comes from own prices, now including the scan's own
+    // listing: |240 - 300| × 1.4826. The scan itself scored against no own
+    // prices, so its stored deviation used the 3.5% floor instead.
     assert.deepEqual(figures(context.service.watchById('learning')), { typical: 300, typicalSource: 'reference-band', p25: 200, p75: 400, robustScale: round(60 * 1.4826) });
     assert.equal(context.service.watchById('learning')?.status, 'Learning');
   } finally { context.close(); }

@@ -257,10 +257,16 @@ export interface Watch {
   typical?: number | null;
   /** Where `typical` comes from: own asking prices, or the reference research series' probable-sale band while the watch is still learning. */
   typicalSource?: 'own-history' | 'reference-band' | null;
-  /** Middle half of the prices behind `typical` (the band's for a reference-band typical); null with fewer than 4 prices. */
+  /** Middle half of the current baseline's prices (the band's for a reference-band typical); null with fewer than 4 prices. */
   p25?: number | null;
   p75?: number | null;
-  /** A listing's deviation is (typical − price) / robustScale: about 1.48 × the median absolute deviation, at least 3.5% of the typical. */
+  /**
+   * The deviation score's denominator: about 1.48 × the median absolute
+   * deviation, at least 3.5% of the typical. Like p25/p75 it describes the
+   * current baseline (what the next scan scores against), so for a listing
+   * already scored (typical − price) / robustScale only approximates its
+   * deviation.
+   */
   robustScale?: number | null;
   referenceMarketWatchId: string | null;
   minPrice: number | null;
