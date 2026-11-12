@@ -11,6 +11,7 @@ import { VisionError } from '../server/vision';
 import { ScoutService, ServiceError, dashboardTopParam, decryptSecret, olxCategoryFromJson, olxCategoryToJson, encryptSecret, escapeDiscordMarkdown, dueWatchSources, filterListings, findFuzzyRescueCandidates, marketStatusAfterMiss, nextWatchScanAt, nextWatchScanSchedule, normalizeSourceIntervals, validateDiscordWebhook, watchSourceIntervals, type ScoutServiceDependencies } from '../server/service';
 import { OTHER_VARIANT_KEY } from '../server/variants';
 import { scoreDeal } from '../server/scoring';
+import { legacyAnalyticsSections } from './legacyAnalytics';
 
 // Pin the legacy DeepSeek path for pre-existing tests: live Jev is the
 // production default whenever a key is available, but these tests assert
@@ -1741,7 +1742,8 @@ function seedWatchStatsScenario(db: any) {
   link.run();
 }
 
-function captureRows(db: any, marker: string) {
+/** Records what the marked statement's all() returns; `hidden` statement methods read as undefined (an older node:sqlite). */
+function captureRows(db: any, marker: string, hidden: string[] = []) {
   const captured: unknown[][] = [];
   const proxy = new Proxy(db, {
     get(target, property) {
@@ -1750,6 +1752,7 @@ function captureRows(db: any, marker: string) {
         if (!sql.includes(marker)) return statement;
         return new Proxy(statement, {
           get(inner, key) {
+            if (typeof key === 'string' && hidden.includes(key)) return undefined;
             if (key === 'all') return (...params: unknown[]) => { const rows = inner.all(...params); captured.push(rows); return rows; };
             const value = Reflect.get(inner, key);
             return typeof value === 'function' ? value.bind(inner) : value;
@@ -1821,12 +1824,14 @@ test('listing detail price history matches the unsplit history query', () => {
   } finally { context.close(); }
 });
 
-test('association-driven analytics rows match the observation-driven query in order', () => {
+test('association-driven analytics rows and sections match the observation-driven query and per-section helpers', () => {
   const context = fixture();
   try {
     seedWatchStatsScenario(context.db);
-    const { proxy, captured } = captureRows(context.db, 'CROSS JOIN observations o INDEXED BY observations_watch_listing ON o.watch_id = wl.watch_id AND o.listing_id = wl.listing_id\n      WHERE');
-    const service = new ScoutService(proxy, () => {});
+    // Baselines on some observations and listings, so discounts and strong deals are not all empty.
+    context.db.prepare('UPDATE observations SET baseline_pln = 150 + (id % 9) * 45 WHERE id % 4 <> 0').run();
+    context.db.prepare('UPDATE listings SET typical_pln = 120 + (id % 5) * 70 WHERE id % 3 <> 0').run();
+    const marker = 'CROSS JOIN observations o INDEXED BY observations_watch_listing ON o.watch_id = wl.watch_id AND o.listing_id = wl.listing_id\n      WHERE';
     const legacy = (options: { days: number; watchId?: string; marketplace?: string }) => {
       const predicates = [
         'w.archived_at IS NULL',
@@ -1845,16 +1850,32 @@ test('association-driven analytics rows match the observation-driven query in or
         JOIN watches w ON w.id = o.watch_id
         JOIN watch_listings wl ON wl.watch_id = o.watch_id AND wl.listing_id = o.listing_id
         WHERE ${predicates.join(' AND ')}
-        GROUP BY day, o.watch_id, o.listing_id`).all(...params);
+        GROUP BY day, o.watch_id, o.listing_id`).all(...params) as Array<Record<string, any>>;
     };
-    for (const options of [{ days: 30 }, { days: 7 }, { days: 30, watchId: 'stats-bounded' }, { days: 30, marketplace: 'OLX' as const }, { days: 30, watchId: 'stats-shipping', marketplace: 'Vinted' as const }]) {
-      captured.length = 0;
-      service.analytics(options);
-      assert.equal(captured.length, 1);
-      const expected = legacy(options);
-      assert.ok(expected.length > 0 || options.marketplace === 'Vinted');
-      // Same rows, same order; the bare columns come from the MAX(observed_at) row.
-      assert.deepEqual((captured[0] as any[]).map((row) => ({ ...row })), (expected as any[]).map((row) => ({ ...row })));
+    // Without setReturnArrays (Node before 22.16) the service maps the row objects instead.
+    for (const hidden of [[], ['setReturnArrays']]) {
+      const { proxy, captured } = captureRows(context.db, marker, hidden);
+      const service = new ScoutService(proxy, () => {});
+      for (const options of [{ days: 30 }, { days: 7 }, { days: 30, watchId: 'stats-bounded' }, { days: 30, marketplace: 'OLX' as const }, { days: 30, watchId: 'stats-shipping', marketplace: 'Vinted' as const }]) {
+        captured.length = 0;
+        const analytics = service.analytics(options);
+        assert.equal(captured.length, 1);
+        const expected = legacy(options);
+        assert.ok(expected.length > 0 || options.marketplace === 'Vinted');
+        // Same rows, same order and columns; the bare columns come from the MAX(observed_at) row.
+        const rows = (captured[0] as any[]).map((row) => (hidden.length ? Object.values(row) : [...row]));
+        assert.deepEqual(rows, expected.map((row) => Object.values(row)));
+        const sections = legacyAnalyticsSections(expected, new Date(Date.now() - options.days * 24 * 60 * 60_000).toISOString());
+        if (!options.marketplace) assert.ok(sections.overview.strongDeals > 0 && sections.overview.medianDiscountPercent !== null);
+        const { scanRuns: _runs, scanSuccessRate: _rate, ...overview } = analytics.overview;
+        assert.equal(JSON.stringify({
+          overview,
+          trend: analytics.trend,
+          discountDistribution: analytics.discountDistribution,
+          watchLeaderboard: analytics.watchLeaderboard,
+          marketplaceDeals: analytics.marketplaceComparison.map(({ scanRuns: _r, scanSuccessRate: _s, averageLatencyMs: _l, ...row }) => row),
+        }), JSON.stringify(sections));
+      }
     }
   } finally { context.close(); }
 });
