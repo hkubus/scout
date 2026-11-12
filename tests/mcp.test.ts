@@ -8,6 +8,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import sharp from 'sharp';
 import { openDatabase } from '../server/db';
 import { FlipStore, sniffImageMime } from '../server/flips';
+import { FLAGS_VERSION, LISTING_FLAGS, STORED_LISTING_FLAGS, flagsJson, storedListingFlags } from '../server/flags';
 import { ScoutService } from '../server/service';
 import { MCP_DASHBOARD_LISTINGS, SCOUT_MCP_FLIP_TOOL_NAMES, SCOUT_MCP_LISTING_TOOL_NAMES, SCOUT_MCP_SESSION_TOOL_NAMES, SCOUT_MCP_TOOL_NAMES, createScoutMcpServer } from '../server/mcp';
 
@@ -167,6 +168,63 @@ test('scout_listings qualifiesOnly keeps the listings whose last score would ale
       assert.deepEqual(await ids({}), ['deal', 'fair', 'unscored']);
       assert.deepEqual(await ids({ qualifiesOnly: false }), ['deal', 'fair', 'unscored']);
       assert.deepEqual(await ids({ qualifiesOnly: true }), ['deal']);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  } finally { context.close(); }
+});
+
+test('scout_search, scout_listings and scout_deals take excludeFlags, and feed rows name their quick flags', async () => {
+  const context = fixture();
+  try {
+    const now = new Date().toISOString();
+    context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at)
+      VALUES ('flag-watch', 'Flag watch', 'iphone 13', '["OLX"]', 1, ?, ?, ?)`).run(now, now, now);
+    const insertListing = context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, flags_json, flags_version, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    const insertLink = context.db.prepare(`INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at, typical_pln, deal_strength, deal_label, typical_source)
+      VALUES ('flag-watch', ?, ?, ?, 1000, 4, 'Very strong', 'own-history')`);
+    for (const [id, title, price] of [['clean', 'iPhone 13 128GB', 700], ['parts', 'iPhone 13 na części', 600], ['case', 'Etui iPhone 13', 650]] as const) {
+      const { lastInsertRowid } = insertListing.run('OLX', id, title, price, `https://www.olx.pl/d/oferta/${id}`, flagsJson(storedListingFlags({ title })), FLAGS_VERSION, now, now);
+      insertLink.run(lastInsertRowid, now, now);
+    }
+    const { server, client } = await connectedClient(context.service);
+    try {
+      const { tools } = await client.listTools();
+      assert.equal(tools.length, SCOUT_MCP_TOOL_NAMES.length, 'no new tools');
+      const flagEnum = (name: string) => ((tools.find((tool) => tool.name === name)!.inputSchema.properties as Record<string, { type?: string; items?: { enum?: string[] } }>).excludeFlags);
+      assert.deepEqual(flagEnum('scout_search')?.items?.enum, [...LISTING_FLAGS]);
+      // Feeds filter on stored flags; accessory depends on the query and is never stored.
+      assert.deepEqual(flagEnum('scout_listings')?.items?.enum, [...STORED_LISTING_FLAGS]);
+      assert.deepEqual(flagEnum('scout_deals')?.items?.enum, [...STORED_LISTING_FLAGS]);
+      for (const name of ['scout_search', 'scout_listings', 'scout_deals']) {
+        const description = String((flagEnum(name) as { description?: string }).description);
+        assert.match(description, /exchange-offer flag/, name);
+        assert.doesNotMatch(description, PAYS, name);
+        assert.doesNotMatch(description, BUYS, name);
+      }
+
+      const call = async (name: string, args: Record<string, unknown>) => JSON.parse(toolText(await client.callTool({ name, arguments: args }) as never));
+      // Full rows carry what matched and where; compact rows only the names.
+      const full = await call('scout_listings', { sort: 'price' });
+      assert.deepEqual(full.listings.map((row: any) => [row.listingId, row.flags]), [
+        ['parts', [{ flag: 'for_parts', match: 'na czesci', in: 'title' }]],
+        ['case', [{ flag: 'accessory', match: 'etui', in: 'title' }]],
+        ['clean', undefined],
+      ]);
+      const compact = await call('scout_listings', { sort: 'price', format: 'compact' });
+      assert.deepEqual(compact.listings.map((row: any) => [row.listingId, row.flags]), [['parts', ['for_parts']], ['case', ['accessory']], ['clean', undefined]]);
+      const kept = await call('scout_listings', { sort: 'price', excludeFlags: ['for_parts'] });
+      assert.deepEqual(kept.listings.map((row: any) => row.listingId), ['case', 'clean']);
+      assert.equal(kept.pagination.total, 2);
+
+      assert.deepEqual((await call('scout_deals', {})).deals.map((deal: any) => deal.listingId), ['parts', 'case', 'clean']);
+      const deals = await call('scout_deals', { excludeFlags: ['for_parts', 'swap'] });
+      assert.deepEqual(deals.deals.map((deal: any) => deal.listingId), ['case', 'clean']);
+      assert.equal(deals.total, 2);
+
+      const rejected = await client.callTool({ name: 'scout_deals', arguments: { excludeFlags: ['accessory'] } }) as { isError?: boolean };
+      assert.equal(rejected.isError, true, 'accessory is not a stored flag');
     } finally {
       await client.close();
       await server.close();

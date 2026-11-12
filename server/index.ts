@@ -21,6 +21,7 @@ import { FlipStore, MAX_FLIP_PHOTO_BYTES, MAX_FLIP_PHOTOS } from './flips';
 import { FLIP_CHANNELS, LISTING_CHANNELS, LISTING_CONDITIONS, PARCEL_SIZES } from '../src/profit';
 import { dashboardListingsParam, dashboardTopParam, ScoutService, ServiceError } from './service';
 import { LISTING_VERIFICATION_FILTERS } from './deals';
+import { LISTING_FLAGS, STORED_LISTING_FLAGS } from './flags';
 import { fetchDiscardSummary } from './fetch-diagnostics';
 import { VERIFICATION_CHECKS_MAX, VERIFICATION_CHECK_MAX_CHARS } from './ai';
 
@@ -367,6 +368,9 @@ app.get('/api/listings', async (request, reply) => {
     minPrice: z.coerce.number().nonnegative().optional(),
     maxPrice: z.coerce.number().nonnegative().optional(),
     verification: z.enum(LISTING_VERIFICATION_FILTERS).optional(),
+    // Comma-separated stored flag names.
+    excludeFlags: z.string().max(200).transform((value) => [...new Set(value.split(',').map((flag) => flag.trim()).filter(Boolean))])
+      .pipe(z.array(z.enum(STORED_LISTING_FLAGS)).max(STORED_LISTING_FLAGS.length)).optional(),
   }).strict().safeParse(request.query);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid listing filters' });
   const query = parsed.data;
@@ -388,6 +392,7 @@ app.get('/api/listings', async (request, reply) => {
     minPrice: query.minPrice,
     maxPrice: query.maxPrice,
     verification: query.verification,
+    excludeFlags: query.excludeFlags,
   });
   return { listings: page.listings, pagination: page.pagination };
 });
@@ -621,6 +626,8 @@ const searchInput = z.object({
   deadlineMs: z.number().int().min(5000).max(120000).optional(),
   // Skip the few-minute result cache.
   refresh: z.boolean().optional().default(false),
+  // Quick flags to drop before AI relevance; flag-only when absent.
+  excludeFlags: z.array(z.enum(LISTING_FLAGS)).max(LISTING_FLAGS.length).optional(),
 }).refine((value) => value.minPrice === null || value.maxPrice === null || value.minPrice <= value.maxPrice, { message: 'Minimum price cannot exceed maximum price', path: ['maxPrice'] });
 
 // Flip ledger. Calendar dates only: the operator's own bookkeeping days.
@@ -1197,4 +1204,11 @@ service.schedulerTick();
 void flips.convertStoredPhotosToWebp().then(
   (count) => { if (count) service.logDiagnostic(`converted ${count} flip photo${count === 1 ? '' : 's'} to WebP`); },
   (error) => { if (!shuttingDown) app.log.warn({ err: error }, 'Converting flip photos to WebP stopped'); },
+);
+// Listings stored before quick flags (or under older flag rules) get them in
+// the background; reads compute them meanwhile, and an interrupted pass
+// resumes on the next start.
+void service.backfillListingFlags().then(
+  (count) => { if (count) service.logDiagnostic(`stored quick flags on ${count} listing${count === 1 ? '' : 's'}`); },
+  (error) => { if (!shuttingDown) app.log.warn({ err: error }, 'Storing quick flags on listings stopped'); },
 );

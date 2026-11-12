@@ -1,4 +1,4 @@
-import type { DuplicateSummary, Listing, ManualSearchResponse, SearchDeal, SearchFilters, SearchScoredAgainst } from '../src/types';
+import type { DuplicateSummary, Listing, ListingFlagName, ManualSearchResponse, SearchDeal, SearchFilters, SearchScoredAgainst } from '../src/types';
 import { SearchConfigError, type Marketplace } from './marketplaces';
 import { vintedFeesNote } from '../src/listingSignals';
 
@@ -25,7 +25,8 @@ export interface ManualSearchListingDetail {
   match: SearchMatch;
   /** `query`, or `typo:<spelling>` for a row only a typoVariants search found. */
   matchedVia: string;
-  flags: string[];
+  /** Quick flag names (server/flags.ts), in LISTING_FLAGS order; empty when none. */
+  flags: ListingFlagName[];
 }
 
 export interface ManualSearchSourceDetail {
@@ -33,6 +34,8 @@ export interface ManualSearchSourceDetail {
   fetched: number;
   /** Listings that passed the deterministic filters, plus rescued near-misses. */
   matched: number;
+  /** The part of `matched` left out by `excludeFlags`, before the AI relevance check. */
+  flagExcluded: number;
   aiExcluded: number;
   /** Kept without an AI verdict; includes `aiBudgetExhausted`. */
   aiUnknown: number;
@@ -98,7 +101,8 @@ export interface CompactSearchListing {
   relevance: SearchRelevance;
   match: SearchMatch;
   matchedVia: string;
-  flags: string[];
+  /** Quick flag names: for_parts, wanted_ad, swap, replica, accessory, damaged, locked. Always present, empty when none. */
+  flags: ListingFlagName[];
   jevCheck: 'passed' | 'unconfirmed' | 'unchecked' | null;
   jevCheckNote: string | null;
   /** With scoreAgainst: the result priced against the watch, as in the full format; null when not scored. */
@@ -124,6 +128,8 @@ export interface CompactSearchSource {
   truncated: boolean;
   pendingShipping: number;
   durationMs: number;
+  /** Matches left out by `excludeFlags` before the AI relevance check; 0 without it. */
+  flagExcluded: number;
   /** errorKind backoff: when the connector's pause ends (ISO); null otherwise. */
   backoffUntil: string | null;
   /** With typoVariants, on a source whose own page loaded: each misspelled search; null otherwise. */
@@ -179,7 +185,7 @@ export function searchErrorKind(error: unknown): SearchErrorKind {
 }
 
 /** A source that never got as far as fetching. */
-export const EMPTY_SEARCH_SOURCE: ManualSearchSourceDetail = { fetched: 0, matched: 0, aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, returned: 0, truncated: false, errorKind: null };
+export const EMPTY_SEARCH_SOURCE: ManualSearchSourceDetail = { fetched: 0, matched: 0, flagExcluded: 0, aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, returned: 0, truncated: false, errorKind: null };
 
 function compactListing(listing: Listing, detail: ManualSearchListingDetail | undefined, ownerType: SearchFilters['ownerType']): CompactSearchListing {
   const listingId = detail?.listingId ?? listing.listingId ?? listing.id.slice(listing.id.indexOf(':') + 1);
@@ -240,6 +246,7 @@ export function toCompactSearch(input: Pick<SearchFilters, 'query' | 'page' | 'o
         durationMs: status.durationMs,
         backoffUntil: status.backoffUntil ?? null,
         variants: status.variants?.map((variant) => ({ query: variant.query, status: variant.status, fetched: variant.fetched, matched: variant.matched, message: variant.message ?? null })) ?? null,
+        flagExcluded: detail.flagExcluded,
       };
     }),
     scoredAgainst: result.scoredAgainst ?? null,

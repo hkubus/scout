@@ -98,7 +98,7 @@ test('live checks the page and the seller\'s listings in two requests and writes
     const before = JSON.stringify(context.db.prepare('SELECT * FROM listings ORDER BY id').all());
     const result = await context.service.listingDetailForAgent('OLX:11', { format: 'compact', include: ['description'], live: true, sellerListings: true }) as CompactListingDetail;
     assert.deepEqual(requests, ['https://www.olx.pl/api/v1/offers/11/', 'https://www.olx.pl/api/v1/offers/?offset=0&limit=11&user_id=1001']);
-    assert.deepEqual({ ...result.liveCheck, checkedAt: 'x' }, { checkedAt: 'x', availability: { status: 'live' }, price: 1700, priceChanged: true, description: 'Opis.' });
+    assert.deepEqual({ ...result.liveCheck, checkedAt: 'x' }, { checkedAt: 'x', availability: { status: 'live' }, price: 1700, priceChanged: true, description: 'Opis.', flags: [] });
     assert.equal(result.description, 'Opis.');
     assert.equal(result.negotiation.priceNegotiable, false, 'the live page wins over the stored flag');
     assert.deepEqual([result.negotiation.seller?.name, result.negotiation.seller?.source], ['Seller A', 'scan']);
@@ -114,6 +114,36 @@ test('live checks the page and the seller\'s listings in two requests and writes
     // Compact output leaves the live description out unless included.
     const plain = await context.service.listingDetailForAgent('OLX:11', { format: 'compact', live: true }) as CompactListingDetail;
     assert.equal('description' in plain.liveCheck!, false);
+  } finally { context.close(); }
+});
+
+test('quick flags come from the stored row, its description snapshot, the watch query and the live page', async () => {
+  const context = fixture();
+  try {
+    seedSellerScenario(context.db);
+    // A row stored before quick flags has none stored; reads compute them from title and condition.
+    const rowId = (context.db.prepare("SELECT id FROM listings WHERE listing_id = '11'").get() as { id: number }).id;
+    context.db.prepare("UPDATE listings SET title = 'Pudełko RTX 3080 replika', condition = 'Uszkodzone' WHERE id = ?").run(rowId);
+    context.db.prepare(`INSERT INTO listing_detail_snapshots (listing_id, marketplace, external_listing_id, title, price_pln, url, description, state_hash, captured_at)
+      VALUES (?, 'OLX', '11', 'Pudełko RTX 3080 replika', 1800, 'https://www.olx.pl/d/oferta/test-CID99-ID11.html', 'Blokada FRP, nie działa.', 'h1', ?)`).run(rowId, daysAgo(1));
+    const detail = context.service.listingDetail('OLX:11');
+    assert.deepEqual(detail.listing.flags, [
+      { flag: 'for_parts', match: 'nie dziala', in: 'description' },
+      { flag: 'replica', match: 'replika', in: 'title' },
+      { flag: 'accessory', match: 'pudelko', in: 'title' },
+      { flag: 'damaged', match: 'uszkodzone', in: 'condition' },
+      { flag: 'locked', match: 'frp', in: 'description' },
+    ]);
+
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: olxOffer(11, 1700, { title: 'RTX 3080', description: '<p>Telefon nie włącza się, sprzedaję na części.</p>' }) } });
+    const compact = await context.service.listingDetailForAgent('OLX:11', { format: 'compact', live: true }) as CompactListingDetail;
+    assert.deepEqual(compact.listing.flags, ['for_parts', 'replica', 'accessory', 'damaged', 'locked']);
+    assert.deepEqual(compact.liveCheck?.flags, [{ flag: 'for_parts', match: 'nie wlacza', in: 'description' }]);
+
+    // A listing the live check finds gone has no live flags.
+    (context.service as any).fetchOlxApi = async () => ({ status: 404, json: { error: { detail: 'Not found' } } });
+    const gone = await context.service.listingDetailForAgent('OLX:11', { live: true }) as Full;
+    assert.deepEqual(gone.liveCheck?.flags, []);
   } finally { context.close(); }
 });
 

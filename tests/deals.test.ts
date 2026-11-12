@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { openDatabase } from '../server/db';
 import { DEAL_TIERS, compactListing, dealsForAgent } from '../server/deals';
 import { ScoutService } from '../server/service';
+import { FLAGS_VERSION, flagsJson, storedListingFlags } from '../server/flags';
 
 if (process.env.SCOUT_JEV_MODE === undefined) process.env.SCOUT_JEV_MODE = 'legacy';
 
@@ -276,5 +277,35 @@ test('compact rows give a signed discount and mark hidden rows', () => {
     // The photo, for a chart or card; null without one, never "".
     assert.equal(byId.get('very')?.image, 'https://example.test/very.jpg');
     assert.equal(byId.get('exc')?.image, null);
+  } finally { context.close(); }
+});
+
+test('scout_deals leaves out stored quick flags on request; rows not yet stored are flagged but kept', async () => {
+  const context = fixture();
+  try {
+    seed(context.db, ROWS);
+    const setTitle = (id: string, title: string, stored: boolean) => context.db.prepare('UPDATE listings SET title = ?, flags_json = ?, flags_version = ? WHERE listing_id = ?')
+      .run(title, stored ? flagsJson(storedListingFlags({ title })) : null, stored ? FLAGS_VERSION : null, id);
+    setTitle('legacy-ready', 'iPhone 13 na części', true);
+    setTitle('strong', 'Etui iPhone 13', true);
+    // Saved before migration 040 and not yet reached by the backfill.
+    setTitle('kept', 'Zamienię iPhone 13 na Pixel 8', false);
+
+    const all = dealsForAgent(context.service);
+    const flags = Object.fromEntries(all.deals.map((deal) => [deal.listingId, deal.flags]));
+    assert.deepEqual(flags, {
+      exc: undefined, 'legacy-ready': ['for_parts'], 'legacy-learning': undefined, 'pro-1': undefined,
+      strong: ['accessory'], kept: ['swap'], 'other-1': undefined,
+    });
+    assert.equal('flags' in all.deals.find((deal) => deal.listingId === 'exc')!, false, 'unflagged rows omit the key');
+
+    const narrowed = dealsForAgent(context.service, { excludeFlags: ['for_parts', 'swap'] });
+    assert.deepEqual(narrowed.deals.map((deal) => deal.listingId), ['exc', 'legacy-learning', 'pro-1', 'strong', 'kept', 'other-1']);
+    assert.equal(narrowed.total, 6);
+
+    await context.service.backfillListingFlags();
+    const stored = dealsForAgent(context.service, { excludeFlags: ['for_parts', 'swap'] });
+    assert.deepEqual(stored.deals.map((deal) => deal.listingId), ['exc', 'legacy-learning', 'pro-1', 'strong', 'other-1']);
+    assert.equal(stored.total, 5);
   } finally { context.close(); }
 });

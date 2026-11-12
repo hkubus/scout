@@ -72,6 +72,7 @@ export function manualSearchKey(input: SearchFilters): string {
     scoreAgainst: input.scoreAgainst?.trim() || null,
     ignoreBackoff: Boolean(input.ignoreBackoff),
     typoVariants: Boolean(input.typoVariants),
+    excludeFlags: [...new Set(input.excludeFlags ?? [])].sort(),
   });
   return stableJson(key);
 }
