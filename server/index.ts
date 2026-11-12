@@ -13,6 +13,7 @@ import { debugApiEnabled, ScoutDebug } from './debug';
 import { backupDatabase, openDatabase, seedDatabase, startWalCheckpointer } from './db';
 import { buildDiscordEmbed } from './notifications';
 import { compressApiResponse } from './compression';
+import { ScoutLogController } from './request-log';
 import { apiTokenCredentialId, bearerToken, clearedSessionCookie, isProtectedRoute, isSameOriginRequest, loadAuthConfig, matchesApiToken, parseCookies, SESSION_COOKIE, sessionCookie, SessionStore, trustProxySetting, verifyPassword } from './auth';
 import { CONSENT_PATH, isConnectedAppToken, isOAuthRoute, mcpChallenge, OAuthStore, registerOAuthRoutes } from './oauth';
 import { isAllowedHost, isCrossSiteBrowserRequest, isPubliclyBoundHost, RateLimiter, rateLimitKey, secretProblem, securityHeaders } from './security';
@@ -101,7 +102,8 @@ declare module 'fastify' {
 const trustProxy = trustProxySetting(process.env.SCOUT_TRUST_PROXY);
 // requestTimeout bounds how long a client may take to send a request, so
 // trickled bodies cannot hold sockets open forever (handlers are unaffected).
-const app = Fastify({ logger: true, bodyLimit: 1_048_576, trustProxy, requestTimeout: 60_000 });
+// ScoutLogController writes one line per request and skips passing probes.
+const app = Fastify({ logger: true, logController: new ScoutLogController(), bodyLimit: 1_048_576, trustProxy, requestTimeout: 60_000 });
 if (trustProxy === true) app.log.warn('SCOUT_TRUST_PROXY=true trusts X-Forwarded-For from any client, so per-IP limits can be spoofed; prefer a hop count or the proxy address');
 await app.register(cors, { origin: corsOrigins.length === 0 ? false : corsOrigins.length === 1 ? corsOrigins[0] : corsOrigins });
 app.decorateRequest('scoutAuth', 'none');
