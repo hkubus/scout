@@ -8,7 +8,7 @@ import { ServiceError } from './service';
 import { randomUUID } from 'node:crypto';
 import { VERIFICATION_CHECKS_MAX, VERIFICATION_CHECK_MAX_CHARS } from './ai';
 import { FLIP_CHANNELS } from '../src/profit';
-import { DEAL_TIERS, DEAL_TIER_STRENGTH, DEALS_DEFAULT_LIMIT, DEALS_MAX_LIMIT, LISTING_VERIFICATION_FILTERS, compactListing, dealsForAgent } from './deals';
+import { DEAL_TIERS, DEAL_TIER_STRENGTH, DEALS_DEFAULT_LIMIT, DEALS_MAX_LIMIT, LISTING_VERIFICATION_FILTERS, compactListing, dealsForAgent, withDuplicateNote } from './deals';
 import { MARKETPLACE_SEARCH_SORTS } from './marketplaces';
 
 export const MCP_DASHBOARD_LISTINGS = 20;
@@ -155,18 +155,18 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       minPrice: z.number().nonnegative().optional().describe('PLN.'),
       maxPrice: z.number().nonnegative().optional().describe('PLN.'),
       verification: z.enum(LISTING_VERIFICATION_FILTERS).optional().describe('AI description check status; none = never checked.'),
-      format: z.enum(['full', 'compact']).optional().describe('compact: short rows (id, price, typical, discountPercent, tier, estimatedNet, watch, variant, url, seenAt, verification...), as scout_deals returns. Default full.'),
+      format: z.enum(['full', 'compact']).optional().describe('compact: short rows (id, price, typical, discountPercent, tier, estimatedNet, watch, variant, url, seenAt, verification...; duplicateCount and duplicateCheapest when the item is also listed on another marketplace), as scout_deals returns. Default full; full rows carry the same duplicateCheapest, with the note on Vinted\'s fees.'),
     },
     annotations: { readOnlyHint: true },
   }, async ({ minTier, format, ...input }) => {
     try {
       const page = service.listingsPage({ ...input, ...(minTier ? { minStrength: DEAL_TIER_STRENGTH[minTier] } : {}) });
-      return text(format === 'compact' ? { listings: page.listings.map(compactListing), pagination: page.pagination } : page);
+      return text(format === 'compact' ? { listings: page.listings.map(compactListing), pagination: page.pagination } : { ...page, listings: page.listings.map(withDuplicateNote) });
     } catch (error) { return toolError(error); }
   });
 
   server.registerTool('scout_deals', {
-    description: 'Strong+ deals right now, best first: listings a watch scan saw in the last 12 h at deal strength Strong (3) or better (minTier raises it), leaving out ones you hid or passed, AI-irrelevant ones, and ones the AI description check rejected (unless includeRejected). Ordered by tier, then percent below typical, then newest, like Deals → Top deals. Each row has typical, discountPercent, tier and estimatedNet (resale at typical after the marketplace fee, less the price). total counts every match. Database only; asking prices, not sales.',
+    description: 'Strong+ deals right now, best first: listings a watch scan saw in the last 12 h at deal strength Strong (3) or better (minTier raises it), leaving out ones you hid or passed, AI-irrelevant ones, and ones the AI description check rejected (unless includeRejected). Ordered by tier, then percent below typical, then newest, like Deals → Top deals. Each row has typical, discountPercent, tier and estimatedNet (resale at typical after the marketplace fee, less the price). A row whose item is also listed on another marketplace (a copy seen in the last 3 days) adds duplicateCount and duplicateCheapest, the copy with the lowest asking price; its note says when Vinted\'s buyer-protection fee and shipping are left out. total counts every match. Database only; asking prices, not sales.',
     inputSchema: {
       minTier: dealTier.optional().default('strong'),
       marketplace: marketplace.optional(),
@@ -182,7 +182,7 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
   });
 
   server.registerTool('scout_listing_detail', {
-    description: 'Detail for one listing: scoring, triage action and a negotiation block (days listed, price drops, negotiable flag, seller and their other listings, relists). format full (default) adds price history, description snapshot and verification trace; compact leaves them out unless included. live: true makes one request to check the listing is still up at its price; sellerListings: true makes one for the seller\'s current listings. Nothing is written.',
+    description: 'Detail for one listing: scoring, triage action and a negotiation block (days listed, price drops, negotiable flag, seller and their other listings, relists). format full (default) adds price history, description snapshot and verification trace; compact leaves them out unless included. live: true makes one request to check the listing is still up at its price; sellerListings: true makes one for the seller\'s current listings. duplicates lists likely copies on other marketplaces, cheapest asking price first, with when each was last seen; a copy\'s note says when Vinted\'s buyer-protection fee and shipping are in neither asking price. Nothing is written.',
     inputSchema: {
       key: z.string().min(3).max(500).describe('<Marketplace>:<listingId>'),
       watchId: z.string().min(1).max(160).optional(),
@@ -359,13 +359,17 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       scoreAgainst: z.string().trim().min(1).max(160).optional()
         .describe('"auto" or a watch id. Each result gets deal {typical, discountPercent, deviation, tier, label, qualifies, basis, variantKey, variantLabel}, scored against that watch\'s learned typical asking price exactly as its scan would; deal is null where the watch\'s own filters would not keep the result. "auto" picks the watch the query names (the scout_price_reference match); scoredAgainst says which, or is null when none matches. Compact rows carry deal too. Database only: no extra fetch or AI call.'),
       format: z.enum(['full', 'compact']).optional().default('full')
-        .describe('compact: smaller, stable rows with every key present (null when unknown): id "<Marketplace>:<listingId>", asking price in PLN, relevance, match kind; sources carry status ok|error with an errorKind and pipeline counts.'),
+        .describe('compact: smaller, stable rows with every key present (null when unknown): id "<Marketplace>:<listingId>", asking price in PLN, relevance, match kind, duplicateCount (0 when none) and duplicateCheapest (null when none) for results a scan already stored that are also listed on another marketplace; sources carry status ok|error with an errorKind and pipeline counts.'),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   }, async ({ olxCategoryId, format, ...input }) => {
     try {
       const filters = { ...input, olxCategory: olxCategoryId ? { id: olxCategoryId, label: String(olxCategoryId), path: '' } : null };
-      if (format === 'compact') return text(toCompactSearch(filters, await service.manualSearchDetailed(filters)));
+      if (format === 'compact') {
+        const result = await service.manualSearchDetailed(filters);
+        service.withDuplicates(result.listings);
+        return text(toCompactSearch(filters, result));
+      }
       return text(await service.manualSearch(filters));
     } catch (error) { return toolError(error); }
   });

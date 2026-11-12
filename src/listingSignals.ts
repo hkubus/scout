@@ -46,36 +46,59 @@ const SHORT_MARKETPLACE: Record<Marketplace, string> = { OLX: "OLX", "Allegro Lo
 
 const zl = (value: number) => `${value.toLocaleString("pl-PL")} zł`;
 
+/**
+ * Said wherever two asking prices are compared and either listing is on
+ * Vinted: its buyer pays a buyer-protection fee and shipping on top, so a
+ * lower Vinted asking price can still cost more overall.
+ */
+export const VINTED_FEES_NOTE = "Asking prices only: Vinted's buyer-protection fee and shipping aren't included.";
+
+/** VINTED_FEES_NOTE when any of the compared listings is on Vinted, else null. */
+export function vintedFeesNote(...marketplaces: string[]) {
+  return marketplaces.includes("Vinted") ? VINTED_FEES_NOTE : null;
+}
+
+/** A copy's asking price against this listing's: "asks 30 zł less", "asks 30 zł more" or "same asking price". */
+export function askingPriceComparison(copyPrice: number, price: number) {
+  const difference = Math.round(copyPrice - price);
+  if (difference === 0) return "same asking price";
+  return `asks ${zl(Math.abs(difference))} ${difference < 0 ? "less" : "more"}`;
+}
+
 export type CrossPostChip = {
   text: string;
   /** Full sentence for tooltips. */
   detail: string;
-  /** Another marketplace has it for less. */
+  /** Another marketplace asks less for it. */
   cheaper: boolean;
 };
 
 /**
- * The feed chip for a listing's likely copies on other marketplaces: what the
- * cheapest saves ("Vinted −50 zł", "2× · Vinted −50 zł"), or that this one is
- * already the cheapest. Null when Scout knows no copy.
+ * The feed chip for a listing's likely copies on other marketplaces, from
+ * the copies seen in the last 3 days: how much less the cheapest asks
+ * ("Vinted asks 50 zł less", "2× · Vinted asks 50 zł less"), or that this one
+ * already asks the least. Fees are not modelled, so the tooltip says when
+ * Vinted's are left out. Null when Scout knows no copy.
  */
-export function crossPostChip(listing: Pick<Listing, "price" | "duplicateCount" | "duplicateCheapest">): CrossPostChip | null {
+export function crossPostChip(listing: Pick<Listing, "marketplace" | "price" | "duplicateCount" | "duplicateCheapest">, now = Date.now()): CrossPostChip | null {
   const count = listing.duplicateCount ?? 0;
   const cheapest = listing.duplicateCheapest;
   if (count < 1 || !cheapest) return null;
-  const caveat = "Matched by title, price, condition and place, not photos: check it is the same item.";
+  const caveats = [vintedFeesNote(listing.marketplace, cheapest.marketplace), "Matched by title, price, condition and place, not photos: check it is the same item."].filter(Boolean).join(" ");
+  const seen = formatAge(cheapest.observedAt, now);
+  const where = `${cheapest.marketplace}${seen ? ` (seen ${seen} ago)` : ""}`;
   const saving = Math.round(listing.price - cheapest.price);
   const copies = count === 1 ? "another listing" : `${count} other listings`;
   if (saving >= 1) {
     return {
-      text: `${count > 1 ? `${count}× · ` : ""}${SHORT_MARKETPLACE[cheapest.marketplace]} −${zl(saving)}`,
-      detail: `Possibly the same item as ${copies}; the cheapest is ${zl(cheapest.price)} on ${cheapest.marketplace}, ${zl(saving)} less. ${caveat}`,
+      text: `${count > 1 ? `${count}× · ` : ""}${SHORT_MARKETPLACE[cheapest.marketplace]} asks ${zl(saving)} less`,
+      detail: `Possibly the same item as ${copies}; the lowest asking price is ${zl(cheapest.price)} on ${where}, ${zl(saving)} less. ${caveats}`,
       cheaper: true,
     };
   }
   return {
     text: count === 1 ? `Also on ${SHORT_MARKETPLACE[cheapest.marketplace]}` : `${count}× elsewhere`,
-    detail: `Possibly the same item as ${copies} (${count === 1 ? `${zl(cheapest.price)} on ${cheapest.marketplace}` : `from ${zl(cheapest.price)}`}); this one is the cheapest. ${caveat}`,
+    detail: `Possibly the same item as ${copies} (${count === 1 ? `${zl(cheapest.price)} on ${where}` : `from ${zl(cheapest.price)}`}); this one asks the least. ${caveats}`,
     cheaper: false,
   };
 }

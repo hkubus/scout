@@ -14,10 +14,17 @@ export function isListingActionEvent(payload: unknown): payload is ListingAction
  * Apply a triage event to loaded rows (one listing can appear once per watch).
  * Returns the same array when nothing changed, so React state updates bail out.
  * The note is not in the event; it arrives with the next reconcile.
+ * A listing you hide is never shown as another row's cheapest copy: that
+ * chip goes at once, and the reconcile brings the next copy if there is one.
  */
 export function patchListingRows(rows: Listing[], event: ListingActionEvent): Listing[] {
   let changed = false;
   const next = rows.map((listing) => {
+    if (event.hidden && listing.duplicateCheapest?.key === event.key) {
+      changed = true;
+      const { duplicateCount: _count, duplicateCheapest: _cheapest, ...rest } = listing;
+      listing = rest;
+    }
     if (listingActionKey(listing) !== event.key) return listing;
     if ((listing.decision ?? null) === event.decision && Boolean(listing.hidden) === event.hidden) return listing;
     changed = true;

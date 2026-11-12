@@ -1,5 +1,6 @@
-import type { Listing, ManualSearchResponse, SearchDeal, SearchFilters, SearchScoredAgainst } from '../src/types';
+import type { DuplicateSummary, Listing, ManualSearchResponse, SearchDeal, SearchFilters, SearchScoredAgainst } from '../src/types';
 import { SearchConfigError, type Marketplace } from './marketplaces';
+import { vintedFeesNote } from '../src/listingSignals';
 
 /**
  * Compact `scout_search` output for agents (`format: "compact"`). Hatbot and
@@ -47,6 +48,31 @@ export interface ManualSearchDetails {
 
 export type ManualSearchDetailedResponse = ManualSearchResponse & { details: ManualSearchDetails };
 
+/** A likely copy of a compact row's item on another marketplace. */
+export interface CompactDuplicate {
+  /** `<Marketplace>:<listingId>`. */
+  id: string;
+  source: Marketplace;
+  /** Its asking price. */
+  price: number;
+  url: string;
+  /** When a scan last saw it. */
+  seenAt: string;
+  /** Only when either listing is on Vinted: its buyer-protection fee and shipping are in neither price. */
+  note?: string;
+}
+
+export function compactDuplicate(listing: Pick<Listing, 'marketplace'>, copy: DuplicateSummary): CompactDuplicate {
+  const note = vintedFeesNote(listing.marketplace, copy.marketplace);
+  return { id: copy.key, source: copy.marketplace, price: copy.price, url: copy.url, seenAt: copy.observedAt, ...(note ? { note } : {}) };
+}
+
+/** A copy as the full formats list it, plus the Vinted fees note when either listing is on Vinted. */
+export function compactDuplicateNote<T extends DuplicateSummary>(listing: Pick<Listing, 'marketplace'>, copy: T): T & { note?: string } {
+  const note = vintedFeesNote(listing.marketplace, copy.marketplace);
+  return note ? { ...copy, note } : copy;
+}
+
 export interface CompactSearchListing {
   id: string;
   listingId: string;
@@ -73,6 +99,10 @@ export interface CompactSearchListing {
   jevCheckNote: string | null;
   /** With scoreAgainst: the result priced against the watch, as in the full format; null when not scored. */
   deal: SearchDeal | null;
+  /** Likely copies of the item on other marketplaces that a scan saw in the last 3 days (hidden copies never count); 0 when none or not stored. */
+  duplicateCount: number;
+  /** The copy with the lowest asking price, which can be above this row's price; null when duplicateCount is 0. */
+  duplicateCheapest: CompactDuplicate | null;
 }
 
 export interface CompactSearchSource {
@@ -151,6 +181,8 @@ function compactListing(listing: Listing, detail: ManualSearchListingDetail | un
     jevCheck: listing.jevCheck ?? null,
     jevCheckNote: listing.jevCheckNote ?? null,
     deal: listing.deal ?? null,
+    duplicateCount: listing.duplicateCount ?? 0,
+    duplicateCheapest: listing.duplicateCount && listing.duplicateCheapest ? compactDuplicate(listing, listing.duplicateCheapest) : null,
   };
 }
 

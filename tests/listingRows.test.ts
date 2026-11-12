@@ -13,9 +13,10 @@ test('compares listings field by field', () => {
   // Nested values compare by reference: a fresh object counts as a change.
   assert.equal(sameListingFields(row('a', { aiDescriptionVerification: {} } as Partial<Listing>), row('a', { aiDescriptionVerification: {} } as Partial<Listing>)), false);
   // Except the cheapest cross-posted copy, which every refetch sends as a fresh object.
-  const cheapest = (price: number) => ({ duplicateCount: 1, duplicateCheapest: { key: 'Vinted:1', marketplace: 'Vinted' as const, price, url: 'https://example.test/1' } });
+  const cheapest = (price: number, observedAt = '2026-11-12T10:00:00.000Z') => ({ duplicateCount: 1, duplicateCheapest: { key: 'Vinted:1', marketplace: 'Vinted' as const, price, url: 'https://example.test/1', observedAt } });
   assert.equal(sameListingFields(row('a', cheapest(90)), row('a', cheapest(90))), true);
   assert.equal(sameListingFields(row('a', cheapest(90)), row('a', cheapest(80))), false);
+  assert.equal(sameListingFields(row('a', cheapest(90)), row('a', cheapest(90, '2026-11-12T11:00:00.000Z'))), false);
   assert.equal(sameListingFields(row('a', cheapest(90)), row('a', { duplicateCount: 1, duplicateCheapest: undefined })), false);
 });
 

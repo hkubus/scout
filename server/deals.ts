@@ -1,4 +1,5 @@
 import type { DealLabel, Listing, ListingDecision, ListingDescriptionVerificationStatus, Marketplace, SellerType } from '../src/types';
+import { compactDuplicate, compactDuplicateNote, type CompactDuplicate } from './mcpFormat';
 import type { ScoutService } from './service';
 import { MATCH_VISIBILITY_MS } from './service';
 
@@ -57,6 +58,19 @@ export interface CompactListing {
   verification: ListingDescriptionVerificationStatus | null;
   /** Only on rows you hid. */
   hidden?: true;
+  /**
+   * Only on rows with likely copies of the same item on other marketplaces
+   * that a scan saw in the last 3 days (copies you hid never count): how many.
+   */
+  duplicateCount?: number;
+  /** With duplicateCount: the copy with the lowest asking price, which can be above this row's price. */
+  duplicateCheapest?: CompactDuplicate;
+}
+
+/** A full listing row with the Vinted fees note on its cheapest copy, as the compact rows carry it. */
+export function withDuplicateNote<T extends Listing>(listing: T): T {
+  if (!listing.duplicateCheapest) return listing;
+  return { ...listing, duplicateCheapest: compactDuplicateNote(listing, listing.duplicateCheapest) };
 }
 
 export function compactListing(listing: Listing): CompactListing {
@@ -89,6 +103,9 @@ export function compactListing(listing: Listing): CompactListing {
     decision: listing.decision ?? null,
     verification: listing.aiDescriptionVerificationStatus ?? null,
     ...(listing.hidden ? { hidden: true as const } : {}),
+    ...(listing.duplicateCount && listing.duplicateCheapest
+      ? { duplicateCount: listing.duplicateCount, duplicateCheapest: compactDuplicate(listing, listing.duplicateCheapest) }
+      : {}),
   };
 }
 

@@ -18,7 +18,7 @@ import { discardResponse, fetchDiscardSummary } from './fetch-diagnostics';
 import { Limiter, mapPool } from './limiter';
 import { BASELINE_MIN_HOURS, BASELINE_MIN_SAMPLES, VARIANT_MIN_SAMPLES, dealStrength, median, ownRobustScale, percentile, pooledVariantSpread, priceStats, scoreDealFromStats, type PooledSpread, type PriceStats, type ScoreResult } from './scoring';
 import { pickVariantBatch, typoVariants } from './typos';
-import { searchErrorKind, type ManualSearchDetailedResponse, type ManualSearchDetails } from './mcpFormat';
+import { compactDuplicateNote, searchErrorKind, type ManualSearchDetailedResponse, type ManualSearchDetails } from './mcpFormat';
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
 import { matchQuality, matchQuery, type MatchCandidate, type QueryMatch } from './queryMatch';
 import { conditionClass, daysListed, outcomeShare, priceDrops, shareOfAsking, titleSimilarity } from './negotiation';
@@ -26,10 +26,11 @@ import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assi
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import type { ListingVerificationFilter } from './deals';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
-import { DUPLICATE_WINDOW_DAYS, findDuplicatePairs } from './duplicates';
+import { DUPLICATE_FEED_DAYS, DUPLICATE_WINDOW_DAYS, findDuplicatePairs } from './duplicates';
 import { summarizeAnalytics, type AnalyticsRow } from './analytics';
 import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, DuplicateListing, ListingLiveCheck, ListingNegotiation, Relist, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, RoleOutcomes, AgentFlip, AgentFlips, ConversationResult, InboxResult, AgentListingVerification } from '../src/types';
 import { estimatedNetAtTypical, flipCost, flipNet, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, suggestedListingPrice, type FeePresets } from '../src/profit';
+import { vintedFeesNote } from '../src/listingSignals';
 import { compareStrongest } from '../src/listingRows';
 import type { SearchDeal, SearchScoredAgainst } from '../src/types';
 import type { MatchKind } from './queryMatch';
@@ -4257,10 +4258,11 @@ export class ScoutService {
 
   /**
    * Listings on other marketplaces that look like the same item, per
-   * "<marketplace>:<listingId>" key, cheapest first. Copies verified gone are
-   * left out. One query for any number of keys.
+   * "<marketplace>:<listingId>" key, cheapest first. Copies verified gone or
+   * hidden by you are left out, and with `seenSince` so are copies no scan
+   * saw since then. One query for any number of keys.
    */
-  private duplicatesByKey(keys: Array<[string, string]>) {
+  private duplicatesByKey(keys: Array<[string, string]>, seenSince?: string) {
     const byKey = new Map<string, DuplicateListing[]>();
     const unique = [...new Map(keys.map((key) => [`${key[0]}:${key[1]}`, key])).values()];
     if (!unique.length) return byKey;
@@ -4269,9 +4271,11 @@ export class ScoutService {
       JOIN listings s ON s.marketplace = json_extract(k.value, '$[0]') AND s.listing_id = json_extract(k.value, '$[1]')
       JOIN listing_duplicate_pairs p ON p.listing_id_${self} = s.id
       JOIN listings o ON o.id = p.listing_id_${other}
-      WHERE COALESCE(o.availability_status, 'live') != 'terminal'`;
-    const json = JSON.stringify(unique);
-    const rows = this.stmt(`${side('a', 'b')} UNION ALL ${side('b', 'a')}`).all(json, json) as Array<Record<string, any>>;
+      WHERE COALESCE(o.availability_status, 'live') != 'terminal'
+        AND NOT EXISTS (SELECT 1 FROM listing_actions a WHERE a.marketplace = o.marketplace AND a.listing_id = o.listing_id AND a.hidden = 1)
+        ${seenSince === undefined ? '' : 'AND o.last_seen_at >= ?'}`;
+    const params = seenSince === undefined ? [JSON.stringify(unique)] : [JSON.stringify(unique), seenSince];
+    const rows = this.stmt(`${side('a', 'b')} UNION ALL ${side('b', 'a')}`).all(...params, ...params) as Array<Record<string, any>>;
     for (const row of rows) {
       const key = `${row.self_marketplace}:${row.self_listing_id}`;
       const copies = byKey.get(key) ?? [];
@@ -4291,15 +4295,26 @@ export class ScoutService {
     return byKey;
   }
 
-  /** Feed rows with the count and cheapest of their cross-posted copies; rows without copies stay as they are. */
-  private withDuplicates(listings: Listing[]) {
-    const copies = this.duplicatesByKey(listings.map((listing) => [listing.marketplace, listing.listingId ?? '']));
+  /**
+   * Feed rows with the count and cheapest of their cross-posted copies seen
+   * in the last DUPLICATE_FEED_DAYS days; rows without such copies stay as
+   * they are.
+   */
+  /**
+   * Adds duplicateCount and duplicateCheapest to rows with likely copies on
+   * other marketplaces seen in the last DUPLICATE_FEED_DAYS days. Search
+   * results only have copies once a scan stored them.
+   */
+  withDuplicates(listings: Listing[]) {
+    const seenSince = new Date(Date.now() - DUPLICATE_FEED_DAYS * 24 * 60 * 60_000).toISOString();
+    const listingIdOf = (listing: Listing) => listing.listingId ?? listing.id.slice(listing.marketplace.length + 1);
+    const copies = this.duplicatesByKey(listings.map((listing) => [listing.marketplace, listingIdOf(listing)]), seenSince);
     for (const listing of listings) {
-      const found = copies.get(`${listing.marketplace}:${listing.listingId}`);
+      const found = copies.get(`${listing.marketplace}:${listingIdOf(listing)}`);
       if (!found?.length) continue;
       const cheapest = found[0];
       listing.duplicateCount = found.length;
-      listing.duplicateCheapest = { key: cheapest.key, marketplace: cheapest.marketplace, price: cheapest.price, url: cheapest.url };
+      listing.duplicateCheapest = { key: cheapest.key, marketplace: cheapest.marketplace, price: cheapest.price, url: cheapest.url, observedAt: cheapest.observedAt };
     }
     return listings;
   }
@@ -4445,7 +4460,11 @@ export class ScoutService {
       seller,
       relists,
     };
-    if (!compact) return { ...detail, negotiation, liveCheck };
+    if (!compact) {
+      // Agents get the Vinted fees note on each copy, as the compact detail has it.
+      const duplicates = detail.duplicates?.map((copy) => compactDuplicateNote({ marketplace }, copy));
+      return { ...detail, ...(duplicates ? { duplicates } : {}), negotiation, liveCheck };
+    }
 
     const listing = detail.listing;
     const result: CompactListingDetail = {
@@ -4480,7 +4499,10 @@ export class ScoutService {
       result.description = (live?.description ?? detail.descriptionSnapshot?.description ?? null)?.slice(0, LIVE_DESCRIPTION_CHARS) ?? null;
     }
     if (detail.duplicates?.length) {
-      result.duplicates = detail.duplicates.map((copy) => ({ key: copy.key, marketplace: copy.marketplace, title: copy.title.slice(0, COMPARABLE_TITLE_CHARS), price: copy.price, url: copy.url, observedAt: copy.observedAt }));
+      result.duplicates = detail.duplicates.map((copy) => {
+        const note = vintedFeesNote(marketplace, copy.marketplace);
+        return { key: copy.key, marketplace: copy.marketplace, title: copy.title.slice(0, COMPARABLE_TITLE_CHARS), price: copy.price, url: copy.url, observedAt: copy.observedAt, ...(note ? { note } : {}) };
+      });
     }
     return result;
   }

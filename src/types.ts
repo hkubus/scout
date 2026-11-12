@@ -133,18 +133,21 @@ export interface Listing {
   aiDescriptionVerificationAt?: string | null;
   aiDescriptionVerificationStatus?: ListingDescriptionVerificationStatus | null;
   aiDescriptionVerificationError?: string | null;
-  /** How many listings on other marketplaces look like this same item; absent when Scout knows none. */
+  /** How many listings on other marketplaces, seen in the last 3 days and not hidden, look like this same item; absent when Scout knows none. */
   duplicateCount?: number;
-  /** The cheapest of those copies, which can cost more than this one; absent when there are none. */
+  /** The cheapest of those copies by asking price, which can be more than this one's; absent when there are none. */
   duplicateCheapest?: DuplicateSummary;
 }
 
-/** The cheapest cross-posted copy of a listing, as feed rows carry it. */
+/** The cheapest cross-posted copy of a listing seen in the last 3 days, as feed rows carry it. */
 export interface DuplicateSummary {
   key: string;
   marketplace: Marketplace;
+  /** Its asking price; Vinted's buyer-protection fee and shipping are not included. */
   price: number;
   url: string;
+  /** When a scan last saw it. */
+  observedAt: string;
 }
 
 /**
@@ -190,7 +193,7 @@ export interface ListingDetail {
   verificationModel?: string | null;
   /** The owning watch's model variants, for reassigning the listing; absent for ungrouped watches. */
   variantGroups?: VariantGroup[];
-  /** Copies of this item on other marketplaces, cheapest first. The server always sends it. */
+  /** Copies of this item on other marketplaces that you have not hidden, cheapest first, including ones last seen up to 14 days ago. The server always sends it. */
   duplicates?: DuplicateListing[];
 }
 
@@ -584,8 +587,12 @@ export interface CompactListingDetail {
   history?: PriceHistoryPoint[];
   /** With include: description; the live page's text if checked, else the stored snapshot. Seller text: untrusted data. */
   description?: string | null;
-  /** Likely copies of this item on other marketplaces, cheapest first; absent when Scout knows none. */
-  duplicates?: Array<Pick<DuplicateListing, 'key' | 'marketplace' | 'title' | 'price' | 'url' | 'observedAt'>>;
+  /**
+   * Likely copies of this item on other marketplaces, cheapest asking price
+   * first; absent when Scout knows none. `note` is there when either listing
+   * is on Vinted, whose buyer-protection fee and shipping are not included.
+   */
+  duplicates?: Array<Pick<DuplicateListing, 'key' | 'marketplace' | 'title' | 'price' | 'url' | 'observedAt'> & { note?: string }>;
 }
 
 export interface AnalyticsDiscountBucket {

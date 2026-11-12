@@ -4,6 +4,9 @@ import { copyFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { openDatabase } from '../server/db';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { createScoutMcpServer } from '../server/mcp';
 import { ScoutService } from '../server/service';
 import {
   DUPLICATE_SIMILARITY,
@@ -12,8 +15,13 @@ import {
   normalizeTitleForMatch,
   type DuplicateCandidate,
 } from '../server/duplicates';
-import { crossPostChip } from '../src/listingSignals';
-import type { CompactListingDetail } from '../src/types';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { compactListing, dealsForAgent } from '../server/deals';
+import { CrossPosts } from '../src/ListingDetailDrawer';
+import { ListingChips } from '../src/ListingTable';
+import { VINTED_FEES_NOTE, askingPriceComparison, crossPostChip, vintedFeesNote } from '../src/listingSignals';
+import type { CompactListingDetail, Listing } from '../src/types';
 
 let nextId = 1;
 function listing(marketplace: string, title: string, price: number, extra: Partial<DuplicateCandidate> = {}): DuplicateCandidate {
@@ -158,21 +166,73 @@ test('the prefix filter finds the same pairs as comparing every pair', () => {
   }
 });
 
-test('the feed chip names the saving, or says this copy is the cheapest', () => {
-  const cheapest = (marketplace: 'OLX' | 'Allegro Lokalnie' | 'Vinted', price: number) => ({ key: `${marketplace}:1`, marketplace, price, url: 'https://example.test/1' });
-  assert.equal(crossPostChip({ price: 500 }), null);
+test('the feed chip says how much less the cheapest copy asks, or that this one asks the least', () => {
+  const now = Date.parse('2026-11-12T12:00:00.000Z');
+  const cheapest = (marketplace: 'OLX' | 'Allegro Lokalnie' | 'Vinted', price: number) => ({ key: `${marketplace}:1`, marketplace, price, url: 'https://example.test/1', observedAt: '2026-11-12T07:00:00.000Z' });
+  assert.equal(crossPostChip({ marketplace: 'OLX', price: 500 }), null);
   assert.deepEqual(
-    { ...crossPostChip({ price: 500, duplicateCount: 1, duplicateCheapest: cheapest('Vinted', 450) }), detail: undefined },
-    { text: 'Vinted −50 zł', cheaper: true, detail: undefined },
+    { ...crossPostChip({ marketplace: 'OLX', price: 500, duplicateCount: 1, duplicateCheapest: cheapest('Allegro Lokalnie', 450) }, now), detail: undefined },
+    { text: 'Allegro asks 50 zł less', cheaper: true, detail: undefined },
   );
-  assert.equal(crossPostChip({ price: 500, duplicateCount: 2, duplicateCheapest: cheapest('Allegro Lokalnie', 420) })?.text, '2× · Allegro −80 zł');
-  assert.match(crossPostChip({ price: 500, duplicateCount: 2, duplicateCheapest: cheapest('Allegro Lokalnie', 420) })!.detail, /420 zł on Allegro Lokalnie, 80 zł less\. Matched by title, price, condition and place, not photos/);
+  const two = crossPostChip({ marketplace: 'OLX', price: 500, duplicateCount: 2, duplicateCheapest: cheapest('Allegro Lokalnie', 420) }, now)!;
+  assert.equal(two.text, '2× · Allegro asks 80 zł less');
+  assert.match(two.detail, /lowest asking price is 420 zł on Allegro Lokalnie \(seen 5 h ago\), 80 zł less\. Matched by title, price, condition and place, not photos/);
   assert.deepEqual(
-    { ...crossPostChip({ price: 450, duplicateCount: 1, duplicateCheapest: cheapest('OLX', 450) }), detail: undefined },
+    { ...crossPostChip({ marketplace: 'Allegro Lokalnie', price: 450, duplicateCount: 1, duplicateCheapest: cheapest('OLX', 450) }, now), detail: undefined },
     { text: 'Also on OLX', cheaper: false, detail: undefined },
   );
-  assert.equal(crossPostChip({ price: 450, duplicateCount: 3, duplicateCheapest: cheapest('OLX', 470) })?.text, '3× elsewhere');
-  assert.match(crossPostChip({ price: 450, duplicateCount: 3, duplicateCheapest: cheapest('OLX', 470) })!.detail, /this one is the cheapest/);
+  const three = crossPostChip({ marketplace: 'Allegro Lokalnie', price: 450, duplicateCount: 3, duplicateCheapest: cheapest('OLX', 470) }, now)!;
+  assert.equal(three.text, '3× elsewhere');
+  assert.match(three.detail, /this one asks the least/);
+});
+
+test('comparisons are of asking prices, with a note whenever either copy is on Vinted', () => {
+  assert.equal(askingPriceComparison(470, 500), 'asks 30 zł less');
+  assert.equal(askingPriceComparison(1_530, 500), `asks ${(1_030).toLocaleString('pl-PL')} zł more`);
+  assert.equal(askingPriceComparison(500.2, 500), 'same asking price');
+  assert.equal(vintedFeesNote('OLX', 'Allegro Lokalnie'), null);
+  assert.equal(vintedFeesNote('Vinted', 'OLX'), VINTED_FEES_NOTE);
+  assert.equal(vintedFeesNote('OLX', 'Allegro Lokalnie', 'Vinted'), VINTED_FEES_NOTE);
+  assert.match(VINTED_FEES_NOTE, /Vinted's buyer-protection fee and shipping aren't included/);
+
+  const cheapest = (marketplace: 'OLX' | 'Allegro Lokalnie' | 'Vinted', price: number) => ({ key: `${marketplace}:1`, marketplace, price, url: 'https://example.test/1', observedAt: new Date().toISOString() });
+  // A Vinted copy asking 30 zł less can cost more once its fee and shipping are paid.
+  const vinted = crossPostChip({ marketplace: 'OLX', price: 500, duplicateCount: 1, duplicateCheapest: cheapest('Vinted', 470) })!;
+  assert.equal(vinted.text, 'Vinted asks 30 zł less');
+  assert.ok(vinted.detail.includes(VINTED_FEES_NOTE));
+  // This listing on Vinted counts too, even when it asks the least.
+  assert.ok(crossPostChip({ marketplace: 'Vinted', price: 470, duplicateCount: 1, duplicateCheapest: cheapest('OLX', 500) })!.detail.includes(VINTED_FEES_NOTE));
+  assert.ok(!crossPostChip({ marketplace: 'OLX', price: 500, duplicateCount: 1, duplicateCheapest: cheapest('Allegro Lokalnie', 470) })!.detail.includes('Vinted'));
+
+  // The drawer words each copy the same way, says how long ago it was seen,
+  // and adds the note when this listing or a copy is on Vinted.
+  const now = Date.parse('2026-11-12T12:00:00.000Z');
+  const copy = (marketplace: 'OLX' | 'Allegro Lokalnie' | 'Vinted', price: number, observedAt: string) => ({ key: `${marketplace}:c`, marketplace, title: `PS5 on ${marketplace}`, price, url: 'https://example.test/c', image: '', observedAt, similarity: 0.9 });
+  const drawer = (listing: { marketplace: 'OLX' | 'Allegro Lokalnie' | 'Vinted'; price: number }, copies: ReturnType<typeof copy>[]) =>
+    renderToStaticMarkup(createElement(CrossPosts, { copies, listing, now }));
+  const html = drawer({ marketplace: 'OLX', price: 1900 }, [copy('Vinted', 1800, '2026-11-12T10:00:00.000Z'), copy('Allegro Lokalnie', 1950, '2026-11-07T12:00:00.000Z')]);
+  assert.match(html, /asks 100 zł less · seen 2 h ago/);
+  assert.match(html, /asks 50 zł more · seen 5 d ago/);
+  assert.ok(html.includes(VINTED_FEES_NOTE.replaceAll("'", '&#x27;')));
+  const noVinted = drawer({ marketplace: 'OLX', price: 1900 }, [copy('Allegro Lokalnie', 1900, '2026-11-12T11:30:00.000Z')]);
+  assert.match(noVinted, /same asking price · seen 30 min ago/);
+  assert.doesNotMatch(noVinted, /Vinted/);
+  assert.ok(drawer({ marketplace: 'Vinted', price: 1900 }, [copy('OLX', 1950, '2026-11-12T11:00:00.000Z')]).includes('buyer-protection fee'));
+});
+
+test('Hidden and Filtered by AI outrank a plain "Also on" chip; a copy that asks less still ranks after the target', () => {
+  const base = { id: 'OLX:o1', marketplace: 'OLX', price: 1900 } as Listing;
+  const plain = { duplicateCount: 1, duplicateCheapest: { key: 'Vinted:v1', marketplace: 'Vinted' as const, price: 1950, url: 'https://example.test/v1', observedAt: new Date().toISOString() } };
+  const cheaper = { duplicateCount: 1, duplicateCheapest: { ...plain.duplicateCheapest, price: 1800 } };
+  const chips = (listing: Partial<Listing>) => [...renderToStaticMarkup(createElement(ListingChips, { listing: { ...base, ...listing } as Listing })).matchAll(/<em[^>]*>(.*?)<\/em>/g)]
+    .map((match) => match[1].replace(/<[^>]+>/g, ''));
+  assert.deepEqual(chips({ ...plain }), ['Also on Vinted']);
+  assert.deepEqual(chips({ ...plain, hidden: true }), ['Hidden', 'Also on Vinted']);
+  assert.deepEqual(chips({ ...plain, aiFiltered: true }), ['Filtered by AI', 'Also on Vinted']);
+  assert.deepEqual(chips({ ...plain, hidden: true, aiFiltered: true }), ['Hidden', 'Filtered by AI', '+1']);
+  assert.deepEqual(chips({ ...plain, decision: 'watch', hidden: true }), ['Maybe', 'Hidden', '+1']);
+  assert.deepEqual(chips({ ...cheaper, hidden: true }), ['Vinted asks 100 zł less', 'Hidden']);
+  assert.deepEqual(chips({ ...cheaper, targetHit: true, hidden: true }), ['Target', 'Vinted asks 100 zł less', '+1']);
 });
 
 // Service: refreshDuplicatePairs, the feed rows, listing detail and aging out.
@@ -227,7 +287,8 @@ test('refreshDuplicatePairs stores copies, badges feed rows and lists them in th
     const olx = rows.find((row) => row.id === 'OLX:o1')!;
     const vinted = rows.find((row) => row.id === 'Vinted:v1')!;
     assert.equal(olx.duplicateCount, 1);
-    assert.deepEqual(olx.duplicateCheapest, { key: 'Vinted:v1', marketplace: 'Vinted', price: 1800, url: 'https://example.test/v1' });
+    assert.deepEqual(olx.duplicateCheapest, { key: 'Vinted:v1', marketplace: 'Vinted', price: 1800, url: 'https://example.test/v1', observedAt: olx.duplicateCheapest?.observedAt });
+    assert.ok(Date.now() - Date.parse(olx.duplicateCheapest!.observedAt) < 60_000);
     assert.equal(vinted.duplicateCount, 1);
     assert.equal(vinted.duplicateCheapest?.key, 'OLX:o1');
     // Rows without copies carry no duplicate fields at all.
@@ -312,5 +373,188 @@ test('compact agent detail lists copies only when there are some', async () => {
     assert.deepEqual(compact.duplicates?.map((copy) => ({ key: copy.key, price: copy.price })), [{ key: 'Vinted:v1', price: 1800 }]);
     const none = await context.service.listingDetailForAgent('Vinted:v2', { format: 'compact' }) as CompactListingDetail;
     assert.equal('duplicates' in none, false);
+  } finally { context.close(); }
+});
+
+// Follow-ups to #47: hidden copies, stale copies, asking-price wording,
+// Hatbot's compact rows and the chip order.
+
+async function callTool(service: ScoutService, name: string, args: Record<string, unknown>) {
+  const server = createScoutMcpServer(service, null);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: 'scout-duplicates-test', version: '1.0.0' });
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  try {
+    const result = await client.callTool({ name, arguments: args }) as { isError?: boolean; content: Array<{ text?: string }> };
+    assert.equal(result.isError ?? false, false, String(result.content[0]?.text));
+    return JSON.parse(String(result.content[0].text));
+  } finally {
+    await client.close();
+    await server.close();
+  }
+}
+
+/** All three copies current: Vinted 1800, OLX 1900, Allegro 1950. */
+function seedThreeCopies(db: any) {
+  seed(db);
+  db.prepare("UPDATE listings SET last_seen_at = ? WHERE listing_id = 'a1'").run(new Date().toISOString());
+}
+
+const rowFor = (service: ScoutService, id: string) => service.listingsPage({ pageSize: 50, visibility: 'all' }).listings.find((row) => row.id === id)!;
+const copyKeys = (copies: Array<{ key: string }> | undefined) => (copies ?? []).map((copy) => copy.key);
+
+test('a listing you hid is never shown as a copy: not in the feed chip, the detail or MCP output', async () => {
+  const context = fixture();
+  try {
+    seedThreeCopies(context.db);
+    assert.equal(context.service.refreshDuplicatePairs().pairs, 3);
+    // Strong enough for scout_deals.
+    context.db.prepare("UPDATE watch_listings SET deal_strength = 5, deal_label = 'Exceptional' WHERE listing_id = (SELECT id FROM listings WHERE listing_id = 'o1')").run();
+    assert.equal(rowFor(context.service, 'OLX:o1').duplicateCheapest?.key, 'Vinted:v1');
+
+    // Hiding the cheapest copy takes effect at once, without a refresh.
+    context.service.updateListingAction('Vinted:v1', { hidden: true });
+    const olx = rowFor(context.service, 'OLX:o1');
+    assert.equal(olx.duplicateCount, 1);
+    assert.equal(olx.duplicateCheapest?.key, 'Allegro Lokalnie:a1');
+    assert.equal(crossPostChip(olx)?.cheaper, false);
+    assert.deepEqual(copyKeys(context.service.listingDetail('OLX:o1').duplicates), ['Allegro Lokalnie:a1']);
+    assert.deepEqual(copyKeys(context.service.listingDetail('Allegro Lokalnie:a1').duplicates), ['OLX:o1']);
+
+    const mcpDetail = await callTool(context.service, 'scout_listing_detail', { key: 'OLX:o1' });
+    assert.deepEqual(copyKeys(mcpDetail.duplicates), ['Allegro Lokalnie:a1']);
+    const mcpCompactDetail = await callTool(context.service, 'scout_listing_detail', { key: 'OLX:o1', format: 'compact' });
+    assert.deepEqual(copyKeys(mcpCompactDetail.duplicates), ['Allegro Lokalnie:a1']);
+    const mcpRows = await callTool(context.service, 'scout_listings', { visibility: 'all', pageSize: 50 });
+    const mcpOlx = mcpRows.listings.find((row: any) => row.id === 'OLX:o1');
+    assert.deepEqual([mcpOlx.duplicateCount, mcpOlx.duplicateCheapest?.key], [1, 'Allegro Lokalnie:a1']);
+    const mcpText = JSON.stringify([
+      mcpDetail.duplicates, mcpCompactDetail.duplicates, mcpRows.listings.map((row: any) => row.duplicateCheapest),
+      (await callTool(context.service, 'scout_listings', { visibility: 'all', pageSize: 50, format: 'compact' })).listings.map((row: any) => row.duplicateCheapest),
+      (await callTool(context.service, 'scout_deals', {})).deals.map((row: any) => row.duplicateCheapest),
+    ]);
+    assert.doesNotMatch(mcpText, /v1/);
+
+    // With every copy hidden there is nothing to show.
+    context.service.updateListingAction('Allegro Lokalnie:a1', { hidden: true });
+    const alone = rowFor(context.service, 'OLX:o1');
+    assert.equal('duplicateCount' in alone, false);
+    assert.equal('duplicateCheapest' in alone, false);
+    assert.deepEqual(context.service.listingDetail('OLX:o1').duplicates, []);
+    assert.equal('duplicates' in (await callTool(context.service, 'scout_listing_detail', { key: 'OLX:o1', format: 'compact' })), false);
+
+    // Unhiding brings it back.
+    context.service.updateListingAction('Vinted:v1', { hidden: false });
+    assert.equal(rowFor(context.service, 'OLX:o1').duplicateCheapest?.key, 'Vinted:v1');
+  } finally { context.close(); }
+});
+
+test('the feed chip uses only copies seen in the last 3 days; the detail still lists older ones', async () => {
+  const context = fixture();
+  try {
+    seedThreeCopies(context.db);
+    const daysAgo = (days: number) => new Date(Date.now() - days * 86_400_000).toISOString();
+    // The cheapest copy was last seen 4 days ago: still paired (14-day window), too old for the chip.
+    context.db.prepare("UPDATE listings SET last_seen_at = ? WHERE listing_id = 'v1'").run(daysAgo(4));
+    assert.equal(context.service.refreshDuplicatePairs().pairs, 3);
+    const olx = rowFor(context.service, 'OLX:o1');
+    assert.equal(olx.duplicateCount, 1);
+    assert.equal(olx.duplicateCheapest?.key, 'Allegro Lokalnie:a1');
+    assert.equal(crossPostChip(olx)?.text, 'Also on Allegro');
+    const detail = context.service.listingDetail('OLX:o1');
+    assert.deepEqual(copyKeys(detail.duplicates), ['Vinted:v1', 'Allegro Lokalnie:a1']);
+    assert.equal(detail.duplicates![0].observedAt, (context.db.prepare("SELECT last_seen_at FROM listings WHERE listing_id = 'v1'").get() as { last_seen_at: string }).last_seen_at);
+    const compact = await context.service.listingDetailForAgent('OLX:o1', { format: 'compact' }) as CompactListingDetail;
+    assert.deepEqual(copyKeys(compact.duplicates), ['Vinted:v1', 'Allegro Lokalnie:a1']);
+
+    // Seen a little under 3 days ago, it counts again.
+    context.db.prepare("UPDATE listings SET last_seen_at = ? WHERE listing_id = 'v1'").run(daysAgo(2.9));
+    const fresh = rowFor(context.service, 'OLX:o1');
+    assert.deepEqual([fresh.duplicateCount, fresh.duplicateCheapest?.key], [2, 'Vinted:v1']);
+  } finally { context.close(); }
+});
+
+test('compact rows Hatbot reads (scout_deals, compact scout_listings) gain the cheapest recent copy as optional keys', async () => {
+  const context = fixture();
+  try {
+    seedThreeCopies(context.db);
+    context.service.refreshDuplicatePairs();
+    context.db.prepare("UPDATE watch_listings SET deal_strength = 5, deal_label = 'Exceptional' WHERE listing_id IN (SELECT id FROM listings WHERE listing_id IN ('o1', 'v2'))").run();
+    const listings = context.service.listingsPage({ pageSize: 50, visibility: 'all' }).listings;
+    const olx = listings.find((row) => row.id === 'OLX:o1')!;
+    const compactOlx = compactListing(olx);
+    // Keys are only added: without its copies the row is the same, key for key.
+    const plain = compactListing({ ...olx, duplicateCount: undefined, duplicateCheapest: undefined });
+    assert.deepEqual(Object.keys(compactOlx), [...Object.keys(plain), 'duplicateCount', 'duplicateCheapest']);
+    const { duplicateCount, duplicateCheapest, ...rest } = compactOlx;
+    assert.deepEqual(rest, plain);
+    assert.equal(duplicateCount, 2);
+    assert.deepEqual(duplicateCheapest, { id: 'Vinted:v1', source: 'Vinted', price: 1800, url: 'https://example.test/v1', seenAt: olx.duplicateCheapest!.observedAt, note: VINTED_FEES_NOTE });
+    // A row without copies has neither key.
+    const pad = compactListing(listings.find((row) => row.id === 'Vinted:v2')!);
+    assert.equal('duplicateCount' in pad, false);
+    assert.equal('duplicateCheapest' in pad, false);
+
+    // The same keys over MCP, in scout_deals and compact scout_listings.
+    const deals = (await callTool(context.service, 'scout_deals', {})).deals;
+    assert.deepEqual(deals.map((row: any) => row.id).sort(), ['OLX:o1', 'Vinted:v2']);
+    assert.deepEqual(deals.find((row: any) => row.id === 'OLX:o1'), JSON.parse(JSON.stringify(compactOlx)));
+    assert.equal('duplicateCheapest' in deals.find((row: any) => row.id === 'Vinted:v2'), false);
+    const compactRows = (await callTool(context.service, 'scout_listings', { format: 'compact', visibility: 'all', pageSize: 50 })).listings;
+    assert.deepEqual(compactRows.find((row: any) => row.id === 'OLX:o1'), JSON.parse(JSON.stringify(compactOlx)));
+    assert.deepEqual(dealsForAgent(context.service).deals.find((row) => row.id === 'OLX:o1')?.duplicateCheapest, duplicateCheapest);
+
+    // The compact detail notes Vinted's fees on the Vinted copy only (this listing is on OLX).
+    const detail = await callTool(context.service, 'scout_listing_detail', { key: 'OLX:o1', format: 'compact' });
+    assert.deepEqual(detail.duplicates.map((copy: any) => [copy.key, copy.note ?? null]), [['Vinted:v1', VINTED_FEES_NOTE], ['Allegro Lokalnie:a1', null]]);
+
+    // An OLX copy against Allegro needs no note.
+    context.service.updateListingAction('Vinted:v1', { hidden: true });
+    const withoutVinted = compactListing(context.service.listingsPage({ pageSize: 50, visibility: 'all' }).listings.find((row) => row.id === 'OLX:o1')!);
+    assert.deepEqual(withoutVinted.duplicateCheapest && { ...withoutVinted.duplicateCheapest, seenAt: undefined }, { id: 'Allegro Lokalnie:a1', source: 'Allegro Lokalnie', price: 1950, url: 'https://example.test/a1', seenAt: undefined });
+  } finally { context.close(); }
+});
+
+test('full scout_listings rows and the full scout_listing_detail note Vinted fees on copies, as the compact formats do', async () => {
+  const context = fixture();
+  try {
+    seedThreeCopies(context.db);
+    context.service.refreshDuplicatePairs();
+    const rows = (await callTool(context.service, 'scout_listings', { visibility: 'all', pageSize: 50 })).listings;
+    const olx = rows.find((row: any) => row.id === 'OLX:o1');
+    assert.equal(olx.duplicateCount, 2);
+    assert.deepEqual({ ...olx.duplicateCheapest, observedAt: undefined }, { key: 'Vinted:v1', marketplace: 'Vinted', price: 1800, url: 'https://example.test/v1', observedAt: undefined, note: VINTED_FEES_NOTE });
+    // The REST rows stay as they were: the dashboard says it in the chip's tooltip.
+    assert.equal('note' in rowFor(context.service, 'OLX:o1').duplicateCheapest!, false);
+
+    const detail = await callTool(context.service, 'scout_listing_detail', { key: 'OLX:o1' });
+    assert.deepEqual(detail.duplicates.map((copy: any) => [copy.key, copy.note ?? null]), [['Vinted:v1', VINTED_FEES_NOTE], ['Allegro Lokalnie:a1', null]]);
+    assert.equal(typeof detail.duplicates[0].similarity, 'number');
+    const rest = context.service.listingDetail('OLX:o1');
+    assert.equal(rest.duplicates?.some((copy) => 'note' in copy), false);
+  } finally { context.close(); }
+});
+
+test('compact scout_search rows always carry duplicateCount and duplicateCheapest', async () => {
+  const context = fixture();
+  try {
+    seedThreeCopies(context.db);
+    context.service.refreshDuplicatePairs();
+    // A search result is not a stored row: no listingId field, only its id.
+    const { listingId: _stored, duplicateCount: _count, duplicateCheapest: _cheapest, ...olx } = rowFor(context.service, 'OLX:o1');
+    const fresh: Listing = { ...olx, id: 'OLX:fresh1', title: 'PlayStation 5 Slim, nowa', price: 2100 };
+    context.service.manualSearchDetailed = async () => ({
+      listings: [olx as Listing, fresh],
+      sources: [],
+      details: { listings: new Map(), sources: new Map() },
+    });
+    const search = await callTool(context.service, 'scout_search', { query: 'ps5', sources: ['OLX'], format: 'compact' });
+    const byId = new Map(search.listings.map((row: any) => [row.id, row]));
+    const stored = byId.get('OLX:o1') as any;
+    assert.equal(stored.duplicateCount, 2);
+    assert.deepEqual({ ...stored.duplicateCheapest, seenAt: undefined }, { id: 'Vinted:v1', source: 'Vinted', price: 1800, url: 'https://example.test/v1', seenAt: undefined, note: VINTED_FEES_NOTE });
+    const unstored = byId.get('OLX:fresh1') as any;
+    assert.equal(unstored.duplicateCount, 0);
+    assert.equal(unstored.duplicateCheapest, null);
   } finally { context.close(); }
 });

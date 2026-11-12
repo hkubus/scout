@@ -21,7 +21,7 @@ export function compareStrongest(a: StrongestFields, b: StrongestFields) {
 
 /** The cheapest cross-posted copy is a small flat object, so it compares by its fields. */
 const sameDuplicateSummary = (a: DuplicateSummary | undefined, b: DuplicateSummary | undefined) =>
-  a === b || (a !== undefined && b !== undefined && a.key === b.key && a.marketplace === b.marketplace && a.price === b.price && a.url === b.url);
+  a === b || (a !== undefined && b !== undefined && a.key === b.key && a.marketplace === b.marketplace && a.price === b.price && a.url === b.url && a.observedAt === b.observedAt);
 
 /**
  * Flat field-by-field comparison. List payloads carry only primitives per row,

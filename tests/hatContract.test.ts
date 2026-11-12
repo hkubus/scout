@@ -23,7 +23,7 @@ const MARKETPLACES = ['OLX', 'Allegro Lokalnie', 'Vinted'];
 const COMPACT_LISTING_KEYS = [
   'id', 'listingId', 'source', 'title', 'price', 'shipping', 'shippingAvailable', 'url', 'image', 'sellerType',
   'condition', 'location', 'negotiable', 'postedAt', 'refreshedAt', 'relevance', 'match', 'matchedVia', 'flags',
-  'jevCheck', 'jevCheckNote', 'deal',
+  'jevCheck', 'jevCheckNote', 'deal', 'duplicateCount', 'duplicateCheapest',
 ];
 const COMPACT_SOURCE_KEYS = [
   'source', 'status', 'errorKind', 'message', 'fetched', 'matched', 'returned', 'aiExcluded', 'aiUnknown',
@@ -111,6 +111,7 @@ test('compact scout_search: stable keys, the documented values and one line of J
         sellerType: null, condition: 'Używane', location: 'Małopolskie, Łapanów', negotiable: false,
         postedAt: '2026-08-20T17:40:08.000Z', refreshedAt: '2026-08-31T14:51:09.000Z',
         relevance: 'not-checked', match: 'strict', matchedVia: 'query', flags: [], jevCheck: null, jevCheckNote: null, deal: null,
+        duplicateCount: 0, duplicateCheapest: null,
       });
       const [source] = payload.sources;
       assert.equal(typeof source.durationMs, 'number');
