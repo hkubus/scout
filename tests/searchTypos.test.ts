@@ -160,6 +160,32 @@ test('a failing misspelled search never fails the marketplace, and a failing mai
   } finally { context.close(); }
 });
 
+test('a misspelled search with no answer in time is left out, and its marketplace answers', async () => {
+  const previous = process.env.SCOUT_SEARCH_TYPO_WAIT_MS;
+  process.env.SCOUT_SEARCH_TYPO_WAIT_MS = '100';
+  const context = searchFixture();
+  const answer = typoStub(iphonePages(), []);
+  let release!: () => void;
+  const hanging = new Promise<void>((resolve) => { release = resolve; });
+  (context.service as any).fetchOlxApi = async (url: string) => {
+    if (new URL(url).searchParams.get('query') === 'iphoen 13') await hanging;
+    return answer(url);
+  };
+  try {
+    const result = await context.service.manualSearch(searchInput('iphone 13', { typoVariants: true, aiRelevance: false }));
+    const [source] = result.sources;
+    assert.equal(source.status, 'ok');
+    assert.deepEqual(source.variants?.map((variant) => variant.status), ['ok', 'error']);
+    assert.match(String(source.variants?.[1].message), /No answer within 0\.1 s/);
+    assert.deepEqual(result.listings.map((listing) => listing.title).sort(), ['Iphon 13 128GB 100% Baterii', 'iPhone 13 128GB']);
+  } finally {
+    release();
+    if (previous === undefined) delete process.env.SCOUT_SEARCH_TYPO_WAIT_MS;
+    else process.env.SCOUT_SEARCH_TYPO_WAIT_MS = previous;
+    context.close();
+  }
+});
+
 test('typed terms hold a typo row to its own spelling', async () => {
   const context = searchFixture();
   const queries: string[] = [];

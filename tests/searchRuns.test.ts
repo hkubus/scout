@@ -370,6 +370,54 @@ test('only clean results are cached; a backoff skip is, until its pause ends', a
   } finally { context.close(); }
 });
 
+test('a search where single AI relevance or Jev check calls failed is not cached', async () => {
+  const restore = liveJevEnv();
+  let failRelevance = true;
+  let failChecks = false;
+  const context = searchFixture({
+    classifyListingRelevanceWithJev: async () => {
+      if (failRelevance) throw new Error('OpenRouter returned HTTP 502');
+      return { relevant: true, p: 0.9, unsure: false } as any;
+    },
+    classifyChecksWithJev: async (input: any) => {
+      if (failChecks) throw new Error('OpenRouter returned HTTP 502');
+      return input.checks.map((check: any) => ({ text: check.text, mode: check.mode, answer: 'yes', confidence: 0.9, outcome: 'passed' }));
+    },
+  });
+  const fetched: string[] = [];
+  (context.service as any).fetchOlxApi = async (url: string) => {
+    fetched.push(String(new URL(url).searchParams.get('query')));
+    return olxPage([{ ...olxOffer('F-1', 'iPhone 13 128GB', 1500), description: 'Komplet z ladowarka.' }]);
+  };
+  try {
+    // Relevance: the failed call leaves the row unknown, so a repeat searches again.
+    const failed = await context.service.manualSearchDetailed(searchInput('iphone 13'));
+    assert.equal(failed.details.listings.get('OLX:F-1')?.relevance, 'unknown');
+    failRelevance = false;
+    const retried = await context.service.manualSearchDetailed(searchInput('iphone 13'));
+    assert.equal(retried.fromCache, undefined);
+    assert.equal(retried.details.listings.get('OLX:F-1')?.relevance, 'relevant');
+    assert.equal(fetched.length, 2);
+    const hit = await context.service.manualSearchDetailed(searchInput('iphone 13'));
+    assert.equal(hit.fromCache, true);
+
+    // Jev checks: the failed call leaves the row unchecked, so a repeat searches again.
+    failChecks = true;
+    fetched.length = 0;
+    const checks = { verificationChecks: [{ text: 'includes charger', mode: 'require' as const }] };
+    const unchecked = await context.service.manualSearch(searchInput('iphone 13', checks));
+    assert.equal(unchecked.listings[0].jevCheck, 'unchecked');
+    failChecks = false;
+    const checked = await context.service.manualSearch(searchInput('iphone 13', checks));
+    assert.equal('fromCache' in checked, false);
+    assert.equal(checked.listings[0].jevCheck, 'passed');
+    assert.equal(fetched.length, 2);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
 test('the result cache drops the least recently used entry and expired ones', async (t) => {
   t.mock.timers.enable({ apis: ['Date'], now: 0 });
   const cache = new SearchCache<string>({ ttlMs: 1000, entries: 2 });

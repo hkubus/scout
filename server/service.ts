@@ -55,6 +55,8 @@ type RelevanceFilterResult = {
   statuses?: Map<NormalizedListing, 'relevant' | 'unknown'>;
   /** Kept as unknown because the per-pass AI budget ran out. */
   budgetExhausted?: number;
+  /** Kept as unknown because the AI call itself failed (an error, not a judgment). */
+  errors?: number;
 };
 
 type DealNotificationCandidate = {
@@ -350,6 +352,20 @@ function searchTypoVariantCount() {
   const configured = Number.parseInt(process.env.SCOUT_SEARCH_TYPO_VARIANTS ?? '', 10);
   if (!Number.isFinite(configured)) return DEFAULT_SEARCH_TYPO_VARIANTS;
   return Math.min(Math.max(configured, 0), MAX_SEARCH_TYPO_VARIANTS);
+}
+
+/**
+ * How long a marketplace waits for its misspelled searches once its own page
+ * answered (SCOUT_SEARCH_TYPO_WAIT_MS, 100 ms to 30 s, default 8 s). A page
+ * 1 fetch normally takes a second or two; a slower one is reported as a
+ * failed variant, so one hanging request cannot hold the marketplace past
+ * its caller's deadline. The request itself still runs to its own timeout.
+ */
+const DEFAULT_SEARCH_TYPO_WAIT_MS = 8_000;
+function searchTypoWaitMs() {
+  const configured = Number.parseInt(process.env.SCOUT_SEARCH_TYPO_WAIT_MS ?? '', 10);
+  if (!Number.isFinite(configured)) return DEFAULT_SEARCH_TYPO_WAIT_MS;
+  return Math.min(Math.max(configured, 100), 30_000);
 }
 
 /** The 1-based marketplace page a manual search asks for (1 to 10). */
@@ -1654,6 +1670,7 @@ export class ScoutService {
     let aiCalls = 0;
     let skipped = 0;
     let budgetExhausted = 0;
+    let errors = 0;
     const pendingClassifications = new Map<string, Promise<{ relevant: boolean }>>();
     const pendingLive = new Map<string, Promise<{ relevant: boolean; status: 'relevant' | 'irrelevant' | 'unknown'; reason: string; error?: string }>>();
     // Relevance rows are collected while the AI calls are awaited and flushed
@@ -1767,9 +1784,11 @@ export class ScoutService {
             pendingLive.set(liveKey, decision);
           }
           const live = await decision;
+          if (live.error) errors += 1;
           persistRelevance(listing, inputHash, jevLive.jevModel, live.relevant, live.status, live.reason, live.error ?? null);
           return { listing, status: live.status };
         } catch (error) {
+          errors += 1;
           const message = (error instanceof Error ? error.message : 'Jev could not classify listing relevance').slice(0, 500);
           persistRelevance(listing, inputHash, jevLive.jevModel, true, 'unknown', 'Jev relevance check failed unexpectedly', message);
           return { listing, status: 'unknown' };
@@ -1788,6 +1807,7 @@ export class ScoutService {
         persistRelevance(listing, inputHash, activeModel, result.relevant, status, result.relevant ? 'AI classified listing as relevant' : 'AI classified listing as irrelevant');
         return { listing, status };
       } catch (error) {
+        errors += 1;
         const message = (error instanceof Error ? error.message : 'OpenRouter could not classify listing relevance').slice(0, 500);
         persistRelevance(listing, inputHash, activeModel, true, 'unknown', 'AI relevance check failed', message);
         if (jevShadow) this.shadowJevRelevance(context, inputHash, null, listing.imageUrl, jevShadow);
@@ -1810,6 +1830,7 @@ export class ScoutService {
       notConfigured: false,
       statuses: new Map(classified.flatMap((item) => item.status === 'irrelevant' ? [] : [[item.listing, item.status] as const])),
       budgetExhausted,
+      errors,
     };
   }
 
@@ -1826,16 +1847,19 @@ export class ScoutService {
     status: Map<NormalizedListing, { state: 'passed' | 'unconfirmed' | 'unchecked'; note: string }>;
     rejected: number;
     inactive: boolean;
+    /** Checks whose Jev call failed; their listings are left unchecked. */
+    failed: number;
   }> {
     const status = new Map<NormalizedListing, { state: 'passed' | 'unconfirmed' | 'unchecked'; note: string }>();
     const live = this.jevLiveConfig();
     if (!checks.length || !listings.length || !live) {
       if (checks.length) for (const listing of listings) status.set(listing, { state: 'unchecked', note: 'Jev checks need an OpenRouter key and Jev live mode' });
-      return { listings, status, rejected: 0, inactive: Boolean(checks.length && listings.length && !live) };
+      return { listings, status, rejected: 0, inactive: Boolean(checks.length && listings.length && !live), failed: 0 };
     }
     const checksKey = checks.map((check) => `${check.mode}:${check.text.toLowerCase()}`).sort();
     let jevCalls = 0;
     let detailFetches = 0;
+    let failed = 0;
     const outcomes = await mapPool(listings, jevCheckConcurrency(), async (listing): Promise<'rejected' | 'passed' | 'unconfirmed' | 'unchecked'> => {
       const inputHash = createHash('sha256').update(JSON.stringify({
         version: 1, marketplace: listing.marketplace, listingId: listing.listingId, title: listing.title, condition: listing.condition ?? null, checks: checksKey,
@@ -1872,6 +1896,7 @@ export class ScoutService {
         status.set(listing, { state: summary, note: issues.join(' · ') + (description ? '' : `${issues.length ? ' · ' : ''}Judged from the title only`) });
         return summary;
       } catch (error) {
+        failed += 1;
         status.set(listing, { state: 'unchecked', note: `Jev check failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 200) });
         return 'unchecked';
       }
@@ -1881,6 +1906,7 @@ export class ScoutService {
       status,
       rejected: outcomes.filter((outcome) => outcome === 'rejected').length,
       inactive: false,
+      failed,
     };
   }
 
@@ -5046,13 +5072,19 @@ export class ScoutService {
         const variantStatuses: SearchTypoVariantStatus[] = [];
         if (typoPairs.length) {
           run.checkpoint();
+          const waitMs = searchTypoWaitMs();
+          let waitTimer: ReturnType<typeof setTimeout> | undefined;
+          const waited = new Promise<'late'>((resolve) => { waitTimer = setTimeout(() => resolve('late'), waitMs); });
           const pages = await Promise.all(typoPairs.map(async (variant) => {
-            try {
-              return { variant, rows: await this.fetchSearchPages(source, variant.query, searchOptions), error: null };
-            } catch (error) {
-              return { variant, rows: [] as NormalizedListing[], error: error instanceof Error ? error.message : 'Search failed' };
-            }
-          }));
+            const page = this.fetchSearchPages(source, variant.query, searchOptions).then(
+              (rows) => ({ variant, rows, error: null as string | null }),
+              (error) => ({ variant, rows: [] as NormalizedListing[], error: error instanceof Error ? error.message : 'Search failed' }),
+            );
+            const answer = await Promise.race([page, waited]);
+            return answer === 'late'
+              ? { variant, rows: [] as NormalizedListing[], error: `No answer within ${Math.round(waitMs / 100) / 10} s; left out so the marketplace is not held up` }
+              : answer;
+          })).finally(() => clearTimeout(waitTimer));
           const seen = new Set(fetched.map(listingKey));
           for (const { variant, rows, error } of pages) {
             for (const listing of rows) {
@@ -5153,6 +5185,8 @@ export class ScoutService {
         let checkStatus = new Map<NormalizedListing, { state: 'passed' | 'unconfirmed' | 'unchecked'; note: string }>();
         let checksNote = '';
         let hiddenByChecks = 0;
+        // Set when the pass threw or any single Jev call failed: a retry may
+        // judge those listings, so the result must not be cached.
         let checksFailed = false;
         if (checks.length) {
           run.checkpoint();
@@ -5161,6 +5195,7 @@ export class ScoutService {
             capped = checked.listings;
             checkStatus = checked.status;
             hiddenByChecks = checked.rejected;
+            checksFailed = checked.failed > 0;
             checksNote = checked.inactive ? ' · Jev checks inactive' : checked.rejected ? ` · ${checked.rejected} hidden by Jev checks` : '';
           } catch (error) {
             checksFailed = true;
@@ -5227,7 +5262,7 @@ export class ScoutService {
             errorKind: null,
           },
           listingDetails,
-          cacheable: !relevanceFailed && !checksFailed && variantStatuses.every((variant) => variant.status === 'ok'),
+          cacheable: !relevanceFailed && !(relevanceResult?.errors) && !checksFailed && variantStatuses.every((variant) => variant.status === 'ok'),
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Search failed';

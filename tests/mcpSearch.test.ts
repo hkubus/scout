@@ -95,7 +95,7 @@ test('scout_search advertises typoVariants off by default, with its cost', async
     const schema = (tool.inputSchema.properties as Record<string, any>).typoVariants;
     assert.deepEqual({ ...schema, description: '' }, { type: 'boolean', default: false, description: '' });
     assert.match(schema.description, /2 extra page fetches per marketplace/);
-    assert.match(schema.description, /never "relevant"/);
+    assert.match(schema.description, /"relevant" only when the check judged it/);
     const compact = JSON.parse(toolText(await client.callTool({ name: 'scout_search', arguments: { query: 'iphone 13', sources: ['OLX'], typoVariants: true, aiRelevance: false, format: 'compact' } })));
     assert.deepEqual(compact.typoVariants, ['iphon 13', 'iphoen 13']);
     assert.deepEqual(compact.listings.map((listing: { matchedVia: string }) => listing.matchedVia), ['typo:iphon 13', 'query']);
