@@ -143,13 +143,15 @@ test('the web dashboard form leaves the feed out, and every form counts the visi
       watching: full.watches.filter((watch) => watch.enabled).length,
       newToday: kept.filter((listing) => Date.parse(listing.postedAt ?? listing.firstSeenAt ?? listing.observedAt) >= midnight.getTime()).length,
       strongDeals: kept.filter((listing) => listing.dealStrength >= 3).length,
-      aiFiltered: feed.length - kept.length,
+      aiFiltered: context.service.listingsPage({ visibility: 'all', aiFiltered: 'only', pageSize: 500 }).listings.length,
     });
+    // Listings' AI view shows hidden rows too, and so does its counter.
+    assert.ok(full.stats.aiFiltered > feed.length - kept.length, 'the scenario hides an AI-filtered row');
     assert.ok(full.stats.newToday > 0 && full.stats.newToday < kept.length);
     assert.ok(full.stats.strongDeals > 0 && full.stats.aiFiltered > 0);
     // Each equals the total of the list it opens.
     assert.equal(full.stats.strongDeals, context.service.listingsPage({ visibility: 'visible', minStrength: 3 }).pagination.total);
-    assert.equal(full.stats.aiFiltered, context.service.listingsPage({ visibility: 'visible', aiFiltered: 'only' }).pagination.total);
+    assert.equal(full.stats.aiFiltered, context.service.listingsPage({ visibility: 'all', aiFiltered: 'only' }).pagination.total);
 
     // ?listings=none: the same dashboard without its rows; the widget's top wins.
     assert.deepEqual(context.service.dashboard({ listings: 'none' }), { ...full, listings: [] });

@@ -6043,25 +6043,27 @@ export class ScoutService {
   }
 
   /**
-   * The dashboard's feed counters: the totals of the visible (not hidden)
-   * 12 h feed lists they stand for, counted by listingsPage itself.
+   * The dashboard's feed counters: the totals of the 12 h feed lists they
+   * open, counted by listingsPage itself, so each matches its list.
    * - `strongDeals`: Strong and above (deal strength 3+), the Strong+
    *   filter's rows, kept by AI relevance filtering;
    * - `newToday`: kept rows posted since local midnight, not merely bumped
    *   or re-seen today (OLX refreshes keep old offers at the top of
    *   "newest"); sources without a posting time fall back to when the watch
    *   first saw the listing;
-   * - `aiFiltered`: the rows AI relevance filtering judged irrelevant.
+   * - `aiFiltered`: the rows AI relevance filtering judged irrelevant,
+   *   hidden ones included, as Listings' AI view shows them.
+   * The first two count visible (not hidden) rows only.
    */
   private dashboardStats(watches: Watch[]) {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const count = (options: NonNullable<Parameters<ScoutService['listingsPage']>[0]>) =>
-      this.listingsPage({ ...options, visibility: 'visible', page: 1, pageSize: 1 }, watches).pagination.total;
+      this.listingsPage({ visibility: 'visible', ...options, page: 1, pageSize: 1 }, watches).pagination.total;
     return {
       newToday: count({ aiFiltered: 'exclude', arrivedSince: today.toISOString() }),
       strongDeals: count({ aiFiltered: 'exclude', minStrength: 3 }),
-      aiFiltered: count({ aiFiltered: 'only' }),
+      aiFiltered: count({ aiFiltered: 'only', visibility: 'all' }),
     };
   }
 

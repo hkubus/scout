@@ -174,8 +174,11 @@ function takeBootTopDeals() {
   return pending;
 }
 
-/** Overview's Top deals for one marketplace, as fetched; triage patches rows in place. */
-type TopDeals = { marketplace: "All" | Marketplace; listings: Listing[]; total: number };
+/**
+ * Overview's Top deals for one marketplace, as fetched; triage patches rows
+ * in place. `failed`: the latest request for this marketplace failed.
+ */
+type TopDeals = { marketplace: "All" | Marketplace; listings: Listing[]; total: number; failed?: boolean };
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
@@ -452,8 +455,11 @@ function ScoutApp({ onLogout }: { onLogout: (() => void) | null }) {
       if (boot && error instanceof ApiError && error.status === 401) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
       if (sequence !== dealsSequence.current) return;
       dirty.current.add("deals");
-      // Leave the loading state; the offline banner says why it is empty.
-      setTopDeals((previous) => previous ?? { marketplace, listings: [], total: 0 });
+      // Leave the loading state. Rows already shown for this marketplace stay;
+      // another marketplace's never stand in for it.
+      setTopDeals((previous) => previous?.marketplace === marketplace
+        ? { ...previous, failed: true }
+        : { marketplace, listings: [], total: 0, failed: true });
     }
   }, []);
   const changeOverviewMarketplace = useCallback((marketplace: "All" | Marketplace) => {
@@ -1130,7 +1136,7 @@ function Overview({
   onToggleHidden,
 }: {
   data: DashboardData;
-  /** Null until the first response; while another marketplace loads, the previous one's rows stay. */
+  /** Null until the first response; rows for another marketplace than `marketplace` mean it is still loading. */
   deals: TopDeals | null;
   marketplace: "All" | Marketplace;
   onMarketplace: (marketplace: "All" | Marketplace) => void;
@@ -1145,11 +1151,13 @@ function Overview({
   // Strong+ deals still worth a look (not hidden, passed or filtered by AI),
   // ranked by the server. A row hidden or passed here leaves at once and a
   // spare row takes its place until the reconcile refetch.
+  const current = deals?.marketplace === marketplace ? deals : null;
   const { topDeals, total } = useMemo(() => {
-    if (!deals) return { topDeals: [], total: 0 };
+    if (!current) return { topDeals: [], total: 0 };
+    const deals = current;
     const kept = deals.listings.filter((listing) => !listing.hidden && listing.decision !== "pass");
     return { topDeals: kept.slice(0, TOP_DEALS), total: Math.max(kept.length, deals.total - (deals.listings.length - kept.length)) };
-  }, [deals]);
+  }, [current]);
   const aiFilteredCount = data.stats.aiFiltered;
   const troubled = data.connectors.filter((connector) => connector.status === "Degraded" || connector.status === "Warning");
   return (
@@ -1211,16 +1219,22 @@ function Overview({
         </div>
         <ListingTable
           listings={topDeals}
-          isLoading={!deals}
+          isLoading={!current}
           onSelect={onSelectListing}
           onToggleHidden={onToggleHidden}
-          empty={
+          empty={current?.failed ? (
+            <div className="empty-state">
+              <WifiOff size={25} />
+              <strong>Couldn’t load top deals</strong>
+              <button className="link-button" onClick={() => onMarketplace(marketplace)}>Try again</button>
+            </div>
+          ) : (
             <div className="empty-state">
               <Search size={25} />
               <strong>No strong deals right now</strong>
               <span>Strong-or-better listings, weighing both % and zł below typical, show up here.</span>
             </div>
-          }
+          )}
         />
         <div className="section-footer">
           <button className="link-button" onClick={() => onNavigate("listings", { minStrength: 3, sort: "Strongest" })}>

@@ -958,7 +958,7 @@ export interface DashboardStats {
   watching: number;
   newToday: number;
   strongDeals: number;
-  /** Visible fresh feed rows AI relevance filtering judged irrelevant (Overview's "N filtered by AI"). */
+  /** Fresh feed rows AI relevance filtering judged irrelevant, hidden ones included (Overview's "N filtered by AI", Listings' AI view). */
   aiFiltered: number;
 }
 
