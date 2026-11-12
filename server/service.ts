@@ -313,6 +313,33 @@ function jevCheckConcurrency() {
 }
 
 /**
+ * AI calls in flight across the whole process (SCOUT_JEV_GLOBAL_CONCURRENCY,
+ * default 16, 1 to 64). Each pass keeps its own pool size, so without this
+ * three searches over three marketplaces could hold 54 calls at once.
+ */
+const DEFAULT_AI_GLOBAL_CONCURRENCY = 16;
+const MAX_AI_GLOBAL_CONCURRENCY = 64;
+function aiGlobalConcurrency() {
+  const configured = Number.parseInt(process.env.SCOUT_JEV_GLOBAL_CONCURRENCY ?? '', 10);
+  if (!Number.isFinite(configured) || configured < 1) return DEFAULT_AI_GLOBAL_CONCURRENCY;
+  return Math.min(configured, MAX_AI_GLOBAL_CONCURRENCY);
+}
+
+/**
+ * One AI function behind the shared limiter. A manual search's calls go
+ * first and, once the search is stopped, stop waiting (the caller's
+ * fail-open handling turns that into "unknown"). Wrapping the leaf functions
+ * covers every call site at once; they never call each other, so the
+ * limiter cannot deadlock.
+ */
+function behindLimiter<Args extends unknown[], Result>(limiter: Limiter, fn: (...args: Args) => Promise<Result>): (...args: Args) => Promise<Result> {
+  return (...args) => {
+    const scope = searchScope.getStore();
+    return limiter.run(() => fn(...args), { signal: scope?.signal, priority: scope?.priority });
+  };
+}
+
+/**
  * Misspelled searches a manual search with typoVariants runs per marketplace,
  * on page 1. SCOUT_SEARCH_TYPO_VARIANTS sets it (0 to 3); 0 turns the extra
  * fetches off while the input is still accepted.
@@ -896,19 +923,21 @@ export class ScoutService {
     this.emit = emit;
     this.searchRuns = new SearchRuns({ slots: MANUAL_SEARCH_SLOTS, deadlineMs: searchDeadlineMs(), maxRunMs: searchMaxRunMs(), ...dependencies.manualSearch });
     this.searchDeadlineDefaultMs = dependencies.manualSearch?.deadlineMs ?? searchDeadlineMs();
-    this.classifyListingRelevance = dependencies.classifyListingRelevance ?? classifyListingRelevanceWithDeepSeek;
-    this.verifyListingDescription = dependencies.verifyListingDescription ?? verifyListingDescriptionWithDeepSeek;
-    this.jevRelevance = dependencies.classifyListingRelevanceWithJev ?? classifyListingRelevanceWithJev;
-    this.jevVerification = dependencies.verifyListingDescriptionWithJev ?? verifyListingDescriptionWithJev;
-    this.jevTermMatch = dependencies.classifyTermMatchWithJev ?? classifyTermMatchWithJev;
-    this.jevNegotiability = dependencies.classifyNegotiabilityWithJev ?? classifyNegotiabilityWithJev;
-    this.jevConditionMatch = dependencies.classifyConditionMatchWithJev ?? classifyConditionMatchWithJev;
-    this.jevVariant = dependencies.classifyWatchVariantWithJev ?? classifyWatchVariantWithJev;
-    this.jevChecks = dependencies.classifyChecksWithJev ?? classifyChecksWithJev;
+    // Per-listing AI calls from scans, searches and checks share one cap.
+    const ai = new Limiter(aiGlobalConcurrency());
+    this.classifyListingRelevance = behindLimiter(ai, dependencies.classifyListingRelevance ?? classifyListingRelevanceWithDeepSeek);
+    this.verifyListingDescription = behindLimiter(ai, dependencies.verifyListingDescription ?? verifyListingDescriptionWithDeepSeek);
+    this.jevRelevance = behindLimiter(ai, dependencies.classifyListingRelevanceWithJev ?? classifyListingRelevanceWithJev);
+    this.jevVerification = behindLimiter(ai, dependencies.verifyListingDescriptionWithJev ?? verifyListingDescriptionWithJev);
+    this.jevTermMatch = behindLimiter(ai, dependencies.classifyTermMatchWithJev ?? classifyTermMatchWithJev);
+    this.jevNegotiability = behindLimiter(ai, dependencies.classifyNegotiabilityWithJev ?? classifyNegotiabilityWithJev);
+    this.jevConditionMatch = behindLimiter(ai, dependencies.classifyConditionMatchWithJev ?? classifyConditionMatchWithJev);
+    this.jevVariant = behindLimiter(ai, dependencies.classifyWatchVariantWithJev ?? classifyWatchVariantWithJev);
+    this.jevChecks = behindLimiter(ai, dependencies.classifyChecksWithJev ?? classifyChecksWithJev);
     this.aiVariantSuggestions = dependencies.suggestVariantGroups ?? suggestVariantGroupsWithDeepSeek;
     this.aiResaleListing = dependencies.writeResaleListing ?? writeResaleListingWithDeepSeek;
-    this.visionRelevance = dependencies.classifyListingRelevanceWithVision ?? classifyListingRelevanceWithVision;
-    this.visionVerification = dependencies.verifyListingDescriptionWithVision ?? verifyListingDescriptionWithVision;
+    this.visionRelevance = behindLimiter(ai, dependencies.classifyListingRelevanceWithVision ?? classifyListingRelevanceWithVision);
+    this.visionVerification = behindLimiter(ai, dependencies.verifyListingDescriptionWithVision ?? verifyListingDescriptionWithVision);
     this.readPurchaseScreenshot = dependencies.readPurchaseScreenshot ?? readPurchaseScreenshotWithVision;
     this.detailHtml = dependencies.fetchListingDetailHtml ?? ((url, marketplace) => this.fetchPublicPage(url, marketplace));
     this.publicExposureWarning = dependencies.publicExposureWarning ?? false;
@@ -6643,9 +6672,11 @@ export class ScoutService {
       limiter = new Limiter(MARKETPLACE_REQUEST_CONCURRENCY);
       this.marketplaceLimiters.set(marketplace, limiter);
     }
-    // A manual search that has been stopped drops its requests still
-    // waiting here instead of firing them later.
-    return limiter.run(task, { signal: searchScope.getStore()?.signal });
+    // A manual search's requests go ahead of waiting scan, detail and
+    // enrichment work; once it is stopped, those still waiting are dropped
+    // instead of firing later.
+    const scope = searchScope.getStore();
+    return limiter.run(task, { signal: scope?.signal, priority: scope?.priority });
   }
 
   private fetchOlxApi(url: string) { return this.marketplaceRequest('OLX', () => this.requestOlxApi(url)); }

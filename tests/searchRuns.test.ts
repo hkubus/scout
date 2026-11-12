@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { olxOffer, olxPage, searchFixture, searchInput } from './searchFixture';
+import { liveJevEnv, olxOffer, olxPage, searchFixture, searchInput } from './searchFixture';
 import { searchErrorKind, toCompactSearch } from '../server/mcpFormat';
 import { SearchCache } from '../server/searchRuns';
 
@@ -389,4 +389,62 @@ test('the result cache drops the least recently used entry and expired ones', as
   const off = new SearchCache<string>({ ttlMs: 0, entries: 50 });
   off.set('a', 'A');
   assert.equal(off.get('a'), undefined);
+});
+
+test('AI calls stay under the global cap across concurrent searches', async () => {
+  const restore = liveJevEnv();
+  const previous = process.env.SCOUT_JEV_GLOBAL_CONCURRENCY;
+  process.env.SCOUT_JEV_GLOBAL_CONCURRENCY = '4';
+  let inFlight = 0;
+  let peak = 0;
+  let calls = 0;
+  const context = searchFixture({
+    classifyListingRelevanceWithJev: async () => {
+      calls += 1;
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await flush();
+      inFlight -= 1;
+      return { relevant: true, p: 0.9, unsure: false } as any;
+    },
+  });
+  (context.service as any).fetchOlxApi = async (url: string) => {
+    const query = String(new URL(url).searchParams.get('query'));
+    return olxPage(Array.from({ length: 12 }, (_, index) => olxOffer(`${query.replace(/\s+/g, '-')}-${index}`, `${query} nr ${index}`, 100 + index)));
+  };
+  try {
+    // Each pass alone may run 6 at once: 18 wanted, 4 allowed.
+    const results = await Promise.all(['alpha one', 'bravo two', 'charlie three'].map((query) => context.service.manualSearch(searchInput(query))));
+    assert.deepEqual(results.map((result) => result.listings.length), [12, 12, 12]);
+    assert.equal(calls, 36);
+    assert.equal(peak, 4);
+  } finally {
+    if (previous === undefined) delete process.env.SCOUT_JEV_GLOBAL_CONCURRENCY;
+    else process.env.SCOUT_JEV_GLOBAL_CONCURRENCY = previous;
+    restore();
+    context.close();
+  }
+});
+
+test("a manual search's marketplace requests go ahead of waiting scan requests", async () => {
+  const context = searchFixture();
+  const service = context.service as any;
+  const order: string[] = [];
+  service.requestOlxApi = async () => {
+    order.push('search');
+    return olxPage([olxOffer('P-1', 'Walkman WM-2', 300)]);
+  };
+  const blockers: Array<() => void> = [];
+  const blocking = [1, 2].map(() => service.marketplaceRequest('OLX', () => new Promise<void>((resolve) => { blockers.push(resolve); })));
+  // Scan work queued first, outside any search.
+  const scans = [1, 2].map((index) => service.marketplaceRequest('OLX', async () => { order.push(`scan ${index}`); }));
+  try {
+    const search = context.service.manualSearch(searchInput('walkman', { aiRelevance: false }));
+    await flush();
+    blockers.shift()!();
+    assert.equal((await search).listings.length, 1);
+    blockers.shift()!();
+    await Promise.all([...blocking, ...scans]);
+    assert.deepEqual(order, ['search', 'scan 1', 'scan 2']);
+  } finally { context.close(); }
 });

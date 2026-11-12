@@ -18,10 +18,12 @@ import type { SearchFilters } from '../src/types';
 
 /**
  * What a manual search's own work runs under: marketplace requests and AI
- * calls read it to stop waiting for a slot once the search is stopped.
+ * calls read it to stop waiting for a slot once the search is stopped, and
+ * to go ahead of scan, detail and enrichment work that is waiting.
  */
 export interface SearchScope {
   signal: AbortSignal;
+  priority: 'high';
 }
 export const searchScope = new AsyncLocalStorage<SearchScope>();
 
@@ -272,7 +274,7 @@ export class SearchRuns<Part, Result> {
         await started;
         limit = setTimeout(() => this.stop(run, 'max-time'), this.settings.maxRunMs);
         limit.unref?.();
-        return await searchScope.run({ signal: run.controller.signal }, () => execute(handle));
+        return await searchScope.run({ signal: run.controller.signal, priority: 'high' }, () => execute(handle));
       } finally {
         clearTimeout(limit);
         run.settled = true;
