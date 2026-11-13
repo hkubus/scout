@@ -73,7 +73,9 @@ const isConjunction = anyOf('i|ani|oraz|ni|lub|albo|czy|and|or|nor');
 const isConditional = anyOf('jesli|jezeli|gdyby|gdy|czy|if|when|whether');
 const isLabelDenial = anyOf('brak|nie|none|no|0|zero|nic|zadn*');
 /** Packaging and extras whose damage or copy says nothing about the item: "uszkodzony kabel", "szkło hartowane uszkodzone". */
-const isNotTheDevice = anyOf('pudelk*|opakowan*|karton*|box|etui|folia|folie|folii|plomb*|naklejk*|seal|packaging|kabel|kabl*|ladowark*|szklo|szkla|szkielk*|hartowan*|ochronn*|pasek|paska');
+const isNotTheDevice = anyOf('pudelk*|opakowan*|karton*|box|etui|folia|folie|folii|plomb*|naklejk*|seal|packaging|kabel|kabl*|ladowark*|hartowan*|ochronn*|pasek|paska');
+/** Glass is an extra only as a screen protector ("uszkodzone szkło hartowane"); "uszkodzone szkło tylne" is the device. */
+const isGlass = anyOf('szklo|szkla|szkielk*');
 const isSoftener = anyOf('lekko|minimalnie|delikatnie|troche|nieznacznie|kosmetycznie|slightly');
 
 /**
@@ -94,16 +96,24 @@ const negatedBefore: Guard = (words, start) => {
 };
 
 /**
- * A negator anywhere earlier in the sentence, up to `reach` words back:
- * lock words are mostly listed as absent ("Brak blokad: iCloud, FRP"), so
- * they need the wider scope.
+ * A negator of a lock word anywhere earlier in the sentence, up to `reach`
+ * words back: lock words are mostly listed as absent ("Brak blokad: iCloud,
+ * FRP"), so they need the wider scope.
  */
+const isLockWord = anyOf('blokad*|blokow*|zablokowan*|simlock*|zabezpiecz*|icloud|frp|mdm|lock*|kont*');
+/** Words between a negator and what it denies: "brak jakichkolwiek blokad", "without any locks". */
+const isQuantifier = anyOf('jakich*|jakiej*|jakieg*|zadn*|any|typu');
 const negatedInSentence = (reach: number): Guard => (words, start) => {
   let seen = 0;
   for (let index = start - 1; index >= 0 && seen < reach; index -= 1) {
     if (words[index] === '.') return false;
     if (isBoundary(words[index])) continue;
-    if (isNegator(words[index])) return true;
+    // Only a negator that denies a lock counts: "bez ładowarki, blokada iCloud" is still locked.
+    if (isNegator(words[index])) {
+      let next = index + 1;
+      while (isGlue(words[next]) || isQuantifier(words[next])) next += 1;
+      if (isLockWord(words[next])) return true;
+    }
     seen += 1;
   }
   return false;
@@ -123,6 +133,7 @@ const labelDenied: Guard = (words, _start, end) => words[end] === ':' && isLabel
 
 /** The damage or copy is the box, case or seal, not the item: "uszkodzone pudełko", "pudełko lekko uszkodzone". */
 const notTheDevice: Guard = (words, start, end) => isNotTheDevice(words[end]) || isNotTheDevice(words[start - 1])
+  || (isGlass(words[end]) && isNotTheDevice(words[end + 1]))
   || (isSoftener(words[start - 1]) && isNotTheDevice(words[start - 2]));
 
 /** "lekko uszkodzony": cosmetic, not for parts. */
@@ -140,8 +151,8 @@ const twoBefore = (terms: string): Guard => {
   return (words, start) => !isBoundary(words[start - 1]) && (matches(words[start - 1]) || (!isBoundary(words[start - 2]) && matches(words[start - 2])));
 };
 
-/** "nie sprzedaję na części": "nie" two words back, in the same clause. ("bez ładowarki, na części" is still for parts.) */
-const negatedTwoBack: Guard = (words, start) => !isBoundary(words[start - 1]) && anyOf('nie|not')(words[start - 2]);
+/** "nie sprzedaję na części": a negated selling verb just before. ("Galaxy S10 nie ładuje na części" is still for parts.) */
+const negatedTwoBack: Guard = (words, start) => anyOf('sprzeda*|oddam|oddaj*|sell*')(words[start - 1]) && anyOf('nie|not')(words[start - 2]);
 
 /** The next word (past a colon and one glue word) denies the match: "blokada iCloud zdjęta", "zamiany mnie nie interesują". */
 const deniedAfter = (terms: string): Guard => {
@@ -223,7 +234,7 @@ const RULES: Rule[] = [
   // sold separately.
   {
     flag: 'for_parts', phrase: ['na', 'czesci'], fields: TEXT,
-    guards: [...STANDARD, negatedTwoBack, after('gwarancj*|rabat*|znizk*|rozlozon*|rozebran*|rozdziel*|podziel*|dziel*'), twoBefore('mozliw*|ewentualn*|rowniez|tez')],
+    guards: [...STANDARD, negatedTwoBack, after('gwarancj*|rabat*|znizk*|rozlozon*|rozdziel*|podziel*|dziel*'), twoBefore('mozliw*|ewentualn*|rowniez|tez')],
   },
   { flag: 'for_parts', phrase: ['uszkodzon*'], fields: TEXT, guards: [...STANDARD, notTheDevice, softened] },
   { flag: 'for_parts', phrase: ['broken'], fields: TEXT, guards: [...STANDARD, notTheDevice] },
@@ -260,6 +271,7 @@ const RULES: Rule[] = [
   // "nie oryginalne pudełko", "Ładowarka nie oryginalna" and "Ekran wymieniony
   // w serwisie, nie oryginalny" describe a part or extra, not the item.
   { flag: 'replica', phrase: ['nie', 'oryginal*|oryginaln*'], fields: TEXT, guards: [conditionalBefore, partNamed, replacedInSentence] },
+  { flag: 'replica', phrase: ['nieoryginal*'], fields: TEXT, guards: [conditionalBefore, partNamed, replacedInSentence] },
 ];
 
 /** Every start index of `phrase` in `words`. */

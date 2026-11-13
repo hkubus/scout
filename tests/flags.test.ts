@@ -55,6 +55,14 @@ const cases: Array<[string, ListingFlagInput, string[]]> = [
   ['nie posiada uszkodzonych elementów', { title: 'Konsola', description: 'Konsola nie posiada uszkodzonych elementów.' }, []],
   ['oddany do naprawy baterii', { title: 'iPhone 13', description: 'Telefon był raz oddany do naprawy baterii w serwisie Apple.' }, []],
   ['nie wymaga niczego do naprawy', { title: 'Laptop', description: 'Nie wymaga niczego do naprawy.' }, []],
+  // Re-check of #54: a fault before "na części", damaged glass on the device, and taken apart.
+  ['nie ładuje na części', { title: 'Samsung Galaxy S10 nie ładuje na części' }, ['for_parts']],
+  ['nie startuje na części', { title: 'Xiaomi Redmi Note 9 nie startuje na części' }, ['for_parts']],
+  ['nie oddam na części', { title: 'Zestaw', description: 'Komplet, nie oddam na części.' }, []],
+  ['uszkodzone szkło tylne', { title: 'iPhone 12 uszkodzone szkło tylne' }, ['for_parts']],
+  ['uszkodzone szkiełko aparatu', { title: 'iPhone XS', description: 'Uszkodzone szkiełko aparatu.' }, ['for_parts']],
+  ['uszkodzone szkło hartowane', { title: 'iPhone 13', description: 'Uszkodzone szkło hartowane, ekran cały.' }, []],
+  ['rozebrany na części', { title: 'Laptop Dell Latitude rozebrany na części' }, ['for_parts']],
   // damaged
   ['condition Uszkodzone', { title: 'iPhone 13', condition: 'Uszkodzone' }, ['damaged']],
   ['condition Uszkodzony (Allegro Lokalnie)', { title: 'iPhone 13', condition: 'Uszkodzony' }, ['damaged']],
@@ -88,6 +96,13 @@ const cases: Array<[string, ListingFlagInput, string[]]> = [
   ['konto usunięte, FRP aktywne', { title: 'Samsung A52', description: 'Konto usunięte, FRP aktywne.' }, ['locked']],
   ['FRP brak dostępu', { title: 'Samsung A52', description: 'Blokada FRP brak dostępu do konta.' }, ['locked']],
   ['z blokadą FRP na koncie poprzedniego właściciela', { title: 'Samsung A52', description: 'Telefon z blokadą FRP na koncie poprzedniego właściciela.' }, ['locked']],
+  // Re-check of #54: only a negator that denies a lock cancels one.
+  ['nie znam hasła, blokada iCloud', { title: 'iPhone 11', description: 'Nie znam hasła, blokada iCloud.' }, ['locked']],
+  ['bez ładowarki blokada iCloud', { title: 'iPhone 12 bez ładowarki blokada iCloud' }, ['locked']],
+  ['bez pudełka, FRP', { title: 'Samsung A52 bez pudełka, FRP' }, ['locked']],
+  ['nie ma blokady iCloud', { title: 'iPhone 13', description: 'Nie ma blokady iCloud.' }, []],
+  ['brak jakichkolwiek blokad iCloud i FRP', { title: 'iPhone 13', description: 'Brak jakichkolwiek blokad iCloud i FRP.' }, []],
+  ['no iCloud lock', { title: 'iPhone 13', description: 'No iCloud lock, no carrier lock.' }, []],
   // wanted_ad
   ['Kupię iPhone 13', { title: 'Kupię iPhone 13' }, ['wanted_ad']],
   ['szukam', { title: 'Szukam PS5 Digital' }, ['wanted_ad']],
@@ -131,6 +146,8 @@ const cases: Array<[string, ListingFlagInput, string[]]> = [
   ['ładowarka nie oryginalna', { title: 'iPhone 13', description: 'Ładowarka nie oryginalna, telefon oryginalny.' }, []],
   ['ekran wymieniony, nie oryginalny', { title: 'iPhone 13', description: 'Ekran wymieniony w serwisie, nie oryginalny.' }, []],
   ['iPhone, nie oryginał', { title: 'iPhone 13', description: 'Telefon nie oryginał, ale działa.' }, ['replica']],
+  ['nieoryginalne in one word', { title: 'Słuchawki AirPods Pro nieoryginalne' }, ['replica']],
+  ['nieoryginalna ładowarka', { title: 'iPhone 13', description: 'Nieoryginalna ładowarka w zestawie.' }, []],
   // accessory
   ['Etui iPhone 13 for iphone 13', { title: 'Etui iPhone 13', query: 'iphone 13' }, ['accessory']],
   ['Etui iPhone 13 for etui iphone 13', { title: 'Etui iPhone 13', query: 'etui iphone 13' }, []],
