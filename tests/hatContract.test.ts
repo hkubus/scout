@@ -27,7 +27,7 @@ const COMPACT_LISTING_KEYS = [
 ];
 const COMPACT_SOURCE_KEYS = [
   'source', 'status', 'errorKind', 'message', 'fetched', 'matched', 'returned', 'aiExcluded', 'aiUnknown',
-  'aiBudgetExhausted', 'truncated', 'pendingShipping', 'durationMs', 'backoffUntil', 'variants',
+  'aiBudgetExhausted', 'truncated', 'pendingShipping', 'durationMs', 'backoffUntil', 'variants', 'flagExcluded',
 ];
 
 function fixture(dependencies: ScoutServiceDependencies = {}) {
@@ -119,7 +119,7 @@ test('compact scout_search: stable keys, the documented values and one line of J
       assert.equal(typeof source.durationMs, 'number');
       assert.deepEqual({ ...source, durationMs: 0 }, {
         source: 'OLX', status: 'ok', errorKind: null, message: '1 matches', fetched: 1, matched: 1, returned: 1,
-        aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, truncated: false, pendingShipping: 0, durationMs: 0, backoffUntil: null, variants: null,
+        aiExcluded: 0, aiUnknown: 0, aiBudgetExhausted: 0, truncated: false, pendingShipping: 0, durationMs: 0, backoffUntil: null, variants: null, flagExcluded: 0,
       });
 
       // An OLX search narrowed to an owner type returns only that type.
@@ -255,7 +255,53 @@ test('past the AI budget rows come back as relevance "unknown" and the source co
     assert.equal(relevance.filter((value) => value === 'relevant').length, 40);
     assert.equal(relevance.filter((value) => value === 'unknown').length, 5);
     assert.deepEqual(result.details.sources.get('OLX'), {
-      fetched: 45, matched: 45, aiExcluded: 0, aiUnknown: 5, aiBudgetExhausted: 5, returned: 45, truncated: false, errorKind: null,
+      fetched: 45, matched: 45, flagExcluded: 0, aiExcluded: 0, aiUnknown: 5, aiBudgetExhausted: 5, returned: 45, truncated: false, errorKind: null,
+    });
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('compact rows carry quick flag names; excludeFlags hides them before any Jev call and the source counts them', async () => {
+  const restore = liveJevEnv();
+  const judged: string[] = [];
+  const context = fixture({
+    classifyListingRelevanceWithJev: async (listing) => { judged.push(listing.title); return { relevant: true, p: 0.9, unsure: false }; },
+    classifyTermMatchWithJev: async () => { throw new Error('no near-misses here'); },
+    classifyConditionMatchWithJev: async () => { throw new Error('no near-misses here'); },
+    classifyListingRelevanceWithVision: async () => { throw new Error('vision must not be called'); },
+  });
+  (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+    offer('GPU-OK', 'Karta graficzna GPU RTX 3060', 1000),
+    offer('GPU-PARTS', 'GPU RTX 3060 na części', 300),
+    { ...offer('GPU-DESC', 'GPU RTX 3070', 900), description: 'Karta nie działa, brak obrazu.' },
+    offer('GPU-SWAP', 'Zamienię GPU RTX 3080 na laptopa', 1500),
+  ], metadata: { visible_total_count: 4 } } });
+  try {
+    await withClient(context.service, async (search) => {
+      // Relevance verdicts are cached, so the narrowed search runs first.
+      const kept = JSON.parse((await search({ query: 'gpu', sources: ['OLX'], format: 'compact', excludeFlags: ['for_parts'] })).text);
+      assertHatContract(kept);
+      assert.deepEqual(kept.listings.map((listing: any) => [listing.listingId, listing.flags]), [['GPU-OK', []], ['GPU-SWAP', ['swap']]]);
+      assert.deepEqual(judged.sort(), ['Karta graficzna GPU RTX 3060', 'Zamienię GPU RTX 3080 na laptopa'], 'hidden rows never reach the relevance check');
+      const [source] = kept.sources;
+      assert.equal(source.fetched, 4);
+      assert.equal(source.matched, 4);
+      assert.equal(source.flagExcluded, 2);
+      assert.equal(source.returned, 2);
+      assert.match(source.message, /^2 matches.* · 2 hidden by flags$/);
+
+      const all = JSON.parse((await search({ query: 'gpu', sources: ['OLX'], format: 'compact' })).text);
+      assertHatContract(all);
+      assert.deepEqual(all.listings.map((listing: any) => [listing.listingId, listing.flags]), [
+        ['GPU-PARTS', ['for_parts']],
+        ['GPU-DESC', ['for_parts']],
+        ['GPU-OK', []],
+        ['GPU-SWAP', ['swap']],
+      ]);
+      assert.equal(all.sources[0].flagExcluded, 0);
+      assert.equal(all.sources[0].returned, 4);
     });
   } finally {
     restore();

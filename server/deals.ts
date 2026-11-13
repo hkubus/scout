@@ -1,4 +1,5 @@
-import type { DealLabel, Listing, ListingDecision, ListingDescriptionVerificationStatus, Marketplace, SellerType } from '../src/types';
+import type { DealLabel, Listing, ListingDecision, ListingDescriptionVerificationStatus, ListingFlagName, Marketplace, SellerType } from '../src/types';
+import type { StoredListingFlagName } from './flags';
 import { compactDuplicate, compactDuplicateNote, type CompactDuplicate } from './mcpFormat';
 import type { ScoutService } from './service';
 import { MATCH_VISIBILITY_MS } from './service';
@@ -65,6 +66,8 @@ export interface CompactListing {
   duplicateCount?: number;
   /** With duplicateCount: the copy with the lowest asking price, which can be above this row's price. */
   duplicateCheapest?: CompactDuplicate;
+  /** Quick flag names (for_parts, wanted_ad, swap, replica, accessory, damaged, locked); only on flagged rows. */
+  flags?: ListingFlagName[];
 }
 
 /** A full listing row with the Vinted fees note on its cheapest copy, as the compact rows carry it. */
@@ -106,6 +109,7 @@ export function compactListing(listing: Listing): CompactListing {
     ...(listing.duplicateCount && listing.duplicateCheapest
       ? { duplicateCount: listing.duplicateCount, duplicateCheapest: compactDuplicate(listing, listing.duplicateCheapest) }
       : {}),
+    ...(listing.flags?.length ? { flags: listing.flags.map((flag) => flag.flag) } : {}),
   };
 }
 
@@ -116,6 +120,8 @@ export interface DealsInput {
   variantKey?: string;
   maxPrice?: number;
   includeRejected?: boolean;
+  /** Leave out listings whose stored quick flags include any of these. */
+  excludeFlags?: StoredListingFlagName[];
   limit?: number;
 }
 
@@ -136,6 +142,7 @@ export function dealsForAgent(service: Pick<ScoutService, 'listingsPage'>, input
     minStrength: DEAL_TIER_STRENGTH[minTier],
     excludeRejected: !input.includeRejected,
     excludePassed: true,
+    excludeFlags: input.excludeFlags,
     visibility: 'visible',
     sort: 'deal',
     page: 1,

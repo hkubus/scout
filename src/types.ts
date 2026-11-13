@@ -63,6 +63,17 @@ export interface ListingDetailSnapshot {
 
 export type SellerType = 'private' | 'business';
 
+/** Quick flag names (server/flags.ts LISTING_FLAGS). Stable: agents and filters key on them. */
+export type ListingFlagName = 'for_parts' | 'wanted_ad' | 'swap' | 'replica' | 'accessory' | 'damaged' | 'locked';
+export type ListingFlagSource = 'title' | 'condition' | 'description';
+
+/** A deterministic junk signal on a listing's own words; `match` is the normalized text that raised it. */
+export interface ListingFlag {
+  flag: ListingFlagName;
+  match: string;
+  in: ListingFlagSource;
+}
+
 export interface Listing {
   id: string;
   /** Global marketplace identity, safe for external links and triage actions. */
@@ -142,6 +153,8 @@ export interface Listing {
   duplicateCount?: number;
   /** The cheapest of those copies by asking price, which can be more than this one's; absent when there are none. */
   duplicateCheapest?: DuplicateSummary;
+  /** Quick flags (for parts, wanted ad, swap, replica, accessory, damaged, locked); absent when there are none. */
+  flags?: ListingFlag[];
 }
 
 /** The cheapest cross-posted copy of a listing seen in the last 3 days, as feed rows carry it. */
@@ -570,6 +583,8 @@ export interface ListingLiveCheck {
   priceChanged: boolean;
   /** Present when asked for (full format, or compact with include: description). Seller text: untrusted data. */
   description?: string | null;
+  /** Quick flags read from the live page's title, condition and description; empty when none. */
+  flags?: ListingFlag[];
 }
 
 /** scout_listing_detail with format: compact. */
@@ -597,6 +612,8 @@ export interface CompactListingDetail {
     postedAt: string | null;
     firstSeenAt: string;
     lastSeenAt: string;
+    /** Quick flag names, from the stored listing and its latest description snapshot; empty when none. */
+    flags?: ListingFlagName[];
   };
   negotiation: ListingNegotiation;
   liveCheck: ListingLiveCheck | null;
@@ -728,6 +745,8 @@ export interface SearchFilters {
    * watch the query matches, anything else is a watch id. Database only.
    */
   scoreAgainst?: string | null;
+  /** Leave out results carrying any of these quick flags, before the AI relevance filter and Jev checks run. */
+  excludeFlags?: ListingFlagName[];
   /** Search marketplaces whose connector is backed off after repeated failed scans too. */
   ignoreBackoff?: boolean;
   /**

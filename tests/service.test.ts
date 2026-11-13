@@ -12,6 +12,7 @@ import { ScoutService, ServiceError, dashboardListingsParam, dashboardTopParam, 
 import { OTHER_VARIANT_KEY } from '../server/variants';
 import { compareStrongest } from '../src/listingRows';
 import { scoreDeal } from '../server/scoring';
+import { FLAGS_VERSION, flagsJson, storedListingFlags } from '../server/flags';
 import { legacyAnalyticsSections } from './legacyAnalytics';
 
 // Pin the legacy DeepSeek path for pre-existing tests: live Jev is the
@@ -1718,6 +1719,134 @@ test('keeps manual search results when AI relevance fails', async () => {
   } finally { context.close(); }
 });
 
+test('manual search rows carry quick flags from title, condition and the OLX description, and store them', async () => {
+  const context = fixture();
+  const fresh = new Date().toISOString();
+  const price = (value: number) => ({ key: 'price', value: { value, currency: 'PLN', negotiable: false } });
+  (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+    { id: 'FLAG-OK', url: 'https://www.olx.pl/d/oferta/flag-ok', title: 'GPU RTX 4070', created_time: fresh, description: 'Działa bez zarzutu.', params: [price(2000)] },
+    { id: 'FLAG-DESC', url: 'https://www.olx.pl/d/oferta/flag-desc', title: 'GPU RTX 3070', created_time: fresh, description: 'Nie włącza się, sprzedaję jako dawcę.', params: [price(900)] },
+    { id: 'FLAG-DMG', url: 'https://www.olx.pl/d/oferta/flag-dmg', title: 'GPU RTX 3060', created_time: fresh, params: [price(700), { key: 'state', value: { label: 'Uszkodzone' } }] },
+  ], metadata: { visible_total_count: 3 } } });
+  const search = (extra: Partial<Parameters<typeof context.service.manualSearch>[0]> = {}) => context.service.manualSearch({ query: 'gpu', sources: ['OLX'], terms: '', excluded: '', minPrice: null, maxPrice: null, shippingOnly: false, condition: 'Any', ...extra });
+  try {
+    const result = await search();
+    const byId = new Map(result.listings.map((listing) => [listing.id.slice('OLX:'.length), listing]));
+    assert.ok(!('flags' in byId.get('FLAG-OK')!), 'unflagged rows keep today\'s keys');
+    assert.deepEqual(byId.get('FLAG-DESC')!.flags, [{ flag: 'for_parts', match: 'nie wlacza', in: 'description' }]);
+    assert.deepEqual(byId.get('FLAG-DMG')!.flags, [{ flag: 'damaged', match: 'uszkodzone', in: 'condition' }]);
+    assert.equal(result.sources[0].message, '3 matches');
+
+    // Stored with the rule version, description flags included.
+    const stored = (id: string) => context.db.prepare('SELECT flags_json, flags_version FROM listings WHERE listing_id = ?').get(id) as { flags_json: string; flags_version: number };
+    assert.deepEqual({ ...stored('FLAG-OK') }, { flags_json: '[]', flags_version: FLAGS_VERSION });
+    assert.deepEqual(JSON.parse(stored('FLAG-DESC').flags_json), [{ flag: 'for_parts', match: 'nie wlacza', in: 'description' }]);
+    assert.deepEqual(JSON.parse(stored('FLAG-DMG').flags_json).map((flag: any) => flag.flag), ['damaged']);
+
+    const narrowed = await search({ excludeFlags: ['damaged', 'for_parts'] });
+    assert.deepEqual(narrowed.listings.map((listing) => listing.title), ['GPU RTX 4070']);
+    assert.equal(narrowed.sources[0].message, '1 matches · 2 hidden by flags');
+    const none = await search({ excludeFlags: ['damaged', 'for_parts'], maxPrice: 1000 });
+    assert.deepEqual(none.listings, []);
+    assert.equal(none.sources[0].message, 'No matching listings · 2 hidden by flags');
+
+    // A later sighting without a condition keeps the stored one, and with it damaged.
+    (context.service as any).fetchOlxApi = async () => ({ status: 200, json: { data: [
+      { id: 'FLAG-DMG', url: 'https://www.olx.pl/d/oferta/flag-dmg', title: 'GPU RTX 3060', created_time: fresh, params: [price(650)] },
+    ], metadata: { visible_total_count: 1 } } });
+    assert.equal((await search({ refresh: true })).listings.length, 1);
+    const resighted = context.db.prepare("SELECT condition, price_pln, flags_json FROM listings WHERE listing_id = 'FLAG-DMG'").get() as { condition: string; price_pln: number; flags_json: string };
+    assert.deepEqual([resighted.condition, resighted.price_pln], ['Uszkodzone', 650]);
+    assert.deepEqual(JSON.parse(resighted.flags_json), [{ flag: 'damaged', match: 'uszkodzone', in: 'condition' }]);
+  } finally { context.close(); }
+});
+
+test('a watch scan stores quick flags and rewrites them when the listing changes', async () => {
+  const context = fixture();
+  try {
+    seedWatch(context.db, 'flag-scan', { query: 'gpu' });
+    const fresh = new Date().toISOString();
+    const offer = { title: 'GPU RTX 3070 na części', description: 'Karta nie włącza się.', state: 'Uszkodzone' as string | null };
+    const service = context.service as any;
+    service.fetchPublicPage = async () => { throw new Error('no detail page fetch expected'); };
+    service.fetchOlxApi = async () => ({ status: 200, json: { data: [{
+      id: 'SCAN-1', url: 'https://www.olx.pl/d/oferta/scan-1', title: offer.title, description: offer.description, created_time: fresh,
+      params: [{ key: 'price', value: { value: 900, currency: 'PLN', negotiable: false } }, ...(offer.state ? [{ key: 'state', value: { label: offer.state } }] : [])],
+    }], metadata: { visible_total_count: 1 } } });
+    // Re-running the originally loaded row keeps the source due.
+    const row = context.db.prepare('SELECT * FROM watches WHERE id = ?').get('flag-scan');
+    const stored = () => context.db.prepare("SELECT flags_json, flags_version FROM listings WHERE listing_id = 'SCAN-1'").get() as { flags_json: string; flags_version: number };
+    const kept = () => context.service.listingsPage({ excludeFlags: ['for_parts'] }).pagination.total;
+
+    await service.runWatch(row);
+    assert.deepEqual(JSON.parse(stored().flags_json), [
+      { flag: 'for_parts', match: 'na czesci', in: 'title' },
+      { flag: 'damaged', match: 'uszkodzone', in: 'condition' },
+    ]);
+    assert.equal(stored().flags_version, FLAGS_VERSION);
+    assert.equal(kept(), 0);
+
+    // The seller retitles it and drops the damage: the next scan's store clears the flags.
+    Object.assign(offer, { title: 'GPU RTX 3070', description: 'Działa bez zarzutu.', state: 'Używane' });
+    await service.runWatch(row);
+    assert.equal(stored().flags_json, '[]');
+    assert.equal(kept(), 1);
+    assert.equal(context.service.listingsPage({}).listings[0].flags, undefined);
+  } finally { context.close(); }
+});
+
+test('the feed leaves out stored quick flags with an exact total, and the backfill stores the rest', async () => {
+  const context = fixture();
+  try {
+    const now = seedWatch(context.db, 'flag-watch', { query: 'iphone 13' });
+    const insertListing = context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, condition, url, flags_json, flags_version, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    const insertLink = context.db.prepare('INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)');
+    const add = (id: string, title: string, flags: string | null, version: number | null = flags === null ? null : FLAGS_VERSION, condition: string | null = null) => {
+      insertListing.run('OLX', id, title, 1000, condition, `https://www.olx.pl/d/oferta/${id}`, flags, version, now, now);
+      const listing = context.db.prepare('SELECT id FROM listings WHERE marketplace = ? AND listing_id = ?').get('OLX', id) as { id: number };
+      insertLink.run('flag-watch', listing.id, now, now);
+    };
+    add('f-ok', 'iPhone 13 128GB', '[]');
+    add('f-parts', 'iPhone 13 na części', flagsJson(storedListingFlags({ title: 'iPhone 13 na części' })));
+    // As a scan stores an OLX offer whose description says it does not start.
+    add('f-desc', 'iPhone 13 128GB', flagsJson(storedListingFlags({ title: 'iPhone 13 128GB', description: 'Nie włącza się.' })));
+    // Saved before migration 040: flagged on read, not excluded until stored.
+    add('f-swap', 'Zamienię iPhone 13 na Pixel 8', null);
+    add('f-case', 'Etui iPhone 13', '[]');
+    // Stored under an older rule version.
+    add('f-old', 'iPhone 13 uszkodzony', '[]', 0, 'Uszkodzone');
+
+    const flagsOf = (rows: any[]) => Object.fromEntries(rows.map((listing) => [listing.listingId, (listing.flags ?? []).map((flag: any) => `${flag.flag}:${flag.in}`)]));
+    assert.deepEqual(flagsOf(context.service.listingsPage({}).listings), {
+      'f-ok': [], 'f-parts': ['for_parts:title'], 'f-desc': ['for_parts:description'], 'f-swap': ['swap:title'],
+      // accessory comes from the watch query at read time and is never stored.
+      'f-case': ['accessory:title'],
+      'f-old': ['for_parts:title', 'damaged:condition'],
+    });
+    assert.ok(!('flags' in context.service.listingsPage({}).listings.find((listing) => listing.listingId === 'f-ok')!), 'unflagged feed rows omit flags');
+
+    const kept = (excludeFlags: any, pageSize = 50) => context.service.listingsPage({ excludeFlags, pageSize, sort: 'price' });
+    assert.deepEqual(kept(['for_parts']).listings.map((listing) => listing.listingId).sort(), ['f-case', 'f-ok', 'f-old', 'f-swap']);
+    assert.equal(kept(['for_parts'], 1).pagination.total, 4);
+    assert.equal(kept(['for_parts'], 1).listings.length, 1);
+    assert.equal(kept(['swap']).pagination.total, 6);
+    assert.equal(kept(['replica', 'wanted_ad']).pagination.total, 6);
+    context.db.prepare("UPDATE listings SET flags_json = 'not json' WHERE listing_id = 'f-ok'").run();
+    assert.equal(kept(['for_parts']).pagination.total, 4, 'unreadable stored flags exclude nothing');
+    context.db.prepare("UPDATE listings SET flags_json = '[]' WHERE listing_id = 'f-ok'").run();
+
+    assert.equal(await context.service.backfillListingFlags(1), 2);
+    assert.equal(await context.service.backfillListingFlags(), 0);
+    const stored = context.db.prepare("SELECT listing_id, flags_json, flags_version FROM listings WHERE listing_id IN ('f-swap', 'f-old') ORDER BY listing_id").all() as any[];
+    assert.deepEqual(stored.map((row) => [row.listing_id, JSON.parse(row.flags_json).map((flag: any) => flag.flag), row.flags_version]), [
+      ['f-old', ['for_parts', 'damaged'], FLAGS_VERSION],
+      ['f-swap', ['swap'], FLAGS_VERSION],
+    ]);
+    assert.deepEqual(kept(['swap', 'damaged']).listings.map((listing) => listing.listingId).sort(), ['f-case', 'f-desc', 'f-ok', 'f-parts']);
+    assert.equal(kept(['swap', 'damaged']).pagination.total, 4);
+  } finally { context.close(); }
+});
+
 test('partitions deterministic misses into term vs condition rescue candidates', () => {
   const base = (overrides: Record<string, any> = {}) => ({
     marketplace: 'OLX' as const, listingId: 'x', title: 'Ladowarka Dell 65W', price: 100, currency: 'PLN' as const,
@@ -2215,7 +2344,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals', '030_perf_indexes', '031_flips', '032_flip_listings', '033_verification_checks', '033_watch_alert_targets', '034_flip_ready_to_list', '034_listing_seller', '035_connected_apps', '035_negotiation_outcomes', '036_shared_sessions', '037_marketplace_session_checks', '038_watch_listing_scores', '039_listing_duplicates']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals', '030_perf_indexes', '031_flips', '032_flip_listings', '033_verification_checks', '033_watch_alert_targets', '034_flip_ready_to_list', '034_listing_seller', '035_connected_apps', '035_negotiation_outcomes', '036_shared_sessions', '037_marketplace_session_checks', '038_watch_listing_scores', '039_listing_duplicates', '040_listing_flags']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -2712,7 +2841,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 44);
+    assert.equal(after.migrations.count, 45);
   } finally { context.close(); }
 });
 

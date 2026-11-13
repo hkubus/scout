@@ -10,6 +10,7 @@ import { VERIFICATION_CHECKS_MAX, VERIFICATION_CHECK_MAX_CHARS } from './ai';
 import { FLIP_CHANNELS } from '../src/profit';
 import { DEAL_TIERS, DEAL_TIER_STRENGTH, DEALS_DEFAULT_LIMIT, DEALS_MAX_LIMIT, LISTING_VERIFICATION_FILTERS, compactListing, dealsForAgent, withDuplicateNote } from './deals';
 import { MARKETPLACE_SEARCH_SORTS } from './marketplaces';
+import { LISTING_FLAGS, STORED_LISTING_FLAGS } from './flags';
 
 export const MCP_DASHBOARD_LISTINGS = 20;
 
@@ -20,6 +21,10 @@ const verificationChecks = z.array(z.object({ text: z.string().trim().min(1).max
 const watchId = z.string().trim().min(1).max(160);
 const variantKey = z.string().trim().min(1).max(64).describe('A model variant id of the watch (scout_watches); __other__ is its unmatched bucket.');
 const dealTier = z.enum(DEAL_TIERS);
+// Descriptions say "exchange offer" for the swap flag: Hatbot's moneyKind
+// treats swap as a payment word, and the tests hold every description to it.
+const feedExcludeFlags = z.array(z.enum(STORED_LISTING_FLAGS)).max(STORED_LISTING_FLAGS.length)
+  .describe('Leave out listings with any of these quick flags: for_parts (broken, for parts or repair), wanted_ad (a wanted ad), the exchange-offer flag (zamiana), replica (fake or copy), damaged (condition label says damaged), locked (iCloud, FRP/Google account or MDM lock). Flagged rows carry flags either way.');
 const flipChannel = z.enum(FLIP_CHANNELS);
 const flipDate = z.string().regex(/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/).describe('YYYY-MM-DD.');
 const flipAmount = z.number().nonnegative().max(10_000_000);
@@ -155,6 +160,7 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       minPrice: z.number().nonnegative().optional().describe('PLN.'),
       maxPrice: z.number().nonnegative().optional().describe('PLN.'),
       verification: z.enum(LISTING_VERIFICATION_FILTERS).optional().describe('AI description check status; none = never checked.'),
+      excludeFlags: feedExcludeFlags.optional(),
       format: z.enum(['full', 'compact']).optional().describe('compact: short rows (id, price, typical, discountPercent, tier, estimatedNet, watch, variant, url, seenAt, verification...; duplicateCount and duplicateCheapest when the item is also listed on another marketplace), as scout_deals returns. Default full; full rows carry the same duplicateCheapest, with the note on Vinted\'s fees.'),
     },
     annotations: { readOnlyHint: true },
@@ -174,6 +180,7 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       variantKey: variantKey.optional(),
       maxPrice: z.number().positive().optional().describe('PLN.'),
       includeRejected: z.boolean().optional().default(false).describe('Keep listings the AI description check rejected.'),
+      excludeFlags: feedExcludeFlags.optional(),
       limit: z.number().int().min(1).max(DEALS_MAX_LIMIT).optional().default(DEALS_DEFAULT_LIMIT),
     },
     annotations: { readOnlyHint: true, idempotentHint: true },
@@ -358,6 +365,8 @@ export function registerScoutMcpTools(server: McpServer, service: ScoutService) 
       aiRelevance: z.boolean().optional().default(true),
       verificationChecks: z.array(z.object({ text: z.string().trim().min(1).max(120), mode: z.enum(['require', 'exclude']) })).max(8).optional()
         .describe('Jev reads each result: exclude hides near-certain matches; require-confirmed results come back with jevCheck "passed".'),
+      excludeFlags: z.array(z.enum(LISTING_FLAGS)).max(LISTING_FLAGS.length).optional()
+        .describe('Drop results with any of these quick flags before the AI relevance check and Jev checks, so they cost no Jev call: for_parts (for parts or repair), wanted_ad (a wanted ad), the exchange-offer flag (zamiana), replica (fake or copy), accessory (an accessory the query did not ask for), damaged (condition label), locked (iCloud, FRP/Google account or MDM lock). Without it nothing is dropped and each result still carries its flags; the source message counts what was hidden.'),
       scoreAgainst: z.string().trim().min(1).max(160).optional()
         .describe('"auto" or a watch id. Each result gets deal {typical, discountPercent, deviation, tier, label, qualifies, basis, variantKey, variantLabel}, scored against that watch\'s learned typical asking price exactly as its scan would; deal is null where the watch\'s own filters would not keep the result. "auto" picks the watch the query names (the scout_price_reference match); scoredAgainst says which, or is null when none matches. Compact rows carry deal too. Database only: no extra fetch or AI call.'),
       ignoreBackoff: z.boolean().optional().default(false)
