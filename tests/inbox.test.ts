@@ -132,6 +132,44 @@ test('Vinted inbox and conversations parse; bundles have no single listing', () 
   assert.equal(parseVintedConversation({ code: 0 }), null);
 });
 
+test('Vinted offers through the offer button parse as offers, in the shape Vinted sent on 2026-11-14', () => {
+  const thread = parseVintedConversation(fixtures.vinted.conversations['7004'])!;
+  assert.deepEqual([thread.lookup, thread.other, thread.read], [{ listingKey: 'Vinted:4005', role: 'sell', title: 'Procesor do komputera' }, { id: '504', name: 'kupujacy_h' }, true]);
+  assert.deepEqual(thread.messages, [
+    { id: '9401', direction: 'in', type: 'offer', text: '189,00 zł', time: '2026-11-04T14:49:00.000Z', offer: { amount: 189, status: 'rejected' } },
+    { id: '94020000001', direction: 'in', type: 'text', text: 'Hej! Zgodzisz się na sprzedaż za 189,00 zł?', time: '2026-11-04T14:49:01.000Z', offer: null },
+    { id: '94030000001', direction: 'out', type: 'offer', text: '230,00 zł', time: '2026-11-04T15:05:00.000Z', offer: { amount: 230, status: 'proposed' } },
+    { id: '9404', direction: 'in', type: 'offer', text: '205,50 zł', time: '2026-11-04T15:20:00.000Z', offer: { amount: 205.5, status: 'cancelled' } },
+    { id: 'action_message:2026-11-04T16:00:00.000Z', direction: 'system', type: 'event', text: 'Przedmiot jest już niedostępny — Kupiony przez innego członka', time: '2026-11-04T16:00:00.000Z', offer: null },
+  ]);
+});
+
+test('A Vinted offer without a readable price object takes its amount from the price label', () => {
+  const { conversation } = fixtures.vinted.conversations['7004'];
+  const [request, , counter] = conversation.messages;
+  const offers = (...changed: Array<[Record<string, any>, Record<string, unknown>]>) => parseVintedConversation({
+    conversation: { ...conversation, messages: changed.map(([message, entity]) => ({ ...message, entity: { ...message.entity, ...entity } })) },
+  })!.messages.map((message) => [message.type, message.text, message.offer]);
+
+  assert.deepEqual(offers(
+    [request, { price: undefined }],
+    [counter, { price: '230.0' }],
+    [request, { price: { cents: 18900, currency: 'PLN' }, created_at_ts: undefined }],
+  ), [
+    ['offer', '189,00 zł', { amount: 189, status: 'rejected' }],
+    ['offer', '189,00 zł', { amount: 189, status: 'rejected' }],
+    ['offer', '230,00 zł', { amount: 230, status: 'proposed' }],
+  ], 'no price object, a bare string, an amount under another key');
+  assert.deepEqual(offers(
+    [request, { price: undefined, price_label: '1\u00a0249,50 zł', body: '1\u00a0249,50 zł' }],
+    [counter, { price: undefined, price_label: undefined, body: '420 zł' }],
+  ).map(([, , offer]) => offer), [{ amount: 1249.5, status: 'rejected' }, { amount: 420, status: 'proposed' }], 'thousands, and the body when there is no label');
+  assert.deepEqual(offers(
+    [request, { price: undefined, price_label: 'około 200 zł', body: '' }],
+    [counter, { price: { amount: '12.0', currency_code: 'EUR' }, currency: 'EUR', price_label: '12,00 €' }],
+  ), [['event', 'około 200 zł', null], ['event', '12,00 €', null]], 'a label that is not a price alone, or not in złoty, stays an event');
+});
+
 test('Allegro Lokalnie inbox, messages and subjects parse', () => {
   const [enquiry, purchase, empty] = parseAllegroInbox(fixtures.allegroLokalnie.inbox);
   assert.deepEqual(enquiry, {
