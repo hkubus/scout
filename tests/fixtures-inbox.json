@@ -1,5 +1,5 @@
 {
-  "_comment": "Synthetic inbox responses in the shapes OLX, Vinted and Allegro Lokalnie returned on 2026-10-17. Every id, name, text and price is made up; fields Scout ignores are trimmed.",
+  "_comment": "Synthetic inbox responses in the shapes OLX, Vinted and Allegro Lokalnie returned on 2026-10-17 (Vinted's conversation 7004 on 2026-11-14). Every id, name, text and price is made up; fields Scout ignores are trimmed.",
   "olx": {
     "unread": {
       "data": [
@@ -115,6 +115,73 @@
           ],
           "transaction": { "id": 83, "current_user_side": "seller", "item_count": 2, "item_ids": [4003, 4004], "item_title": "Zestaw" },
           "opposite_user": { "id": 503, "login": "kupujacy_f" }
+        },
+        "code": 0
+      },
+      "7004": {
+        "_comment": "Selling: a buyer's offers through Vinted's offer button and our counter-offer, with every entity key Vinted sent on 2026-11-14.",
+        "conversation": {
+          "id": 7004,
+          "read_by_current_user": true,
+          "read_by_opposite_user": false,
+          "subtitle": "Procesor do komputera",
+          "messages": [
+            {
+              "id": 9401,
+              "entity_type": "offer_request_message",
+              "entity": {
+                "offer_request_id": 9401, "transaction_id": 84, "user_id": 504, "status": 30, "status_title": "Odrzucone",
+                "body": "189,00 zł", "title": "Kupujący zaproponował cenę za przedmiot", "price_label": "189,00 zł", "original_price_label": "249,99 zł",
+                "original_price": { "amount": "249.99", "currency_code": "PLN" }, "price": { "amount": "189.0", "currency_code": "PLN" },
+                "currency": "PLN", "current": false, "price_fixed": true
+              },
+              "created_at_ts": "2026-11-04T15:49:00+01:00"
+            },
+            {
+              "entity_type": "message",
+              "entity": { "body": "Hej! Zgodzisz się na sprzedaż za 189,00 zł?", "photos": [], "user_id": 504, "sent_via_mobile": false, "id": 94020000001, "is_hidden": false, "safety_flag": 0 },
+              "created_at_ts": "2026-11-04T15:49:01+01:00",
+              "created_time_ago": "04.11.2026"
+            },
+            {
+              "id": 94030000001,
+              "entity_type": "offer_message",
+              "entity": {
+                "price_label": "230,00 zł", "price": { "amount": "230.0", "currency_code": "PLN" }, "original_price_label": "249,99 zł",
+                "original_price": { "amount": "249.99", "currency_code": "PLN" }, "currency": "PLN", "user_id": 400, "current": false, "price_fixed": true
+              },
+              "created_at_ts": "2026-11-04T16:05:00+01:00"
+            },
+            {
+              "id": 9404,
+              "entity_type": "offer_request_message",
+              "entity": {
+                "offer_request_id": 9404, "transaction_id": 84, "user_id": 504, "status": 40, "status_title": "Anulowane",
+                "body": "205,50 zł", "title": "Kupujący zaproponował cenę", "price_label": "205,50 zł", "original_price_label": "249,99 zł",
+                "original_price": { "amount": "249.99", "currency_code": "PLN" }, "price": { "amount": "205.5", "currency_code": "PLN" },
+                "currency": "PLN", "current": true, "price_fixed": true
+              },
+              "created_at_ts": "2026-11-04T16:20:00+01:00"
+            },
+            {
+              "entity_type": "action_message",
+              "entity": {
+                "template": { "style": "gray_box" }, "title": "Przedmiot jest już niedostępny", "subtitle": "Kupiony przez innego członka",
+                "actions": [], "interpolation_values": { "title": { "username": "kupujacy_h", "current_username": "sprzedajacy_z", "count": 1 } }
+              },
+              "created_at_ts": "2026-11-04T17:00:00+01:00",
+              "created_time_ago": "04.11.2026",
+              "display_group": 10,
+              "event_group": "sale",
+              "event_type": "not_available"
+            }
+          ],
+          "transaction": {
+            "id": 84, "status": 450, "offer_id": 85, "buyer_id": 504, "seller_id": 400, "is_completed": false, "current_user_side": "seller",
+            "is_bundle": false, "item_count": 1, "item_id": 4005, "item_ids": [4005], "item_title": "Procesor do komputera",
+            "offer_price": { "amount": "249.99", "currency_code": "PLN" }
+          },
+          "opposite_user": { "id": 504, "login": "kupujacy_h", "is_system": false }
         },
         "code": 0
       }

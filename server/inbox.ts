@@ -256,6 +256,14 @@ function pln(amount: unknown, currency: unknown, divisor = 1) {
   return Number.isFinite(value) && value > 0 ? Math.round((value / divisor) * 100) / 100 : null;
 }
 
+/** A złoty price label and nothing else, as Vinted writes it: "189,00 zł", "1 249,50 zł". */
+const PRICE_LABEL = /^(\d{1,3}(?:[\s  .]\d{3})+|\d+)(?:,(\d{1,2}))?\s*(?:zł|pln)$/i;
+
+function plnLabel(value: unknown) {
+  const match = typeof value === 'string' ? PRICE_LABEL.exec(value.trim()) : null;
+  return match ? pln(`${match[1].replace(/\D/g, '')}.${match[2] ?? '0'}`, 'PLN') : null;
+}
+
 const byTime = (a: { time: string | null }, b: { time: string | null }) => (a.time ?? '').localeCompare(b.time ?? '');
 
 function offerStatus(action: string): NonNullable<InboxMessage['offer']>['status'] {
@@ -364,8 +372,9 @@ export function parseVintedConversation(json: unknown): { lookup: Lookup; other:
     const id = idText(entity.id) ?? idText(message.id) ?? idText(entity.offer_request_id) ?? `${kind || 'event'}:${time ?? index}`;
     if (kind === 'message') return [{ id, direction, type: 'text', text: plainText(entity.body), time, offer: null }];
     if (kind === 'offer_request_message' || kind === 'offer_message') {
+      // `price` was {amount, currency_code} on 2026-10-17 and 2026-11-14; the label is all an offer shows otherwise.
       const price = record(entity.price);
-      const amount = pln(price?.amount, price?.currency_code ?? entity.currency);
+      const amount = pln(price?.amount, price?.currency_code ?? entity.currency) ?? plnLabel(entity.price_label) ?? plnLabel(entity.body);
       const status = kind === 'offer_message' ? 'proposed' : VINTED_OFFER_STATUS[Number(entity.status)] ?? null;
       return [{ id, direction, type: amount === null ? 'event' : 'offer', text: plainText(entity.body) || plainText(entity.price_label), time, offer: amount === null ? null : { amount, status } }];
     }
