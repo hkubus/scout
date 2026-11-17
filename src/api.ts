@@ -56,6 +56,27 @@ async function fetchJson<T>(path: string, init?: RequestInit, timeoutMs = 20_000
   }
 }
 
+/** A file from the API, with the name its Content-Disposition suggests; errors arrive as JSON like any other call. */
+async function fetchFile(path: string, timeoutMs: number): Promise<{ blob: Blob; filename: string | null }> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(
+    () => controller.abort(new ApiError(`Request timed out after ${Math.round(timeoutMs / 1000)}s`, 0)),
+    timeoutMs,
+  );
+  try {
+    const response = await fetch(path, { signal: controller.signal });
+    if (response.status === 401) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({})) as { error?: string };
+      throw new ApiError(payload.error ?? `Request failed (${response.status})`, response.status);
+    }
+    const filename = /filename="([^"]+)"/.exec(response.headers.get('content-disposition') ?? '')?.[1] ?? null;
+    return { blob: await response.blob(), filename };
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit, timeoutMs?: number): Promise<T> {
   const canDedupe = (init?.method ?? 'GET').toUpperCase() === 'GET';
   if (!canDedupe) return fetchJson<T>(path, init, timeoutMs);
@@ -195,5 +216,6 @@ export const api = {
   logs: (signal?: AbortSignal) => request<{ logs: LogEntry[] }>('/api/logs', { signal }),
   exportData: () => request<Record<string, unknown>>('/api/export'),
   backup: () => request<{ backup: string; message: string }>('/api/backup', { method: 'POST' }),
+  improvementExport: (includePrivate: boolean) => fetchFile(`/api/export/improvement?includePrivate=${includePrivate}`, 15 * 60_000),
   systemUpdate: () => request<{ ok: true; message: string; steps: { command: string; success: boolean; output: string }[] }>('/api/system/update', { method: 'POST' }, 360_000),
 };

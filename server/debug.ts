@@ -15,9 +15,9 @@ import type { ScoutService } from './service';
 
 export const REDACTED = '[redacted: encrypted secret]';
 // encryptSecret() output: base64url(12-byte iv).base64url(16-byte tag).base64url(ciphertext)
-const ENCRYPTED_SECRET = /^[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]+$/;
+export const ENCRYPTED_SECRET = /^[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]+$/;
 // The same shape anywhere inside a value, e.g. `' ' || value` in free-form SQL.
-const EMBEDDED_SECRET = /[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]+/g;
+export const EMBEDDED_SECRET = /[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]+/g;
 const QUERY_TIMEOUT_MS = 5_000;
 const QUERY_MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
 const READ_STATEMENT = /^(?:select|with|values|explain|pragma)\b/i;
@@ -30,6 +30,22 @@ const SAFE_ENV_KEYS = [
   'SCOUT_CHROMIUM_PATH', 'SCOUT_DIST_PATH', 'SCOUT_SEED_DEMO', 'SCOUT_SKIP_MIGRATION_BACKUP',
 ];
 const SECRET_ENV_KEYS = ['SCOUT_SECRET', 'SCOUT_OPENROUTER_API_KEY', 'OPENROUTER_API_KEY'];
+
+/** The process and the non-secret configuration it runs with; secrets only as configured or not. */
+export function runtimeEnvironment() {
+  const env: Record<string, string | null> = {};
+  for (const key of SAFE_ENV_KEYS) env[key] = process.env[key] ?? null;
+  const secretsConfigured: Record<string, boolean> = {};
+  for (const key of SECRET_ENV_KEYS) secretsConfigured[key] = Boolean(process.env[key]?.trim());
+  return {
+    uptimeSeconds: Math.round(process.uptime()),
+    node: process.version,
+    platform: `${process.platform}/${process.arch}`,
+    memory: process.memoryUsage(),
+    env,
+    secretsConfigured,
+  };
+}
 
 /**
  * SCOUT_DEBUG_API=true/false decides explicitly; unset, the debug API is on
@@ -126,29 +142,59 @@ process.stdin.on('end', () => {
 
 type QueryChildResult = { error?: 'open' | 'sql'; message?: string; columns?: string[]; rows?: Array<Record<string, unknown>>; truncated?: boolean };
 
-function runQueryChild(payload: object, timeoutMs: number): Promise<QueryChildResult> {
+/**
+ * Run `script` in a short-lived Node child that reads `payload` as JSON on
+ * stdin and prints one JSON result on stdout, so slow SQLite work cannot
+ * block Scout's event loop. The child is killed at the deadline, when its
+ * output passes maxOutputBytes, or when `signal` aborts.
+ */
+export function runNodeChild<T>(script: string, payload: object, options: {
+  timeoutMs: number;
+  maxOutputBytes: number;
+  errors: { timeout: () => Error; tooLarge: () => Error; noResult: () => Error; aborted?: () => Error };
+  signal?: AbortSignal;
+}): Promise<T> {
   return new Promise((resolvePromise, reject) => {
+    const aborted = options.errors.aborted ?? (() => new ServiceError('The request was cancelled', 400));
+    if (options.signal?.aborted) { reject(aborted()); return; }
     // Keep flags such as --experimental-sqlite that node:sqlite needs on older Node 22.
     const flags = process.execArgv.filter((flag) => flag.startsWith('--experimental'));
-    const child = spawn(process.execPath, [...flags, '--no-warnings', '--max-old-space-size=256', '-e', QUERY_CHILD], { stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: process.env.PATH ?? '' } });
+    const child = spawn(process.execPath, [...flags, '--no-warnings', '--max-old-space-size=256', '-e', script], { stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: process.env.PATH ?? '' } });
     const chunks: Buffer[] = [];
     let bytes = 0;
     let failure: Error | null = null;
     const kill = (error: Error) => { if (!failure) { failure = error; child.kill('SIGKILL'); } };
-    const timer = setTimeout(() => kill(new ServiceError(`Query exceeded the ${timeoutMs} ms debug time limit and was stopped`, 400)), timeoutMs);
+    const timer = setTimeout(() => kill(options.errors.timeout()), options.timeoutMs);
+    const onAbort = () => kill(aborted());
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    const settle = () => { clearTimeout(timer); options.signal?.removeEventListener('abort', onAbort); };
     child.stdout.on('data', (chunk: Buffer) => {
       bytes += chunk.byteLength;
-      if (bytes > QUERY_MAX_OUTPUT_BYTES) kill(new ServiceError('Query result is too large; select fewer columns or rows', 400));
+      if (bytes > options.maxOutputBytes) kill(options.errors.tooLarge());
       else chunks.push(chunk);
     });
     child.stderr.resume();
-    child.on('error', (error) => { clearTimeout(timer); reject(error); });
+    // A child killed before it read its input closes stdin under us.
+    child.stdin.on('error', () => {});
+    child.on('error', (error) => { settle(); reject(error); });
     child.on('close', () => {
-      clearTimeout(timer);
+      settle();
       if (failure) { reject(failure); return; }
-      try { resolvePromise(JSON.parse(Buffer.concat(chunks).toString('utf8')) as QueryChildResult); } catch { reject(new ServiceError('Query process ended without a result (out of memory?)', 400)); }
+      try { resolvePromise(JSON.parse(Buffer.concat(chunks).toString('utf8')) as T); } catch { reject(options.errors.noResult()); }
     });
     child.stdin.end(JSON.stringify(payload));
+  });
+}
+
+function runQueryChild(payload: object, timeoutMs: number): Promise<QueryChildResult> {
+  return runNodeChild<QueryChildResult>(QUERY_CHILD, payload, {
+    timeoutMs,
+    maxOutputBytes: QUERY_MAX_OUTPUT_BYTES,
+    errors: {
+      timeout: () => new ServiceError(`Query exceeded the ${timeoutMs} ms debug time limit and was stopped`, 400),
+      tooLarge: () => new ServiceError('Query result is too large; select fewer columns or rows', 400),
+      noResult: () => new ServiceError('Query process ended without a result (out of memory?)', 400),
+    },
   });
 }
 
@@ -260,19 +306,10 @@ export class ScoutDebug {
 
   /** Process, configuration, readiness, and the in-memory log buffer. */
   runtime() {
-    const env: Record<string, string | null> = {};
-    for (const key of SAFE_ENV_KEYS) env[key] = process.env[key] ?? null;
-    const secrets: Record<string, boolean> = {};
-    for (const key of SECRET_ENV_KEYS) secrets[key] = Boolean(process.env[key]?.trim());
     return {
       now: new Date().toISOString(),
       pid: process.pid,
-      uptimeSeconds: Math.round(process.uptime()),
-      node: process.version,
-      platform: `${process.platform}/${process.arch}`,
-      memory: process.memoryUsage(),
-      env,
-      secretsConfigured: secrets,
+      ...runtimeEnvironment(),
       readiness: this.service.readiness(),
       settings: this.service.settings(),
       logs: this.service.logs(),

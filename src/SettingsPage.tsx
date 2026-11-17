@@ -4,6 +4,7 @@ import {
   ArrowRight,
   Check,
   Database,
+  Download,
   LoaderCircle,
   LogOut,
   Unplug,
@@ -136,6 +137,8 @@ export default function SettingsPage({
   const [savingSession, setSavingSession] = useState(false);
   const [checkingSession, setCheckingSession] = useState<Marketplace | null>(null);
   const [recoveryBusy, setRecoveryBusy] = useState(false);
+  const [preparingImprovement, setPreparingImprovement] = useState(false);
+  const [improvementIncludesPrivate, setImprovementIncludesPrivate] = useState(true);
   const [resettingAi, setResettingAi] = useState(false);
   const [updating, setUpdating] = useState(false);
   const [updateOutput, setUpdateOutput] = useState<string | null>(null);
@@ -424,6 +427,26 @@ export default function SettingsPage({
     } catch (error) {
       onToast(errorMessage(error), "error");
     } finally {
+      setRecoveryBusy(false);
+    }
+  };
+  const exportImprovementData = async () => {
+    setRecoveryBusy(true);
+    setPreparingImprovement(true);
+    try {
+      const { blob, filename } = await api.improvementExport(improvementIncludesPrivate);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename ?? `scout-improvement-${new Date().toISOString().slice(0, 10)}.sqlite`;
+      anchor.click();
+      // A large file can still be starting its save when click() returns.
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      onToast("Improvement data downloaded.");
+    } catch (error) {
+      onToast(errorMessage(error), "error");
+    } finally {
+      setPreparingImprovement(false);
       setRecoveryBusy(false);
     }
   };
@@ -731,6 +754,17 @@ export default function SettingsPage({
               <button className="outline-button" title="A WAL-aware SQLite copy beside the database; store it with the deployment secret" disabled={recoveryBusy || resettingAi || !settingsLoaded} onClick={() => void createBackup()}><ShieldCheck size={15} />Create database backup</button>
               <button className="outline-button danger-outline" disabled={recoveryBusy || resettingAi || !settingsLoaded} onClick={() => void resetAiResults()}>{resettingAi ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}Reset AI results</button>
             </div>
+            <div className="settings-actions settings-actions--stack">
+              <button className="outline-button" title="One SQLite file to analyse what Scout should do better" disabled={recoveryBusy || resettingAi || !settingsLoaded} onClick={() => void exportImprovementData()}>
+                {preparingImprovement ? <LoaderCircle size={15} className="spin" /> : <Download size={15} />}
+                {preparingImprovement ? "Preparing…" : "Download improvement data"}
+              </button>
+              <label className="check-option" title="Your buy, sale and agreed prices: the real outcome of the deals Scout found">
+                <input type="checkbox" checked={improvementIncludesPrivate} disabled={recoveryBusy} onChange={(event) => setImprovementIncludesPrivate(event.target.checked)} />
+                <strong>Include flips and negotiation outcomes</strong>
+              </label>
+            </div>
+            <p className="settings-inline-note">Improvement data holds everything Scout has seen and decided: listings, prices, scores, AI verdicts, your triage, scans, connector runs, alerts and the recent log, with a guide to each table. API keys, webhooks, ntfy topics, marketplace and sign-in sessions, connected apps and photos are left out.</p>
           </Section>
           <Section title="Update and access">
             <div className="settings-actions settings-actions--stack">

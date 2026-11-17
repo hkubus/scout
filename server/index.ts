@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { listings as seedListings, watches as seedWatches } from '../src/data';
 import { MARKETPLACE_SEARCH_SORTS, validateSearchUrl } from './marketplaces';
 import { debugApiEnabled, ScoutDebug } from './debug';
+import { buildImprovementExport, improvementContext, improvementExportStream } from './improvementExport';
 import { backupDatabase, openDatabase, seedDatabase, startWalCheckpointer } from './db';
 import { buildDiscordEmbed } from './notifications';
 import { compressApiResponse } from './compression';
@@ -128,7 +129,7 @@ app.addHook('onRequest', async (request, reply) => {
   // Other /mcp POSTs count like any API call; the handler charges live tool
   // calls to the expensive bucket once the body is parsed and auth passed.
   const connectedApp = route === '/mcp' && isConnectedAppToken(bearerToken(request.headers.authorization) ?? '');
-  const expensive = !connectedApp && (/\/search$|\/categories$|\/scan$|\/check$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/listing-draft$|\/flips\/import\/(?:url|screenshot)$|\/market-watches$|\/export$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route));
+  const expensive = !connectedApp && (/\/search$|\/categories$|\/scan$|\/check$|\/scans$|\/compare-verification$|\/snapshot$|\/trend$|\/analytics$|\/listing-detail$|\/listing-draft$|\/flips\/import\/(?:url|screenshot)$|\/market-watches$|\/export(?:\/improvement)?$|\/settings\/(?:webhook|ntfy)\/test$|\/settings\/ai\/reset$|\/backup$|\/system\/update$/.test(route));
   // Registration is public, so it gets the tightest bucket of its own.
   const limit = route === '/oauth/register' ? 10 : route === '/oauth/token' || route === CONSENT_PATH ? 30 : expensive ? 30 : connectedApp ? 120 : 240;
   // Snapshot images use the general limit so a screen of saved photos loads.
@@ -482,6 +483,26 @@ app.get('/api/export', async (_request, reply) => {
   return reply.header('Content-Disposition', `attachment; filename="scout-export-${new Date().toISOString().slice(0, 10)}.json"`).type('application/json').send(stream);
 });
 app.post('/api/backup', async (_request, reply) => reply.code(201).send({ backup: basename(backupDatabase(db)), message: 'SQLite backup created beside the configured database file.' }));
+// Everything that could help improve Scout as one redacted SQLite file (see
+// README "Improvement data"). Built in a child process beside the database, streamed
+// (compressed when the client accepts it), then deleted. Leaving early stops
+// the build.
+app.get('/api/export/improvement', async (request, reply) => {
+  const query = z.object({ includePrivate: z.enum(['true', 'false']).optional() }).strict().safeParse(request.query);
+  if (!query.success) return reply.code(400).send({ error: 'includePrivate must be true or false' });
+  const left = new AbortController();
+  let stream: ReturnType<typeof improvementExportStream> | undefined;
+  reply.raw.once('close', () => { left.abort(); stream?.destroy(); });
+  const file = await buildImprovementExport(db, { includePrivate: query.data.includePrivate !== 'false', context: improvementContext(service), signal: left.signal });
+  // The client left just as the file was finished: nobody will read it.
+  if (left.signal.aborted) { file.cleanup(); return reply.code(400).send({ error: 'The improvement export was cancelled' }); }
+  stream = improvementExportStream(file);
+  return reply
+    .header('Content-Disposition', `attachment; filename="${file.filename}"`)
+    .header('Cache-Control', 'no-store')
+    .type('application/vnd.sqlite3')
+    .send(stream);
+});
 
 app.put('/api/marketplace-sessions/:marketplace', async (request, reply) => {
   const params = z.object({ marketplace: marketplaceParam }).safeParse(request.params);
