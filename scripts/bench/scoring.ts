@@ -38,7 +38,7 @@ import {
   type ListingState,
   type WatchCfg,
 } from './scoring-data';
-import { normalizeFilterText, parseIncludedExcluded, termMatches } from '../../server/text';
+import { excludedTermMatches, normalizeFilterText, parseIncludedExcluded } from '../../server/text';
 import { DEFAULT_FEE_PRESETS, estimatedNetAtTypical, flipNet, isFlipChannel, normalizeFeePresets, saleFee, type FeePresets } from '../../src/profit';
 
 const started = Date.now();
@@ -360,8 +360,10 @@ for (const watch of watches) {
   for (const assoc of assocByWatch.get(watch.id)?.values() ?? []) {
     const listing = listings.get(assoc.listingId);
     if (!listing) continue;
+    // As the watch filter decides it now (evaluateDeterministic): excluded terms and their inflections, on the title and the condition label.
     const title = normalizeFilterText(listing.title);
-    const excludedHit = excluded.some((term) => termMatches(title, title.replace(/ /g, ''), term));
+    const conditionText = normalizeFilterText(listing.condition ?? '');
+    const excludedHit = excluded.some((term) => excludedTermMatches(title, title.replace(/ /g, ''), term) || (conditionText !== '' && excludedTermMatches(conditionText, conditionText.replace(/ /g, ''), term)));
     const isBroken = junkKinds(listing.title, watch.query).includes('broken');
     if (isBroken) {
       broken += 1;
@@ -382,7 +384,7 @@ for (const watch of watches) {
 }
 bench.metric('scoring.exclusion.broken_title_kept', 'Watch listings with a broken/for-parts title that the watch\'s excluded terms let through ("uszkodzone" misses "uszkodzona", "niesprawna", …)', brokenKept, 'count', 'lower', `of ${brokenTotal} broken titles`);
 bench.metric('scoring.exclusion.broken_title_kept_strong_plus', 'Of those, labelled Strong+ (they look like deals because they are broken)', brokenKeptStrong, 'count', 'lower');
-bench.metric('scoring.exclusion.damaged_condition_kept', 'Watch listings whose marketplace condition says damaged/for parts (exclusions only read the title)', damagedConditionKept, 'count', 'lower');
+bench.metric('scoring.exclusion.damaged_condition_kept', 'Watch listings whose marketplace condition says damaged/for parts that the watch\'s excluded terms let through (watches without exclusions count too)', damagedConditionKept, 'count', 'lower');
 bench.metric('scoring.flags.broken_title_unflagged_share', 'Broken-title watch listings without a damaged/for_parts quick flag', ratio(brokenUnflagged, brokenTotal), 'share', 'lower', `n=${brokenTotal}`);
 bench.table('exclusions_by_watch', exclusionRows);
 bench.table('exclusion_misses', exclusionExamples);

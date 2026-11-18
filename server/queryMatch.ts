@@ -6,7 +6,7 @@
  * and "rtx 3080" match both ways and "iphone 5" never matches "iphone 15".
  * Pure: the caller loads candidates and computes prices.
  */
-import { normalizeFilterText, parseIncludedExcluded, queryTokens, splitTerms, termMatches } from './text';
+import { excludedTermMatches, normalizeFilterText, parseIncludedExcluded, queryTokens, splitTerms, termMatches } from './text';
 import { OTHER_VARIANT_KEY, assignVariant, type VariantGroup } from './variants';
 
 export interface MatchCandidate {
@@ -65,7 +65,7 @@ export function matchQuery(query: string, candidates: MatchCandidate[], options:
   const matches: QueryMatch[] = [];
   for (const candidate of candidates) {
     const { included, excluded } = parseIncludedExcluded(candidate.query, candidate.includedTerms, candidate.excludedTerms);
-    if (excluded.some((term) => termMatches(title.text, title.glued, term))) continue;
+    if (excluded.some((term) => excludedTermMatches(title.text, title.glued, term))) continue;
     const own = spaced(`${candidate.query} ${included.join(' ')}`);
     if (vetoes.some((term) => termMatches(own.text, own.glued, term))) continue;
     const required = included.every((term) => termMatches(title.text, title.glued, term));

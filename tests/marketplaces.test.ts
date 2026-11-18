@@ -860,6 +860,23 @@ test('a model number does not match the same number used as a quantity', () => {
   assert.deepEqual(keptCards('zasilacz 650'), ['Zasilacz Corsair 650W']);
 });
 
+test('excluded terms also rule out inflected forms and the condition label', () => {
+  const base = { marketplace: 'OLX' as const, price: 100, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/test', observedAt: new Date().toISOString(), shippingAvailable: null as boolean | null };
+  const listings = [
+    { ...base, listingId: '1', title: 'RTX 2070 SUPER – USZKODZONA' },
+    { ...base, listingId: '2', title: 'RTX 2070 uszkodzony wentylator' },
+    { ...base, listingId: '3', title: 'RTX 2070 nieuszkodzona, sprawna' },
+    { ...base, listingId: '4', title: 'RTX 2070 bez uszkodzeń' },
+    { ...base, listingId: '5', title: 'RTX 2070 sprawna', condition: 'Uszkodzone' },
+    { ...base, listingId: '6', title: 'RTX 2070 sprawna', condition: 'Używane' },
+    { ...base, listingId: '7', title: 'RTX 2070 Uszkodzone' },
+  ];
+  assert.deepEqual(filterListings(listings, 'rtx 2070', '', 'uszkodzone').map((listing) => listing.listingId), ['3', '4', '6']);
+  // Terms of six letters or more cover their endings; shorter ones stay exact.
+  const more = [{ ...base, listingId: '8', title: 'RTX 2070 niesprawny' }, { ...base, listingId: '9', title: 'RTX 2070 dwie karty' }];
+  assert.deepEqual(filterListings(more, 'rtx 2070', '', 'niesprawne, karta').map((listing) => listing.listingId), ['9']);
+});
+
 test('relaxes the implicit query terms only for opt-in manual searches', () => {
   const base = { marketplace: 'OLX' as const, price: 100, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/test', observedAt: new Date().toISOString(), shippingAvailable: null as boolean | null };
   const listings = [

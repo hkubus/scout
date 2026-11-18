@@ -113,3 +113,32 @@ export function termMatches(titleSpaced: string, titleGlued: string, term: strin
   const compact = term.replace(/ /g, '');
   return /\d/.test(compact) && compact.length >= 3 && titleGlued.includes(compact);
 }
+
+const inflectedTermPatterns = new Map<string, RegExp | null>();
+
+/**
+ * A word that also matches the term's Polish inflections, or null when the
+ * term isn't a single word of six or more letters. The ending is dropped
+ * (uszkodzone → uszkodzon) and the stem must start a word followed by at
+ * most four letters, so "uszkodzone" covers "USZKODZONA", "uszkodzony" and
+ * "uszkodzonej", "laptop" covers "laptopa", but "nieuszkodzona" and
+ * "uszkodzeń" (damage, as in "bez uszkodzeń") stay out.
+ */
+function inflectedTermPattern(term: string) {
+  let pattern = inflectedTermPatterns.get(term);
+  if (pattern === undefined) {
+    const stem = /^[a-z]{6,}$/.test(term) ? term.replace(/(?:ego|emu|ych|ymi|ami|ach|ej|ym|om|ow|a|e|i|o|u|y)$/, '') : '';
+    pattern = stem.length >= 5 ? new RegExp(`(?:^| )${stem}[a-z]{0,4}(?: |$)`) : null;
+    if (inflectedTermPatterns.size < 500) inflectedTermPatterns.set(term, pattern);
+  }
+  return pattern;
+}
+
+/**
+ * termMatches for an excluded term, which also rules out the term's Polish
+ * inflections: excluding "uszkodzone" drops "Karta USZKODZONA" too. Included
+ * terms stay exact, so this only ever removes more.
+ */
+export function excludedTermMatches(titleSpaced: string, titleGlued: string, term: string) {
+  return termMatches(titleSpaced, titleGlued, term) || Boolean(inflectedTermPattern(term)?.test(titleSpaced));
+}

@@ -21,7 +21,7 @@ import { legacyTypoVariants, pickVariantBatch, typoVariantPairs, type TypoVarian
 import { isDamagedLabel, normalizeRequestedCondition } from './searchCondition';
 import { EMPTY_SEARCH_SOURCE, compactDuplicateNote, searchErrorKind, type ManualSearchDetailedResponse, type ManualSearchDetails, type ManualSearchListingDetail, type ManualSearchSourceDetail } from './mcpFormat';
 import { SearchCache, SearchQueueTimeoutError, SearchRuns, SearchStoppedError, manualSearchKey, searchScope, type SearchRunHandle, type SearchRunSettings } from './searchRuns';
-import { normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
+import { excludedTermMatches, normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
 import { matchQuality, matchQuery, type MatchCandidate, type QueryMatch } from './queryMatch';
 import { conditionClass, daysListed, groupOutcomes, MIN_OUTCOME_AGREED, priceDrops, shareOfAsking, titleSimilarity, type OutcomeRow } from './negotiation';
 import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, VARIANT_RULES_VERSION, assignVariant, finalizeVariantSuggestions, parseVariantGroups, suggestVariantGroupsFromTitles, variantLabelFor, type VariantGroup, type VariantSample } from './variants';
@@ -8144,7 +8144,11 @@ function evaluateDeterministic(
   relaxed = false,
 ) {
   const titleGlued = title.replace(/ /g, '');
-  const excludedHit = excluded.some((term) => termMatches(title, titleGlued, term));
+  // Excluded terms also read the marketplace's condition label, so excluding
+  // "uszkodzone" drops an OLX "Uszkodzone" or Allegro "Uszkodzony" listing
+  // whatever its title says.
+  const conditionExcluded = condition !== '' && excluded.some((term) => excludedTermMatches(condition, condition.replace(/ /g, ''), term));
+  const excludedHit = conditionExcluded || excluded.some((term) => excludedTermMatches(title, titleGlued, term));
   const matchedTerms = included.filter((term) => termMatches(title, titleGlued, term)).length;
   let termOk = matchedTerms === included.length && !excludedHit;
   // Relaxed pass (manual search fallback only): keep offers that match a
@@ -8157,7 +8161,7 @@ function evaluateDeterministic(
   const sellerOk = (!options.sellerType || !listing.sellerType || listing.sellerType === options.sellerType)
     && (!options.ignorePromoted || listing.promoted !== true);
   const damagedOk = !options.excludeDamaged || !isDamagedLabel(condition);
-  return { termOk, conditionOk, priceOk, shippingOk, sellerOk, damagedOk };
+  return { termOk, conditionOk, priceOk, shippingOk, sellerOk, damagedOk, conditionExcluded };
 }
 
 export function filterListings(listings: NormalizedListing[], query: string, includedRaw: string, excludedRaw: string, filters: ListingFilters | boolean = {}) {
@@ -8247,8 +8251,9 @@ export function findFuzzyRescueCandidates(
     const title = normalizeFilterText(listing.title);
     const condition = normalizeFilterText(listing.condition ?? '');
     const evaluated = evaluateDeterministic(listing, title, condition, included, excluded, requestedCondition, options);
-    // A damaged listing on a used search is a hard drop, so no Jev call is spent on it.
-    if (!evaluated.priceOk || !evaluated.shippingOk || !evaluated.sellerOk || !evaluated.damagedOk) continue;
+    // A damaged listing on a used search, or one whose condition label is an
+    // excluded term, is a hard drop, so no Jev call is spent on it.
+    if (!evaluated.priceOk || !evaluated.shippingOk || !evaluated.sellerOk || !evaluated.damagedOk || evaluated.conditionExcluded) continue;
     if (!evaluated.termOk && evaluated.conditionOk && hasTermFilter) termCandidates.push(listing);
     else if (!evaluated.conditionOk && evaluated.termOk && hasConditionFilter) conditionCandidates.push(listing);
   }
