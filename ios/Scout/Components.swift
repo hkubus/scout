@@ -751,7 +751,8 @@ struct VerificationVerdict {
             symbol = "exclamationmark.octagon.fill"
             color = .red
         default:
-            title = "Inconclusive"
+            // Such deals still alert, marked unverified; only a reject holds them.
+            title = "Not verified"
             symbol = "questionmark.circle"
             color = .secondary
         }

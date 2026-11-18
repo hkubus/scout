@@ -153,7 +153,28 @@ export interface DealNotificationInput {
   targetPrice?: number | null;
   /** Display-only estimate of what reselling at the typical would net (whole zł). */
   estimatedNet?: number | null;
+  /** Set when the description check gave no verdict (descriptionUnverifiedReason); the alert says so. */
+  descriptionUnverified?: string | null;
 }
+
+/**
+ * Why a listing's description check gave no verdict, short enough for an
+ * alert line: null for pass, reject, pending, not-configured or no check.
+ * `unknown` (inconclusive AI answer, no description, page or AI failure) and
+ * `fallback` (AI provider outage) still alert, marked with this reason.
+ */
+export function descriptionUnverifiedReason(input: { status: string | null | undefined; verification?: { issues?: string[]; summary?: string } | null; error?: string | null }): string | null {
+  const clip = (text: string) => (text.length > 140 ? `${text.slice(0, 139)}…` : text);
+  if (input.status === 'fallback') return 'AI check unavailable (provider outage)';
+  if (input.status !== 'unknown') return null;
+  if (input.error) return clip(`check failed: ${input.error.split('\n')[0].trim()}`);
+  const issue = input.verification?.issues?.find((text) => text.trim())?.trim();
+  if (issue) return clip(`inconclusive: ${issue}`);
+  const summary = input.verification?.summary?.trim();
+  return summary ? clip(`inconclusive: ${summary}`) : 'inconclusive';
+}
+
+const unverifiedLine = (reason: string) => `⚠️ Description not verified: ${reason.replace(/[\r\n]+/g, ' ')}`;
 
 const pln = (value: number) => `${Math.round(value).toLocaleString('pl-PL')} zł`;
 const signedPln = (value: number) => `${value >= 0 ? '+' : '−'}${pln(Math.abs(value))}`;
@@ -203,6 +224,7 @@ export function buildNtfyPayload(
     title: targetHit ? `Target price hit · ${listing.marketplace}` : `${notificationPriorityLabel(priority)} deal · ${listing.marketplace}`,
     message: [
       listing.title,
+      ...(input.descriptionUnverified ? [unverifiedLine(input.descriptionUnverified)] : []),
       ...(input.variantLabel ? [`Variant: ${input.variantLabel}`] : []),
       priceLine(input),
       ...(targetHit ? [`At or below your ${pln(input.targetPrice!)} target`] : []),
@@ -219,6 +241,33 @@ export function buildNtfyPayload(
     ...(image ? { attach: image } : {}),
     ...(options.openInApp ? { actions: [{ action: 'view' as const, label: 'Open listing', url: listing.url, clear: true }] } : {}),
   };
+}
+
+/**
+ * A 4xx a retry cannot fix (a bad payload, a deleted webhook, a wrong token
+ * or topic); 408 and 429 are transient. Deliveries that hit one are not
+ * retried, and the same unchanged alert is not sent again.
+ */
+export function isPermanentDeliveryStatus(status: number) {
+  return status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
+
+/** A delivery the channel refused for good (isPermanentDeliveryStatus). */
+export class DeliveryRejectedError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'DeliveryRejectedError';
+    this.status = status;
+  }
+}
+
+/** Throws for a non-2xx channel reply: DeliveryRejectedError when retrying cannot help. */
+export function assertDeliveryResponse(channel: 'Discord' | 'ntfy', status: number) {
+  if (status >= 200 && status < 300) return;
+  const message = `${channel} returned ${status}`;
+  throw isPermanentDeliveryStatus(status) ? new DeliveryRejectedError(message, status) : new Error(message);
 }
 
 export async function publishNtfy(config: NtfyConfig, payload: NtfyPayload, fetcher: typeof fetch = globalThis.fetch) {
@@ -238,7 +287,7 @@ export async function publishNtfy(config: NtfyConfig, payload: NtfyPayload, fetc
   });
   discardResponse(response, 'ntfy');
   if (response.status >= 300 && response.status < 400) throw new Error('ntfy server redirected the request; configure its final URL');
-  if (!response.ok) throw new Error(`ntfy returned ${response.status}`);
+  assertDeliveryResponse('ntfy', response.status);
 }
 
 export function buildDiscordEmbed(input: DealNotificationInput) {
@@ -252,7 +301,7 @@ export function buildDiscordEmbed(input: DealNotificationInput) {
     embeds: [{
       title: safeTitle,
       url: listing.url,
-      ...(targetHit || context ? { description: [targetHit ? `Target price hit: at or below ${pln(input.targetPrice!)}` : null, context || null].filter(Boolean).join('\n') } : {}),
+      ...(targetHit || context || input.descriptionUnverified ? { description: [input.descriptionUnverified ? unverifiedLine(input.descriptionUnverified) : null, targetHit ? `Target price hit: at or below ${pln(input.targetPrice!)}` : null, context || null].filter(Boolean).join('\n') } : {}),
       color: targetHit ? 0x2f9e44 : (input.discountPercent ?? 0) >= 30 ? 0xf15a35 : 0xf4b734,
       thumbnail: image ? { url: image } : undefined,
       fields: [

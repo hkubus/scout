@@ -249,6 +249,8 @@ export interface AgentListingVerification {
   watch: { id: string; name: string } | null;
   /** pass, reject or unknown; fallback after a provider outage. */
   status: ListingDescriptionVerificationStatus | null;
+  /** For unknown and fallback: why there is no verdict. Scans still alert such deals, marked unverified; only a reject holds them. */
+  unverifiedReason: string | null;
   verification: ListingDescriptionVerification | null;
   checks: VerificationCheck[];
   model: string | null;

@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { connect as connectHttp2, type SecureClientSessionOptions } from 'node:http2';
 import { brotliDecompressSync, gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
 import type { Browser, BrowserContext, Page } from 'playwright-core';
-import { buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
+import { DeliveryRejectedError, assertDeliveryResponse, buildDiscordEmbed, buildNtfyPayload, descriptionUnverifiedReason, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseOfferPage, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, type SellerType, parseOlxCategoryFacets, type ListingDetailResult, type SellerListingsPage, allegroSellerProfileUrl, olxSellerListingsUrl, parseAllegroSellerProfile, parseOlxSellerListings, parseVintedWardrobe, vintedWardrobeUrl, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult, olxDetailHint, setOlxDetailHint } from './marketplaces';
 import { MarketplaceSessionValidationError, SESSION_CHECK_URLS, classifySessionCheck, parseMarketplaceStorageState, type MarketplaceStorageState, type SessionCheckOutcome } from './marketplace-sessions';
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, writeResaleListingWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseVerificationChecks, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type VerificationCheck } from './ai';
@@ -90,10 +90,14 @@ type DealNotificationCandidate = {
 };
 
 /**
- * One description-check run: whether the deal may alert, and whether the
- * verdict came from one already stored (no AI call ran for it).
+ * One description-check run: whether the verdict cleared the alert (pass, a
+ * provider-outage fallback, no AI key), why it gave no verdict when it did
+ * not (unknown or fallback, see descriptionUnverifiedReason; such deals still
+ * alert, marked unverified), and whether the verdict came from one already
+ * stored (no AI call ran for it). Only a reject is neither allowed nor
+ * unverified, so only a reject holds the alert.
  */
-type DescriptionVerificationRun = { allowed: boolean; reused: boolean };
+type DescriptionVerificationRun = { allowed: boolean; reused: boolean; unverified: string | null };
 
 /** The description check's input for a candidate and its page's description; its hash keys every verdict cache. */
 function descriptionVerificationContext(candidate: DealNotificationCandidate, description: string | null): ListingDescriptionVerificationContext {
@@ -171,7 +175,12 @@ type DigestCandidateRow = {
   confidence: number;
   priority: NotificationPriority;
   observed_at: string;
+  /** The listing's description-check status when the digest is built. */
+  verification_status?: string | null;
 };
+
+/** A digest line's marker for a deal whose description check gave no verdict. */
+const digestUnverified = (row: DigestCandidateRow) => row.verification_status === 'unknown' || row.verification_status === 'fallback';
 
 const DEFAULT_DAILY_DIGEST_CONFIG: DailyDigestConfig = {
   enabled: false,
@@ -195,8 +204,14 @@ export const MATCH_VISIBILITY_MS = 12 * 60 * 60_000;
  * client pages past it with `page` instead of losing results silently.
  */
 const MANUAL_SEARCH_RESULT_CAP = 200;
-/** Consecutive failed scans of a marketplace before its connector backs off. */
+/** Consecutive failed scheduler ticks of a marketplace before its connector backs off. */
 const CONNECTOR_BACKOFF_AFTER_FAILURES = 2;
+/**
+ * Runs of one scheduler tick start within milliseconds (seconds on a loaded
+ * host); ticks are 30 s apart. Runs that started closer than this, and
+ * overlapped in time, are one tick for the backoff streak.
+ */
+const CONNECTOR_TICK_GAP_MS = 15_000;
 /**
  * Manual-search Jev checks, per source per page: at most this many uncached
  * Jev calls, and detail-page fetches for at most this many listings whose
@@ -652,6 +667,13 @@ export function dueWatchSources(
  * later); sources that were not due keep their existing time. The watch-wide
  * next_scan_at is the earliest source time, so the scheduler wakes the watch
  * exactly when its next marketplace is ready.
+ *
+ * A scanned source advances from the time it was due, not from when the scan
+ * finished, so the 30 s scheduler tick and the scan's own duration do not
+ * stretch every interval: a 7 min watch runs every 7 min, not 7.5. When that
+ * time has already passed (a scan late by more than an interval, a night or
+ * day boundary in between) or the source was not due yet (Scan now), it
+ * advances from the finish as before.
  */
 export function nextWatchScanSchedule(options: {
   sources: Marketplace[];
@@ -668,6 +690,12 @@ export function nextWatchScanSchedule(options: {
     const interval = options.intervals[source] ?? 5;
     if (scannedSet.has(source)) {
       let next = nextWatchScanAt(options.finishedAt, interval, options.nightIntervalMinutes);
+      const due = options.prior[source] ? Date.parse(options.prior[source] as string) : Number.NaN;
+      const finished = Date.parse(options.finishedAt);
+      if (Number.isFinite(due) && due <= finished) {
+        const fromDue = nextWatchScanAt(new Date(due).toISOString(), interval, options.nightIntervalMinutes);
+        if (Date.parse(fromDue) > finished) next = fromDue;
+      }
       const backoffUntil = options.backoff?.[source];
       if (backoffUntil && Date.parse(backoffUntil) > Date.parse(next)) next = backoffUntil;
       nextBySource[source] = next;
@@ -679,6 +707,35 @@ export function nextWatchScanSchedule(options: {
   }
   const nextScanAt = Object.values(nextBySource).sort()[0] ?? nextWatchScanAt(options.finishedAt, 5, options.nightIntervalMinutes);
   return { nextBySource, nextScanAt };
+}
+
+/**
+ * How many scheduler ticks in a row a marketplace has failed, newest first.
+ * `runs` are its finished ok/error runs, newest start first. Runs that
+ * started within CONNECTOR_TICK_GAP_MS of the next newer one while it was
+ * still running are the same tick: several watches failing together is one
+ * failure, and any ok run in a tick makes the tick ok. A run that started
+ * after the previous one finished (a retry, a forced scan) is its own tick.
+ */
+export function connectorFailedTicks(runs: Array<{ status: string; startedAt: string; finishedAt: string | null }>, tickGapMs = CONNECTOR_TICK_GAP_MS) {
+  let ticks = 0;
+  let tickFailed = true;
+  // Start of the next newer run, NaN before the first.
+  let newerStarted = Number.NaN;
+  for (const run of runs) {
+    const started = Date.parse(run.startedAt);
+    const finished = run.finishedAt ? Date.parse(run.finishedAt) : Number.NaN;
+    const sameTick = Number.isFinite(newerStarted) && Number.isFinite(started) && newerStarted - started < tickGapMs
+      && !(Number.isFinite(finished) && finished <= newerStarted);
+    if (!sameTick) {
+      if (ticks > 0 && !tickFailed) break;
+      ticks += 1;
+      tickFailed = true;
+    }
+    if (run.status !== 'error') tickFailed = false;
+    if (Number.isFinite(started)) newerStarted = started;
+  }
+  return tickFailed ? ticks : ticks - 1;
 }
 
 const nowIso = () => new Date().toISOString();
@@ -2405,7 +2462,7 @@ export class ScoutService {
         this.updateListingDetailSnapshot(snapshot?.id ?? null, 'not-configured', null);
         this.saveDescriptionVerification({ marketplace, listingId, status: 'not-configured' });
       });
-      return { allowed: true, reused: false };
+      return { allowed: true, reused: false, unverified: null };
     }
 
     let description: string | null;
@@ -2439,14 +2496,16 @@ export class ScoutService {
         this.saveDescriptionVerification({ marketplace, listingId, status: 'unknown', model: activeModel, error: message });
       });
       this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: 'unknown' });
-      return { allowed: false, reused: false };
+      // Stored with its error and no input hash, so it is no finished verdict:
+      // the next scan that sees the listing fetches the page again.
+      return { allowed: false, reused: false, unverified: descriptionUnverifiedReason({ status: 'unknown', error: message }) };
     }
 
     const context = descriptionVerificationContext(candidate, description);
     const inputHash = listingDescriptionVerificationInputHash(context);
     // Everything up to the fresh AI call is synchronous, so the snapshot and
     // any cached decision are written in one transaction.
-    type CachedOutcome = { done: true; allowed: boolean; reused: boolean; emit: ListingDescriptionVerificationStatus | null } | { done: false; snapshotId: number | null };
+    type CachedOutcome = { done: true; allowed: boolean; reused: boolean; unverified: string | null; emit: ListingDescriptionVerificationStatus | null } | { done: false; snapshotId: number | null };
     const outcome = this.transaction((): CachedOutcome => {
       const snapshot = this.captureListingDetailSnapshot(candidate, description);
       const row = this.stmt(`SELECT ai_description_verification_json, ai_description_verification_input_hash,
@@ -2457,7 +2516,7 @@ export class ScoutService {
       if (cached && row?.ai_description_verification_input_hash === inputHash && row.ai_description_verification_model === activeModel) {
         this.updateListingDetailSnapshot(snapshot?.id ?? null, cached.decision, inputHash);
         this.saveDescriptionVerification({ marketplace, listingId, status: cached.decision, verification: cached, inputHash, model: activeModel });
-        return { done: true, allowed: cached.decision === 'pass', reused: true, emit: null };
+        return { done: true, allowed: cached.decision === 'pass', reused: true, unverified: descriptionUnverifiedReason({ status: cached.decision, verification: cached }), emit: null };
       }
       // The listing's slot lost its verdict (a fetch error or a missing
       // description overwrote it, or the text flapped A -> B -> A): a fresh
@@ -2478,7 +2537,7 @@ export class ScoutService {
         const status: ListingDescriptionVerificationStatus = row.ai_description_verification_status === 'fallback' ? 'fallback' : 'unknown';
         this.updateListingDetailSnapshot(snapshot?.id ?? null, status, inputHash);
         this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: activeModel, error: row.ai_description_verification_error });
-        return { done: true, allowed: status === 'fallback', reused: true, emit: null };
+        return { done: true, allowed: status === 'fallback', reused: true, unverified: descriptionUnverifiedReason({ status, error: String(row.ai_description_verification_error) }), emit: null };
       }
 
       if (!description) {
@@ -2491,7 +2550,7 @@ export class ScoutService {
         };
         this.updateListingDetailSnapshot(snapshot?.id ?? null, unknown.decision, inputHash);
         this.saveDescriptionVerification({ marketplace, listingId, status: unknown.decision, verification: unknown, inputHash, model: activeModel });
-        return { done: true, allowed: false, reused: false, emit: unknown.decision };
+        return { done: true, allowed: false, reused: false, unverified: 'no description on the listing page', emit: unknown.decision };
       }
 
       // Cross-listing reuse is keyed by input hash, which omits the gallery
@@ -2508,7 +2567,7 @@ export class ScoutService {
       if (shared) {
         this.updateListingDetailSnapshot(snapshot?.id ?? null, shared.decision, inputHash);
         this.saveDescriptionVerification({ marketplace, listingId, status: shared.decision, verification: shared, inputHash, model: activeModel });
-        return { done: true, allowed: shared.decision === 'pass', reused: true, emit: null };
+        return { done: true, allowed: shared.decision === 'pass', reused: true, unverified: descriptionUnverifiedReason({ status: shared.decision, verification: shared }), emit: null };
       }
       // A fresh AI call follows: the snapshot shows pending while it runs.
       if (snapshot?.id) this.stmt("UPDATE listing_detail_snapshots SET verification_status = 'pending' WHERE id = ? AND verification_status IS NOT 'pending'").run(snapshot.id);
@@ -2516,7 +2575,7 @@ export class ScoutService {
     });
     if (outcome.done) {
       if (outcome.emit) this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: outcome.emit });
-      return { allowed: outcome.allowed, reused: outcome.reused };
+      return { allowed: outcome.allowed, reused: outcome.reused, unverified: outcome.unverified };
     }
     const snapshot = outcome.snapshotId === null ? null : { id: outcome.snapshotId };
 
@@ -2540,7 +2599,7 @@ export class ScoutService {
       this.saveDescriptionVerification({ marketplace, listingId, status: verification.decision, verification, inputHash, model: activeModel });
       if (basis) this.saveVerdictByHash(inputHash, activeModel, basis === 'photos' ? `${marketplace}:${listingId}` : '', verification);
       this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: verification.decision });
-      return { allowed: verification.decision === 'pass', reused: false };
+      return { allowed: verification.decision === 'pass', reused: false, unverified: descriptionUnverifiedReason({ status: verification.decision, verification }) };
     } catch (error) {
       const message = (error instanceof Error ? error.message : 'OpenRouter could not verify the listing description').slice(0, 500);
       // Only genuine provider outages keep the historical fail-open alert. A
@@ -2552,7 +2611,7 @@ export class ScoutService {
       this.updateListingDetailSnapshot(snapshot?.id ?? null, status, inputHash);
       this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: activeModel, error: message });
       this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status });
-      return { allowed: status === 'fallback', reused: false };
+      return { allowed: status === 'fallback', reused: false, unverified: descriptionUnverifiedReason({ status, error: message }) };
     }
   }
 
@@ -2653,13 +2712,18 @@ export class ScoutService {
           // notifyDeal ignores hidden listings, so verifying one would only
           // fetch its page and spend an AI call for nothing.
           if (this.isListingHidden(candidate.listing)) continue;
+          let descriptionUnverified: string | null = null;
           if (candidate.requiresDescriptionVerification) {
             // notifyDeal re-plans after the awaits, since state can change.
             const plan = this.planDealNotification(candidate.watchId, candidate.listing, candidate.discountPercent, context, false, isTargetHit(candidate.targetPrice));
             if (!plan.channels.length && !plan.digestDue && this.hasFreshDescriptionVerification(candidate, context)) continue;
-            if (!await this.verifyHighPriorityDeal(candidate, context)) continue;
+            // Only a reject holds the alert; a check without a verdict alerts
+            // marked unverified (the owner's call: speed beats a missed deal).
+            const run = await this.sharedDescriptionVerification(candidate, context);
+            if (!run.allowed && run.unverified === null) continue;
+            descriptionUnverified = run.unverified;
           }
-          await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence, context, candidate.variantLabel ?? null, { targetPrice: candidate.targetPrice ?? null, estimatedNet: candidate.estimatedNet ?? null });
+          await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence, context, candidate.variantLabel ?? null, { targetPrice: candidate.targetPrice ?? null, estimatedNet: candidate.estimatedNet ?? null, descriptionUnverified });
         }
       }
     };
@@ -5066,6 +5130,7 @@ export class ScoutService {
       key: `${marketplace}:${listingId}`,
       watch: watch ? { id: String(watch.id), name: String(watch.name) } : null,
       status: (stored?.status ?? null) as ListingDescriptionVerificationStatus | null,
+      unverifiedReason: descriptionUnverifiedReason({ status: stored?.status, verification, error: stored?.error }),
       verification: verification ? {
         decision: verification.decision,
         confidence: verification.confidence,
@@ -7750,7 +7815,7 @@ export class ScoutService {
         color: 0x1d61e8,
         fields: shown.map((row) => ({
           name: `${row.discount_percent.toFixed(1)}% below typical · ${row.marketplace} · ${row.watch_name}`.slice(0, 256),
-          value: `[${escapeDiscordMarkdown(row.title.replace(/[\r\n]+/g, ' ').slice(0, 180))}](${row.url})\n${Number(row.price_pln).toLocaleString('pl-PL')} zł · typical ${Number(row.typical_pln).toLocaleString('pl-PL')} zł · ${row.confidence}% confidence`.slice(0, 1024),
+          value: `[${escapeDiscordMarkdown(row.title.replace(/[\r\n]+/g, ' ').slice(0, 180))}](${row.url})\n${Number(row.price_pln).toLocaleString('pl-PL')} zł · typical ${Number(row.typical_pln).toLocaleString('pl-PL')} zł · ${row.confidence}% confidence${digestUnverified(row) ? '\n⚠️ Description not verified' : ''}`.slice(0, 1024),
         })),
         footer: { text: 'Scout · daily digest · asking prices' },
         timestamp: nowIso(),
@@ -7765,7 +7830,7 @@ export class ScoutService {
       topic: config.topic,
       title: `Scout daily digest · ${date} · ${rows.length} ${rows.length === 1 ? 'deal' : 'deals'}`,
       message: [
-        ...shown.map((row) => `${row.discount_percent.toFixed(1)}% · ${row.title} · ${Number(row.price_pln).toLocaleString('pl-PL')} zł\n${row.url}`),
+        ...shown.map((row) => `${row.discount_percent.toFixed(1)}% · ${row.title} · ${Number(row.price_pln).toLocaleString('pl-PL')} zł${digestUnverified(row) ? ' · ⚠️ not verified' : ''}\n${row.url}`),
         ...(hidden ? [`+ ${hidden} more deal${hidden === 1 ? '' : 's'} in Scout`] : []),
       ].join('\n\n'),
       priority: 3,
@@ -7784,7 +7849,7 @@ export class ScoutService {
         if (!encrypted) throw new Error('Discord webhook is not configured');
         const response = await fetch(validateDiscordWebhook(decryptSecret(encrypted)), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(deliveryPayload), signal: AbortSignal.timeout(12_000) });
         discardResponse(response, 'discord-webhook');
-        if (!response.ok) throw new Error(`Discord returned ${response.status}`);
+        assertDeliveryResponse('Discord', response.status);
       } else {
         const config = this.ntfyConfig();
         if (!config) throw new Error('ntfy is not configured');
@@ -7801,10 +7866,9 @@ export class ScoutService {
       return 'delivered' as const;
     } catch (error) {
       const message = (error instanceof Error ? error.message : `${input.channel} digest delivery failed`).slice(0, 500);
-      const nextAttempt = input.attemptCount < 5 ? new Date(Date.now() + exponentialBackoff(input.attemptCount - 1, 30_000, 6 * 60 * 60_000)).toISOString() : null;
-      this.stmt("UPDATE notification_deliveries SET status = 'failed', message = ?, next_attempt_at = ?, updated_at = ? WHERE listing_key = ? AND channel = ?").run(message, nextAttempt, nowIso(), input.deliveryKey, input.channel);
+      this.recordDeliveryFailure(input.channel, input.deliveryKey, input.attemptCount, error, message);
       this.stmt("UPDATE notifications SET status = 'failed' WHERE listing_key = ?").run(input.eventKey);
-      this.recordRun(input.channel, 'error', message, started, nowIso());
+      this.recordRun(input.channel, 'error', this.deliveryRunMessage(input.channel, error, message), started, nowIso());
       return 'failed' as const;
     }
   }
@@ -7823,10 +7887,14 @@ export class ScoutService {
     if (!channels.length) return;
     this.digestRunning = true;
     try {
-      const candidates = this.stmt(`SELECT c.*, w.name AS watch_name
+      // Unverified deals are queued (they alert, marked); one whose check
+      // later rejected it drops out like a hidden one.
+      const candidates = this.stmt(`SELECT c.*, w.name AS watch_name, l.ai_description_verification_status AS verification_status
         FROM daily_digest_candidates c JOIN watches w ON w.id = c.watch_id
+        LEFT JOIN listings l ON l.marketplace = c.marketplace AND l.listing_id = c.listing_id
         WHERE c.digest_date IS NULL
           AND NOT EXISTS (SELECT 1 FROM listing_actions a WHERE a.marketplace = c.marketplace AND a.listing_id = c.listing_id AND a.hidden = 1)
+          AND COALESCE(l.ai_description_verification_status, '') <> 'reject'
         ORDER BY c.discount_percent DESC, c.observed_at ASC, c.id ASC`).all() as DigestCandidateRow[];
       const planned: Array<{ channel: DigestChannel; eventKey: string; payload: Record<string, any> }> = [];
       this.transaction(() => {
@@ -7883,6 +7951,7 @@ export class ScoutService {
       variantLabel?: string | null;
       targetPrice?: number | null;
       estimatedNet?: number | null;
+      descriptionUnverified?: string | null;
     } | undefined;
   }
 
@@ -7894,7 +7963,7 @@ export class ScoutService {
       if (existing) {
         const attempts = Number(existing.attempt_count ?? 0);
         const updatedAt = String(existing.updated_at ?? existing.created_at ?? '');
-        if (existing.status === 'delivered' || attempts >= maxAttempts) return null;
+        if (existing.status === 'delivered' || existing.status === 'rejected' || attempts >= maxAttempts) return null;
         if (existing.status === 'failed' && existing.next_attempt_at && Date.parse(existing.next_attempt_at) > Date.now()) return null;
         if (existing.status === 'pending' && updatedAt && Date.parse(updatedAt) > Date.parse(staleBefore)) return null;
         const nextAttempt = attempts + 1;
@@ -7909,6 +7978,29 @@ export class ScoutService {
   private latestDeliveryForAlert(watchId: string, listing: NormalizedListing, channel: 'Discord' | 'ntfy') {
     const prefix = `${watchId}|${listing.marketplace}|${listing.listingId}|alert:`;
     return this.stmt("SELECT listing_key, status, attempt_count, next_attempt_at, updated_at, created_at FROM notification_deliveries WHERE channel = ? AND listing_key LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT 1").get(channel, `${ScoutService.escapeLike(prefix)}%|channel:${channel}`) as Record<string, any> | undefined;
+  }
+
+  /** The highest alert:N event any channel has recorded for this watch listing (0 when none). */
+  private latestAlertEventSequence(watchId: string, listing: NormalizedListing) {
+    // alert:N keys share the prefix; ';' sorts right after ':', so the range
+    // is exactly the keys under it and uses the unique index.
+    const prefix = `${watchId}|${listing.marketplace}|${listing.listingId}|alert:`;
+    const rows = this.stmt('SELECT listing_key FROM notifications WHERE listing_key >= ? AND listing_key < ?').all(prefix, `${prefix.slice(0, -1)};`) as Array<{ listing_key: string }>;
+    let latest = 0;
+    for (const row of rows) {
+      const sequence = Number(/^\d+$/.test(row.listing_key.slice(prefix.length)) ? row.listing_key.slice(prefix.length) : 0);
+      if (sequence > latest) latest = sequence;
+    }
+    return latest;
+  }
+
+  /** Price and priority of a rejected delivery's alert, read from its event payload. */
+  private rejectedAlert(deliveryKey: string) {
+    const eventKey = deliveryKey.includes('|channel:') ? deliveryKey.slice(0, deliveryKey.indexOf('|channel:')) : deliveryKey;
+    const row = this.stmt('SELECT payload_json FROM notifications WHERE listing_key = ?').get(eventKey) as { payload_json?: string } | undefined;
+    const meta = this.notificationMeta(parseJson<Record<string, any>>(row?.payload_json, {}));
+    if (!meta) return undefined;
+    return { last_alerted_price_pln: Number(meta.listing?.price), last_priority: meta.priority };
   }
 
   private alertState(watchId: string, listing: NormalizedListing, channel: 'Discord' | 'ntfy') {
@@ -7939,16 +8031,17 @@ export class ScoutService {
     variantLabel?: string | null;
     targetPrice?: number | null;
     estimatedNet?: number | null;
+    descriptionUnverified?: string | null;
     legacy?: boolean;
   }) {
-    const alert = { listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence, variantLabel: input.variantLabel, targetPrice: input.targetPrice ?? null, estimatedNet: input.estimatedNet ?? null };
+    const alert = { listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence, variantLabel: input.variantLabel, targetPrice: input.targetPrice ?? null, estimatedNet: input.estimatedNet ?? null, descriptionUnverified: input.descriptionUnverified ?? null };
     const started = nowIso();
     try {
       if (input.channel === 'Discord') {
         if (!input.encryptedDiscord) throw new Error('Discord webhook is not configured');
         const response = await fetch(validateDiscordWebhook(decryptSecret(input.encryptedDiscord)), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(buildDiscordEmbed(alert)), signal: AbortSignal.timeout(12_000) });
         discardResponse(response, 'discord-webhook');
-        if (!response.ok) throw new Error(`Discord returned ${response.status}`);
+        assertDeliveryResponse('Discord', response.status);
       } else {
         if (!input.ntfy) throw new Error('ntfy is not configured');
         await publishNtfy(input.ntfy, buildNtfyPayload(alert, input.ntfy.topic, input.priority, { openInApp: input.ntfy.openInApp, watchId: input.watchId }));
@@ -7971,12 +8064,30 @@ export class ScoutService {
       return 'delivered' as const;
     } catch (error) {
       const message = (error instanceof Error ? error.message : `${input.channel} delivery failed`).slice(0, 500);
-      const nextAttempt = input.attemptCount < 5 ? new Date(Date.now() + exponentialBackoff(input.attemptCount - 1, 30_000, 6 * 60 * 60_000)).toISOString() : null;
-      this.stmt("UPDATE notification_deliveries SET status = 'failed', message = ?, next_attempt_at = ?, updated_at = ? WHERE listing_key = ? AND channel = ?").run(message, nextAttempt, nowIso(), input.deliveryKey, input.channel);
+      this.recordDeliveryFailure(input.channel, input.deliveryKey, input.attemptCount, error, message);
       this.stmt("UPDATE notifications SET status = 'failed' WHERE listing_key = ? AND status <> 'delivered'").run(input.eventKey);
-      this.recordRun(input.channel, 'error', message, started, nowIso());
+      this.recordRun(input.channel, 'error', this.deliveryRunMessage(input.channel, error, message), started, nowIso());
       return 'failed' as const;
     }
+  }
+
+  /**
+   * A failed attempt is retried with backoff up to 5 attempts in all, except
+   * a permanent refusal (DeliveryRejectedError): it is marked 'rejected' and
+   * never claimed again, and planDealNotification sends the listing again only
+   * once it improves on the rejected alert.
+   */
+  private recordDeliveryFailure(channel: 'Discord' | 'ntfy', deliveryKey: string, attemptCount: number, error: unknown, message: string) {
+    const rejected = error instanceof DeliveryRejectedError;
+    const nextAttempt = !rejected && attemptCount < 5 ? new Date(Date.now() + exponentialBackoff(attemptCount - 1, 30_000, 6 * 60 * 60_000)).toISOString() : null;
+    this.stmt('UPDATE notification_deliveries SET status = ?, message = ?, next_attempt_at = ?, updated_at = ? WHERE listing_key = ? AND channel = ?').run(rejected ? 'rejected' : 'failed', message, nextAttempt, nowIso(), deliveryKey, channel);
+  }
+
+  /** The channel's connector-run message: a permanent refusal says it is not retried and what to check. */
+  private deliveryRunMessage(channel: 'Discord' | 'ntfy', error: unknown, message: string) {
+    if (!(error instanceof DeliveryRejectedError)) return message;
+    const check = channel === 'Discord' ? 'the webhook URL' : 'the ntfy topic and token';
+    return `${message}: rejected, not retried. Check ${check} in Settings if every alert fails.`.slice(0, 500);
   }
 
   /**
@@ -8020,13 +8131,21 @@ export class ScoutService {
         const state = this.alertState(watchId, listing, channel);
         const latest = this.latestDeliveryForAlert(watchId, listing, channel);
         const latestSequence = latest?.listing_key ? Number(latest.listing_key.match(/\|alert:(\d+)\|channel:/)?.[1] ?? 0) : 0;
-        const latestDue = latest && latest.status !== 'delivered' && Number(latest.attempt_count ?? 0) < 5
+        const latestOpen = latest && latest.status !== 'delivered' && latest.status !== 'rejected' && Number(latest.attempt_count ?? 0) < 5;
+        const latestDue = latestOpen
           && !(latest.status === 'failed' && latest.next_attempt_at && Date.parse(latest.next_attempt_at) > Date.now())
           && !(latest.status === 'pending' && latest.updated_at && Date.parse(latest.updated_at) > Date.now() - 15 * 60_000);
         if (latestDue) sequence = latestSequence || Number(state?.alert_sequence ?? 1);
-        else if (latest && latest.status !== 'delivered' && Number(latest.attempt_count ?? 0) < 5) continue;
+        else if (latestOpen) continue;
+        // A refused alert is not sent again until the listing improves on it
+        // as a re-alert must (shouldAlert), so a bad payload or dead webhook
+        // cannot restart the sequence on every scan.
+        else if (latest?.status === 'rejected' && !this.shouldAlert(this.rejectedAlert(String(latest.listing_key)), listing.price, priority)) continue;
         else if (!this.shouldAlert(state, listing.price, priority)) continue;
-        else sequence = Math.max(Number(state?.alert_sequence ?? 0), latestSequence) + 1;
+        // Numbered past every channel's events: a channel that starts alerting
+        // later must not reuse (INSERT OR IGNORE) another channel's older
+        // alert:N row, whose price and time are not its own.
+        else sequence = Math.max(Number(state?.alert_sequence ?? 0), latestSequence, this.latestAlertEventSequence(watchId, listing)) + 1;
         eventKey = this.notificationEventKey(watchId, listing, sequence);
         deliveryKey = this.notificationDeliveryKey(eventKey, channel);
       }
@@ -8043,7 +8162,7 @@ export class ScoutService {
     maybeConfidence?: number,
     context?: ScanNotifyContext,
     variantLabel?: string | null,
-    extras: { targetPrice?: number | null; estimatedNet?: number | null } = {},
+    extras: { targetPrice?: number | null; estimatedNet?: number | null; descriptionUnverified?: string | null } = {},
   ) {
     const legacy = typeof watchIdOrListing !== 'string';
     const watchId = legacy ? '__legacy__' : watchIdOrListing;
@@ -8053,6 +8172,7 @@ export class ScoutService {
     const confidence = (legacy ? discountOrConfidence : maybeConfidence) as number;
     const targetPrice = extras.targetPrice ?? null;
     const estimatedNet = extras.estimatedNet ?? null;
+    const descriptionUnverified = extras.descriptionUnverified ?? null;
     const plan = this.planDealNotification(watchId, listing, discountPercent, context, legacy, isTargetHit(targetPrice));
     if (plan.hidden) return;
     const { priority, encryptedDiscord, ntfy } = plan;
@@ -8061,7 +8181,7 @@ export class ScoutService {
 
     const planned: Array<{ channel: 'Discord' | 'ntfy'; eventKey: string; deliveryKey: string; sequence?: number; claim: { id: number; attemptCount: number }; legacy: boolean }> = [];
     for (const { channel, sequence, eventKey, deliveryKey } of plan.channels) {
-      const payload = { ...buildDiscordEmbed({ listing, typical, discountPercent, confidence, variantLabel, targetPrice, estimatedNet }), _scout: { watchId, listing, typical, discountPercent, confidence, priority, sequence, variantLabel, targetPrice, estimatedNet } };
+      const payload = { ...buildDiscordEmbed({ listing, typical, discountPercent, confidence, variantLabel, targetPrice, estimatedNet, descriptionUnverified }), _scout: { watchId, listing, typical, discountPercent, confidence, priority, sequence, variantLabel, targetPrice, estimatedNet, ...(descriptionUnverified ? { descriptionUnverified } : {}) } };
       this.stmt('INSERT OR IGNORE INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(eventKey, JSON.stringify(payload), 'pending', nowIso());
       const claim = this.claimNotificationDelivery(deliveryKey, channel);
       if (claim) planned.push({ channel, eventKey, deliveryKey, sequence: legacy ? undefined : sequence, claim, legacy });
@@ -8084,6 +8204,7 @@ export class ScoutService {
       variantLabel,
       targetPrice,
       estimatedNet,
+      descriptionUnverified,
       legacy: item.legacy,
     })));
   }
@@ -8134,6 +8255,7 @@ export class ScoutService {
         variantLabel: meta.variantLabel,
         targetPrice: meta.targetPrice ?? null,
         estimatedNet: meta.estimatedNet ?? null,
+        descriptionUnverified: meta.descriptionUnverified ?? null,
         legacy: meta.watchId === '__legacy__',
       });
     }
@@ -8160,18 +8282,23 @@ export class ScoutService {
   }
 
   /**
-   * Backoff deadline for a failed run, or null when it is the first failure
-   * in a row: one blocked page or timeout on one watch must not pause the
-   * connector for every watch and search. From the second consecutive failed
-   * outcome it is 5 min, doubling with each further one up to 6 h; skipped
-   * rows neither break nor extend the streak.
+   * Backoff deadline for a failed run, or null when its tick is the first
+   * failed one in a row: one blocked page or timeout on one watch must not
+   * pause the connector for every watch and search, and neither must several
+   * watches failing in the same scheduler tick (connectorFailedTicks). From
+   * the second consecutive failed tick it is 5 min, doubling with each
+   * further one up to 6 h; skipped rows neither break nor extend the streak.
    */
   private connectorBackoffAfterFailure(source: string, runId: number): string | null {
-    const recent = this.stmt("SELECT status FROM connector_runs WHERE source = ? AND id != ? AND status IN ('ok', 'error') ORDER BY started_at DESC, id DESC LIMIT 8").all(source, runId) as Array<{ status: string }>;
-    const streak = recent.findIndex((run) => run.status !== 'error');
-    const failuresBefore = streak === -1 ? recent.length : streak;
-    if (failuresBefore + 1 < CONNECTOR_BACKOFF_AFTER_FAILURES) return null;
-    return new Date(Date.now() + exponentialBackoff(failuresBefore + 1 - CONNECTOR_BACKOFF_AFTER_FAILURES)).toISOString();
+    // The failing run is still 'running' here; it counts as an error that ends now.
+    const rows = this.stmt(`SELECT id, status, started_at, finished_at FROM connector_runs
+      WHERE source = ? AND (status IN ('ok', 'error') OR id = ?) ORDER BY started_at DESC, id DESC LIMIT 48`).all(source, runId) as Array<{ id: number; status: string; started_at: string; finished_at: string | null }>;
+    const finished = nowIso();
+    const failedTicks = connectorFailedTicks(rows.map((row) => Number(row.id) === runId
+      ? { status: 'error', startedAt: row.started_at, finishedAt: finished }
+      : { status: row.status, startedAt: row.started_at, finishedAt: row.finished_at }));
+    if (failedTicks < CONNECTOR_BACKOFF_AFTER_FAILURES) return null;
+    return new Date(Date.now() + exponentialBackoff(failedTicks - CONNECTOR_BACKOFF_AFTER_FAILURES)).toISOString();
   }
 
   /**

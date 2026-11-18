@@ -514,8 +514,8 @@ export function CrossPosts({ copies, listing, now = Date.now() }: { copies: Dupl
 function VerificationLine({ status }: { status: NonNullable<Listing["aiDescriptionVerificationStatus"]> }) {
   if (status === "pass") return <div className="description-verification-result description-verification-result--pass"><CheckCircle2 size={15} /><strong>Description looks fine</strong></div>;
   if (status === "reject") return <div className="description-verification-result description-verification-result--reject"><AlertTriangle size={15} /><strong>Alert held:</strong><span>the description mentions a material issue.</span></div>;
-  if (status === "unknown") return <div className="description-verification-result description-verification-result--unknown"><AlertTriangle size={15} /><strong>Alert held:</strong><span>the description could not be checked.</span></div>;
-  if (status === "fallback") return <div className="description-verification-result description-verification-result--unknown"><AlertTriangle size={15} /><strong>Alerted without an AI check</strong><span>(the check failed).</span></div>;
+  if (status === "unknown") return <div className="description-verification-result description-verification-result--unknown"><AlertTriangle size={15} /><strong>Description not verified:</strong><span>the check gave no verdict, so alerts go out marked unverified.</span></div>;
+  if (status === "fallback") return <div className="description-verification-result description-verification-result--unknown"><AlertTriangle size={15} /><strong>Description not verified:</strong><span>the AI provider was down, so alerts go out marked unverified.</span></div>;
   if (status === "pending") return <div className="description-verification-result description-verification-result--pending"><LoaderCircle size={15} className="spin" /><strong>Checking the description…</strong></div>;
   return null;
 }
