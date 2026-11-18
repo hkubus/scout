@@ -1498,11 +1498,13 @@ export class ScoutService {
   }
 
   /**
-   * Live description verification (Phase 2): Jev decides; unsure or Jev
-   * failure escalates to exactly one vision call over the gallery photos.
-   * When vision fails after an unsure Jev answer, Jev's lean decides; when
-   * Jev failed too, the error propagates so the caller keeps the fail-open
-   * alert behavior for provider outages.
+   * Live description verification (Phase 2): Jev decides; an unsure pass or
+   * unknown, or a Jev failure, escalates to exactly one vision call over the
+   * gallery photos. An unsure reject stands without vision: vision can only
+   * release the alert by passing, and it agreed with every reject lean on
+   * the owner's data. When vision fails after an unsure Jev answer, Jev's
+   * lean decides; when Jev failed too, the error propagates so the caller
+   * keeps the fail-open alert behavior for provider outages.
    */
   private async verifyDescriptionLive(
     context: ListingDescriptionVerificationContext,
@@ -1537,6 +1539,17 @@ export class ScoutService {
         };
         this.logJevLive('verification', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: false });
         return verification;
+      }
+      if (judgment.decision === 'reject') {
+        this.logJevLive('verification', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: true });
+        const confidence = judgment.confidence === null ? 'none' : judgment.confidence.toFixed(2);
+        return {
+          decision: 'reject',
+          confidence: judgment.confidence ?? 0,
+          summary: `Jev leaned reject (confidence ${confidence}); vision skipped.`,
+          issues: judgment.issues ?? [],
+          evidence: [],
+        };
       }
     } catch (error) {
       jevFailed = error instanceof Error ? error.message : String(error);

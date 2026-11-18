@@ -3255,7 +3255,7 @@ test('verifies high-priority deals live with Jev and vision escalation', async (
   const context = fixture({
     classifyListingRelevanceWithJev: async () => ({ relevant: true, p: 0.9, unsure: false }),
     verifyListingDescriptionWithJev: async (ctx: any) => ctx.description?.includes('suspicious')
-      ? { decision: 'reject', confidence: 0.4, unsure: true }
+      ? { decision: 'unknown', confidence: 0.4, unsure: true }
       : { decision: 'pass', confidence: 0.85, unsure: false },
     verifyListingDescriptionWithVision: async (input: any) => {
       visionCalls.push({ imageUrls: input.imageUrls });
@@ -3285,7 +3285,8 @@ test('verifies high-priority deals live with Jev and vision escalation', async (
     // Vision outage keeps today's fail-open alert behavior.
     assert.equal(await (failing.service as any).verifyHighPriorityDealOnce(candidate), true);
     // A malformed vision reply after an unsure Jev answer falls back to the
-    // Jev lean instead of holding the alert as unknown.
+    // Jev lean instead of holding the alert as unknown (an unsure reject
+    // never reaches vision and holds it).
     const leaningPass = { ...candidate, listing: liveListing({ listingId: 'live-3', url: 'https://www.olx.pl/d/oferta/live-3' }) };
     const leaningReject = { ...candidate, listing: liveListing({ listingId: 'live-4', url: 'https://www.olx.pl/d/oferta/live-4' }) };
     assert.equal(await (unsureJev.service as any).verifyHighPriorityDealOnce(leaningPass), true);

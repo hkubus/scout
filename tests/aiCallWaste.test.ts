@@ -175,3 +175,50 @@ test('term-match rescue: near-misses without the query model number make no call
     context.close();
   }
 });
+
+/** A stored listing and the candidate a scan builds for it. */
+function dealCandidate(listingId: string, db?: any) {
+  if (db) {
+    const now = new Date().toISOString();
+    db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run('OLX', listingId, 'PS5 console', 1500, `https://www.olx.pl/d/oferta/${listingId}`, now, now);
+  }
+  return {
+    watchId: 'deal-watch', listing: listing(listingId, 'PS5 console', { price: 1500 }),
+    typical: 2000, discountPercent: 25, confidence: 0.9, requiresDescriptionVerification: true,
+  };
+}
+const detailPage = (description: string) => `<meta property="og:description" content="${description}"><meta property="og:image" content="https://ireland.apollo.olxcdn.com/v1/files/abc-PL/image;s=644x461">`;
+
+test('verification: an unsure reject stands without vision; an unsure pass or unknown still escalates', async () => {
+  const restore = liveJevEnv();
+  const vision: string[] = [];
+  const context = fixture({
+    verifyListingDescriptionWithJev: async (ctx: any) => /cracked/i.test(ctx.description) ? { decision: 'reject', confidence: 0.45, unsure: true, issues: ['cracked screen'] }
+      : /maybe/.test(ctx.description) ? { decision: 'pass', confidence: 0.55, unsure: true }
+        : { decision: 'unknown', confidence: 0.3, unsure: true },
+    verifyListingDescriptionWithVision: async (input: any) => { vision.push(input.description); return { decision: 'pass', confidence: 0.8, issues: [], imagesSeen: 1 }; },
+    classifyNegotiabilityWithJev: async () => ({ decision: 'fixed', confidence: 0.9, unsure: false }),
+  });
+  try {
+    let page = detailPage('Cracked screen, otherwise works.');
+    context.service.fetchPublicPage = async () => page;
+    assert.equal(await context.service.verifyHighPriorityDealOnce(dealCandidate('cracked', context.db)), false);
+    assert.deepEqual(vision, []);
+    const stored = context.db.prepare("SELECT ai_description_verification_status AS status, ai_description_verification_json AS json FROM listings WHERE listing_id = 'cracked'").get() as { status: string; json: string };
+    assert.equal(stored.status, 'reject');
+    assert.equal(JSON.parse(stored.json).summary, 'Jev leaned reject (confidence 0.45); vision skipped.');
+    assert.deepEqual(JSON.parse(stored.json).issues, ['cracked screen']);
+    const log = context.db.prepare("SELECT jev_unsure, vision_verdict, vision_error FROM jev_shadow_log WHERE task = 'verification'").all() as Array<Record<string, unknown>>;
+    assert.deepEqual(log.map((row) => ({ ...row })), [{ jev_unsure: 1, vision_verdict: null, vision_error: null }]);
+
+    page = detailPage('maybe works');
+    assert.equal(await context.service.verifyHighPriorityDealOnce(dealCandidate('maybe')), true);
+    page = detailPage('no idea');
+    assert.equal(await context.service.verifyHighPriorityDealOnce(dealCandidate('unsure')), true);
+    assert.deepEqual(vision, ['maybe works', 'no idea']);
+  } finally {
+    restore();
+    context.close();
+  }
+});

@@ -410,6 +410,10 @@ for (const lean of ['pass', 'reject'] as const) {
   const agree = rows.filter((row) => row.vision_verdict === lean).length;
   bench.metric(`ai.verification.${lean}_lean_vision_agreement`, `Vision agreed with a low-confidence Jev "${lean}"`, pct(ratio(agree, rows.length)), '%', 'info', `${agree}/${rows.length}`);
 }
+// verifyDescriptionLive now lets an unsure reject stand without vision.
+const rejectLeanVision = vVision.filter((row) => row.jev_unsure === 1 && parseAnswer(row).decision === 'reject');
+bench.metric('ai.verification.reject_lean_vision_calls', 'Vision calls after a low-confidence Jev "reject" (now skipped: the lean stands)', rejectLeanVision.length, 'calls', 'info',
+  `${rejectLeanVision.filter((row) => row.vision_verdict === 'pass').length} of them passed in vision`);
 const unknownChoice = vVisionDone.filter((row) => parseAnswer(row).decision === 'unknown');
 bench.metric('ai.verification.unknown_choice_share', 'Vision escalations caused by Jev choosing "unknown" (not low confidence)', pct(ratio(unknownChoice.length, vVisionDone.length)), '%', 'info');
 bench.metric('ai.verification.unknown_choice_vision_reject', 'Of those, vision rejected', pct(ratio(unknownChoice.filter((row) => row.vision_verdict === 'reject').length, unknownChoice.length)), '%', 'info');
