@@ -31,6 +31,7 @@ import { bucketDailyObservations, type MarketTrendObservation } from './marketTr
 import { DUPLICATE_FEED_DAYS, DUPLICATE_WINDOW_DAYS, findDuplicatePairs } from './duplicates';
 import { summarizeAnalytics, type AnalyticsRow } from './analytics';
 import { FLAGS_VERSION, accessoryFlag, flagsJson, listingFlags, mergeFlags, parseFlagsJson, storedListingFlags, type StoredListingFlagName } from './flags';
+import { PLAIN_VARIANT_RULE_MODEL, lacksQueryModelNumber, plainVariantMatch } from './aiRules';
 import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SearchTypoVariantStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, DuplicateListing, ListingLiveCheck, ListingNegotiation, Relist, NegotiationFigures, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, AgentFlip, AgentFlips, ConversationResult, InboxResult, AgentListingVerification } from '../src/types';
 import { estimatedNetAtTypical, flipCost, flipNet, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, suggestedListingPrice, type FeePresets } from '../src/profit';
 import { vintedFeesNote } from '../src/listingSignals';
@@ -43,7 +44,10 @@ type WatchRow = Record<string, any>;
 
 /** Settings key for the Flips page's seller-fee presets. */
 export const FEE_PRESETS_KEY = 'flip_fee_presets';
-type ListingRelevanceSearch = Pick<ListingRelevanceContext, 'query' | 'includedTerms' | 'excludedTerms'>;
+type ListingRelevanceSearch = Pick<ListingRelevanceContext, 'query' | 'includedTerms' | 'excludedTerms'> & {
+  /** The watch's variant groups; with them, titles that plainly name one skip the AI. */
+  variantGroups?: VariantGroup[];
+};
 type RelevanceFilterResult = {
   listings: NormalizedListing[];
   excluded: number;
@@ -213,6 +217,9 @@ const RESEARCH_TYPO_LEGACY = 1;
 const RESEARCH_TYPO_CURRENT = 2;
 /** Jev variant assignments a grouped watch may request per scan and source. */
 const VARIANT_JEV_BUDGET = 10;
+/** `jev_fuzzy_cache.decision` for a failed rescue call, retried after FUZZY_ERROR_RETRY_MS. */
+const FUZZY_ERROR_DECISION = 'error';
+const FUZZY_ERROR_RETRY_MS = 60 * 60_000;
 /**
  * A standing deal that cannot alert (already alerted at this price, no due
  * channel or digest) is not re-verified while its stored verdict for the
@@ -1737,6 +1744,23 @@ export class ScoutService {
       let cached: CachedRelevance | undefined;
       if (watchId) {
         cached = this.stmt('SELECT input_hash, model, relevant, reason, error, relevance_status FROM listing_relevance WHERE watch_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, listing.marketplace, listing.listingId) as CachedRelevance | undefined;
+        // A title that names one of the watch's variants and nothing else is
+        // relevant without an AI call. It also replaces an AI exclusion of the
+        // same input: the prompt does not see the variant groups, so it read
+        // "iPhone 12 mini 64GB" as another model than "iPhone 12".
+        const plain = search.variantGroups?.length ? plainVariantMatch({
+          title: listing.title, condition: listing.condition,
+          query: search.query, includedTerms: search.includedTerms, excludedTerms: search.excludedTerms,
+          groups: search.variantGroups,
+        }) : null;
+        if (plain) {
+          const reason = `Title plainly names the "${plain.label}" variant`.slice(0, 240);
+          const sameInput = cached?.input_hash === inputHash && !cached.error;
+          const keptByAi = sameInput && cached?.model === activeModel && cached.relevance_status === 'relevant';
+          const ruleRow = sameInput && cached?.model === PLAIN_VARIANT_RULE_MODEL && cached.relevance_status === 'relevant' && cached.reason === reason;
+          if (!keptByAi && !ruleRow) persistRelevance(listing, inputHash, PLAIN_VARIANT_RULE_MODEL, true, 'relevant', reason);
+          return { listing, status: 'relevant' };
+        }
         const cachedStatus: 'relevant' | 'irrelevant' | 'unknown' = cached?.relevance_status === 'irrelevant' || cached?.relevance_status === 'unknown' || cached?.relevance_status === 'relevant'
           ? cached.relevance_status
           : cached?.error ? 'unknown' : cached?.relevant === 0 ? 'irrelevant' : 'relevant';
@@ -1929,8 +1953,11 @@ export class ScoutService {
    */
   private readFuzzyCache(inputHash: string, model: string, task: 'term-match' | 'condition' | 'variant' | 'checks'): { rescued: boolean; decision: string } | null {
     try {
-      const row = this.stmt('SELECT rescued, decision FROM jev_fuzzy_cache WHERE input_hash = ? AND model = ? AND task = ?').get(inputHash, model, task) as { rescued?: number; decision?: string } | undefined;
+      const row = this.stmt('SELECT rescued, decision, checked_at FROM jev_fuzzy_cache WHERE input_hash = ? AND model = ? AND task = ?').get(inputHash, model, task) as { rescued?: number; decision?: string; checked_at?: string } | undefined;
       if (!row || row.rescued === undefined || row.rescued === null) return null;
+      // A failed call is remembered briefly so a provider outage does not
+      // re-send the same near-miss on every scan; after the window it retries.
+      if (row.decision === FUZZY_ERROR_DECISION && !(Date.now() - Date.parse(row.checked_at ?? '') < FUZZY_ERROR_RETRY_MS)) return null;
       return { rescued: Number(row.rescued) === 1, decision: String(row.decision ?? '') };
     } catch {
       // Missing table (migration not yet applied) means cache miss.
@@ -1968,7 +1995,11 @@ export class ScoutService {
     if (!live) return { rescued, rescuedByTerm, rescuedByCondition };
     const FUZZY_RESCUE_BUDGET = 10;
     let budget = FUZZY_RESCUE_BUDGET;
-    const gatedTerm = gate ? candidates.termCandidates.filter(gate) : candidates.termCandidates;
+    // A near-miss with none of the query's numbers ("GTX 1660 Super" for
+    // "rtx 2060") is never the searched model, so it is dropped before the
+    // gate and the budget and Jev is spent on candidates that can pass.
+    const viableTerm = candidates.termCandidates.filter((listing) => !lacksQueryModelNumber(listing.title, search.query, search.includedTerms, search.excludedTerms));
+    const gatedTerm = gate ? viableTerm.filter(gate) : viableTerm;
     const gatedCondition = gate ? candidates.conditionCandidates.filter(gate) : candidates.conditionCandidates;
     const termSlice = gatedTerm.slice(0, FUZZY_RESCUE_BUDGET);
     budget -= termSlice.length;
@@ -1979,9 +2010,17 @@ export class ScoutService {
     // Verdicts still round-trip through `jev_fuzzy_cache`, so repeating a scan
     // reuses them instead of re-spending.
     type RescueTask = { listing: NormalizedListing; run: () => Promise<boolean> };
+    // Candidates with the same title and condition (the rest of the input is
+    // this pass's search) share one call instead of racing the cache.
+    const inFlight = new Map<string, Promise<boolean>>();
+    const once = (key: string, run: () => Promise<boolean>) => {
+      const pending = inFlight.get(key) ?? run();
+      inFlight.set(key, pending);
+      return pending;
+    };
     const termTasks: RescueTask[] = termSlice.map((listing) => ({
       listing,
-      run: async () => {
+      run: () => once(`term-match\u0000${listing.title}\u0000${listing.condition ?? ''}`, async () => {
         const inputHash = listingTermMatchInputHash({
           title: listing.title, listingCondition: listing.condition,
           query: search.query,
@@ -2000,13 +2039,14 @@ export class ScoutService {
           return rescuedListing;
         } catch (error) {
           this.logJevLive('term-match', inputHash, live, { jevError: error instanceof Error ? error.message : String(error) });
+          this.writeFuzzyCache(inputHash, live.jevModel, 'term-match', FUZZY_ERROR_DECISION, null, false);
           return false;
         }
-      },
+      }),
     }));
     const conditionTasks: RescueTask[] = conditionSlice.map((listing) => ({
       listing,
-      run: async () => {
+      run: () => once(`condition\u0000${listing.title}\u0000${listing.condition ?? ''}`, async () => {
         const inputHash = listingConditionMatchInputHash({
           title: listing.title, listingCondition: listing.condition, requestedCondition: search.condition ?? 'Any',
         });
@@ -2022,9 +2062,10 @@ export class ScoutService {
           return rescuedListing;
         } catch (error) {
           this.logJevLive('condition', inputHash, live, { jevError: error instanceof Error ? error.message : String(error) });
+          this.writeFuzzyCache(inputHash, live.jevModel, 'condition', FUZZY_ERROR_DECISION, null, false);
           return false;
         }
-      },
+      }),
     }));
     const tasks = [...termTasks, ...conditionTasks];
     const outcomes = new Array<boolean>(tasks.length).fill(false);
@@ -4199,7 +4240,7 @@ export class ScoutService {
       else triage.none += count;
     }
 
-    const relevanceRow = this.stmt("SELECT SUM(CASE WHEN relevance_status IN ('relevant', 'irrelevant') THEN 1 ELSE 0 END) AS judged, SUM(CASE WHEN relevance_status = 'relevant' THEN 1 ELSE 0 END) AS passed FROM listing_relevance WHERE checked_at >= ?").get(cutoff) as { judged?: number; passed?: number };
+    const relevanceRow = this.stmt("SELECT SUM(CASE WHEN relevance_status IN ('relevant', 'irrelevant') THEN 1 ELSE 0 END) AS judged, SUM(CASE WHEN relevance_status = 'relevant' THEN 1 ELSE 0 END) AS passed FROM listing_relevance WHERE checked_at >= ? AND model != ?").get(cutoff, PLAIN_VARIANT_RULE_MODEL) as { judged?: number; passed?: number };
     const shadowRow = this.stmt('SELECT SUM(CASE WHEN agreement IS NOT NULL THEN 1 ELSE 0 END) AS judged, SUM(CASE WHEN agreement = 1 THEN 1 ELSE 0 END) AS agreed FROM jev_shadow_log WHERE created_at >= ?').get(cutoff) as { judged?: number; agreed?: number };
     const relevanceJudged = Number(relevanceRow.judged ?? 0);
     const shadowJudged = Number(shadowRow.judged ?? 0);
@@ -6668,6 +6709,7 @@ export class ScoutService {
             query: row.query,
             includedTerms: row.included_terms ?? '',
             excludedTerms: row.excluded_terms ?? '',
+            variantGroups: baselines.groups,
           }, row.id, row.ai_relevance === undefined ? true : Boolean(row.ai_relevance), strongEnough);
           const candidates = this.transaction(() => {
             const pendingCandidates: DealNotificationCandidate[] = [];

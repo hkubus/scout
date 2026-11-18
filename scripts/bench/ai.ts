@@ -18,6 +18,7 @@
 
 import { listingRelevanceInputHash, listingTermMatchInputHash, LISTING_DESCRIPTION_MAX_CHARS } from '../../server/ai';
 import { listingFlags } from '../../server/flags';
+import { lacksQueryModelNumber, plainVariantMatch } from '../../server/aiRules';
 import { listingDescriptionText, type Marketplace } from '../../server/marketplaces';
 import { isModelToken } from '../../server/queryMatch';
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from '../../server/text';
@@ -275,7 +276,8 @@ bench.table('relevance repeat calls by gap since the same input was last asked',
 // ============================================================== fuzzy rescue
 
 type FuzzyRow = { input_hash: string; model: string; task: string; decision: string; confidence: number | null; rescued: number; checked_at: string };
-const fuzzy = all<FuzzyRow>(db, 'SELECT * FROM jev_fuzzy_cache');
+// Rows with decision 'error' are the rescue's retry backoff, not verdicts.
+const fuzzy = all<FuzzyRow>(db, "SELECT * FROM jev_fuzzy_cache WHERE decision != 'error'");
 const termCache = fuzzy.filter((row) => row.task === 'term-match');
 const termCalls = taskRows('term-match');
 const termRescued = termCache.filter((row) => row.rescued === 1).length;
@@ -286,6 +288,17 @@ bench.metric('ai.term_match.reject_share', 'Term-match verdicts that were a conf
 const termErrored = new Set(termCalls.filter((row) => row.jev_error !== null).map((row) => row.input_hash));
 bench.metric('ai.term_match.errors_retried', 'Term-match calls repeated after an error (errors are not cached)', termCalls.filter((row, index) => termCalls.findIndex((other) => other.input_hash === row.input_hash) !== index && termErrored.has(row.input_hash)).length, 'calls', 'lower');
 bench.metric('ai.term_match.repeat_calls', 'Term-match calls on an input already answered', repeats(termCalls).repeat, 'calls', 'lower');
+// The rescue now remembers a failed call for an hour (FUZZY_ERROR_RETRY_MS).
+const lastFailure = new Map<string, number>();
+let retriesInBackoff = 0;
+for (const row of [...termCalls, ...taskRows('condition')].sort((a, b) => a.created_at.localeCompare(b.created_at))) {
+  const at = Date.parse(row.created_at);
+  const failed = lastFailure.get(row.input_hash);
+  if (failed !== undefined && at - failed < 60 * 60_000) retriesInBackoff += 1;
+  if (row.jev_error !== null) lastFailure.set(row.input_hash, at);
+  else lastFailure.delete(row.input_hash);
+}
+bench.metric('ai.term_match.retries_within_hour_of_error', 'Rescue calls (term or condition) re-sent within an hour of the same input failing (the backoff skips these)', retriesInBackoff, 'calls', 'info');
 bench.table('fuzzy cache by task and verdict', (() => {
   const map = new Map<string, { task: string; decision: string; rescued: number; rows: number; confSum: number; confN: number }>();
   for (const row of fuzzy) {
@@ -312,10 +325,10 @@ bench.table('fuzzy cache by task and verdict', (() => {
 })());
 
 // Offline: recover the titles behind term-match hashes by hashing every stored
-// listing against every watch and research query, then test a rule a
-// deterministic pre-filter could apply before spending a Jev call: the title
-// has none of the query's model-number tokens (digits), e.g. "GTX 1660 Super"
-// for "rtx 2060". Only listings Scout stored are recoverable; manual-search
+// listing against every watch and research query, then replay the rule
+// rescueFuzzyMisses applies before spending a Jev call (lacksQueryModelNumber
+// in server/aiRules.ts): the title has none of the query's number-bearing
+// terms, e.g. "GTX 1660 Super" for "rtx 2060". Only listings Scout stored are recoverable; manual-search
 // queries are not in the export, so this is a subset.
 const listingTitles = all<{ title: string; condition: string | null }>(db, 'SELECT DISTINCT title, condition FROM listings');
 const searches = [
@@ -335,13 +348,12 @@ for (const listing of listingTitles) {
     const text = normalizeFilterText(listing.title);
     const glued = text.replace(/ /g, '');
     const { included } = parseIncludedExcluded(search.query, search.included, search.excluded);
-    const numeric = included.filter((term) => /\d/.test(term));
     recovered.push({
       query: search.query,
       title: listing.title,
       decision: cached.decision,
       rescued: cached.rescued,
-      noModelToken: numeric.length > 0 && numeric.every((term) => !termMatches(text, glued, term)),
+      noModelToken: lacksQueryModelNumber(listing.title, search.query, search.included, search.excluded),
       missing: included.filter((term) => !termMatches(text, glued, term)).join(' '),
     });
   }
@@ -587,6 +599,25 @@ const dealByRow = new Map(all<{ watch_id: string; marketplace: string; listing_i
 const plainExcluded = plain.filter((row) => row.ai === 'irrelevant');
 bench.metric('ai.rules.plain_excluded_strong_deals', 'Plain-match titles the AI excluded that were Very strong / Exceptional deals', plainExcluded.filter((row) => ['Very strong', 'Exceptional'].includes(dealByRow.get(row.key) ?? '')).length, 'rows', 'lower',
   'the relevance check only runs on gated (deal-strength) listings, so an exclusion here hides a deal');
+
+// The shipped plain-variant rule (server/aiRules.ts) on the same judged rows:
+// what it decides without an AI call, and where it overrides an AI exclusion.
+const shipped = relRows.flatMap((row) => {
+  const status = relStatus(row);
+  const watch = watchById.get(row.watch_id);
+  const groups = watch ? groupsByWatch.get(watch.id) ?? [] : [];
+  if ((status !== 'relevant' && status !== 'irrelevant') || !watch || !row.title || !groups.length) return [];
+  const match = plainVariantMatch({ title: row.title, condition: row.condition, query: watch.query, includedTerms: watch.included_terms ?? '', excludedTerms: watch.excluded_terms ?? '', groups });
+  return [{ watch: watch.name, title: row.title, ai: status, p: /p=([\d.]+)/.exec(row.reason ?? '')?.[1] ?? null, variant: match?.label ?? null, hash: row.input_hash }];
+});
+const shippedDecided = shipped.filter((row) => row.variant !== null);
+const decidedHashes = new Set(shippedDecided.map((row) => row.hash));
+bench.metric('ai.relevance.plain_variant_calls', 'Logged relevance calls on inputs the plain-variant rule now decides', relevanceCalls.filter((row) => decidedHashes.has(row.input_hash)).length, 'calls', 'info',
+  `of ${relevanceCalls.length} relevance calls (manual searches have no groups, so the rule never runs there)`);
+bench.metric('ai.relevance.plain_variant_decided', 'Judged rows on watches with variant groups the plain-variant rule decides without AI', pct(ratio(shippedDecided.length, shipped.length)), '%', 'higher',
+  `${shippedDecided.length} of ${shipped.length}`);
+bench.metric('ai.relevance.plain_variant_overrides', 'Of those, rows the AI had excluded (the rule keeps them)', shippedDecided.filter((row) => row.ai === 'irrelevant').length, 'rows', 'info');
+bench.table('plain-variant rule overrides of AI exclusions', shippedDecided.filter((row) => row.ai === 'irrelevant').slice(0, examples).map(({ hash: _hash, ...row }) => row));
 
 // Candidate accessory vocabulary the AI excludes but flags.ts does not know
 // (GPU fans and coolers, phone cases in other languages, bare chips). Not repo
