@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { connect as connectHttp2, type SecureClientSessionOptions } from 'node:http2';
 import { brotliDecompressSync, gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
 import type { Browser, BrowserContext, Page } from 'playwright-core';
-import { DeliveryRejectedError, assertDeliveryResponse, buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
+import { DeliveryRejectedError, assertDeliveryResponse, buildDiscordEmbed, buildNtfyPayload, descriptionUnverifiedReason, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseOfferPage, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, type SellerType, parseOlxCategoryFacets, type ListingDetailResult, type SellerListingsPage, allegroSellerProfileUrl, olxSellerListingsUrl, parseAllegroSellerProfile, parseOlxSellerListings, parseVintedWardrobe, vintedWardrobeUrl, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult, olxDetailHint, setOlxDetailHint } from './marketplaces';
 import { MarketplaceSessionValidationError, SESSION_CHECK_URLS, classifySessionCheck, parseMarketplaceStorageState, type MarketplaceStorageState, type SessionCheckOutcome } from './marketplace-sessions';
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, writeResaleListingWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseVerificationChecks, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type VerificationCheck } from './ai';
@@ -84,10 +84,14 @@ type DealNotificationCandidate = {
 };
 
 /**
- * One description-check run: whether the deal may alert, and whether the
- * verdict came from one already stored (no AI call ran for it).
+ * One description-check run: whether the verdict cleared the alert (pass, a
+ * provider-outage fallback, no AI key), why it gave no verdict when it did
+ * not (unknown or fallback, see descriptionUnverifiedReason; such deals still
+ * alert, marked unverified), and whether the verdict came from one already
+ * stored (no AI call ran for it). Only a reject is neither allowed nor
+ * unverified, so only a reject holds the alert.
  */
-type DescriptionVerificationRun = { allowed: boolean; reused: boolean };
+type DescriptionVerificationRun = { allowed: boolean; reused: boolean; unverified: string | null };
 
 /** The description check's input for a candidate and its page's description; its hash keys every verdict cache. */
 function descriptionVerificationContext(candidate: DealNotificationCandidate, description: string | null): ListingDescriptionVerificationContext {
@@ -165,7 +169,12 @@ type DigestCandidateRow = {
   confidence: number;
   priority: NotificationPriority;
   observed_at: string;
+  /** The listing's description-check status when the digest is built. */
+  verification_status?: string | null;
 };
+
+/** A digest line's marker for a deal whose description check gave no verdict. */
+const digestUnverified = (row: DigestCandidateRow) => row.verification_status === 'unknown' || row.verification_status === 'fallback';
 
 const DEFAULT_DAILY_DIGEST_CONFIG: DailyDigestConfig = {
   enabled: false,
@@ -2302,7 +2311,7 @@ export class ScoutService {
         this.updateListingDetailSnapshot(snapshot?.id ?? null, 'not-configured', null);
         this.saveDescriptionVerification({ marketplace, listingId, status: 'not-configured' });
       });
-      return { allowed: true, reused: false };
+      return { allowed: true, reused: false, unverified: null };
     }
 
     let description: string | null;
@@ -2336,14 +2345,16 @@ export class ScoutService {
         this.saveDescriptionVerification({ marketplace, listingId, status: 'unknown', model: activeModel, error: message });
       });
       this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: 'unknown' });
-      return { allowed: false, reused: false };
+      // Stored with its error and no input hash, so it is no finished verdict:
+      // the next scan that sees the listing fetches the page again.
+      return { allowed: false, reused: false, unverified: descriptionUnverifiedReason({ status: 'unknown', error: message }) };
     }
 
     const context = descriptionVerificationContext(candidate, description);
     const inputHash = listingDescriptionVerificationInputHash(context);
     // Everything up to the fresh AI call is synchronous, so the snapshot and
     // any cached decision are written in one transaction.
-    type CachedOutcome = { done: true; allowed: boolean; reused: boolean; emit: ListingDescriptionVerificationStatus | null } | { done: false; snapshotId: number | null };
+    type CachedOutcome = { done: true; allowed: boolean; reused: boolean; unverified: string | null; emit: ListingDescriptionVerificationStatus | null } | { done: false; snapshotId: number | null };
     const outcome = this.transaction((): CachedOutcome => {
       const snapshot = this.captureListingDetailSnapshot(candidate, description);
       const row = this.stmt(`SELECT ai_description_verification_json, ai_description_verification_input_hash,
@@ -2354,7 +2365,7 @@ export class ScoutService {
       if (cached && row?.ai_description_verification_input_hash === inputHash && row.ai_description_verification_model === activeModel) {
         this.updateListingDetailSnapshot(snapshot?.id ?? null, cached.decision, inputHash);
         this.saveDescriptionVerification({ marketplace, listingId, status: cached.decision, verification: cached, inputHash, model: activeModel });
-        return { done: true, allowed: cached.decision === 'pass', reused: true, emit: null };
+        return { done: true, allowed: cached.decision === 'pass', reused: true, unverified: descriptionUnverifiedReason({ status: cached.decision, verification: cached }), emit: null };
       }
       if (row?.ai_description_verification_error && row.ai_description_verification_input_hash === inputHash
         && row.ai_description_verification_model === activeModel && row.ai_description_verification_at
@@ -2362,7 +2373,7 @@ export class ScoutService {
         const status: ListingDescriptionVerificationStatus = row.ai_description_verification_status === 'fallback' ? 'fallback' : 'unknown';
         this.updateListingDetailSnapshot(snapshot?.id ?? null, status, inputHash);
         this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: activeModel, error: row.ai_description_verification_error });
-        return { done: true, allowed: status === 'fallback', reused: true, emit: null };
+        return { done: true, allowed: status === 'fallback', reused: true, unverified: descriptionUnverifiedReason({ status, error: String(row.ai_description_verification_error) }), emit: null };
       }
 
       if (!description) {
@@ -2375,7 +2386,7 @@ export class ScoutService {
         };
         this.updateListingDetailSnapshot(snapshot?.id ?? null, unknown.decision, inputHash);
         this.saveDescriptionVerification({ marketplace, listingId, status: unknown.decision, verification: unknown, inputHash, model: activeModel });
-        return { done: true, allowed: false, reused: false, emit: unknown.decision };
+        return { done: true, allowed: false, reused: false, unverified: 'no description on the listing page', emit: unknown.decision };
       }
 
       // Cross-listing reuse is keyed by input hash, which omits the gallery
@@ -2391,7 +2402,7 @@ export class ScoutService {
       if (shared) {
         this.updateListingDetailSnapshot(snapshot?.id ?? null, shared.decision, inputHash);
         this.saveDescriptionVerification({ marketplace, listingId, status: shared.decision, verification: shared, inputHash, model: activeModel });
-        return { done: true, allowed: shared.decision === 'pass', reused: true, emit: null };
+        return { done: true, allowed: shared.decision === 'pass', reused: true, unverified: descriptionUnverifiedReason({ status: shared.decision, verification: shared }), emit: null };
       }
       // A fresh AI call follows: the snapshot shows pending while it runs.
       if (snapshot?.id) this.stmt("UPDATE listing_detail_snapshots SET verification_status = 'pending' WHERE id = ? AND verification_status IS NOT 'pending'").run(snapshot.id);
@@ -2399,7 +2410,7 @@ export class ScoutService {
     });
     if (outcome.done) {
       if (outcome.emit) this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: outcome.emit });
-      return { allowed: outcome.allowed, reused: outcome.reused };
+      return { allowed: outcome.allowed, reused: outcome.reused, unverified: outcome.unverified };
     }
     const snapshot = outcome.snapshotId === null ? null : { id: outcome.snapshotId };
 
@@ -2422,7 +2433,7 @@ export class ScoutService {
       this.updateListingDetailSnapshot(snapshot?.id ?? null, verification.decision, inputHash);
       this.saveDescriptionVerification({ marketplace, listingId, status: verification.decision, verification, inputHash, model: activeModel });
       this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: verification.decision });
-      return { allowed: verification.decision === 'pass', reused: false };
+      return { allowed: verification.decision === 'pass', reused: false, unverified: descriptionUnverifiedReason({ status: verification.decision, verification }) };
     } catch (error) {
       const message = (error instanceof Error ? error.message : 'OpenRouter could not verify the listing description').slice(0, 500);
       // Only genuine provider outages keep the historical fail-open alert. A
@@ -2434,7 +2445,7 @@ export class ScoutService {
       this.updateListingDetailSnapshot(snapshot?.id ?? null, status, inputHash);
       this.saveDescriptionVerification({ marketplace, listingId, status, inputHash, model: activeModel, error: message });
       this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status });
-      return { allowed: status === 'fallback', reused: false };
+      return { allowed: status === 'fallback', reused: false, unverified: descriptionUnverifiedReason({ status, error: message }) };
     }
   }
 
@@ -2535,13 +2546,18 @@ export class ScoutService {
           // notifyDeal ignores hidden listings, so verifying one would only
           // fetch its page and spend an AI call for nothing.
           if (this.isListingHidden(candidate.listing)) continue;
+          let descriptionUnverified: string | null = null;
           if (candidate.requiresDescriptionVerification) {
             // notifyDeal re-plans after the awaits, since state can change.
             const plan = this.planDealNotification(candidate.watchId, candidate.listing, candidate.discountPercent, context, false, isTargetHit(candidate.targetPrice));
             if (!plan.channels.length && !plan.digestDue && this.hasFreshDescriptionVerification(candidate, context)) continue;
-            if (!await this.verifyHighPriorityDeal(candidate, context)) continue;
+            // Only a reject holds the alert; a check without a verdict alerts
+            // marked unverified (the owner's call: speed beats a missed deal).
+            const run = await this.sharedDescriptionVerification(candidate, context);
+            if (!run.allowed && run.unverified === null) continue;
+            descriptionUnverified = run.unverified;
           }
-          await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence, context, candidate.variantLabel ?? null, { targetPrice: candidate.targetPrice ?? null, estimatedNet: candidate.estimatedNet ?? null });
+          await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence, context, candidate.variantLabel ?? null, { targetPrice: candidate.targetPrice ?? null, estimatedNet: candidate.estimatedNet ?? null, descriptionUnverified });
         }
       }
     };
@@ -4887,6 +4903,7 @@ export class ScoutService {
       key: `${marketplace}:${listingId}`,
       watch: watch ? { id: String(watch.id), name: String(watch.name) } : null,
       status: (stored?.status ?? null) as ListingDescriptionVerificationStatus | null,
+      unverifiedReason: descriptionUnverifiedReason({ status: stored?.status, verification, error: stored?.error }),
       verification: verification ? {
         decision: verification.decision,
         confidence: verification.confidence,
@@ -7524,7 +7541,7 @@ export class ScoutService {
         color: 0x1d61e8,
         fields: shown.map((row) => ({
           name: `${row.discount_percent.toFixed(1)}% below typical · ${row.marketplace} · ${row.watch_name}`.slice(0, 256),
-          value: `[${escapeDiscordMarkdown(row.title.replace(/[\r\n]+/g, ' ').slice(0, 180))}](${row.url})\n${Number(row.price_pln).toLocaleString('pl-PL')} zł · typical ${Number(row.typical_pln).toLocaleString('pl-PL')} zł · ${row.confidence}% confidence`.slice(0, 1024),
+          value: `[${escapeDiscordMarkdown(row.title.replace(/[\r\n]+/g, ' ').slice(0, 180))}](${row.url})\n${Number(row.price_pln).toLocaleString('pl-PL')} zł · typical ${Number(row.typical_pln).toLocaleString('pl-PL')} zł · ${row.confidence}% confidence${digestUnverified(row) ? '\n⚠️ Description not verified' : ''}`.slice(0, 1024),
         })),
         footer: { text: 'Scout · daily digest · asking prices' },
         timestamp: nowIso(),
@@ -7539,7 +7556,7 @@ export class ScoutService {
       topic: config.topic,
       title: `Scout daily digest · ${date} · ${rows.length} ${rows.length === 1 ? 'deal' : 'deals'}`,
       message: [
-        ...shown.map((row) => `${row.discount_percent.toFixed(1)}% · ${row.title} · ${Number(row.price_pln).toLocaleString('pl-PL')} zł\n${row.url}`),
+        ...shown.map((row) => `${row.discount_percent.toFixed(1)}% · ${row.title} · ${Number(row.price_pln).toLocaleString('pl-PL')} zł${digestUnverified(row) ? ' · ⚠️ not verified' : ''}\n${row.url}`),
         ...(hidden ? [`+ ${hidden} more deal${hidden === 1 ? '' : 's'} in Scout`] : []),
       ].join('\n\n'),
       priority: 3,
@@ -7596,10 +7613,14 @@ export class ScoutService {
     if (!channels.length) return;
     this.digestRunning = true;
     try {
-      const candidates = this.stmt(`SELECT c.*, w.name AS watch_name
+      // Unverified deals are queued (they alert, marked); one whose check
+      // later rejected it drops out like a hidden one.
+      const candidates = this.stmt(`SELECT c.*, w.name AS watch_name, l.ai_description_verification_status AS verification_status
         FROM daily_digest_candidates c JOIN watches w ON w.id = c.watch_id
+        LEFT JOIN listings l ON l.marketplace = c.marketplace AND l.listing_id = c.listing_id
         WHERE c.digest_date IS NULL
           AND NOT EXISTS (SELECT 1 FROM listing_actions a WHERE a.marketplace = c.marketplace AND a.listing_id = c.listing_id AND a.hidden = 1)
+          AND COALESCE(l.ai_description_verification_status, '') <> 'reject'
         ORDER BY c.discount_percent DESC, c.observed_at ASC, c.id ASC`).all() as DigestCandidateRow[];
       const planned: Array<{ channel: DigestChannel; eventKey: string; payload: Record<string, any> }> = [];
       this.transaction(() => {
@@ -7656,6 +7677,7 @@ export class ScoutService {
       variantLabel?: string | null;
       targetPrice?: number | null;
       estimatedNet?: number | null;
+      descriptionUnverified?: string | null;
     } | undefined;
   }
 
@@ -7735,9 +7757,10 @@ export class ScoutService {
     variantLabel?: string | null;
     targetPrice?: number | null;
     estimatedNet?: number | null;
+    descriptionUnverified?: string | null;
     legacy?: boolean;
   }) {
-    const alert = { listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence, variantLabel: input.variantLabel, targetPrice: input.targetPrice ?? null, estimatedNet: input.estimatedNet ?? null };
+    const alert = { listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence, variantLabel: input.variantLabel, targetPrice: input.targetPrice ?? null, estimatedNet: input.estimatedNet ?? null, descriptionUnverified: input.descriptionUnverified ?? null };
     const started = nowIso();
     try {
       if (input.channel === 'Discord') {
@@ -7865,7 +7888,7 @@ export class ScoutService {
     maybeConfidence?: number,
     context?: ScanNotifyContext,
     variantLabel?: string | null,
-    extras: { targetPrice?: number | null; estimatedNet?: number | null } = {},
+    extras: { targetPrice?: number | null; estimatedNet?: number | null; descriptionUnverified?: string | null } = {},
   ) {
     const legacy = typeof watchIdOrListing !== 'string';
     const watchId = legacy ? '__legacy__' : watchIdOrListing;
@@ -7875,6 +7898,7 @@ export class ScoutService {
     const confidence = (legacy ? discountOrConfidence : maybeConfidence) as number;
     const targetPrice = extras.targetPrice ?? null;
     const estimatedNet = extras.estimatedNet ?? null;
+    const descriptionUnverified = extras.descriptionUnverified ?? null;
     const plan = this.planDealNotification(watchId, listing, discountPercent, context, legacy, isTargetHit(targetPrice));
     if (plan.hidden) return;
     const { priority, encryptedDiscord, ntfy } = plan;
@@ -7883,7 +7907,7 @@ export class ScoutService {
 
     const planned: Array<{ channel: 'Discord' | 'ntfy'; eventKey: string; deliveryKey: string; sequence?: number; claim: { id: number; attemptCount: number }; legacy: boolean }> = [];
     for (const { channel, sequence, eventKey, deliveryKey } of plan.channels) {
-      const payload = { ...buildDiscordEmbed({ listing, typical, discountPercent, confidence, variantLabel, targetPrice, estimatedNet }), _scout: { watchId, listing, typical, discountPercent, confidence, priority, sequence, variantLabel, targetPrice, estimatedNet } };
+      const payload = { ...buildDiscordEmbed({ listing, typical, discountPercent, confidence, variantLabel, targetPrice, estimatedNet, descriptionUnverified }), _scout: { watchId, listing, typical, discountPercent, confidence, priority, sequence, variantLabel, targetPrice, estimatedNet, ...(descriptionUnverified ? { descriptionUnverified } : {}) } };
       this.stmt('INSERT OR IGNORE INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(eventKey, JSON.stringify(payload), 'pending', nowIso());
       const claim = this.claimNotificationDelivery(deliveryKey, channel);
       if (claim) planned.push({ channel, eventKey, deliveryKey, sequence: legacy ? undefined : sequence, claim, legacy });
@@ -7906,6 +7930,7 @@ export class ScoutService {
       variantLabel,
       targetPrice,
       estimatedNet,
+      descriptionUnverified,
       legacy: item.legacy,
     })));
   }
@@ -7956,6 +7981,7 @@ export class ScoutService {
         variantLabel: meta.variantLabel,
         targetPrice: meta.targetPrice ?? null,
         estimatedNet: meta.estimatedNet ?? null,
+        descriptionUnverified: meta.descriptionUnverified ?? null,
         legacy: meta.watchId === '__legacy__',
       });
     }

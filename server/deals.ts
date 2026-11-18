@@ -1,6 +1,7 @@
 import type { DealLabel, Listing, ListingDecision, ListingDescriptionVerificationStatus, ListingFlagName, Marketplace, SellerType } from '../src/types';
 import type { StoredListingFlagName } from './flags';
 import { compactDuplicate, compactDuplicateNote, type CompactDuplicate } from './mcpFormat';
+import { descriptionUnverifiedReason } from './notifications';
 import type { ScoutService } from './service';
 import { MATCH_VISIBILITY_MS } from './service';
 
@@ -57,6 +58,11 @@ export interface CompactListing {
   seenAt: string;
   decision: ListingDecision | null;
   verification: ListingDescriptionVerificationStatus | null;
+  /**
+   * Only on rows whose description check gave no verdict (verification
+   * unknown or fallback): why. Their alerts still went out, marked unverified.
+   */
+  unverified?: string;
   /** Only on rows you hid. */
   hidden?: true;
   /**
@@ -74,6 +80,11 @@ export interface CompactListing {
 export function withDuplicateNote<T extends Listing>(listing: T): T {
   if (!listing.duplicateCheapest) return listing;
   return { ...listing, duplicateCheapest: compactDuplicateNote(listing, listing.duplicateCheapest) };
+}
+
+function unverifiedField(listing: Listing): { unverified?: string } {
+  const reason = descriptionUnverifiedReason({ status: listing.aiDescriptionVerificationStatus, verification: listing.aiDescriptionVerification, error: listing.aiDescriptionVerificationError });
+  return reason ? { unverified: reason } : {};
 }
 
 export function compactListing(listing: Listing): CompactListing {
@@ -105,6 +116,7 @@ export function compactListing(listing: Listing): CompactListing {
     seenAt: listing.observedAt,
     decision: listing.decision ?? null,
     verification: listing.aiDescriptionVerificationStatus ?? null,
+    ...unverifiedField(listing),
     ...(listing.hidden ? { hidden: true as const } : {}),
     ...(listing.duplicateCount && listing.duplicateCheapest
       ? { duplicateCount: listing.duplicateCount, duplicateCheapest: compactDuplicate(listing, listing.duplicateCheapest) }
