@@ -189,8 +189,14 @@ export const MATCH_VISIBILITY_MS = 12 * 60 * 60_000;
  * client pages past it with `page` instead of losing results silently.
  */
 const MANUAL_SEARCH_RESULT_CAP = 200;
-/** Consecutive failed scans of a marketplace before its connector backs off. */
+/** Consecutive failed scheduler ticks of a marketplace before its connector backs off. */
 const CONNECTOR_BACKOFF_AFTER_FAILURES = 2;
+/**
+ * Runs of one scheduler tick start within milliseconds (seconds on a loaded
+ * host); ticks are 30 s apart. Runs that started closer than this, and
+ * overlapped in time, are one tick for the backoff streak.
+ */
+const CONNECTOR_TICK_GAP_MS = 15_000;
 /**
  * Manual-search Jev checks, per source per page: at most this many uncached
  * Jev calls, and detail-page fetches for at most this many listings whose
@@ -606,6 +612,13 @@ export function dueWatchSources(
  * later); sources that were not due keep their existing time. The watch-wide
  * next_scan_at is the earliest source time, so the scheduler wakes the watch
  * exactly when its next marketplace is ready.
+ *
+ * A scanned source advances from the time it was due, not from when the scan
+ * finished, so the 30 s scheduler tick and the scan's own duration do not
+ * stretch every interval: a 7 min watch runs every 7 min, not 7.5. When that
+ * time has already passed (a scan late by more than an interval, a night or
+ * day boundary in between) or the source was not due yet (Scan now), it
+ * advances from the finish as before.
  */
 export function nextWatchScanSchedule(options: {
   sources: Marketplace[];
@@ -622,6 +635,12 @@ export function nextWatchScanSchedule(options: {
     const interval = options.intervals[source] ?? 5;
     if (scannedSet.has(source)) {
       let next = nextWatchScanAt(options.finishedAt, interval, options.nightIntervalMinutes);
+      const due = options.prior[source] ? Date.parse(options.prior[source] as string) : Number.NaN;
+      const finished = Date.parse(options.finishedAt);
+      if (Number.isFinite(due) && due <= finished) {
+        const fromDue = nextWatchScanAt(new Date(due).toISOString(), interval, options.nightIntervalMinutes);
+        if (Date.parse(fromDue) > finished) next = fromDue;
+      }
       const backoffUntil = options.backoff?.[source];
       if (backoffUntil && Date.parse(backoffUntil) > Date.parse(next)) next = backoffUntil;
       nextBySource[source] = next;
@@ -633,6 +652,35 @@ export function nextWatchScanSchedule(options: {
   }
   const nextScanAt = Object.values(nextBySource).sort()[0] ?? nextWatchScanAt(options.finishedAt, 5, options.nightIntervalMinutes);
   return { nextBySource, nextScanAt };
+}
+
+/**
+ * How many scheduler ticks in a row a marketplace has failed, newest first.
+ * `runs` are its finished ok/error runs, newest start first. Runs that
+ * started within CONNECTOR_TICK_GAP_MS of the next newer one while it was
+ * still running are the same tick: several watches failing together is one
+ * failure, and any ok run in a tick makes the tick ok. A run that started
+ * after the previous one finished (a retry, a forced scan) is its own tick.
+ */
+export function connectorFailedTicks(runs: Array<{ status: string; startedAt: string; finishedAt: string | null }>, tickGapMs = CONNECTOR_TICK_GAP_MS) {
+  let ticks = 0;
+  let tickFailed = true;
+  // Start of the next newer run, NaN before the first.
+  let newerStarted = Number.NaN;
+  for (const run of runs) {
+    const started = Date.parse(run.startedAt);
+    const finished = run.finishedAt ? Date.parse(run.finishedAt) : Number.NaN;
+    const sameTick = Number.isFinite(newerStarted) && Number.isFinite(started) && newerStarted - started < tickGapMs
+      && !(Number.isFinite(finished) && finished <= newerStarted);
+    if (!sameTick) {
+      if (ticks > 0 && !tickFailed) break;
+      ticks += 1;
+      tickFailed = true;
+    }
+    if (run.status !== 'error') tickFailed = false;
+    if (Number.isFinite(started)) newerStarted = started;
+  }
+  return tickFailed ? ticks : ticks - 1;
 }
 
 const nowIso = () => new Date().toISOString();
@@ -7886,18 +7934,23 @@ export class ScoutService {
   }
 
   /**
-   * Backoff deadline for a failed run, or null when it is the first failure
-   * in a row: one blocked page or timeout on one watch must not pause the
-   * connector for every watch and search. From the second consecutive failed
-   * outcome it is 5 min, doubling with each further one up to 6 h; skipped
-   * rows neither break nor extend the streak.
+   * Backoff deadline for a failed run, or null when its tick is the first
+   * failed one in a row: one blocked page or timeout on one watch must not
+   * pause the connector for every watch and search, and neither must several
+   * watches failing in the same scheduler tick (connectorFailedTicks). From
+   * the second consecutive failed tick it is 5 min, doubling with each
+   * further one up to 6 h; skipped rows neither break nor extend the streak.
    */
   private connectorBackoffAfterFailure(source: string, runId: number): string | null {
-    const recent = this.stmt("SELECT status FROM connector_runs WHERE source = ? AND id != ? AND status IN ('ok', 'error') ORDER BY started_at DESC, id DESC LIMIT 8").all(source, runId) as Array<{ status: string }>;
-    const streak = recent.findIndex((run) => run.status !== 'error');
-    const failuresBefore = streak === -1 ? recent.length : streak;
-    if (failuresBefore + 1 < CONNECTOR_BACKOFF_AFTER_FAILURES) return null;
-    return new Date(Date.now() + exponentialBackoff(failuresBefore + 1 - CONNECTOR_BACKOFF_AFTER_FAILURES)).toISOString();
+    // The failing run is still 'running' here; it counts as an error that ends now.
+    const rows = this.stmt(`SELECT id, status, started_at, finished_at FROM connector_runs
+      WHERE source = ? AND (status IN ('ok', 'error') OR id = ?) ORDER BY started_at DESC, id DESC LIMIT 48`).all(source, runId) as Array<{ id: number; status: string; started_at: string; finished_at: string | null }>;
+    const finished = nowIso();
+    const failedTicks = connectorFailedTicks(rows.map((row) => Number(row.id) === runId
+      ? { status: 'error', startedAt: row.started_at, finishedAt: finished }
+      : { status: row.status, startedAt: row.started_at, finishedAt: row.finished_at }));
+    if (failedTicks < CONNECTOR_BACKOFF_AFTER_FAILURES) return null;
+    return new Date(Date.now() + exponentialBackoff(failedTicks - CONNECTOR_BACKOFF_AFTER_FAILURES)).toISOString();
   }
 
   /**
