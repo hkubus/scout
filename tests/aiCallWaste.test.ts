@@ -223,6 +223,42 @@ test('verification: an unsure reject stands without vision; an unsure pass or un
   }
 });
 
+test('verification: a listing without a description is judged from its photos, without Jev; with no photos either it stays unknown', async () => {
+  const restore = liveJevEnv();
+  const jev: Array<string | null> = [];
+  const vision: Array<string | null> = [];
+  let visionDecision: 'pass' | 'reject' = 'reject';
+  const context = fixture({
+    verifyListingDescriptionWithJev: async (ctx: any) => { jev.push(ctx.description); return { decision: 'pass', confidence: 0.9, unsure: false }; },
+    verifyListingDescriptionWithVision: async (input: any) => {
+      vision.push(input.description);
+      return { decision: visionDecision, confidence: 0.85, issues: visionDecision === 'reject' ? ['no display output in the photos'] : [], imagesSeen: 1 };
+    },
+    classifyNegotiabilityWithJev: async () => ({ decision: 'fixed', confidence: 0.9, unsure: false }),
+  });
+  const status = (listingId: string) => (context.db.prepare('SELECT ai_description_verification_status AS status FROM listings WHERE listing_id = ?').get(listingId) as { status: string }).status;
+  // Only a photo: what a Vinted page with nothing but the marketing blurb leaves.
+  context.service.fetchPublicPage = async () => '<meta property="og:image" content="https://ireland.apollo.olxcdn.com/v1/files/abc-PL/image;s=644x461">';
+  try {
+    assert.equal(await context.service.verifyHighPriorityDealOnce(dealCandidate('photos-reject', context.db)), false);
+    assert.equal(status('photos-reject'), 'reject');
+    // A photo verdict stays with its listing: the same text on another listing is looked at again.
+    visionDecision = 'pass';
+    assert.equal(await context.service.verifyHighPriorityDealOnce(dealCandidate('photos-pass', context.db)), true);
+    assert.equal(status('photos-pass'), 'pass');
+    assert.deepEqual(jev, []);
+    assert.deepEqual(vision, [null, null]);
+
+    context.service.fetchPublicPage = async () => '<html></html>';
+    assert.equal(await context.service.verifyHighPriorityDealOnce(dealCandidate('bare', context.db)), false);
+    assert.equal(status('bare'), 'unknown');
+    assert.equal(vision.length, 2);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
 test('relevance: watch scans and manual searches reuse each other\'s verdicts by input hash and model', async () => {
   const restore = liveJevEnv();
   const titles: string[] = [];

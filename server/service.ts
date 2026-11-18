@@ -1673,7 +1673,9 @@ export class ScoutService {
     const startedAt = Date.now();
     let judgment: JevVerificationJudgment | null = null;
     let jevFailed: string | null = null;
-    try {
+    // Without a description (none on the page, or only marketplace
+    // boilerplate) Jev has nothing to read: the photos decide directly.
+    if (context.description) try {
       judgment = await this.jevVerification(context, { apiKey: live.apiKey, model: live.jevModel });
       if (!judgment.unsure) {
         const verification: ListingDescriptionVerification = {
@@ -1706,7 +1708,7 @@ export class ScoutService {
 
     try {
       const vision = await this.visionVerification(visionInput, visionConfig);
-      const verification = visionToVerification(vision, judgment ? 'Jev was unsure; vision tiebreak.' : 'Jev failed; vision decided directly.');
+      const verification = visionToVerification(vision, judgment ? 'Jev was unsure; vision tiebreak.' : context.description ? 'Jev failed; vision decided directly.' : 'No listing description; vision decided from the photos.');
       this.logJevLive('verification', inputHash, live, startedAt,
         judgment
           ? { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: true }
@@ -2562,7 +2564,10 @@ export class ScoutService {
         return { done: true, allowed: status === 'fallback', reused: true, unverified: descriptionUnverifiedReason({ status, error: String(row.ai_description_verification_error) }), emit: null };
       }
 
-      if (!description) {
+      // Live mode still checks the photos of a listing without a description
+      // (verifyDescriptionLive skips Jev for it); only without photos to look
+      // at does it stay unknown, which alerts marked unverified.
+      if (!description && !(jevLive && galleryImageUrls.length)) {
         const unknown: ListingDescriptionVerification = {
           decision: 'unknown',
           confidence: 0,
