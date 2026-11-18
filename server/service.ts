@@ -24,7 +24,7 @@ import { SearchCache, SearchQueueTimeoutError, SearchRuns, SearchStoppedError, m
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from './text';
 import { matchQuality, matchQuery, type MatchCandidate, type QueryMatch } from './queryMatch';
 import { conditionClass, daysListed, groupOutcomes, MIN_OUTCOME_AGREED, priceDrops, shareOfAsking, titleSimilarity, type OutcomeRow } from './negotiation';
-import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, assignVariant, finalizeVariantSuggestions, parseVariantGroups, suggestVariantGroupsFromTitles, variantLabelFor, type VariantGroup, type VariantSample } from './variants';
+import { AUTO_VARIANT_MIN_LISTINGS, OTHER_VARIANT_KEY, OTHER_VARIANT_LABEL, VARIANT_RULES_VERSION, assignVariant, finalizeVariantSuggestions, parseVariantGroups, suggestVariantGroupsFromTitles, variantLabelFor, type VariantGroup, type VariantSample } from './variants';
 import { computeSaleBand, MIN_BAND_SAMPLES, type MarketBandSample } from './marketBand';
 import type { ListingVerificationFilter } from './deals';
 import { bucketDailyObservations, type MarketTrendObservation } from './marketTrend';
@@ -43,6 +43,8 @@ type WatchRow = Record<string, any>;
 
 /** Settings key for the Flips page's seller-fee presets. */
 export const FEE_PRESETS_KEY = 'flip_fee_presets';
+/** Settings key: the VARIANT_RULES_VERSION saved variant keys were last re-tagged with. */
+const VARIANT_RULES_SETTING = 'variant_rules_version';
 type ListingRelevanceSearch = Pick<ListingRelevanceContext, 'query' | 'includedTerms' | 'excludedTerms'>;
 type RelevanceFilterResult = {
   listings: NormalizedListing[];
@@ -3195,6 +3197,79 @@ export class ScoutService {
         // next scan asks again (gated and cached).
         if (association.variant_source === 'manual' && association.variant_key && ids.has(association.variant_key)) continue;
         update.run(groups.length ? assignVariant(association.title, groups) : null, groups.length ? 'rule' : null, association.association_id);
+      }
+    });
+  }
+
+  /**
+   * Re-tag saved listings once after assignVariant's rules change
+   * (VARIANT_RULES_VERSION), the way the next scan would: a manual pick is
+   * kept, a rule match to a named group wins, a Jev pick stays where the
+   * rules find no group, and everything else is Other. Every grouped watch
+   * is then re-scored, since its buckets changed. Returns how many listings
+   * moved to another variant.
+   */
+  retagVariantRules(): number {
+    if (Number(this.getSetting(VARIANT_RULES_SETTING) ?? 1) >= VARIANT_RULES_VERSION) return 0;
+    let moved = 0;
+    const watchRows = this.stmt('SELECT id, variant_groups_json FROM watches').all() as Array<{ id: string; variant_groups_json: string | null }>;
+    for (const watch of watchRows) {
+      const groups = parseVariantGroups(watch.variant_groups_json);
+      if (!groups.length) continue;
+      const ids = new Set(groups.map((group) => group.id));
+      const associations = this.stmt('SELECT wl.id, wl.variant_key, wl.variant_source, l.title FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE wl.watch_id = ?').all(watch.id) as Array<{ id: number; variant_key: string | null; variant_source: string | null; title: string }>;
+      this.transaction(() => {
+        const update = this.stmt('UPDATE watch_listings SET variant_key = ?, variant_source = ? WHERE id = ?');
+        for (const association of associations) {
+          const kept = association.variant_key !== null && ids.has(association.variant_key);
+          if (association.variant_source === 'manual' && kept) continue;
+          const rule = assignVariant(String(association.title ?? ''), groups);
+          const next = rule !== OTHER_VARIANT_KEY ? { key: rule, source: 'rule' }
+            : association.variant_source === 'jev' && kept ? { key: association.variant_key!, source: 'jev' }
+              : { key: OTHER_VARIANT_KEY, source: 'rule' };
+          if (next.key === association.variant_key && next.source === association.variant_source) continue;
+          update.run(next.key, next.source, association.id);
+          if (next.key !== association.variant_key) moved += 1;
+        }
+      });
+      this.rescoreWatchListings(watch.id);
+    }
+    this.setSetting(VARIANT_RULES_SETTING, String(VARIANT_RULES_VERSION));
+    return moved;
+  }
+
+  /**
+   * Re-score a watch's saved listings against its current baselines, as
+   * setListingVariant does for one listing. After the variant groups or the
+   * price bounds change, stored labels would otherwise keep describing the
+   * old buckets (an i5 priced against whole PCs from before the bounds) until
+   * each listing is seen again. A listing outside the bounds loses its score,
+   * since a scan would no longer keep it. Nothing alerts.
+   */
+  rescoreWatchListings(watchId: string) {
+    const row = this.stmt('SELECT * FROM watches WHERE id = ?').get(watchId) as WatchRow | undefined;
+    if (!row) return;
+    const baselines = this.watchBaselines(row);
+    const referenceMedian = row.reference_market_watch_id ? this.referenceBandMedian(String(row.reference_market_watch_id)) : null;
+    const minPrice = row.min_price_pln === null || row.min_price_pln === undefined ? null : Number(row.min_price_pln);
+    const maxPrice = row.max_price_pln === null || row.max_price_pln === undefined ? null : Number(row.max_price_pln);
+    const associations = this.stmt('SELECT wl.id, wl.variant_key, l.price_pln FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE wl.watch_id = ?').all(watchId) as Array<{ id: number; variant_key: string | null; price_pln: number }>;
+    this.transaction(() => {
+      const scored = this.stmt(`UPDATE watch_listings SET typical_pln = ?, deal_strength = ?, deal_label = ?, typical_source = ?, ${STORED_SCORE_SET} WHERE id = ?`);
+      const unscored = this.stmt(`UPDATE watch_listings SET typical_pln = NULL, deal_strength = NULL, deal_label = NULL, typical_source = NULL, ${STORED_SCORE_SET} WHERE id = ?`);
+      for (const association of associations) {
+        const price = Number(association.price_pln);
+        if (!(price > 0) || (minPrice !== null && price < minPrice) || (maxPrice !== null && price > maxPrice)) {
+          unscored.run(null, null, null, null, association.id);
+          continue;
+        }
+        const { score, useReference, dealStrength } = this.variantDealScore(row, price, baselines, association.variant_key ?? OTHER_VARIANT_KEY, referenceMedian);
+        if (score.typical !== null && (score.isReady || useReference)) {
+          const strength = dealStrength ?? 1;
+          scored.run(score.typical, strength, dealLabelFromStrength(strength), score.isReady ? 'own-history' : 'reference-band', ...storedScore(score, true), association.id);
+        } else {
+          unscored.run(...storedScore(score, false), association.id);
+        }
       }
     });
   }
@@ -6441,6 +6516,10 @@ export class ScoutService {
     // Repartition the watch's saved listings immediately when the model groups
     // change; otherwise the new keys would only converge one scan at a time.
     if (groupsChanged) this.retagWatchVariants(id);
+    // New buckets or bounds change every stored score, so re-score now
+    // instead of one listing per scan.
+    const samePln = (next: number | null | undefined, stored: number | null) => next === undefined || (next ?? null) === (stored === null ? null : Number(stored));
+    if (groupsChanged || !samePln(body.minPrice, current.min_price_pln) || !samePln(body.maxPrice, current.max_price_pln)) this.rescoreWatchListings(id);
     this.emit('watch', { id, archived: body.archived });
     return { ok: true };
   }

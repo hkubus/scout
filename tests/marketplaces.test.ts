@@ -828,6 +828,38 @@ test('drops query stopwords but keeps single-digit models on token boundaries', 
   assert.deepEqual(filterListings(listings, 'iphone 5', '', '').map((listing) => listing.listingId), ['2']);
 });
 
+test('a model number does not match the same number used as a quantity', () => {
+  const base = { marketplace: 'OLX' as const, price: 100, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/test', observedAt: new Date().toISOString(), shippingAvailable: null as boolean | null };
+  const titles = [
+    'iPhone 12 64GB czarny',
+    'Apple iPhone12 Pro',
+    'Iphone 12mini Red',
+    'iPhone 12, 128 GB',
+    'iPhone 12 w etui',
+    'Smartfon Apple iPhone 17 Pro Max 12 GB / 256 GB',
+    'iPhone 15 gwarancja 12 miesięcy',
+    'iPhone 13 12m gwarancji',
+    'iPhone 16 12mc gwarancji',
+    'Etui iPhone 14 za 12zł',
+    'iPhone 11 12gb ram',
+  ];
+  const listings = titles.map((title, index) => ({ ...base, listingId: String(index), title }));
+  const kept = (query: string, included = '') => filterListings(listings, query, included, '').map((listing) => listing.title);
+  assert.deepEqual(kept('iphone 12'), ['iPhone 12 64GB czarny', 'Apple iPhone12 Pro', 'Iphone 12mini Red', 'iPhone 12, 128 GB', 'iPhone 12 w etui']);
+  assert.deepEqual(kept('', 'iphone,12'), kept('iphone 12'));
+  // A quantity is still found by writing its unit.
+  assert.deepEqual(kept('iphone 12gb'), ['Smartfon Apple iPhone 17 Pro Max 12 GB / 256 GB', 'iPhone 11 12gb ram']);
+
+  const cards = ['GTX 1660Ti 6GB', 'Karta GTX1660 Super', 'Intel i5-12400F', 'RTX 2060S', 'Zasilacz Corsair 650W', 'Galaxy S23 5G'].map((title, index) => ({ ...base, listingId: String(index), title }));
+  const keptCards = (query: string) => filterListings(cards, query, '', '').map((listing) => listing.title);
+  assert.deepEqual(keptCards('1660'), ['GTX 1660Ti 6GB', 'Karta GTX1660 Super']);
+  assert.deepEqual(keptCards('12400'), ['Intel i5-12400F']);
+  assert.deepEqual(keptCards('2060'), ['RTX 2060S']);
+  assert.deepEqual(keptCards('s23 5'), ['Galaxy S23 5G']);
+  // Watts name a power supply, so they are not a quantity unit.
+  assert.deepEqual(keptCards('zasilacz 650'), ['Zasilacz Corsair 650W']);
+});
+
 test('relaxes the implicit query terms only for opt-in manual searches', () => {
   const base = { marketplace: 'OLX' as const, price: 100, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/test', observedAt: new Date().toISOString(), shippingAvailable: null as boolean | null };
   const listings = [

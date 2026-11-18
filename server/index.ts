@@ -1219,6 +1219,14 @@ process.once('SIGTERM', () => { void shutdown('SIGTERM'); });
 process.once('SIGINT', () => { void shutdown('SIGINT'); });
 await app.listen({ port, host });
 service.logDiagnostic(`started · ${formatMemoryLine()}`);
+// Saved variant keys follow a change in the variant rules once, before the
+// first scan scores against them.
+try {
+  const moved = service.retagVariantRules();
+  if (moved) service.logDiagnostic(`moved ${moved} listing${moved === 1 ? '' : 's'} to the variant the current rules give`);
+} catch (error) {
+  app.log.warn({ err: error }, 'Re-tagging listing variants stopped');
+}
 service.schedulerTick();
 // Flip photos stored before WebP became the format are converted in the
 // background; an interrupted pass resumes on the next start.

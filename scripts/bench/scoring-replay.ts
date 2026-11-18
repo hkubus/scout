@@ -39,6 +39,8 @@ import {
   applyObservation,
   assignVariantGlued,
   buildBaselines,
+  passedTermFilterAt06e9554,
+  retaggedVariant,
   inBounds,
   junkKinds,
   junkProxies,
@@ -59,6 +61,7 @@ import {
   type Obs,
   type WatchCfg,
 } from './scoring-data';
+import { filterListings } from '../../server/service';
 
 const started = Date.now();
 const bench = new Bench('scoring-replay');
@@ -136,6 +139,10 @@ interface Decision {
 
 const scenarios: Record<string, BaselineOptions> = {
   current: {},
+  // The repo's variant rules applied the way ScoutService.retagVariantRules re-tags saved listings (see variantOverride).
+  rules_now: {},
+  // rules_now, and listings the repo's watch filter (query, included and excluded terms) now rejects are never stored.
+  rules_now_refiltered: {},  // listings the repo's watch filter now rejects but the 06e9554 one kept are never stored
   no_flag_hidden: { exclude: (s) => s.listing.flags.length > 0 || s.listing.hidden || s.listing.decision === 'pass' },
   no_junk: { exclude: (s) => isJunkState(s) },
   window30: { windowDays: 30 },
@@ -145,9 +152,24 @@ const scenarios: Record<string, BaselineOptions> = {
   variant_glued: {},
 };
 /** Scenarios that replace stored variant keys with a different rule. */
-const variantOverride: Record<string, (watch: WatchCfg, listing: ListingInfo) => string> = {
+const variantOverride: Record<string, (watch: WatchCfg, listing: ListingInfo, assoc: Assoc) => string> = {
   variant_glued: (watch, listing) => assignVariantGlued(listing.title, watch.groups),
+  rules_now: (watch, listing, assoc) => retaggedVariant(watch, listing, assoc),
+  rules_now_refiltered: (watch, listing, assoc) => retaggedVariant(watch, listing, assoc),
 };
+/** Scenarios that drop listings the repo's watch filter newly rejects, from baselines and decisions alike. */
+const refilter = new Set(['rules_now_refiltered']);
+const passesFilterCache = new Map<string, boolean>();
+function passesWatchFilter(watch: WatchCfg, listing: ListingInfo) {
+  const key = `${watch.id}|${listing.id}`;
+  let passes = passesFilterCache.get(key);
+  if (passes === undefined) {
+    const now = filterListings([{ marketplace: listing.marketplace as never, listingId: listing.listingId, title: listing.title, condition: listing.condition ?? undefined, price: listing.price, currency: 'PLN', url: '', observedAt: '', shippingAvailable: null }], watch.query, String(watch.raw.included_terms ?? ''), watch.excludedTerms, {}).length === 1;
+    passes = now || !passedTermFilterAt06e9554(watch, listing.title);
+    passesFilterCache.set(key, passes);
+  }
+  return passes;
+}
 const junkTitleCache = new Map<string, boolean>();
 function isJunkState(state: ListingState) {
   const listing = state.listing;
@@ -220,9 +242,17 @@ for (const name of requested) {
       const swapped = new Map<number, Assoc>();
       for (const [id, assoc] of assocs) {
         const listing = listings.get(id);
-        swapped.set(id, listing ? { ...assoc, variantKey: override(watch, listing) } : assoc);
+        swapped.set(id, listing ? { ...assoc, variantKey: override(watch, listing, assoc) } : assoc);
       }
       assocs = swapped;
+    }
+    if (refilter.has(name)) {
+      const kept = new Map<number, Assoc>();
+      for (const [id, assoc] of assocs) {
+        const listing = listings.get(id);
+        if (listing && passesWatchFilter(watch, listing)) kept.set(id, assoc);
+      }
+      assocs = kept;
     }
     const list = observations.get(watch.id) ?? [];
     const states = new Map<number, ListingState>();
@@ -478,16 +508,66 @@ const gates: Record<string, (d: Decision) => boolean> = {
   verified_if_over_40pct: (d) => (d.discount ?? 0) < 40 || d.listing.verification === 'pass',
 };
 const gateRows: Array<Record<string, unknown>> = [];
-for (const [gate, keep] of Object.entries(gates)) {
-  const kept = currentResult.alerts.filter(keep);
-  const dropped = currentResult.alerts.filter((d) => !keep(d));
-  const droppedJunk = dropped.filter((d) => residualJunk(d.junk)).length;
-  bench.metric(`replay.gate.${gate}.alerts`, `gate ${gate}: alerts left`, kept.length, 'count', 'info');
-  bench.metric(`replay.gate.${gate}.alert_junk_share`, `gate ${gate}: alert junk share`, ratio(kept.filter((d) => residualJunk(d.junk)).length, kept.length), 'share', 'lower');
-  bench.metric(`replay.gate.${gate}.clean_alerts_lost`, `gate ${gate}: clean alerts it would drop`, dropped.length - droppedJunk, 'count', 'lower');
-  gateRows.push({ gate, alertsLeft: kept.length, dropped: dropped.length, droppedJunk, cleanLost: dropped.length - droppedJunk, junkPctLeft: pct(ratio(kept.filter((d) => residualJunk(d.junk)).length, kept.length)) });
+// The gates on today's decisions, and on the scenario that models the shipped variant rules and filter.
+for (const scenario of ['current', 'rules_now_refiltered'].filter((name) => results.has(name))) {
+  const prefix = scenario === 'current' ? 'replay.gate' : `replay.${scenario}.gate`;
+  for (const [gate, keep] of Object.entries(gates)) {
+    const kept = results.get(scenario)!.alerts.filter(keep);
+    const dropped = results.get(scenario)!.alerts.filter((d) => !keep(d));
+    const droppedJunk = dropped.filter((d) => residualJunk(d.junk)).length;
+    bench.metric(`${prefix}.${gate}.alerts`, `${scenario}, gate ${gate}: alerts left`, kept.length, 'count', 'info');
+    bench.metric(`${prefix}.${gate}.alert_junk_share`, `${scenario}, gate ${gate}: alert junk share`, ratio(kept.filter((d) => residualJunk(d.junk)).length, kept.length), 'share', 'lower');
+    bench.metric(`${prefix}.${gate}.clean_alerts_lost`, `${scenario}, gate ${gate}: clean alerts it would drop`, dropped.length - droppedJunk, 'count', 'lower');
+    gateRows.push({ scenario, gate, alertsLeft: kept.length, dropped: dropped.length, droppedJunk, cleanLost: dropped.length - droppedJunk, junkPctLeft: pct(ratio(kept.filter((d) => residualJunk(d.junk)).length, kept.length)) });
+  }
 }
 bench.table('alert_gates', gateRows);
+const otherAlertExamples = [...results.entries()].filter(([name]) => name === 'current' || name === 'rules_now_refiltered')
+  .flatMap(([name, result]) => result.alerts.filter((d) => d.watch.groups.length > 0 && d.key === OTHER_VARIANT_KEY).map((d) => ({ scenario: name, ...example(d) })));
+bench.table('other_bucket_alerts', otherAlertExamples.slice(0, exampleCount * 2));
+
+// The future reference is the median of the decision's own bucket, so a scenario that re-buckets listings
+// also moves its yardstick. Score current and the shipped rules against one yardstick: the shipped buckets.
+const shipped = decisionsByScenario.get('rules_now_refiltered');
+if (shipped) {
+  const yardstick = new Map(shipped.filter((d) => !d.junk.any && d.futureRef).map((d) => [`${d.watch.id}|${d.listing.id}`, d]));
+  const byBucket = new Map<string, { current: number[]; shipped: number[]; currentBias: number[]; shippedBias: number[] }>();
+  const add = (d: Decision, side: 'current' | 'shipped') => {
+    const ref = yardstick.get(`${d.watch.id}|${d.listing.id}`);
+    if (!ref || !d.ready || !d.typical) return;
+    const id = `${d.watch.name}|${ref.key === OTHER_VARIANT_KEY ? 'Other' : ref.key.slice(0, 22)}`;
+    let row = byBucket.get(id);
+    if (!row) byBucket.set(id, (row = { current: [], shipped: [], currentBias: [], shippedBias: [] }));
+    row[side].push(Math.abs(d.typical / ref.futureRef! - 1));
+    row[`${side}Bias`].push(d.typical / ref.futureRef! - 1);
+  };
+  for (const d of decisionsByScenario.get('current') ?? []) add(d, 'current');
+  for (const d of shipped) add(d, 'shipped');
+  for (const [side, decisions] of [['current', decisionsByScenario.get('current') ?? []], ['shipped', shipped]] as const) {
+    const missed = decisions.filter((d) => {
+      const ref = yardstick.get(`${d.watch.id}|${d.listing.id}`);
+      return ref && d.ready && !d.alerts && !d.junk.any && 1 - d.obs.price / ref.futureRef! >= 0.25;
+    });
+    bench.metric(`replay.fixed_yardstick.${side}.missed_clean_deals`, `${side === 'current' ? 'current' : 'rules_now_refiltered'}: clean ready listings ≥25% below the shipped bucket's future clean median that did not alert`, missed.length, 'count', 'lower');
+  }
+  const all = { current: [...byBucket.values()].flatMap((row) => row.current), shipped: [...byBucket.values()].flatMap((row) => row.shipped) };
+  for (const side of ['current', 'shipped'] as const) {
+    const dist = distribution(all[side]);
+    bench.metric(`replay.fixed_yardstick.${side}.typical_abs_err.p50`, `${side === 'current' ? 'current' : 'rules_now_refiltered'}: |typical / future clean median of the shipped bucket − 1| p50`, dist.p50, 'ratio', 'lower', `n=${dist.n}`);
+    bench.metric(`replay.fixed_yardstick.${side}.typical_abs_err.p90`, `${side === 'current' ? 'current' : 'rules_now_refiltered'}: same, p90`, dist.p90, 'ratio', 'lower');
+  }
+  bench.table('typical_error_fixed_yardstick', [...byBucket.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([bucket, row]) => ({
+    bucket,
+    currentN: row.current.length,
+    currentP50: pct(distribution(row.current).p50),
+    currentP90: pct(distribution(row.current).p90),
+    currentBiasP50: pct(distribution(row.currentBias).p50),
+    shippedN: row.shipped.length,
+    shippedP50: pct(distribution(row.shipped).p50),
+    shippedP90: pct(distribution(row.shipped).p90),
+    shippedBiasP50: pct(distribution(row.shippedBias).p50),
+  })));
+}
 
 // Junk by discount band among ready Strong+ first sightings: where implausible prices start.
 const bands = [[0, 20], [20, 30], [30, 40], [40, 60], [60, 101]];

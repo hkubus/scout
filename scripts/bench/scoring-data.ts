@@ -28,7 +28,7 @@ import {
   type PriceStats,
   type ScoreResult,
 } from '../../server/scoring';
-import { normalizeFilterText, splitTerms, termMatches } from '../../server/text';
+import { normalizeFilterText, parseIncludedExcluded, splitTerms, termMatches } from '../../server/text';
 import type { Db } from './lib';
 
 export { OTHER_VARIANT_KEY, assignVariant };
@@ -379,10 +379,26 @@ export function alertsOn(watch: WatchCfg, scored: Scored, price: number) {
 export const MIN_SAMPLES = { baseline: BASELINE_MIN_SAMPLES, variant: VARIANT_MIN_SAMPLES };
 
 /**
- * What-if variant rule: assignVariant (server/variants.ts:88) with the watch
- * filter's term matching (server/text.ts:51), so glued model tokens
+ * Re-tag one saved listing the way ScoutService.retagVariantRules does after
+ * the variant rules change: a manual pick stays, a rule match to a named
+ * group wins, a Jev pick stays where the rules find none, the rest is Other.
+ */
+export function retaggedVariant(watch: WatchCfg, listing: Pick<ListingInfo, 'title'>, assoc: Pick<Assoc, 'variantKey' | 'variantSource'>): string {
+  const ids = new Set(watch.groups.map((group) => group.id));
+  const kept = assoc.variantKey !== null && ids.has(assoc.variantKey);
+  if (assoc.variantSource === 'manual' && kept) return assoc.variantKey!;
+  const rule = assignVariant(listing.title, watch.groups);
+  if (rule !== OTHER_VARIANT_KEY) return rule;
+  return assoc.variantSource === 'jev' && kept ? assoc.variantKey! : OTHER_VARIANT_KEY;
+}
+
+/**
+ * What-if variant rule: assignVariant (server/variants.ts) with the watch
+ * filter's term matching (server/text.ts termMatches), so glued model tokens
  * ("1660ti", "rtx2060") reach their group the way they already pass the
- * include/exclude filter.
+ * include/exclude filter. Since VARIANT_RULES_VERSION 2 the repo's own
+ * assignVariant does this; unlike retaggedVariant this overrides manual and
+ * Jev picks too.
  */
 export function assignVariantGlued(title: string, groups: VariantGroup[]): string {
   if (!groups.length) return OTHER_VARIANT_KEY;
@@ -397,6 +413,28 @@ export function assignVariantGlued(title: string, groups: VariantGroup[]): strin
     if (required.every((term) => termMatches(spaced, glued, term)) && !excluded.some((term) => termMatches(spaced, glued, term))) return group.id;
   }
   return OTHER_VARIANT_KEY;
+}
+
+/** termMatches as of 06e9554, before numbers learned units and exclusions learned inflections. */
+function termMatchesAt06e9554(spaced: string, glued: string, term: string) {
+  if (!term) return false;
+  if (/^\d+$/.test(term)) return spaced.split(' ').some((token) => token.split(/[a-z]+/).includes(term));
+  if (spaced.includes(term)) return true;
+  const compact = term.replace(/ /g, '');
+  return /\d/.test(compact) && compact.length >= 3 && glued.includes(compact);
+}
+
+/**
+ * The watch's term filter (query or included terms, excluded terms; title
+ * only) as of 06e9554. A listing that passed it but fails the repo's
+ * filterListings now is one the change keeps out; one that failed both got
+ * in by the AI rescue or a typo variant, which the replay leaves alone.
+ */
+export function passedTermFilterAt06e9554(watch: WatchCfg, title: string) {
+  const { included, excluded } = parseIncludedExcluded(watch.query, String(watch.raw.included_terms ?? ''), watch.excludedTerms);
+  const spaced = normalizeFilterText(title);
+  const glued = spaced.replace(/ /g, '');
+  return included.every((term) => termMatchesAt06e9554(spaced, glued, term)) && !excluded.some((term) => termMatchesAt06e9554(spaced, glued, term));
 }
 
 // ------------------------------------------------------------ text heuristics
