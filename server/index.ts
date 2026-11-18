@@ -794,7 +794,8 @@ app.delete('/api/flip-photos/:id', async (request, reply) => {
   return { ok: true };
 });
 app.put('/api/flips/fee-presets', async (request, reply) => {
-  const preset = z.object({ percent: z.number().min(0).max(50), fixed: z.number().min(0).max(1000) }).strict();
+  // Buy costs are optional so a client that only edits seller fees keeps the saved ones.
+  const preset = z.object({ percent: z.number().min(0).max(50), fixed: z.number().min(0).max(1000), buyPercent: z.number().min(0).max(50).optional(), buyFixed: z.number().min(0).max(1000).optional() }).strict();
   const parsed = z.object(Object.fromEntries(FLIP_CHANNELS.map((channel) => [channel, preset])) as Record<(typeof FLIP_CHANNELS)[number], typeof preset>).strict().safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: 'Invalid fee presets', details: parsed.error.flatten() });
   return { feePresets: flips.setFeePresets(parsed.data) };

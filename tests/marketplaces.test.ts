@@ -760,6 +760,14 @@ test('ntfy alerts attach the photo and carry price, resale and seller context', 
   assert.match(lines[2], /^≈ \+500 zł net if resold at typical on OLX$/);
   assert.equal(lines[3], 'Używane · Private seller · Shipping · posted 3 h ago');
   assert.equal(lines.at(-1), listing.url);
+  // With its basis the line says which resale price and buying costs it assumes.
+  const resaleBasis = { source: 'own-sales' as const, resalePrice: 1150, samples: 2, buyCosts: 15, label: 'your 2 recent sales' };
+  const based = buildNtfyPayload({ listing, typical: 1400, discountPercent: 35.7, confidence: 94, estimatedNet: 235, resaleBasis }, 'scout-deals');
+  assert.match(based.message.split('\n')[2], /^≈ \+235 zł net on OLX · resale 1\s?150 zł \(your 2 recent sales\) · buying 15 zł$/);
+  const fields = buildDiscordEmbed({ listing, typical: 1400, discountPercent: 35.7, confidence: 94, estimatedNet: 235, resaleBasis }).embeds[0].fields;
+  assert.match(fields.find((item) => item.name === 'Est. net')?.value ?? '', /^≈ \+235 zł on OLX · resale 1\s?150 zł \(your 2 recent sales\) · buying 15 zł$/);
+  assert.equal(fields.some((item) => item.name === 'Est. net at typical'), false);
+  assert.equal(buildDiscordEmbed({ listing, typical: 1400, discountPercent: 35.7, confidence: 94, estimatedNet: 500 }).embeds[0].fields.find((item) => item.name === 'Est. net at typical')?.value, '≈ +500 zł on OLX');
   // Only https images are attached.
   assert.equal(buildNtfyPayload({ listing: { ...listing, imageUrl: 'http://example.com/a.jpg' }, typical: 1400, discountPercent: 35.7, confidence: 94 }, 'scout-deals').attach, undefined);
 });

@@ -47,7 +47,7 @@ export default memo(function ListingTable({
         <span role="columnheader">Price</span>
         <span role="columnheader">Typical</span>
         <span role="columnheader">vs typical</span>
-        <span role="columnheader" title="What reselling at the typical asking price on the same marketplace would net after its seller fee">Est. net</span>
+        <span role="columnheader" title="What buying here and reselling on the same marketplace would net after buying costs and its seller fee, at your own recent sale price, a research band's probable-sale p25, or 88% of the typical">Est. net</span>
         <span role="columnheader">Age</span>
         <span role="columnheader" aria-label="Actions" />
       </div>
@@ -129,7 +129,7 @@ const ListingRow = memo(function ListingRow({ listing, onSelect, onToggleHidden 
   && previous.onToggleHidden === next.onToggleHidden
   && sameListingFields(previous.listing, next.listing));
 
-/** Estimated net at the typical; an estimate from asking prices, so it stays muted when unknown. */
+/** Estimated net at the resale basis; an estimate, so it stays muted when unknown. */
 function NetCell({ listing }: { listing: Listing }) {
   const net = listing.estimatedNet ?? null;
   if (net === null || listing.typical === null) return <span className="net-cell net-cell--empty" role="cell">—</span>;
@@ -137,7 +137,9 @@ function NetCell({ listing }: { listing: Listing }) {
     <span
       className={`net-cell ${net >= 0 ? "result-positive" : "result-negative"}`}
       role="cell"
-      title={`If resold at the typical ${formatPln(listing.typical)} on ${listing.marketplace}, after its seller fee. An estimate from asking prices, not sales.`}
+      title={listing.resaleBasis
+        ? `If resold at ${formatPln(listing.resaleBasis.resalePrice)} (${listing.resaleBasis.label}) on ${listing.marketplace}, after ${formatPln(listing.resaleBasis.buyCosts)} buying costs and its seller fee. An estimate, not a sale.`
+        : `If resold at the typical ${formatPln(listing.typical)} on ${listing.marketplace}, after its seller fee. An estimate from asking prices, not sales.`}
     >
       {net >= 0 ? "+" : "−"}{Math.abs(net).toLocaleString("pl-PL")} zł
     </span>

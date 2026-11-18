@@ -704,6 +704,7 @@ final class AlertRuleTests: XCTestCase {
         let listing = try XCTUnwrap(DemoTransport.dashboard().listings.first)
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(listing)) as? [String: Any])
         object.removeValue(forKey: "estimatedNet")
+        object.removeValue(forKey: "resaleBasis")
         object.removeValue(forKey: "targetHit")
         change(&object)
         return try JSONDecoder().decode(Listing.self, from: JSONSerialization.data(withJSONObject: object))
@@ -749,6 +750,23 @@ final class AlertRuleTests: XCTestCase {
         XCTAssertNil(older.estimatedNet)
         XCTAssertNil(older.targetHit)
         XCTAssertFalse(older.isTargetHit)
+        XCTAssertNil(older.resaleBasis)
+        XCTAssertEqual(older.estimatedNetSuffix, "net at typical")
+    }
+
+    func testDecodesTheResaleBasisBehindTheNet() throws {
+        let based = try listing {
+            $0["estimatedNet"] = 52
+            $0["resaleBasis"] = ["source": "own-sales", "resalePrice": 235, "samples": 1, "buyCosts": 24, "label": "your recent sale"]
+        }
+        XCTAssertEqual(based.resaleBasis, ResaleBasis(source: "own-sales", resalePrice: 235, samples: 1, buyCosts: 24, label: "your recent sale"))
+        XCTAssertEqual(based.estimatedNetSuffix, "net at your recent sale")
+        let haircut = try listing { $0["resaleBasis"] = ["source": "typical-haircut", "resalePrice": 264, "samples": NSNull(), "buyCosts": 16, "label": "88% of typical"] }
+        XCTAssertNil(haircut.resaleBasis?.samples)
+        // Fee presets from a server with buying costs, and from one without.
+        let presets = try JSONDecoder().decode(FeePresets.self, from: Data(#"{"Vinted":{"percent":0,"fixed":0,"buyPercent":5,"buyFixed":16},"OLX":{"percent":0,"fixed":0}}"#.utf8))
+        XCTAssertEqual(Profit.buyCost(price: 159, preset: presets[.vinted]), 23.95)
+        XCTAssertEqual(Profit.buyCost(price: 159, preset: presets[.olx]), 0)
     }
 
     func testDraftSendsAlertRulesAndNullSoEditsCanClearThem() throws {
@@ -785,9 +803,11 @@ final class AlertRuleTests: XCTestCase {
         let dashboard = try await client.dashboard()
         let sony = try XCTUnwrap(dashboard.listings.first { $0.watchId == "watch-sony" })
         XCTAssertTrue(sony.isTargetHit)
-        // 1199 typical − 4.9% Allegro Lokalnie fee − 749.
-        XCTAssertEqual(sony.estimatedNet, 391)
-        XCTAssertEqual(dashboard.listings.first { $0.key == "OLX:890231" }?.estimatedNet, 1100)
+        // 88% of the 1199 typical (1055) − 4.9% Allegro Lokalnie fee − 749 − 15 zł shipping in.
+        XCTAssertEqual(sony.estimatedNet, 239)
+        XCTAssertEqual(sony.resaleBasis?.label, "88% of typical")
+        // 2639 − 1899 − 15.
+        XCTAssertEqual(dashboard.listings.first { $0.key == "OLX:890231" }?.estimatedNet, 725)
         XCTAssertFalse(dashboard.listings.contains { $0.estimatedNet == nil })
         XCTAssertEqual(dashboard.listings.filter(\.isTargetHit).count, 1)
         XCTAssertEqual(dashboard.watches.first { $0.id == "watch-deck" }?.minSaving, 300)

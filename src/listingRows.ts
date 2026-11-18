@@ -23,9 +23,13 @@ export function compareStrongest(a: StrongestFields, b: StrongestFields) {
 const sameDuplicateSummary = (a: DuplicateSummary | undefined, b: DuplicateSummary | undefined) =>
   a === b || (a !== undefined && b !== undefined && a.key === b.key && a.marketplace === b.marketplace && a.price === b.price && a.url === b.url && a.observedAt === b.observedAt);
 
+/** The resale basis behind the estimated net is flat too. */
+const sameResaleBasis = (a: Listing["resaleBasis"], b: Listing["resaleBasis"]) =>
+  a === b || (!!a && !!b && a.source === b.source && a.resalePrice === b.resalePrice && a.samples === b.samples && a.buyCosts === b.buyCosts && a.label === b.label);
+
 /**
  * Flat field-by-field comparison. List payloads carry only primitives per row,
- * apart from the cheapest-copy summary; another nested value (e.g. a
+ * apart from the cheapest-copy summary and the resale basis; another nested value (e.g. a
  * verification object) compares by reference, so a fresh one counts as a
  * change and the row simply re-renders.
  */
@@ -35,7 +39,9 @@ export function sameListingFields(a: Listing, b: Listing) {
   if (aKeys.length !== Object.keys(b).length) return false;
   for (const key of aKeys) {
     if (!(key in b)) return false;
-    if (key === "duplicateCheapest" ? !sameDuplicateSummary(a.duplicateCheapest, b.duplicateCheapest) : a[key] !== b[key]) return false;
+    if (key === "duplicateCheapest" ? !sameDuplicateSummary(a.duplicateCheapest, b.duplicateCheapest)
+      : key === "resaleBasis" ? !sameResaleBasis(a.resaleBasis, b.resaleBasis)
+        : a[key] !== b[key]) return false;
   }
   return true;
 }

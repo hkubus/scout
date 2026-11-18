@@ -4,6 +4,7 @@ import { api, forgetInFlightGets } from "./api";
 import { subscribe, subscribeStatus } from "./events";
 import {
   DAC7_THRESHOLD,
+  BUY_COST_NOTES,
   FEE_PRESET_NOTES,
   FLIP_CHANNELS,
   LISTING_CHANNELS,
@@ -633,10 +634,17 @@ function ReadyDialog({ flip, onClose, onSaved, onEditListing }: { flip: Flip; on
 }
 
 function FeePresetsPanel({ presets, onSaved, onToast }: { presets: FeePresets; onSaved: (presets: FeePresets) => void; onToast: (message: string, type?: ToastType) => void }) {
-  const [draft, setDraft] = useState(() => Object.fromEntries(FLIP_CHANNELS.map((channel) => [channel, { percent: String(presets[channel].percent), fixed: String(presets[channel].fixed) }])) as Record<FlipChannel, { percent: string; fixed: string }>);
+  type Draft = { percent: string; fixed: string; buyPercent: string; buyFixed: string };
+  const [draft, setDraft] = useState(() => Object.fromEntries(FLIP_CHANNELS.map((channel) => [channel, {
+    percent: String(presets[channel].percent),
+    fixed: String(presets[channel].fixed),
+    buyPercent: String(presets[channel].buyPercent ?? 0),
+    buyFixed: String(presets[channel].buyFixed ?? 0),
+  }])) as Record<FlipChannel, Draft>);
   const [busy, setBusy] = useState(false);
-  const parsed = FLIP_CHANNELS.map((channel) => [channel, { percent: toAmount(draft[channel].percent), fixed: toAmount(draft[channel].fixed) }] as const);
-  const valid = parsed.every(([, preset]) => Number.isFinite(preset.percent) && preset.percent <= 50 && Number.isFinite(preset.fixed) && preset.fixed <= 1000);
+  const parsed = FLIP_CHANNELS.map((channel) => [channel, { percent: toAmount(draft[channel].percent), fixed: toAmount(draft[channel].fixed), buyPercent: toAmount(draft[channel].buyPercent), buyFixed: toAmount(draft[channel].buyFixed) }] as const);
+  const valid = parsed.every(([, preset]) => [preset.percent, preset.buyPercent].every((value) => Number.isFinite(value) && value <= 50) && [preset.fixed, preset.buyFixed].every((value) => Number.isFinite(value) && value <= 1000));
+  const edit = (channel: FlipChannel, field: keyof Draft, value: string) => setDraft((current) => ({ ...current, [channel]: { ...current[channel], [field]: value } }));
   const save = async () => {
     setBusy(true);
     try {
@@ -651,15 +659,19 @@ function FeePresetsPanel({ presets, onSaved, onToast }: { presets: FeePresets; o
   };
   return (
     <details className="flips-panel flips-section">
-      <summary>Seller fee presets</summary>
-      <p className="field-hint">Prefill the platform fee when you record a sale, and the listing drawer's estimate. Private-seller rates as of September 2026; check them against your own account.</p>
+      <summary>Fee presets</summary>
+      <p className="field-hint">Seller fees prefill the platform fee when you record a sale. Seller fees and buying costs (shipping and buyer protection when you buy shipped) go into every estimated net. Private-seller rates as of September 2026; check them against your own account.</p>
       <div className="fee-preset-grid">
         {FLIP_CHANNELS.map((channel) => (
           <div className="fee-preset-row" key={channel}>
             <strong>{channel}</strong>
-            <label>%<input inputMode="decimal" aria-label={`${channel} fee percent`} value={draft[channel].percent} onChange={(event) => setDraft((current) => ({ ...current, [channel]: { ...current[channel], percent: event.target.value } }))} /></label>
-            <label>+ zł<input inputMode="decimal" aria-label={`${channel} fixed fee`} value={draft[channel].fixed} onChange={(event) => setDraft((current) => ({ ...current, [channel]: { ...current[channel], fixed: event.target.value } }))} /></label>
+            <label>%<input inputMode="decimal" aria-label={`${channel} fee percent`} value={draft[channel].percent} onChange={(event) => edit(channel, "percent", event.target.value)} /></label>
+            <label>+ zł<input inputMode="decimal" aria-label={`${channel} fixed fee`} value={draft[channel].fixed} onChange={(event) => edit(channel, "fixed", event.target.value)} /></label>
             <small>{FEE_PRESET_NOTES[channel]}</small>
+            <span className="fee-preset-buy">Buying</span>
+            <label>%<input inputMode="decimal" aria-label={`${channel} buying cost percent`} value={draft[channel].buyPercent} onChange={(event) => edit(channel, "buyPercent", event.target.value)} /></label>
+            <label>+ zł<input inputMode="decimal" aria-label={`${channel} fixed buying cost`} value={draft[channel].buyFixed} onChange={(event) => edit(channel, "buyFixed", event.target.value)} /></label>
+            <small>{BUY_COST_NOTES[channel]}</small>
           </div>
         ))}
       </div>

@@ -1,4 +1,5 @@
 import type { DealLabel, Listing, ListingDecision, ListingDescriptionVerificationStatus, ListingFlagName, Marketplace, SellerType } from '../src/types';
+import type { ResaleBasis } from '../src/profit';
 import type { StoredListingFlagName } from './flags';
 import { compactDuplicate, compactDuplicateNote, type CompactDuplicate } from './mcpFormat';
 import type { ScoutService } from './service';
@@ -38,8 +39,10 @@ export interface CompactListing {
   tier: DealTier | null;
   dealLabel: DealLabel;
   typicalSource: 'own-history' | 'reference-band' | null;
-  /** Whole złoty from reselling at typical on this marketplace after its fee preset, less the price; an estimate. */
+  /** Whole złoty from buying here and reselling on this marketplace at resaleBasis.resalePrice, after buying costs and the fee preset; an estimate. */
   estimatedNet: number | null;
+  /** The resale price and buying costs estimatedNet assumes: own-sales, sale-band (probable-sale p25) or typical-haircut (88% of typical). */
+  resaleBasis: ResaleBasis | null;
   watchId: string | null;
   watch: string;
   variantKey: string | null;
@@ -90,6 +93,7 @@ export function compactListing(listing: Listing): CompactListing {
     dealLabel: listing.dealLabel,
     typicalSource: listing.typicalSource ?? null,
     estimatedNet: listing.estimatedNet ?? null,
+    resaleBasis: listing.resaleBasis ?? null,
     watchId: listing.watchId ?? null,
     watch: listing.watch,
     variantKey: listing.variantKey ?? null,

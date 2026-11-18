@@ -119,6 +119,19 @@ test('GET /api/listings takes excludeFlags over stored flags, after the startup 
       assert.deepEqual(await response.json(), { error: 'Invalid listing filters' });
     }
     assert.equal((await get('excludeFlags=for_parts', false)).status, 401);
+
+    // Fee presets take optional buying costs; a client that sends only seller
+    // fees (the iOS app) keeps the saved ones.
+    const putPresets = async (body: unknown) => {
+      const response = await fetch(`${scout.origin}/api/flips/fee-presets`, { method: 'PUT', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      return { status: response.status, body: await response.json() as { feePresets?: Record<string, Record<string, number>> } };
+    };
+    const sellerOnly = { OLX: { percent: 0, fixed: 0 }, 'Allegro Lokalnie': { percent: 4.9, fixed: 0 }, Vinted: { percent: 0, fixed: 0 }, Other: { percent: 0, fixed: 0 } };
+    const saved = await putPresets({ ...sellerOnly, OLX: { percent: 0, fixed: 0, buyPercent: 0, buyFixed: 25 } });
+    assert.deepEqual([saved.status, saved.body.feePresets?.OLX], [200, { percent: 0, fixed: 0, buyPercent: 0, buyFixed: 25 }]);
+    const merged = await putPresets({ ...sellerOnly, OLX: { percent: 8, fixed: 0 } });
+    assert.deepEqual([merged.status, merged.body.feePresets?.OLX, merged.body.feePresets?.Vinted], [200, { percent: 8, fixed: 0, buyPercent: 0, buyFixed: 25 }, { percent: 0, fixed: 0, buyPercent: 5, buyFixed: 16 }]);
+    assert.equal((await putPresets({ ...sellerOnly, Vinted: { percent: 0, fixed: 0, buyPercent: 90 } })).status, 400);
   } finally {
     await scout.stop();
   }

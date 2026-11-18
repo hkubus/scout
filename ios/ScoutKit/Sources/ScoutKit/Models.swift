@@ -101,10 +101,13 @@ public struct Listing: Codable, Hashable, Sendable {
     public var promoted: Bool?
     /// `private` or `business` from the marketplace's own flag; nil when unknown.
     public var sellerType: String?
-    /// Whole złoty that reselling at the typical asking price on the same
-    /// marketplace would net after its seller fee, minus this price. An
-    /// estimate from asking prices; nil without a typical or on older servers.
+    /// Whole złoty that buying here and reselling on the same marketplace
+    /// would net after buying costs and its seller fee, at the resale price in
+    /// `resaleBasis` (older servers: at the typical). An estimate; nil without
+    /// a typical or on older servers.
     public var estimatedNet: Double?
+    /// The resale price and buying costs `estimatedNet` assumes. Nil on older servers.
+    public var resaleBasis: ResaleBasis?
     /// The price is at or below the watch's target price. Missing on older servers.
     public var targetHit: Bool?
     /// Manual search with `scoreAgainst` only: this result priced against the
@@ -119,6 +122,8 @@ public struct Listing: Codable, Hashable, Sendable {
     public var postedDate: Date? { ScoutDate.parse(postedAt) }
     public var isBusinessSeller: Bool { sellerType == SellerType.business.rawValue }
     public var isTargetHit: Bool { targetHit == true }
+    /// What follows the estimated net: "net at 88% of typical", or "net at typical" from older servers.
+    public var estimatedNetSuffix: String { "net at \(resaleBasis?.label ?? "typical")" }
     /// Bumped well after posting (more than an hour later).
     public var bumpedDate: Date? {
         guard let posted = postedDate, let refreshed = ScoutDate.parse(refreshedAt), refreshed.timeIntervalSince(posted) > 3600 else { return nil }
@@ -126,6 +131,29 @@ public struct Listing: Codable, Hashable, Sendable {
     }
     public var imageURL: URL? { image.isEmpty ? nil : URL(string: image) }
     public var webURL: URL? { URL(string: url) }
+}
+
+/// Where an estimated resale price comes from: the operator's own recent
+/// sales of the model (`own-sales`), a linked research band's probable-sale
+/// p25 (`sale-band`), or 88% of the typical asking price (`typical-haircut`).
+public struct ResaleBasis: Codable, Hashable, Sendable {
+    public var source: String
+    /// Whole złoty.
+    public var resalePrice: Double
+    /// Own sales or band samples behind it; nil for the haircut.
+    public var samples: Int?
+    /// Buying costs assumed on top of the asking price, whole złoty.
+    public var buyCosts: Double
+    /// Plain words for the source, e.g. "your 2 recent sales".
+    public var label: String
+
+    public init(source: String, resalePrice: Double, samples: Int?, buyCosts: Double, label: String) {
+        self.source = source
+        self.resalePrice = resalePrice
+        self.samples = samples
+        self.buyCosts = buyCosts
+        self.label = label
+    }
 }
 
 public struct PriceHistoryPoint: Codable, Hashable, Sendable {

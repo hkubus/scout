@@ -12,13 +12,26 @@ export interface FeePreset {
   percent: number;
   /** Fixed seller fee per sale, in PLN. */
   fixed: number;
+  /**
+   * What buying here costs on top of the asking price, as a percentage of it
+   * (buyer protection). Missing on presets saved before buy costs existed.
+   */
+  buyPercent?: number;
+  /** Fixed buying cost per purchase (shipping, a protection fee), in PLN. */
+  buyFixed?: number;
 }
 
 export type FeePresets = Record<FlipChannel, FeePreset>;
 
 /**
  * Seller-side fees for private sellers as of 2026-09. The buyer pays
- * shipping and buyer protection on all three platforms.
+ * shipping and buyer protection on all three platforms, which the buy-side
+ * figures cover when you are the buyer (shipped, since that is how most
+ * flips are bought):
+ * - Vinted: buyer protection 5% + 2,90 zł, plus about 13 zł parcel shipping.
+ * - OLX and Allegro Lokalnie: about 15 zł parcel shipping with the
+ *   platform's delivery.
+ * Rough figures to edit on the Flips page; a local pickup costs nothing.
  * - OLX: a standard listing with OLX Przesyłka has no seller commission. The
  *   optional "Zapłać, jeśli sprzedasz" model charges roughly 6–10% in
  *   Elektronika depending on price, so set the rate here if you use it.
@@ -27,10 +40,10 @@ export type FeePresets = Record<FlipChannel, FeePreset>;
  * - Vinted: no seller fee.
  */
 export const DEFAULT_FEE_PRESETS: FeePresets = {
-  OLX: { percent: 0, fixed: 0 },
-  "Allegro Lokalnie": { percent: 4.9, fixed: 0 },
-  Vinted: { percent: 0, fixed: 0 },
-  Other: { percent: 0, fixed: 0 },
+  OLX: { percent: 0, fixed: 0, buyPercent: 0, buyFixed: 15 },
+  "Allegro Lokalnie": { percent: 4.9, fixed: 0, buyPercent: 0, buyFixed: 15 },
+  Vinted: { percent: 0, fixed: 0, buyPercent: 5, buyFixed: 16 },
+  Other: { percent: 0, fixed: 0, buyPercent: 0, buyFixed: 0 },
 };
 
 export const FEE_PRESET_NOTES: Record<FlipChannel, string> = {
@@ -40,23 +53,44 @@ export const FEE_PRESET_NOTES: Record<FlipChannel, string> = {
   Other: "Anything else, e.g. a sale in person.",
 };
 
+export const BUY_COST_NOTES: Record<FlipChannel, string> = {
+  OLX: "Buying shipped with OLX Przesyłka: about 15 zł shipping. Pickup: 0.",
+  "Allegro Lokalnie": "Buying shipped with Allegro Lokalnie delivery: about 15 zł shipping. Pickup: 0.",
+  Vinted: "Buyer protection 5% + 2,90 zł, plus about 13 zł shipping.",
+  Other: "Anything else, e.g. buying in person.",
+};
+
 const round2 = (value: number) => Math.round(value * 100) / 100;
 
 export function isFlipChannel(value: unknown): value is FlipChannel {
   return typeof value === "string" && (FLIP_CHANNELS as readonly string[]).includes(value);
 }
 
-/** Merge stored presets over the defaults, dropping anything malformed. */
-export function normalizeFeePresets(value: unknown): FeePresets {
+const presetPercent = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 50;
+const presetAmount = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1000;
+
+/**
+ * Merge stored presets over the defaults, dropping anything malformed. Buy
+ * costs missing from `value` (a client that only edits seller fees) come
+ * from `fallback`, the presets saved so far.
+ */
+export function normalizeFeePresets(value: unknown, fallback: FeePresets = DEFAULT_FEE_PRESETS): FeePresets {
   const stored = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
   const presets = { ...DEFAULT_FEE_PRESETS };
   for (const channel of FLIP_CHANNELS) {
     const entry = stored[channel];
-    if (typeof entry !== "object" || entry === null) continue;
-    const { percent, fixed } = entry as Record<string, unknown>;
+    const defaults = DEFAULT_FEE_PRESETS[channel];
+    const previous = fallback[channel] ?? defaults;
+    if (typeof entry !== "object" || entry === null) {
+      presets[channel] = { ...defaults, buyPercent: previous.buyPercent ?? defaults.buyPercent, buyFixed: previous.buyFixed ?? defaults.buyFixed };
+      continue;
+    }
+    const { percent, fixed, buyPercent, buyFixed } = entry as Record<string, unknown>;
     presets[channel] = {
-      percent: typeof percent === "number" && Number.isFinite(percent) && percent >= 0 && percent <= 50 ? percent : DEFAULT_FEE_PRESETS[channel].percent,
-      fixed: typeof fixed === "number" && Number.isFinite(fixed) && fixed >= 0 && fixed <= 1000 ? fixed : DEFAULT_FEE_PRESETS[channel].fixed,
+      percent: presetPercent(percent) ? (percent as number) : defaults.percent,
+      fixed: presetAmount(fixed) ? (fixed as number) : defaults.fixed,
+      buyPercent: presetPercent(buyPercent) ? (buyPercent as number) : previous.buyPercent ?? defaults.buyPercent,
+      buyFixed: presetAmount(buyFixed) ? (buyFixed as number) : previous.buyFixed ?? defaults.buyFixed,
     };
   }
   return presets;
@@ -65,6 +99,12 @@ export function normalizeFeePresets(value: unknown): FeePresets {
 export function saleFee(salePrice: number, preset: FeePreset) {
   if (!Number.isFinite(salePrice) || salePrice <= 0) return 0;
   return round2((salePrice * preset.percent) / 100 + preset.fixed);
+}
+
+/** What buying at `price` on a channel costs on top of the price (shipping, buyer protection). */
+export function buyCost(price: number, preset: FeePreset) {
+  if (!Number.isFinite(price) || price <= 0) return 0;
+  return round2((price * (preset.buyPercent ?? 0)) / 100 + (preset.buyFixed ?? 0));
 }
 
 export interface FlipAmounts {
@@ -96,12 +136,91 @@ export function estimateFlipNet(input: { buyPrice: number; buyCosts: number; res
 /**
  * What buying at `price` and reselling at the typical asking price on a
  * channel would net after its seller fee, in whole złoty; null without a
- * typical. Asking prices overstate what an item sells for, so callers label
- * it as an estimate.
+ * typical. Asking prices overstate what an item sells for (flips sold at
+ * about 0.88 of it), so Scout shows {@link estimateResaleNet} instead; this
+ * stays as the upper bound it used to show.
  */
 export function estimatedNetAtTypical(price: number, typical: number | null | undefined, preset: FeePreset) {
   if (typical === null || typical === undefined || !Number.isFinite(typical) || typical <= 0 || !Number.isFinite(price)) return null;
   return Math.round(estimateFlipNet({ buyPrice: price, buyCosts: 0, resalePrice: typical, preset }).net);
+}
+
+/**
+ * Share of the typical asking price a resale is assumed to fetch when
+ * nothing better is known. On the 2026-11-18 data the operator's flips sold
+ * at 0.879 of the typical at purchase, and research listings ended at 0.885
+ * of the active asking median: asking prices run about 12% above exits.
+ */
+export const TYPICAL_RESALE_SHARE = 0.88;
+/** The operator's own sales count towards a resale price for this long. */
+export const OWN_SALES_WINDOW_DAYS = 120;
+
+/**
+ * Where an estimated resale price comes from, best first: the operator's own
+ * recent sales of the same model, the probable-sale band's lower quartile
+ * of a linked research series, or the typical asking price less the usual
+ * asking-to-exit gap.
+ */
+export type ResaleBasisSource = "own-sales" | "sale-band" | "typical-haircut";
+
+export interface ResaleBasis {
+  source: ResaleBasisSource;
+  /** Resale price the estimate assumes, in whole złoty. */
+  resalePrice: number;
+  /** Own sales or band samples behind it; null for the haircut. */
+  samples: number | null;
+  /** Buying costs assumed on top of the asking price, in whole złoty. */
+  buyCosts: number;
+  /** Plain words for the source: "your 2 recent sales", "probable-sale p25", "88% of typical". */
+  label: string;
+}
+
+export interface ResaleEvidence {
+  /** Sale prices of the operator's recent sold flips of the same model. */
+  ownSales?: readonly number[];
+  /** Lower quartile of a linked research series' probable-sale band, once the band has enough samples. */
+  bandP25?: number | null;
+  bandSamples?: number;
+}
+
+const medianOf = (values: readonly number[]) => {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+};
+
+/**
+ * The resale price an estimate should assume, or null without a typical.
+ * Never above the typical asking price: a lucky sale or a thin band should
+ * not promise more than the market asks.
+ */
+export function resaleBasis(typical: number | null | undefined, evidence: ResaleEvidence = {}): Omit<ResaleBasis, "buyCosts"> | null {
+  if (typical === null || typical === undefined || !Number.isFinite(typical) || typical <= 0) return null;
+  const sales = (evidence.ownSales ?? []).filter((price) => Number.isFinite(price) && price > 0);
+  if (sales.length) {
+    const count = sales.length;
+    return { source: "own-sales", resalePrice: Math.round(Math.min(typical, medianOf(sales))), samples: count, label: `your ${count === 1 ? "recent sale" : `${count} recent sales`}` };
+  }
+  const p25 = evidence.bandP25;
+  if (p25 !== null && p25 !== undefined && Number.isFinite(p25) && p25 > 0) {
+    return { source: "sale-band", resalePrice: Math.round(Math.min(typical, p25)), samples: evidence.bandSamples ?? null, label: "probable-sale p25" };
+  }
+  return { source: "typical-haircut", resalePrice: Math.round(typical * TYPICAL_RESALE_SHARE), samples: null, label: `${Math.round(TYPICAL_RESALE_SHARE * 100)}% of typical` };
+}
+
+/**
+ * What buying at `price` on a channel and reselling there at the
+ * {@link resaleBasis} would net, after that channel's buying costs and
+ * seller fee, in whole złoty; null without a typical. Display-only: it never
+ * gates, orders or suppresses an alert.
+ */
+export function estimateResaleNet(price: number, typical: number | null | undefined, preset: FeePreset, evidence: ResaleEvidence = {}): { net: number; basis: ResaleBasis } | null {
+  if (!Number.isFinite(price)) return null;
+  const basis = resaleBasis(typical, evidence);
+  if (!basis) return null;
+  const costs = buyCost(price, preset);
+  const { net } = estimateFlipNet({ buyPrice: price, buyCosts: costs, resalePrice: basis.resalePrice, preset });
+  return { net: Math.round(net), basis: { ...basis, buyCosts: Math.round(costs) } };
 }
 
 /**

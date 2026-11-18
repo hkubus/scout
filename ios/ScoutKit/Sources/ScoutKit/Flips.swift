@@ -39,10 +39,16 @@ public struct FeePreset: Codable, Hashable, Sendable {
     public var percent: Double
     /// Fixed seller fee per sale, in PLN.
     public var fixed: Double
+    /// Buying here on top of the asking price, as a percentage (buyer protection). Nil from older servers.
+    public var buyPercent: Double?
+    /// Fixed buying cost per purchase (shipping), in PLN. Nil from older servers.
+    public var buyFixed: Double?
 
-    public init(percent: Double, fixed: Double) {
+    public init(percent: Double, fixed: Double, buyPercent: Double? = nil, buyFixed: Double? = nil) {
         self.percent = percent
         self.fixed = fixed
+        self.buyPercent = buyPercent
+        self.buyFixed = buyFixed
     }
 }
 
@@ -56,10 +62,10 @@ public struct FeePresets: Hashable, Sendable {
 
     /// Private-seller defaults as of 2026-09 (see `src/profit.ts`).
     public static let defaults = FeePresets([
-        .olx: FeePreset(percent: 0, fixed: 0),
-        .allegroLokalnie: FeePreset(percent: 4.9, fixed: 0),
-        .vinted: FeePreset(percent: 0, fixed: 0),
-        .other: FeePreset(percent: 0, fixed: 0),
+        .olx: FeePreset(percent: 0, fixed: 0, buyPercent: 0, buyFixed: 15),
+        .allegroLokalnie: FeePreset(percent: 4.9, fixed: 0, buyPercent: 0, buyFixed: 15),
+        .vinted: FeePreset(percent: 0, fixed: 0, buyPercent: 5, buyFixed: 16),
+        .other: FeePreset(percent: 0, fixed: 0, buyPercent: 0, buyFixed: 0),
     ])
 
     public subscript(channel: FlipChannel) -> FeePreset {
@@ -415,6 +421,15 @@ public enum Profit {
     public static func saleFee(salePrice: Double, preset: FeePreset) -> Double {
         guard salePrice.isFinite, salePrice > 0 else { return 0 }
         return round2(salePrice * preset.percent / 100 + preset.fixed)
+    }
+
+    /// Share of the typical asking price a resale is assumed to fetch without better evidence.
+    public static let typicalResaleShare = 0.88
+
+    /// What buying at `price` on a channel costs on top of it (shipping, buyer protection).
+    public static func buyCost(price: Double, preset: FeePreset) -> Double {
+        guard price.isFinite, price > 0 else { return 0 }
+        return round2(price * (preset.buyPercent ?? 0) / 100 + (preset.buyFixed ?? 0))
     }
 
     public static func cost(buyPrice: Double, buyCosts: Double) -> Double {

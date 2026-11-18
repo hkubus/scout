@@ -4518,7 +4518,9 @@ test('target prices alert while learning on every channel, and the minimum savin
     const deal = store('big-saving', 670);
     assert.ok(deal);
     assert.equal(deal.targetPrice, null);
-    assert.equal(deal.estimatedNet, Math.round(deal.typical - 670));
+    // 88% of the typical, less 15 zł OLX shipping in and the 670 zł price.
+    assert.equal(deal.estimatedNet, Math.round(Math.round(deal.typical * 0.88) - 15 - 670));
+    assert.deepEqual(deal.resaleBasis, { source: 'typical-haircut', resalePrice: Math.round(deal.typical * 0.88), samples: null, buyCosts: 15, label: '88% of typical' });
     // The floor does not touch the feed: the small-saving row is still scored.
     const feed = context.service.listingsPage({ page: 1, pageSize: 100 }).listings;
     const smallSaving = feed.find((item) => item.listingId === 'small-saving')!;
@@ -4529,8 +4531,20 @@ test('target prices alert while learning on every channel, and the minimum savin
     context.db.prepare('UPDATE watches SET target_price_pln = 700 WHERE id = ?').run('target-watch');
     const refreshed = context.service.listingsPage({ page: 1, pageSize: 100 }).listings;
     const bigSaving = refreshed.find((item) => item.listingId === 'big-saving')!;
-    assert.equal(bigSaving.estimatedNet, Math.round(bigSaving.typical! * 0.9 - 670));
+    const resale = Math.round(bigSaving.typical! * 0.88);
+    assert.equal(bigSaving.estimatedNet, Math.round(resale - Math.round(resale * 10) / 100 - 15 - 670));
     assert.equal(bigSaving.targetHit, true);
+    // A recent sale of the same thing from this watch replaces the haircut; an
+    // unrelated or old sale does not count.
+    const sell = (title: string, watchId: string | null, soldOn: string, price: number) => context.db.prepare(`INSERT INTO flips (title, watch_id, buy_channel, bought_on, buy_price_pln, sold_on, sale_channel, sale_price_pln, sale_fee_pln, created_at, updated_at)
+      VALUES (?, ?, 'OLX', ?, 500, ?, 'OLX', ?, 0, ?, ?)`).run(title, watchId, soldOn, soldOn, price, new Date().toISOString(), new Date().toISOString());
+    const today = new Date().toISOString().slice(0, 10);
+    sell('CPU from this watch', 'target-watch', today, 900);
+    sell('Monitor', null, today, 5000);
+    sell('CPU sold long ago', 'target-watch', '2025-01-01', 100);
+    const withSale = context.service.listingsPage({ page: 1, pageSize: 100 }).listings.find((item) => item.listingId === 'big-saving')!;
+    assert.deepEqual(withSale.resaleBasis, { source: 'own-sales', resalePrice: 900, samples: 1, buyCosts: 15, label: 'your recent sale' });
+    assert.equal(withSale.estimatedNet, Math.round(900 - 90 - 15 - 670));
     assert.equal(refreshed.find((item) => item.listingId === 'base-0')!.targetHit, false);
     const watch = context.service.watchById('target-watch')!;
     assert.equal(watch.targetPrice, 700);

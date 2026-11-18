@@ -32,7 +32,8 @@ import { DUPLICATE_FEED_DAYS, DUPLICATE_WINDOW_DAYS, findDuplicatePairs } from '
 import { summarizeAnalytics, type AnalyticsRow } from './analytics';
 import { FLAGS_VERSION, accessoryFlag, flagsJson, listingFlags, mergeFlags, parseFlagsJson, storedListingFlags, type StoredListingFlagName } from './flags';
 import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SearchTypoVariantStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, DuplicateListing, ListingLiveCheck, ListingNegotiation, Relist, NegotiationFigures, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, AgentFlip, AgentFlips, ConversationResult, InboxResult, AgentListingVerification } from '../src/types';
-import { estimatedNetAtTypical, flipCost, flipNet, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, suggestedListingPrice, type FeePresets } from '../src/profit';
+import { flipCost, flipNet, listingConditionFromLabel, normalizeFeePresets, suggestedListingPrice, type FeePresets, type ResaleBasis } from '../src/profit';
+import { ResaleContext } from './resale';
 import { vintedFeesNote } from '../src/listingSignals';
 import { compareStrongest } from '../src/listingRows';
 import type { ListingFlag, SearchDeal, SearchScoredAgainst } from '../src/types';
@@ -74,6 +75,8 @@ type DealNotificationCandidate = {
   targetPrice?: number | null;
   /** Display-only resale estimate carried into the alert text. */
   estimatedNet?: number | null;
+  /** What the estimate assumes the item resells for, and why. */
+  resaleBasis?: ResaleBasis | null;
   /** Watch search terms naming the sought item; verification uses them to reject accessories/parts. */
   query?: string;
   includedTerms?: string;
@@ -1174,6 +1177,23 @@ export class ScoutService {
   /** The operator's seller-fee presets from the Flips page, for resale estimates. */
   private feePresets(): FeePresets {
     return normalizeFeePresets(parseJson<unknown>(this.getSetting(FEE_PRESETS_KEY), {}));
+  }
+
+  /**
+   * What the display-only resale basis reads, for one request: fee presets
+   * now, sold flips, watch filters and research bands on first use.
+   */
+  private resaleContext() {
+    return new ResaleContext(this.feePresets(), {
+      flips: () => (this.stmt('SELECT title, watch_id, sold_on, sale_price_pln FROM flips WHERE sold_on IS NOT NULL AND sale_price_pln > 0').all() as Array<{ title: string; watch_id: string | null; sold_on: string; sale_price_pln: number }>)
+        .map((flip) => ({ title: String(flip.title), watchId: flip.watch_id === null ? null : String(flip.watch_id), soldOn: String(flip.sold_on), salePrice: Number(flip.sale_price_pln) })),
+      watches: () => (this.stmt('SELECT id, query, included_terms, excluded_terms, variant_groups_json, reference_market_watch_id FROM watches').all() as WatchRow[])
+        .map((watch) => ({ id: String(watch.id), query: String(watch.query ?? ''), includedTerms: String(watch.included_terms ?? ''), excludedTerms: String(watch.excluded_terms ?? ''), groups: parseVariantGroups(watch.variant_groups_json), referenceId: watch.reference_market_watch_id ? String(watch.reference_market_watch_id) : null })),
+      band: (referenceId) => {
+        const band = this.referenceBand(referenceId);
+        return { p25: band.eligibleCount >= MIN_BAND_SAMPLES ? band.p25 : null, samples: band.eligibleCount };
+      },
+    });
   }
 
   private setSetting(key: string, value: string) {
@@ -2495,7 +2515,7 @@ export class ScoutService {
             if (!plan.channels.length && !plan.digestDue && this.hasFreshDescriptionVerification(candidate, context)) continue;
             if (!await this.verifyHighPriorityDeal(candidate, context)) continue;
           }
-          await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence, context, candidate.variantLabel ?? null, { targetPrice: candidate.targetPrice ?? null, estimatedNet: candidate.estimatedNet ?? null });
+          await this.notifyDeal(candidate.watchId, candidate.listing, candidate.typical, candidate.discountPercent, candidate.confidence, context, candidate.variantLabel ?? null, { targetPrice: candidate.targetPrice ?? null, estimatedNet: candidate.estimatedNet ?? null, resaleBasis: candidate.resaleBasis ?? null });
         }
       }
     };
@@ -2895,7 +2915,7 @@ export class ScoutService {
     };
   }
 
-  private listingFromRow(row: Record<string, any>, baselineReady: boolean, variantGroups: VariantGroup[] = [], feePresets: FeePresets = this.feePresets()): Listing {
+  private listingFromRow(row: Record<string, any>, baselineReady: boolean, variantGroups: VariantGroup[] = [], resale: ResaleContext = this.resaleContext()): Listing {
     const typicalSource = row.typical_source === 'reference-band' || row.typical_source === 'own-history' ? row.typical_source : null;
     const associationTypical = row.watch_typical_pln ?? row.typical_pln;
     // An own-history typical is only written once the listing's own variant is
@@ -2918,6 +2938,7 @@ export class ScoutService {
       ? row.watch_id ? `${row.watch_id}:${marketplaceListingKey}` : undefined
       : `${row.watch_id}:${row.watch_listing_id}`;
     const flags = listingRowFlags(row);
+    const estimate = resale.estimate(String(row.marketplace), row.watch_id ?? null, row.variant_key ?? null, price, typical);
     return {
       id: marketplaceListingKey,
       marketplaceListingKey,
@@ -2950,7 +2971,8 @@ export class ScoutService {
       refreshedAt: row.refreshed_at ?? null,
       promoted: row.promoted === null || row.promoted === undefined ? null : Boolean(row.promoted),
       sellerType: row.seller_type === 'private' || row.seller_type === 'business' ? row.seller_type : null,
-      estimatedNet: isFlipChannel(row.marketplace) ? estimatedNetAtTypical(price, typical, feePresets[row.marketplace]) : null,
+      estimatedNet: estimate?.net ?? null,
+      resaleBasis: estimate?.basis ?? null,
       targetHit: listingHitsTarget({ target_price_pln: row.watch_target_price_pln }, price),
       listingId: String(row.listing_id),
       decision: parseListingDecision(row.listing_decision),
@@ -4425,8 +4447,8 @@ export class ScoutService {
       LEFT JOIN listing_actions a ON a.marketplace = l.marketplace AND a.listing_id = l.listing_id
       WHERE ${where}
       ORDER BY ${orderBy} LIMIT ? OFFSET ?`).all(...params, ...orderParams, pageSize, (page - 1) * pageSize) as Array<Record<string, any>>;
-    const feePresets = this.feePresets();
-    const listings = this.withDuplicates(rows.map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100, watches.get(row.watch_id)?.variantGroups ?? [], feePresets)));
+    const resale = this.resaleContext();
+    const listings = this.withDuplicates(rows.map((row) => this.listingFromRow(row, watches.get(row.watch_id)?.readiness === 100, watches.get(row.watch_id)?.variantGroups ?? [], resale)));
     return { listings, pagination: { page, pageSize, total, hasNext: page * pageSize < total } };
   }
 
@@ -7485,22 +7507,26 @@ export class ScoutService {
     // A target-price hit alerts even while the watch is learning; the
     // minimum saving applies to deal alerts only.
     const targetPrice = listingHitsTarget(row, listing.price) ? watchPlnFromRow(row.target_price_pln) : null;
-    const candidate = (typical: number | null, discountPercent: number | null, confidence: number, dealStrength: number | null): DealNotificationCandidate => ({
-      watchId: String(row.id),
-      listing,
-      typical,
-      discountPercent,
-      confidence,
-      requiresDescriptionVerification: (dealStrength ?? 0) >= 4,
-      query: String(row.query ?? ''),
-      includedTerms: String(row.included_terms ?? ''),
-      excludedTerms: String(row.excluded_terms ?? ''),
-      verificationChecks: parseVerificationChecks(row.verification_checks_json),
-      variantKey,
-      variantLabel,
-      targetPrice,
-      estimatedNet: estimatedNetAtTypical(listing.price, typical, this.feePresets()[listing.marketplace]),
-    });
+    const candidate = (typical: number | null, discountPercent: number | null, confidence: number, dealStrength: number | null): DealNotificationCandidate => {
+      const estimate = this.resaleContext().estimate(listing.marketplace, String(row.id), variantKey, listing.price, typical);
+      return {
+        watchId: String(row.id),
+        listing,
+        typical,
+        discountPercent,
+        confidence,
+        requiresDescriptionVerification: (dealStrength ?? 0) >= 4,
+        query: String(row.query ?? ''),
+        includedTerms: String(row.included_terms ?? ''),
+        excludedTerms: String(row.excluded_terms ?? ''),
+        verificationChecks: parseVerificationChecks(row.verification_checks_json),
+        variantKey,
+        variantLabel,
+        targetPrice,
+        estimatedNet: estimate?.net ?? null,
+        resaleBasis: estimate?.basis ?? null,
+      };
+    };
     if (score.isReady && score.typical !== null) {
       const discountPercent = score.discountPercent ?? 0;
       const dealStrength = scoredStrength ?? 1;
@@ -7688,6 +7714,7 @@ export class ScoutService {
       variantLabel?: string | null;
       targetPrice?: number | null;
       estimatedNet?: number | null;
+      resaleBasis?: ResaleBasis | null;
     } | undefined;
   }
 
@@ -7744,9 +7771,10 @@ export class ScoutService {
     variantLabel?: string | null;
     targetPrice?: number | null;
     estimatedNet?: number | null;
+    resaleBasis?: ResaleBasis | null;
     legacy?: boolean;
   }) {
-    const alert = { listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence, variantLabel: input.variantLabel, targetPrice: input.targetPrice ?? null, estimatedNet: input.estimatedNet ?? null };
+    const alert = { listing: input.listing, typical: input.typical, discountPercent: input.discountPercent, confidence: input.confidence, variantLabel: input.variantLabel, targetPrice: input.targetPrice ?? null, estimatedNet: input.estimatedNet ?? null, resaleBasis: input.resaleBasis ?? null };
     const started = nowIso();
     try {
       if (input.channel === 'Discord') {
@@ -7848,7 +7876,7 @@ export class ScoutService {
     maybeConfidence?: number,
     context?: ScanNotifyContext,
     variantLabel?: string | null,
-    extras: { targetPrice?: number | null; estimatedNet?: number | null } = {},
+    extras: { targetPrice?: number | null; estimatedNet?: number | null; resaleBasis?: ResaleBasis | null } = {},
   ) {
     const legacy = typeof watchIdOrListing !== 'string';
     const watchId = legacy ? '__legacy__' : watchIdOrListing;
@@ -7858,6 +7886,7 @@ export class ScoutService {
     const confidence = (legacy ? discountOrConfidence : maybeConfidence) as number;
     const targetPrice = extras.targetPrice ?? null;
     const estimatedNet = extras.estimatedNet ?? null;
+    const resaleBasis = estimatedNet === null ? null : extras.resaleBasis ?? null;
     const plan = this.planDealNotification(watchId, listing, discountPercent, context, legacy, isTargetHit(targetPrice));
     if (plan.hidden) return;
     const { priority, encryptedDiscord, ntfy } = plan;
@@ -7866,7 +7895,7 @@ export class ScoutService {
 
     const planned: Array<{ channel: 'Discord' | 'ntfy'; eventKey: string; deliveryKey: string; sequence?: number; claim: { id: number; attemptCount: number }; legacy: boolean }> = [];
     for (const { channel, sequence, eventKey, deliveryKey } of plan.channels) {
-      const payload = { ...buildDiscordEmbed({ listing, typical, discountPercent, confidence, variantLabel, targetPrice, estimatedNet }), _scout: { watchId, listing, typical, discountPercent, confidence, priority, sequence, variantLabel, targetPrice, estimatedNet } };
+      const payload = { ...buildDiscordEmbed({ listing, typical, discountPercent, confidence, variantLabel, targetPrice, estimatedNet, resaleBasis }), _scout: { watchId, listing, typical, discountPercent, confidence, priority, sequence, variantLabel, targetPrice, estimatedNet, resaleBasis } };
       this.stmt('INSERT OR IGNORE INTO notifications (listing_key, payload_json, status, created_at) VALUES (?, ?, ?, ?)').run(eventKey, JSON.stringify(payload), 'pending', nowIso());
       const claim = this.claimNotificationDelivery(deliveryKey, channel);
       if (claim) planned.push({ channel, eventKey, deliveryKey, sequence: legacy ? undefined : sequence, claim, legacy });
@@ -7889,6 +7918,7 @@ export class ScoutService {
       variantLabel,
       targetPrice,
       estimatedNet,
+      resaleBasis,
       legacy: item.legacy,
     })));
   }
@@ -7939,6 +7969,7 @@ export class ScoutService {
         variantLabel: meta.variantLabel,
         targetPrice: meta.targetPrice ?? null,
         estimatedNet: meta.estimatedNet ?? null,
+        resaleBasis: meta.resaleBasis ?? null,
         legacy: meta.watchId === '__legacy__',
       });
     }
