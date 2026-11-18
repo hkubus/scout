@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { connect as connectHttp2, type SecureClientSessionOptions } from 'node:http2';
 import { brotliDecompressSync, gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
 import type { Browser, BrowserContext, Page } from 'playwright-core';
-import { buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
+import { DeliveryRejectedError, assertDeliveryResponse, buildDiscordEmbed, buildNtfyPayload, isSafeNetworkHost, meetsMinimumPriority, notificationKey, notificationPriorityRank, parseNotificationPriority, priorityFromDiscount, publishNtfy, SCOUT_APP_DEALS_LINK, validateNtfyConfig, type NtfyConfig } from './notifications';
 import { SearchConfigError, buildMarketplaceSearchUrl, buildOlxCategoryFacetsUrl, buildOlxFriendlyLinksUrl, buildOlxSearchApiUrl, createAllegroLokalnieAdapter, createOlxJsonAdapter, createPublicAdapter, createVintedJsonAdapter, exponentialBackoff, isMarketplaceImageUrl, parseListingDescription, parseListingImageUrls, parseOfferPage, parseShippingAvailability, validateSearchUrl, type AllegroApiFetchResult, type ConnectorAdapter, type ConnectorPathReporter, type ListingAvailability, type Marketplace, type NormalizedListing, type OlxApiFetchResult, type OlxCategory, type OlxCategoryFacet, type OlxSearchPathParams, type SellerType, parseOlxCategoryFacets, type ListingDetailResult, type SellerListingsPage, allegroSellerProfileUrl, olxSellerListingsUrl, parseAllegroSellerProfile, parseOlxSellerListings, parseVintedWardrobe, vintedWardrobeUrl, parseOlxFriendlyLinks, resolveOlxSearchPath, type VintedApiFetchResult, type VintedPageFetchResult, olxDetailHint, setOlxDetailHint } from './marketplaces';
 import { MarketplaceSessionValidationError, SESSION_CHECK_URLS, classifySessionCheck, parseMarketplaceStorageState, type MarketplaceStorageState, type SessionCheckOutcome } from './marketplace-sessions';
 import { DEFAULT_DEEPSEEK_MODEL, classifyListingRelevanceWithDeepSeek, suggestVariantGroupsWithDeepSeek, writeResaleListingWithDeepSeek, legacyListingRelevanceInputHash, listingConditionMatchInputHash, listingDescriptionVerificationInputHash, listingNegotiabilityInputHash, listingVariantInputHash, listingRelevanceInputHash, listingTermMatchInputHash, normalizeOpenRouterModel, DeepSeekError, parseStoredListingDescriptionVerification, parseVerificationChecks, verifyListingDescriptionWithDeepSeek, type ListingDescriptionVerificationContext, type ListingRelevanceContext, type VerificationCheck } from './ai';
@@ -7558,7 +7558,7 @@ export class ScoutService {
         if (!encrypted) throw new Error('Discord webhook is not configured');
         const response = await fetch(validateDiscordWebhook(decryptSecret(encrypted)), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(deliveryPayload), signal: AbortSignal.timeout(12_000) });
         discardResponse(response, 'discord-webhook');
-        if (!response.ok) throw new Error(`Discord returned ${response.status}`);
+        assertDeliveryResponse('Discord', response.status);
       } else {
         const config = this.ntfyConfig();
         if (!config) throw new Error('ntfy is not configured');
@@ -7575,10 +7575,9 @@ export class ScoutService {
       return 'delivered' as const;
     } catch (error) {
       const message = (error instanceof Error ? error.message : `${input.channel} digest delivery failed`).slice(0, 500);
-      const nextAttempt = input.attemptCount < 5 ? new Date(Date.now() + exponentialBackoff(input.attemptCount - 1, 30_000, 6 * 60 * 60_000)).toISOString() : null;
-      this.stmt("UPDATE notification_deliveries SET status = 'failed', message = ?, next_attempt_at = ?, updated_at = ? WHERE listing_key = ? AND channel = ?").run(message, nextAttempt, nowIso(), input.deliveryKey, input.channel);
+      this.recordDeliveryFailure(input.channel, input.deliveryKey, input.attemptCount, error, message);
       this.stmt("UPDATE notifications SET status = 'failed' WHERE listing_key = ?").run(input.eventKey);
-      this.recordRun(input.channel, 'error', message, started, nowIso());
+      this.recordRun(input.channel, 'error', this.deliveryRunMessage(input.channel, error, message), started, nowIso());
       return 'failed' as const;
     }
   }
@@ -7668,7 +7667,7 @@ export class ScoutService {
       if (existing) {
         const attempts = Number(existing.attempt_count ?? 0);
         const updatedAt = String(existing.updated_at ?? existing.created_at ?? '');
-        if (existing.status === 'delivered' || attempts >= maxAttempts) return null;
+        if (existing.status === 'delivered' || existing.status === 'rejected' || attempts >= maxAttempts) return null;
         if (existing.status === 'failed' && existing.next_attempt_at && Date.parse(existing.next_attempt_at) > Date.now()) return null;
         if (existing.status === 'pending' && updatedAt && Date.parse(updatedAt) > Date.parse(staleBefore)) return null;
         const nextAttempt = attempts + 1;
@@ -7683,6 +7682,29 @@ export class ScoutService {
   private latestDeliveryForAlert(watchId: string, listing: NormalizedListing, channel: 'Discord' | 'ntfy') {
     const prefix = `${watchId}|${listing.marketplace}|${listing.listingId}|alert:`;
     return this.stmt("SELECT listing_key, status, attempt_count, next_attempt_at, updated_at, created_at FROM notification_deliveries WHERE channel = ? AND listing_key LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT 1").get(channel, `${ScoutService.escapeLike(prefix)}%|channel:${channel}`) as Record<string, any> | undefined;
+  }
+
+  /** The highest alert:N event any channel has recorded for this watch listing (0 when none). */
+  private latestAlertEventSequence(watchId: string, listing: NormalizedListing) {
+    // alert:N keys share the prefix; ';' sorts right after ':', so the range
+    // is exactly the keys under it and uses the unique index.
+    const prefix = `${watchId}|${listing.marketplace}|${listing.listingId}|alert:`;
+    const rows = this.stmt('SELECT listing_key FROM notifications WHERE listing_key >= ? AND listing_key < ?').all(prefix, `${prefix.slice(0, -1)};`) as Array<{ listing_key: string }>;
+    let latest = 0;
+    for (const row of rows) {
+      const sequence = Number(/^\d+$/.test(row.listing_key.slice(prefix.length)) ? row.listing_key.slice(prefix.length) : 0);
+      if (sequence > latest) latest = sequence;
+    }
+    return latest;
+  }
+
+  /** Price and priority of a rejected delivery's alert, read from its event payload. */
+  private rejectedAlert(deliveryKey: string) {
+    const eventKey = deliveryKey.includes('|channel:') ? deliveryKey.slice(0, deliveryKey.indexOf('|channel:')) : deliveryKey;
+    const row = this.stmt('SELECT payload_json FROM notifications WHERE listing_key = ?').get(eventKey) as { payload_json?: string } | undefined;
+    const meta = this.notificationMeta(parseJson<Record<string, any>>(row?.payload_json, {}));
+    if (!meta) return undefined;
+    return { last_alerted_price_pln: Number(meta.listing?.price), last_priority: meta.priority };
   }
 
   private alertState(watchId: string, listing: NormalizedListing, channel: 'Discord' | 'ntfy') {
@@ -7722,7 +7744,7 @@ export class ScoutService {
         if (!input.encryptedDiscord) throw new Error('Discord webhook is not configured');
         const response = await fetch(validateDiscordWebhook(decryptSecret(input.encryptedDiscord)), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(buildDiscordEmbed(alert)), signal: AbortSignal.timeout(12_000) });
         discardResponse(response, 'discord-webhook');
-        if (!response.ok) throw new Error(`Discord returned ${response.status}`);
+        assertDeliveryResponse('Discord', response.status);
       } else {
         if (!input.ntfy) throw new Error('ntfy is not configured');
         await publishNtfy(input.ntfy, buildNtfyPayload(alert, input.ntfy.topic, input.priority, { openInApp: input.ntfy.openInApp, watchId: input.watchId }));
@@ -7745,12 +7767,30 @@ export class ScoutService {
       return 'delivered' as const;
     } catch (error) {
       const message = (error instanceof Error ? error.message : `${input.channel} delivery failed`).slice(0, 500);
-      const nextAttempt = input.attemptCount < 5 ? new Date(Date.now() + exponentialBackoff(input.attemptCount - 1, 30_000, 6 * 60 * 60_000)).toISOString() : null;
-      this.stmt("UPDATE notification_deliveries SET status = 'failed', message = ?, next_attempt_at = ?, updated_at = ? WHERE listing_key = ? AND channel = ?").run(message, nextAttempt, nowIso(), input.deliveryKey, input.channel);
+      this.recordDeliveryFailure(input.channel, input.deliveryKey, input.attemptCount, error, message);
       this.stmt("UPDATE notifications SET status = 'failed' WHERE listing_key = ? AND status <> 'delivered'").run(input.eventKey);
-      this.recordRun(input.channel, 'error', message, started, nowIso());
+      this.recordRun(input.channel, 'error', this.deliveryRunMessage(input.channel, error, message), started, nowIso());
       return 'failed' as const;
     }
+  }
+
+  /**
+   * A failed attempt is retried with backoff up to 5 attempts in all, except
+   * a permanent refusal (DeliveryRejectedError): it is marked 'rejected' and
+   * never claimed again, and planDealNotification sends the listing again only
+   * once it improves on the rejected alert.
+   */
+  private recordDeliveryFailure(channel: 'Discord' | 'ntfy', deliveryKey: string, attemptCount: number, error: unknown, message: string) {
+    const rejected = error instanceof DeliveryRejectedError;
+    const nextAttempt = !rejected && attemptCount < 5 ? new Date(Date.now() + exponentialBackoff(attemptCount - 1, 30_000, 6 * 60 * 60_000)).toISOString() : null;
+    this.stmt('UPDATE notification_deliveries SET status = ?, message = ?, next_attempt_at = ?, updated_at = ? WHERE listing_key = ? AND channel = ?').run(rejected ? 'rejected' : 'failed', message, nextAttempt, nowIso(), deliveryKey, channel);
+  }
+
+  /** The channel's connector-run message: a permanent refusal says it is not retried and what to check. */
+  private deliveryRunMessage(channel: 'Discord' | 'ntfy', error: unknown, message: string) {
+    if (!(error instanceof DeliveryRejectedError)) return message;
+    const check = channel === 'Discord' ? 'the webhook URL' : 'the ntfy topic and token';
+    return `${message}: rejected, not retried. Check ${check} in Settings if every alert fails.`.slice(0, 500);
   }
 
   /**
@@ -7794,13 +7834,21 @@ export class ScoutService {
         const state = this.alertState(watchId, listing, channel);
         const latest = this.latestDeliveryForAlert(watchId, listing, channel);
         const latestSequence = latest?.listing_key ? Number(latest.listing_key.match(/\|alert:(\d+)\|channel:/)?.[1] ?? 0) : 0;
-        const latestDue = latest && latest.status !== 'delivered' && Number(latest.attempt_count ?? 0) < 5
+        const latestOpen = latest && latest.status !== 'delivered' && latest.status !== 'rejected' && Number(latest.attempt_count ?? 0) < 5;
+        const latestDue = latestOpen
           && !(latest.status === 'failed' && latest.next_attempt_at && Date.parse(latest.next_attempt_at) > Date.now())
           && !(latest.status === 'pending' && latest.updated_at && Date.parse(latest.updated_at) > Date.now() - 15 * 60_000);
         if (latestDue) sequence = latestSequence || Number(state?.alert_sequence ?? 1);
-        else if (latest && latest.status !== 'delivered' && Number(latest.attempt_count ?? 0) < 5) continue;
+        else if (latestOpen) continue;
+        // A refused alert is not sent again until the listing improves on it
+        // as a re-alert must (shouldAlert), so a bad payload or dead webhook
+        // cannot restart the sequence on every scan.
+        else if (latest?.status === 'rejected' && !this.shouldAlert(this.rejectedAlert(String(latest.listing_key)), listing.price, priority)) continue;
         else if (!this.shouldAlert(state, listing.price, priority)) continue;
-        else sequence = Math.max(Number(state?.alert_sequence ?? 0), latestSequence) + 1;
+        // Numbered past every channel's events: a channel that starts alerting
+        // later must not reuse (INSERT OR IGNORE) another channel's older
+        // alert:N row, whose price and time are not its own.
+        else sequence = Math.max(Number(state?.alert_sequence ?? 0), latestSequence, this.latestAlertEventSequence(watchId, listing)) + 1;
         eventKey = this.notificationEventKey(watchId, listing, sequence);
         deliveryKey = this.notificationDeliveryKey(eventKey, channel);
       }

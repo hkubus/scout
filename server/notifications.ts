@@ -221,6 +221,33 @@ export function buildNtfyPayload(
   };
 }
 
+/**
+ * A 4xx a retry cannot fix (a bad payload, a deleted webhook, a wrong token
+ * or topic); 408 and 429 are transient. Deliveries that hit one are not
+ * retried, and the same unchanged alert is not sent again.
+ */
+export function isPermanentDeliveryStatus(status: number) {
+  return status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
+
+/** A delivery the channel refused for good (isPermanentDeliveryStatus). */
+export class DeliveryRejectedError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'DeliveryRejectedError';
+    this.status = status;
+  }
+}
+
+/** Throws for a non-2xx channel reply: DeliveryRejectedError when retrying cannot help. */
+export function assertDeliveryResponse(channel: 'Discord' | 'ntfy', status: number) {
+  if (status >= 200 && status < 300) return;
+  const message = `${channel} returned ${status}`;
+  throw isPermanentDeliveryStatus(status) ? new DeliveryRejectedError(message, status) : new Error(message);
+}
+
 export async function publishNtfy(config: NtfyConfig, payload: NtfyPayload, fetcher: typeof fetch = globalThis.fetch) {
   assertSafeNtfyHost(config.serverUrl);
   if (fetcher === processFetch) await assertSafeNtfyDestination(config.serverUrl);
@@ -238,7 +265,7 @@ export async function publishNtfy(config: NtfyConfig, payload: NtfyPayload, fetc
   });
   discardResponse(response, 'ntfy');
   if (response.status >= 300 && response.status < 400) throw new Error('ntfy server redirected the request; configure its final URL');
-  if (!response.ok) throw new Error(`ntfy returned ${response.status}`);
+  assertDeliveryResponse('ntfy', response.status);
 }
 
 export function buildDiscordEmbed(input: DealNotificationInput) {
