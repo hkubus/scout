@@ -482,7 +482,7 @@ app.get('/api/export', async (_request, reply) => {
   const stream = service.exportStream();
   return reply.header('Content-Disposition', `attachment; filename="scout-export-${new Date().toISOString().slice(0, 10)}.json"`).type('application/json').send(stream);
 });
-app.post('/api/backup', async (_request, reply) => reply.code(201).send({ backup: basename(backupDatabase(db)), message: 'SQLite backup created beside the configured database file.' }));
+app.post('/api/backup', async (_request, reply) => reply.code(201).send({ backup: basename(await backupDatabase(db)), message: 'SQLite backup created beside the configured database file.' }));
 // Everything that could help improve Scout as one redacted SQLite file (see
 // README "Improvement data"). Built in a child process beside the database, streamed
 // (compressed when the client accepts it), then deleted. Leaving early stops
@@ -1064,8 +1064,12 @@ if (debug) {
     if (!body.success) return reply.code(400).send({ error: body.error.issues[0]?.message ?? 'Invalid query request' });
     return debug.query(body.data.sql, body.data.params ?? [], body.data.maxRows);
   });
-  app.get('/api/debug/snapshot', async (_request, reply) => {
-    const snapshot = debug.snapshot();
+  app.get('/api/debug/snapshot', async (request, reply) => {
+    // Built in a child process; leaving early stops it.
+    const left = new AbortController();
+    reply.raw.once('close', () => left.abort());
+    const snapshot = await debug.snapshot({ signal: left.signal });
+    if (left.signal.aborted) { snapshot.cleanup(); return reply.code(400).send({ error: 'The debug snapshot was cancelled' }); }
     const stream = createReadStream(snapshot.path);
     stream.on('close', snapshot.cleanup);
     return reply
@@ -1232,4 +1236,16 @@ void flips.convertStoredPhotosToWebp().then(
 void service.backfillListingFlags().then(
   (count) => { if (count) service.logDiagnostic(`stored quick flags on ${count} listing${count === 1 ? '' : 's'}`); },
   (error) => { if (!shuttingDown) app.log.warn({ err: error }, 'Storing quick flags on listings stopped'); },
+);
+// Price histories stored before the per-scan dedup lose their redundant
+// rows, and research photos stored at full size are re-encoded, in short
+// slices in the background; each pass resumes after a restart and runs to
+// the end once. The file keeps its size: SQLite reuses the freed pages.
+void service.compactObservations({ shouldStop: () => shuttingDown }).then(
+  (count) => { if (count) service.logDiagnostic(`removed ${count.toLocaleString('en')} redundant price-history row${count === 1 ? '' : 's'}`); },
+  (error) => { if (!shuttingDown) app.log.warn({ err: error }, 'Compacting price history stopped'); },
+);
+void service.shrinkStoredSnapshotImages({ shouldStop: () => shuttingDown }).then(
+  (result) => { if (result.images) service.logDiagnostic(`re-encoded ${result.images} research photo${result.images === 1 ? '' : 's'}: ${(result.bytesBefore / 1048576).toFixed(1)} MB → ${(result.bytesAfter / 1048576).toFixed(1)} MB`); },
+  (error) => { if (!shuttingDown) app.log.warn({ err: error }, 'Re-encoding research photos stopped'); },
 );

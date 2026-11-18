@@ -730,7 +730,7 @@ export function registerScoutDebugMcpTools(server: McpServer, debug: ScoutDebug)
   });
 
   server.registerTool('scout_debug_runtime', {
-    description: 'Debug: process uptime, memory, Node version, non-secret environment configuration, readiness, settings, and the in-memory log buffer.',
+    description: 'Debug: process uptime, memory, Node version, non-secret environment configuration, readiness, settings, and the log: this process\'s in-memory buffer (source "memory") plus warnings and errors stored across restarts (source "stored", with a repeats count).',
     annotations: { readOnlyHint: true },
   }, async () => {
     try { return text(debug.runtime()); } catch (error) { return toolError(error); }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 // @ts-ignore node:sqlite is present in the supported Node 22+ runtime.
@@ -98,17 +98,28 @@ test('a runaway query is stopped at the deadline without blocking the event loop
   } finally { context.close(); }
 });
 
-test('snapshot copies the database with credentials blanked and cleans up', () => {
+test('snapshot copies the database with credentials blanked and cleans up', async () => {
   const context = fixture();
   try {
-    context.db.prepare('INSERT INTO marketplace_sessions (marketplace, storage_state_encrypted, created_at, updated_at) VALUES (?, ?, ?, ?)').run('OLX', encryptSecret('{"cookies":[]}'), 'now', 'now');
-    const snapshot = context.debug.snapshot();
+    const session = encryptSecret(`{"cookies":[{"name":"sid","value":"${'SESSION-COOKIE-MARKER'.repeat(400)}"}]}`);
+    context.db.prepare('INSERT INTO marketplace_sessions (marketplace, storage_state_encrypted, created_at, updated_at) VALUES (?, ?, ?, ?)').run('OLX', session, 'now', 'now');
+    const webhook = String((context.db.prepare("SELECT value FROM settings WHERE key = 'discord_webhook'").get() as { value: string }).value);
+    context.db.prepare("INSERT INTO flips (title, buy_channel, bought_on, buy_price_pln, note, created_at, updated_at) VALUES ('RTX 3070', 'OLX', '2026-09-01', 1200, ?, 'now', 'now')").run('FLIP-NOTE-MARKER'.repeat(500));
+    // The copy is built in a child process: the event loop keeps turning.
+    let ticks = 0;
+    const timer = setInterval(() => { ticks += 1; }, 5);
+    const snapshot = await context.debug.snapshot().finally(() => clearInterval(timer));
+    assert.ok(ticks >= 1, 'the event loop kept running during the snapshot');
     const copy = new DatabaseSync(snapshot.path, { readOnly: true });
     try {
       assert.equal((copy.prepare("SELECT value FROM settings WHERE key = 'discord_webhook'").get() as { value: string }).value, REDACTED);
       assert.equal((copy.prepare("SELECT value FROM settings WHERE key = 'default_interval'").get() as { value: string }).value, '5');
       assert.equal((copy.prepare('SELECT storage_state_encrypted AS state FROM marketplace_sessions').get() as { state: string }).state, REDACTED);
     } finally { copy.close(); }
+    // secure_delete instead of a second VACUUM: nothing redacted is left in free pages either.
+    const bytes = readFileSync(snapshot.path);
+    assert.equal(snapshot.bytes, bytes.byteLength);
+    for (const secret of [session, webhook, 'FLIP-NOTE-MARKER']) assert.equal(bytes.includes(secret), false, `${secret.slice(0, 40)} must not be in the snapshot`);
     snapshot.cleanup();
     assert.deepEqual(readdirSync(context.directory).filter((file) => file.includes('.debug-')), []);
   } finally { context.close(); }
@@ -151,7 +162,7 @@ test('the private flip ledger and negotiation outcomes are hidden from tables, r
     for (const sql of ['SELECT * FROM flips', 'select title from "FLIPS"', 'WITH x AS (SELECT buy_price_pln FROM flips) SELECT * FROM x', 'SELECT data FROM flip_photos', 'SELECT final_price_pln FROM negotiation_outcomes']) {
       await assert.rejects(context.debug.query(sql), (error: unknown) => error instanceof ServiceError && error.status === 403, sql);
     }
-    const snapshot = context.debug.snapshot();
+    const snapshot = await context.debug.snapshot();
     const copy = new DatabaseSync(snapshot.path, { readOnly: true });
     try {
       assert.equal((copy.prepare('SELECT COUNT(*) AS count FROM flips').get() as { count: number }).count, 0);
@@ -172,7 +183,7 @@ test('connected apps are hidden like the flip ledger', async () => {
       assert.equal(names.includes(table), false, table);
       await assert.rejects(context.debug.query(`SELECT * FROM ${table}`), (error: unknown) => error instanceof ServiceError && error.status === 403, table);
     }
-    const snapshot = context.debug.snapshot();
+    const snapshot = await context.debug.snapshot();
     const copy = new DatabaseSync(snapshot.path, { readOnly: true });
     try {
       assert.equal((copy.prepare('SELECT COUNT(*) AS count FROM connected_app_tokens').get() as { count: number }).count, 0);

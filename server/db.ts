@@ -3,10 +3,11 @@
 // resume after a home-server restart.
 // @ts-ignore node:sqlite is present in the supported Node 22+ runtime.
 import { DatabaseSync } from 'node:sqlite';
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { Worker } from 'node:worker_threads';
+import { runNodeChild } from './nodeChild';
 
 function prunePreMigrationBackups(absolutePath: string, keep = 5) {
   try {
@@ -155,6 +156,12 @@ export function openDatabase(databasePath = process.env.SCOUT_DB_PATH ?? './data
     // The redundant IN lets the partial scans_unfinished index serve the lookup.
     db.prepare("UPDATE scans SET status = 'interrupted', completed_at = ?, error = COALESCE(error, 'Process restarted before scan completed') WHERE status IN ('running', 'interrupted') AND status = 'running'").run(new Date().toISOString());
   }
+  if (db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'connector_runs'").get()) {
+    // The connector run of every scan the restart cut short. 'interrupted' is
+    // outside the ok/error outcomes that drive connector backoff, so a restart
+    // neither starts nor breaks a failure streak.
+    db.prepare("UPDATE connector_runs SET status = 'interrupted', finished_at = ?, message = COALESCE(message, '') || ' (interrupted: Scout restarted before the run finished)' WHERE status = 'running'").run(new Date().toISOString());
+  }
   return db;
 }
 
@@ -251,12 +258,66 @@ export function seedDatabase(db: any, seed: { watches: Array<any>; listings: Arr
   for (const listing of seed.listings) listingStmt.run(listing.marketplace, listing.id, listing.title, listing.subtitle ?? '', listing.price, listing.typical, listing.url, listing.image, listing.condition ?? '', listing.location ?? '', now, now);
 }
 
-export function backupDatabase(db: any, databasePath = process.env.SCOUT_DB_PATH ?? './data/scout.sqlite', keep = 10) {
+// Runs in a child process (see runNodeChild): VACUUM INTO from its own
+// read-only connection. In WAL mode the main connection keeps reading and
+// writing meanwhile, where VACUUM INTO on it blocked the server 3-9 s.
+const BACKUP_CHILD = `
+const { DatabaseSync } = require('node:sqlite');
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => { input += chunk; });
+process.stdin.on('end', () => {
+  const job = JSON.parse(input);
+  try {
+    const source = new DatabaseSync(job.source, { readOnly: true });
+    try {
+      source.exec('PRAGMA busy_timeout = 5000');
+      source.prepare('VACUUM INTO ?').run(job.target);
+    } finally { source.close(); }
+    process.stdout.write(JSON.stringify({ ok: true }));
+  } catch (error) { process.stdout.write(JSON.stringify({ error: String(error && error.message || error) })); }
+});
+`;
+const BACKUP_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * Write a compacted copy of the database beside it and keep the newest
+ * `keep` copies. The copy is built in a child process so the event loop and
+ * the main connection's writes carry on; only when no child process can be
+ * started does it fall back to VACUUM INTO on `db`, which blocks until done.
+ * (node:sqlite's backup() steps on the main connection itself and held up its
+ * writes for seconds at a time, so it is not used.)
+ */
+export async function backupDatabase(db: any, databasePath = process.env.SCOUT_DB_PATH ?? './data/scout.sqlite', keep = 10, options: { timeoutMs?: number } = {}) {
   const absolutePath = resolve(databasePath);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const backupPath = `${absolutePath}.${stamp}-${randomBytes(3).toString('hex')}.backup.sqlite`;
-  const escapedPath = backupPath.replace(/'/g, "''");
-  db.exec(`VACUUM INTO '${escapedPath}'`);
+  const remove = () => { for (const suffix of ['', '-journal']) { try { unlinkSync(`${backupPath}${suffix}`); } catch { /* already gone */ } } };
+  // VACUUM INTO fills an existing empty file, so the copy is private from its first byte.
+  writeFileSync(backupPath, '', { mode: 0o600, flag: 'wx' });
+  try {
+    const timeoutMs = options.timeoutMs ?? BACKUP_TIMEOUT_MS;
+    let result: { ok?: boolean; error?: string } | null = null;
+    try {
+      result = await runNodeChild<{ ok?: boolean; error?: string }>(BACKUP_CHILD, { source: absolutePath, target: backupPath }, {
+        timeoutMs,
+        maxOutputBytes: 64 * 1024,
+        errors: {
+          timeout: () => new Error(`The backup took longer than ${Math.round(timeoutMs / 60_000)} minutes and was stopped`),
+          tooLarge: () => new Error('The backup process answered with too much output'),
+          noResult: () => new Error('The backup process ended without a result (out of memory or disk?)'),
+        },
+      });
+    } catch (error) {
+      // spawn() itself failed (no memory for a process, a missing binary): copy here instead.
+      if (!(error instanceof Error && 'syscall' in error && String((error as { syscall?: unknown }).syscall).startsWith('spawn'))) throw error;
+    }
+    if (result?.error) throw new Error(`Could not back up the database: ${result.error}`);
+    if (!result) db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
+  } catch (error) {
+    remove();
+    throw error;
+  }
   try { chmodSync(backupPath, 0o600); } catch { /* permissions are best-effort on non-POSIX filesystems */ }
   pruneBackups(absolutePath, keep);
   return backupPath;

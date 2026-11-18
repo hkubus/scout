@@ -37,6 +37,8 @@ import { vintedFeesNote } from '../src/listingSignals';
 import { compareStrongest } from '../src/listingRows';
 import type { ListingFlag, SearchDeal, SearchScoredAgainst } from '../src/types';
 import type { MatchKind } from './queryMatch';
+import { AppLog, type LogHistoryEntry } from './appLog';
+import { SNAPSHOT_IMAGE_SHRINK_BYTES, shrinkSnapshotImage } from './snapshotImages';
 
 type Database = any;
 type WatchRow = Record<string, any>;
@@ -298,8 +300,36 @@ const ONE_PIXEL_GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABA
  * undici `fetch` is HTTP/1.1-only).
  */
 const MARKETPLACE_API_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-/** Scan-path log entries kept in memory for the Logs tab; pure diagnostics, never persisted. */
+/** Log entries kept in memory for the Logs tab; warnings and errors are also stored in app_log (appLog.ts). */
 const LOG_BUFFER_LIMIT = 500;
+/** A Jev fuzzy-rescue verdict is kept this long after it was last written. */
+const JEV_FUZZY_CACHE_DAYS = 90;
+/** Settings that track compactObservations: where an interrupted pass resumes, and when it finished. */
+const OBSERVATION_COMPACTION_CURSOR_KEY = 'observation_compaction_cursor';
+const OBSERVATION_COMPACTION_DONE_KEY = 'observation_compaction_done_at';
+// Rows in (?, ?] of the id range that sit strictly inside a run of one price
+// on one UTC day of their watch's history of their listing: both neighbours
+// (by observed_at, id) have the same price and day. scripts/bench/
+// perf-compact-observations.sql is the same rule with window functions.
+const REDUNDANT_OBSERVATIONS_DELETE = `DELETE FROM observations WHERE id IN (
+  SELECT c.id FROM (
+    SELECT o.id, o.price_pln, substr(o.observed_at, 1, 10) AS day,
+      (SELECT p.id FROM observations p INDEXED BY observations_watch_listing
+        WHERE p.watch_id = o.watch_id AND p.listing_id = o.listing_id AND (p.observed_at, p.id) < (o.observed_at, o.id)
+        ORDER BY p.observed_at DESC, p.id DESC LIMIT 1) AS prev_id,
+      (SELECT n.id FROM observations n INDEXED BY observations_watch_listing
+        WHERE n.watch_id = o.watch_id AND n.listing_id = o.listing_id AND (n.observed_at, n.id) > (o.observed_at, o.id)
+        ORDER BY n.observed_at, n.id LIMIT 1) AS next_id
+    FROM observations o WHERE o.id > ? AND o.id <= ?
+  ) AS c
+  JOIN observations prev ON prev.id = c.prev_id
+  JOIN observations next ON next.id = c.next_id
+  WHERE prev.price_pln = c.price_pln AND next.price_pln = c.price_pln
+    AND substr(prev.observed_at, 1, 10) = c.day AND substr(next.observed_at, 1, 10) = c.day
+)`;
+/** Settings that track shrinkStoredSnapshotImages. */
+const SNAPSHOT_IMAGE_SHRINK_CURSOR_KEY = 'snapshot_image_shrink_cursor';
+const SNAPSHOT_IMAGE_SHRINK_DONE_KEY = 'snapshot_image_shrink_done_at';
 
 /**
  * Jev relevance and fuzzy-rescue judgments are independent network round trips,
@@ -936,6 +966,7 @@ export class ScoutService {
   private readonly schedulerOwner = `scheduler-${process.pid}-${randomBytes(8).toString('hex')}`;
   private logSequence = 0;
   private readonly logBuffer: LogEntry[] = [];
+  private readonly appLog: AppLog;
   private readonly searchRuns: SearchRuns<ManualSearchPart, ManualSearchPart[]>;
   private readonly searchDeadlineDefaultMs: number;
   private readonly searchCache = new SearchCache<ManualSearchPart[]>({ ttlMs: searchCacheMs(), entries: SEARCH_CACHE_ENTRIES });
@@ -943,6 +974,7 @@ export class ScoutService {
   constructor(db: Database, emit: (event: string, payload: unknown) => void, dependencies: ScoutServiceDependencies = {}) {
     this.db = db;
     this.emit = emit;
+    this.appLog = new AppLog(db);
     this.searchRuns = new SearchRuns({ slots: MANUAL_SEARCH_SLOTS, deadlineMs: searchDeadlineMs(), maxRunMs: searchMaxRunMs(), ...dependencies.manualSearch });
     this.searchDeadlineDefaultMs = dependencies.manualSearch?.deadlineMs ?? searchDeadlineMs();
     // Per-listing AI calls from scans, searches and checks share one cap.
@@ -1077,6 +1109,7 @@ export class ScoutService {
     const entry: LogEntry = { id: ++this.logSequence, at: nowIso(), level, scope, message };
     this.logBuffer.push(entry);
     if (this.logBuffer.length > LOG_BUFFER_LIMIT) this.logBuffer.splice(0, this.logBuffer.length - LOG_BUFFER_LIMIT);
+    this.appLog.record(entry);
     if (level === 'error') console.error(`[${scope}] ${message}`);
     else console.info(`[${scope}] ${message}`);
     this.emit('log', entry);
@@ -1084,6 +1117,16 @@ export class ScoutService {
 
   logs(): LogEntry[] {
     return [...this.logBuffer].reverse();
+  }
+
+  /**
+   * The log buffer plus up to `storedLimit` stored warnings and errors it no
+   * longer holds (from before a restart, or pushed out of the buffer), newest
+   * first. For the debug API and the improvement export; the Logs tab keeps
+   * reading logs().
+   */
+  logHistory(storedLimit = 500): LogHistoryEntry[] {
+    return this.appLog.history(this.logBuffer, storedLimit);
   }
 
   /** Runtime diagnostics (memory, fetch body discards) surfaced through the same log buffer and SSE stream as scan logs. */
@@ -3618,25 +3661,25 @@ export class ScoutService {
     // Daily reduction in SQL: the last observation per listing per day
     // (ISO-8601 UTC timestamps sort correctly under date()). SQLite takes
     // bare columns from the MAX(observed_at) row, so price and typical are
-    // the ones observed last — matching the previous JS-side dedupe. COUNT is
-    // not a min/max aggregate, so it leaves that choice intact; adding
-    // MIN(observed_at) here would not.
-    const dailyRows = this.stmt(`SELECT date(o.observed_at) AS day, o.listing_id, l.marketplace, o.price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at, COUNT(*) AS n
+    // the ones observed last — matching the previous JS-side dedupe. Adding
+    // MIN(observed_at) here would break that choice.
+    const dailyRows = this.stmt(`SELECT date(o.observed_at) AS day, o.listing_id, l.marketplace, o.price_pln, COALESCE(o.baseline_pln, CASE WHEN o.scan_id IS NULL THEN l.typical_pln END) AS typical_pln, MAX(o.observed_at) AS observed_at
       FROM watch_listings wl
       JOIN listings l ON l.id = wl.listing_id
       CROSS JOIN observations o INDEXED BY observations_watch_listing ON o.watch_id = wl.watch_id AND o.listing_id = wl.listing_id AND o.observed_at >= ?2
       WHERE wl.watch_id = ?1 AND ${filters}
       GROUP BY day, o.listing_id`).all(...filterParams) as Array<Record<string, any>>;
-    // Raw-row totals come from the per-group counts; the window's first and
-    // last observation are ordered LIMIT-1 probes with the same filters.
+    // The window's first and last observation are ordered LIMIT-1 probes
+    // with the same filters.
     const probe = (direction: 'ASC' | 'DESC') => (this.stmt(`SELECT o.observed_at AS at FROM observations o
       JOIN listings l ON l.id = o.listing_id
       JOIN watch_listings wl ON wl.watch_id = o.watch_id AND wl.listing_id = o.listing_id
       WHERE o.watch_id = ?1 AND o.observed_at >= ?2 AND ${filters}
       ORDER BY o.observed_at ${direction} LIMIT 1`).get(...filterParams) as { at?: string } | undefined)?.at ?? null;
-    let totalObservations = 0;
-    for (const item of dailyRows) totalObservations += Number(item.n);
-    const bounds = { total: totalObservations, first_at: dailyRows.length ? probe('ASC') : null, last_at: dailyRows.length ? probe('DESC') : null };
+    // One observation per listing per day, the unit the chart is built
+    // from. Stored rows are no measure: a day at one price keeps two rows
+    // since the per-scan dedup, and older histories had one per scan.
+    const bounds = { total: dailyRows.length, first_at: dailyRows.length ? probe('ASC') : null, last_at: dailyRows.length ? probe('DESC') : null };
     const observations = dailyRows.map((item): WatchAnalyticsObservation => ({
       listingId: Number(item.listing_id),
       marketplace: item.marketplace as Marketplace,
@@ -4600,6 +4643,66 @@ export class ScoutService {
       });
       afterId = Number(rows[rows.length - 1].id);
       await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  /**
+   * Remove the observation rows the per-scan dedup in storeListing would
+   * never have written: within one watch's history of one listing, a run of
+   * rows at one price on one UTC day keeps its first and its last row.
+   * Histories stored before that dedup hold a row per scan (94% of the rows
+   * of a real database). Every read keeps its inputs: daily analytics read
+   * each day's latest row, readiness and first-observed gates the earliest,
+   * the scan baseline the latest. Nothing references observations by id.
+   *
+   * Walks observation ids in order, 500 at a time, judging each row by its
+   * neighbours in observations_watch_listing, in slices that hold the write
+   * lock for about `sliceMs` so scans and requests keep running. Id order
+   * keeps the deletes on neighbouring pages (one listing's rows, written once
+   * per scan, are spread over the whole table). Removing a row inside a run
+   * never changes whether another row is inside one, so the order does not
+   * matter. Between slices it pauses at least `pauseMs`, and long enough to
+   * delete at most `rowsPerSecond`: faster, the WAL outgrows the checkpointer
+   * worker and commits stall on the inline safety-net checkpoint (1-2 s each
+   * on a real 235 MB copy at ~37,000 rows a second; at 4,000 a second the
+   * worst slice was ~250 ms and the median 31 ms). The position is saved
+   * with each slice, so an interrupted pass resumes where it stopped; a
+   * finished pass is recorded and never runs again. Returns the rows removed
+   * by this call.
+   */
+  async compactObservations(options: { sliceMs?: number; pauseMs?: number; rowsPerSecond?: number; shouldStop?: () => boolean } = {}): Promise<number> {
+    if (this.getSetting(OBSERVATION_COMPACTION_DONE_KEY)) return 0;
+    const sliceMs = options.sliceMs ?? 25;
+    const pauseMs = options.pauseMs ?? 50;
+    const rowsPerSecond = options.rowsPerSecond ?? 4_000;
+    const span = 500;
+    let afterId = Number(this.getSetting(OBSERVATION_COMPACTION_CURSOR_KEY) ?? 0) || 0;
+    let removed = 0;
+    for (;;) {
+      if (options.shouldStop?.()) return removed;
+      const slice = this.transaction(() => {
+        const started = performance.now();
+        const lastId = Number((this.stmt('SELECT MAX(id) AS id FROM observations').get() as { id: number | null }).id ?? 0);
+        let cursor = afterId;
+        let deleted = 0;
+        // At least one span per slice, so a slow statement cannot stall the pass.
+        do {
+          if (cursor >= lastId) break;
+          const upTo = Math.min(cursor + span, lastId);
+          deleted += Number(this.stmt(REDUNDANT_OBSERVATIONS_DELETE).run(cursor, upTo).changes);
+          cursor = upTo;
+        } while (performance.now() - started < sliceMs);
+        const finished = cursor >= lastId;
+        if (finished) {
+          this.setSetting(OBSERVATION_COMPACTION_DONE_KEY, nowIso());
+          this.stmt('DELETE FROM settings WHERE key = ?').run(OBSERVATION_COMPACTION_CURSOR_KEY);
+        } else this.setSetting(OBSERVATION_COMPACTION_CURSOR_KEY, String(cursor));
+        return { cursor, deleted, finished };
+      });
+      afterId = slice.cursor;
+      removed += slice.deleted;
+      if (slice.finished) return removed;
+      await new Promise((resolve) => setTimeout(resolve, Math.max(pauseMs, (slice.deleted / rowsPerSecond) * 1000)));
     }
   }
 
@@ -5907,6 +6010,10 @@ export class ScoutService {
         }));
         for (const item of batch) if (item && images.length < SNAPSHOT_MAX_IMAGES) images.push(item);
       }
+      for (const image of images) {
+        const smaller = await shrinkSnapshotImage(image.data, image.mime);
+        if (smaller) Object.assign(image, smaller);
+      }
       if (!description && !images.length) {
         this.markSnapshotFailure(Number(listing.id), source === 'manual' ? 0 : 1);
         return { ok: false, message: 'detail page exposed no usable description or images' };
@@ -6018,6 +6125,39 @@ export class ScoutService {
       capturedAt: String(snapshot.captured_at),
       images: images.map((image) => ({ id: Number(image.id), position: Number(image.position), byteSize: Number(image.byte_size) })),
     };
+  }
+
+  /**
+   * Re-encode the oversized photos stored before capture shrank them (see
+   * snapshotImages.ts), one at a time with `pauseMs` between them; the
+   * encoding runs off the event loop. The position is saved after each photo,
+   * so an interrupted pass resumes; a finished pass is recorded and never
+   * runs again. Freed pages are reused by later writes.
+   */
+  async shrinkStoredSnapshotImages(options: { pauseMs?: number; shouldStop?: () => boolean } = {}): Promise<{ images: number; bytesBefore: number; bytesAfter: number }> {
+    const totals = { images: 0, bytesBefore: 0, bytesAfter: 0 };
+    if (this.getSetting(SNAPSHOT_IMAGE_SHRINK_DONE_KEY)) return totals;
+    let afterId = Number(this.getSetting(SNAPSHOT_IMAGE_SHRINK_CURSOR_KEY) ?? 0) || 0;
+    for (;;) {
+      if (options.shouldStop?.()) return totals;
+      const next = this.stmt('SELECT id, mime_type, byte_size FROM market_listing_snapshot_images WHERE id > ? AND byte_size > ? ORDER BY id LIMIT 1').get(afterId, SNAPSHOT_IMAGE_SHRINK_BYTES) as { id: number; mime_type: string; byte_size: number } | undefined;
+      if (!next) {
+        this.setSetting(SNAPSHOT_IMAGE_SHRINK_DONE_KEY, nowIso());
+        this.stmt('DELETE FROM settings WHERE key = ?').run(SNAPSHOT_IMAGE_SHRINK_CURSOR_KEY);
+        return totals;
+      }
+      afterId = Number(next.id);
+      const stored = this.stmt('SELECT data FROM market_listing_snapshot_images WHERE id = ?').get(afterId) as { data?: Uint8Array } | undefined;
+      const smaller = stored?.data ? await shrinkSnapshotImage(stored.data, String(next.mime_type)) : null;
+      // Unless the photo was deleted or replaced while it was being encoded.
+      if (smaller && Number(this.stmt('UPDATE market_listing_snapshot_images SET mime_type = ?, byte_size = ?, data = ? WHERE id = ? AND byte_size = ?').run(smaller.mime, smaller.data.byteLength, smaller.data, afterId, next.byte_size).changes)) {
+        totals.images += 1;
+        totals.bytesBefore += Number(next.byte_size);
+        totals.bytesAfter += smaller.data.byteLength;
+      }
+      this.setSetting(SNAPSHOT_IMAGE_SHRINK_CURSOR_KEY, String(afterId));
+      await new Promise((resolve) => setTimeout(resolve, options.pauseMs ?? 200));
+    }
   }
 
   marketSnapshotImage(imageId: number): { mime: string; data: Buffer } | null {
@@ -7162,6 +7302,13 @@ export class ScoutService {
     this.stmt('DELETE FROM market_price_observations WHERE observed_at < ?').run(cutoff);
     this.stmt('DELETE FROM listing_relevance WHERE checked_at < ?').run(cutoff);
     this.stmt('DELETE FROM manual_relevance_cache WHERE checked_at < ?').run(cutoff);
+    // Shadow judgments are calibration history read over the analytics
+    // window and as a listing's verification trace, like the relevance rows.
+    this.stmt('DELETE FROM jev_shadow_log WHERE created_at < ?').run(cutoff);
+    // A fuzzy-rescue verdict is reused while its listing keeps showing up in
+    // scans; listings rarely stay up past 45 days (the longest seen: 86).
+    this.stmt('DELETE FROM jev_fuzzy_cache WHERE checked_at < ?').run(new Date(Date.now() - JEV_FUZZY_CACHE_DAYS * 24 * 60 * 60_000).toISOString());
+    this.appLog.prune();
     this.stmt('DELETE FROM connector_runs WHERE started_at < ?').run(cutoff);
     this.connectorRunCountCache = null;
     this.stmt('DELETE FROM scans WHERE started_at < ?').run(cutoff);
