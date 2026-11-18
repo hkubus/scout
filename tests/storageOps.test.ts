@@ -223,14 +223,16 @@ test('a restart closes connector runs left running without touching backoff', ()
     const service = new ScoutService(db, () => {}, { suggestVariantGroups: async () => [] });
     // The backoff from the last error still stands.
     assert.equal((service as any).activeConnectorBackoff('OLX'), backoff);
-    // An interrupted run is neither a failure nor a success: after an ok run a
-    // first failure starts no backoff, and after an error a second one does.
-    assert.equal((service as any).connectorBackoffAfterFailure('Vinted', -1), null);
-    assert.ok((service as any).connectorBackoffAfterFailure('OLX', -1));
     // The connector list no longer reports a run that will never finish.
     const olx = service.getConnectors().find((connector) => connector.name === 'OLX')!;
     assert.equal(olx.status, 'Idle');
     assert.match(olx.detail, /interrupted/);
+    // An interrupted run is neither a failure nor a success: after an ok run a
+    // first failure starts no backoff, and after an error a second one does.
+    // The new failure is a run still marked running, as the scheduler has it.
+    const failing = (source: string) => Number(db.prepare("INSERT INTO connector_runs (source, status, message, started_at) VALUES (?, 'running', 'Scanning GPU', ?)").run(source, new Date().toISOString()).lastInsertRowid);
+    assert.equal((service as any).connectorBackoffAfterFailure('Vinted', failing('Vinted')), null);
+    assert.ok((service as any).connectorBackoffAfterFailure('OLX', failing('OLX')));
   } finally {
     db.close();
     rmSync(context.directory, { recursive: true, force: true });
