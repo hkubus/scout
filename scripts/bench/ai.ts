@@ -18,6 +18,8 @@
 
 import { listingRelevanceInputHash, listingTermMatchInputHash, LISTING_DESCRIPTION_MAX_CHARS } from '../../server/ai';
 import { listingFlags } from '../../server/flags';
+import { lacksQueryModelNumber, plainVariantMatch } from '../../server/aiRules';
+import { listingDescriptionText, type Marketplace } from '../../server/marketplaces';
 import { isModelToken } from '../../server/queryMatch';
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from '../../server/text';
 import { OTHER_VARIANT_KEY, assignVariant, parseVariantGroups, type VariantGroup } from '../../server/variants';
@@ -52,6 +54,8 @@ type ShadowRow = {
   vision_images_seen: number | null;
   vision_error: string | null;
   note: string | null;
+  /** Since migration 041; absent from older exports. */
+  duration_ms?: number | null;
 };
 
 const shadow = all<ShadowRow>(db, 'SELECT * FROM jev_shadow_log ORDER BY created_at, id');
@@ -90,7 +94,7 @@ bench.metric('ai.calls.live_share', 'Share of logged calls made in Jev live mode
 bench.metric('ai.shadow.deepseek_rows', 'Rows with a DeepSeek decision to compare against (shadow mode)', shadow.filter((row) => row.deepseek_decision !== null).length, 'rows', 'info',
   'zero means Jev-vs-DeepSeek agreement cannot be measured from this export');
 bench.metric('ai.calls.unlogged_checks_cached', 'Manual-search check verdicts cached but never logged as calls', scalar(db, "SELECT COUNT(*) FROM jev_fuzzy_cache WHERE task = 'checks'"), 'rows', 'info',
-  'applySearchChecks (server/service.ts) calls Jev without logJevLive; title-only calls leave no row at all');
+  'before migration 041 applySearchChecks did not log its Jev calls; title-only verdicts left no row at all. Now every check call is logged as task "checks"');
 
 const taskSummary = [...byTask.entries()].map(([task, rows]) => ({
   task,
@@ -135,9 +139,10 @@ function safeGroups(raw: string | null): VariantGroup[] {
 
 const relevanceCalls = taskRows('relevance');
 // Repeat calls: a call whose exact input was already answered (no error) by an
-// earlier call. Live mode skips the cross-listing reuse the legacy path has
-// (server/service.ts filterListingsByAiRelevance), so identical titles on
-// different listings each cost a call.
+// earlier call. Until 2026-11 live mode keyed reuse per listing URL, so
+// identical titles on different listings, and the same input on the watch
+// and manual paths, each cost a call; filterListingsByAiRelevance now
+// dedupes and reuses by input hash and model across both caches.
 function repeats(rows: ShadowRow[]) {
   const decided = new Map<string, unknown[]>();
   let repeat = 0;
@@ -274,7 +279,8 @@ bench.table('relevance repeat calls by gap since the same input was last asked',
 // ============================================================== fuzzy rescue
 
 type FuzzyRow = { input_hash: string; model: string; task: string; decision: string; confidence: number | null; rescued: number; checked_at: string };
-const fuzzy = all<FuzzyRow>(db, 'SELECT * FROM jev_fuzzy_cache');
+// Rows with decision 'error' are the rescue's retry backoff, not verdicts.
+const fuzzy = all<FuzzyRow>(db, "SELECT * FROM jev_fuzzy_cache WHERE decision != 'error'");
 const termCache = fuzzy.filter((row) => row.task === 'term-match');
 const termCalls = taskRows('term-match');
 const termRescued = termCache.filter((row) => row.rescued === 1).length;
@@ -285,6 +291,17 @@ bench.metric('ai.term_match.reject_share', 'Term-match verdicts that were a conf
 const termErrored = new Set(termCalls.filter((row) => row.jev_error !== null).map((row) => row.input_hash));
 bench.metric('ai.term_match.errors_retried', 'Term-match calls repeated after an error (errors are not cached)', termCalls.filter((row, index) => termCalls.findIndex((other) => other.input_hash === row.input_hash) !== index && termErrored.has(row.input_hash)).length, 'calls', 'lower');
 bench.metric('ai.term_match.repeat_calls', 'Term-match calls on an input already answered', repeats(termCalls).repeat, 'calls', 'lower');
+// The rescue now remembers a failed call for an hour (FUZZY_ERROR_RETRY_MS).
+const lastFailure = new Map<string, number>();
+let retriesInBackoff = 0;
+for (const row of [...termCalls, ...taskRows('condition')].sort((a, b) => a.created_at.localeCompare(b.created_at))) {
+  const at = Date.parse(row.created_at);
+  const failed = lastFailure.get(row.input_hash);
+  if (failed !== undefined && at - failed < 60 * 60_000) retriesInBackoff += 1;
+  if (row.jev_error !== null) lastFailure.set(row.input_hash, at);
+  else lastFailure.delete(row.input_hash);
+}
+bench.metric('ai.term_match.retries_within_hour_of_error', 'Rescue calls (term or condition) re-sent within an hour of the same input failing (the backoff skips these)', retriesInBackoff, 'calls', 'info');
 bench.table('fuzzy cache by task and verdict', (() => {
   const map = new Map<string, { task: string; decision: string; rescued: number; rows: number; confSum: number; confN: number }>();
   for (const row of fuzzy) {
@@ -311,10 +328,10 @@ bench.table('fuzzy cache by task and verdict', (() => {
 })());
 
 // Offline: recover the titles behind term-match hashes by hashing every stored
-// listing against every watch and research query, then test a rule a
-// deterministic pre-filter could apply before spending a Jev call: the title
-// has none of the query's model-number tokens (digits), e.g. "GTX 1660 Super"
-// for "rtx 2060". Only listings Scout stored are recoverable; manual-search
+// listing against every watch and research query, then replay the rule
+// rescueFuzzyMisses applies before spending a Jev call (lacksQueryModelNumber
+// in server/aiRules.ts): the title has none of the query's number-bearing
+// terms, e.g. "GTX 1660 Super" for "rtx 2060". Only listings Scout stored are recoverable; manual-search
 // queries are not in the export, so this is a subset.
 const listingTitles = all<{ title: string; condition: string | null }>(db, 'SELECT DISTINCT title, condition FROM listings');
 const searches = [
@@ -334,13 +351,12 @@ for (const listing of listingTitles) {
     const text = normalizeFilterText(listing.title);
     const glued = text.replace(/ /g, '');
     const { included } = parseIncludedExcluded(search.query, search.included, search.excluded);
-    const numeric = included.filter((term) => /\d/.test(term));
     recovered.push({
       query: search.query,
       title: listing.title,
       decision: cached.decision,
       rescued: cached.rescued,
-      noModelToken: numeric.length > 0 && numeric.every((term) => !termMatches(text, glued, term)),
+      noModelToken: lacksQueryModelNumber(listing.title, search.query, search.included, search.excluded),
       missing: included.filter((term) => !termMatches(text, glued, term)).join(' '),
     });
   }
@@ -359,8 +375,19 @@ bench.metric('ai.variant.none_share', 'Variant verdicts "none of the variants"',
 // ============================================================= negotiability
 
 const negotiability = taskRows('negotiability');
-bench.metric('ai.negotiability.unsure_rate', 'Negotiability calls that came back unsure (no write, asked again on the next fresh check)', pct(ratio(negotiability.filter((row) => row.jev_unsure === 1).length, negotiability.length)), '%', 'lower');
+bench.metric('ai.negotiability.unsure_rate', 'Negotiability calls that came back unsure (cached 14 days for the same text)', pct(ratio(negotiability.filter((row) => row.jev_unsure === 1).length, negotiability.length)), '%', 'lower');
 bench.metric('ai.negotiability.useful_calls', 'Negotiability calls that changed a listing', negotiability.filter((row) => row.jev_unsure === 0).length, 'calls', 'higher');
+// upgradeNegotiabilityFromDescription now remembers an unsure answer for the
+// same text for 14 days (NEGOTIABILITY_UNSURE_TTL_MS).
+const lastUnsure = new Map<string, number>();
+let unsureRepeats = 0;
+for (const row of negotiability) {
+  const at = Date.parse(row.created_at);
+  const previous = lastUnsure.get(row.input_hash);
+  if (previous !== undefined && at - previous < 14 * 86_400_000) unsureRepeats += 1;
+  if (row.jev_unsure === 1) lastUnsure.set(row.input_hash, at);
+}
+bench.metric('ai.negotiability.unsure_repeats', 'Negotiability calls on a text that was answered unsure within 14 days (now skipped)', unsureRepeats, 'calls', 'lower');
 
 // ================================================== description verification
 
@@ -397,6 +424,10 @@ for (const lean of ['pass', 'reject'] as const) {
   const agree = rows.filter((row) => row.vision_verdict === lean).length;
   bench.metric(`ai.verification.${lean}_lean_vision_agreement`, `Vision agreed with a low-confidence Jev "${lean}"`, pct(ratio(agree, rows.length)), '%', 'info', `${agree}/${rows.length}`);
 }
+// verifyDescriptionLive now lets an unsure reject stand without vision.
+const rejectLeanVision = vVision.filter((row) => row.jev_unsure === 1 && parseAnswer(row).decision === 'reject');
+bench.metric('ai.verification.reject_lean_vision_calls', 'Vision calls after a low-confidence Jev "reject" (now skipped: the lean stands)', rejectLeanVision.length, 'calls', 'info',
+  `${rejectLeanVision.filter((row) => row.vision_verdict === 'pass').length} of them passed in vision`);
 const unknownChoice = vVisionDone.filter((row) => parseAnswer(row).decision === 'unknown');
 bench.metric('ai.verification.unknown_choice_share', 'Vision escalations caused by Jev choosing "unknown" (not low confidence)', pct(ratio(unknownChoice.length, vVisionDone.length)), '%', 'info');
 bench.metric('ai.verification.unknown_choice_vision_reject', 'Of those, vision rejected', pct(ratio(unknownChoice.filter((row) => row.vision_verdict === 'reject').length, unknownChoice.length)), '%', 'info');
@@ -438,6 +469,45 @@ bench.metric('ai.verification.cross_listing_repeats', 'Verifications of an input
 bench.metric('ai.verification.boilerplate_calls', 'Jev calls on the Vinted marketing blurb instead of a description', boilerCalls, 'calls', 'lower',
   `${boilerVision} of them also went to vision`);
 bench.metric('ai.verification.unmatched_calls', 'Verification calls with no snapshot for their input', unmatched, 'calls', 'info');
+// description_verification_cache (migration 041): a verdict is kept by input
+// hash for 7 days, text-only verdicts for any listing, vision verdicts for the
+// listing whose photos were seen (approximated here as inputs only one
+// listing had). A lean after a failed vision tiebreak and a failed call are
+// not kept. Counts the calls such a cache would have answered.
+const VERDICT_REUSE_MS = 7 * 86_400_000;
+let verdictCacheHits = 0;
+for (const [hash, rows] of callsByHash) {
+  const singleListing = (snapshotHashes.get(hash)?.listings ?? 1) <= 1;
+  let keptText: number | null = null;
+  let keptPhotos: number | null = null;
+  for (const row of rows) {
+    const at = Date.parse(row.created_at);
+    const fresh = (kept: number | null) => kept !== null && at - kept < VERDICT_REUSE_MS;
+    if (fresh(keptText) || (singleListing && fresh(keptPhotos))) {
+      verdictCacheHits += 1;
+      continue;
+    }
+    if (row.vision_verdict !== null) keptPhotos = at;
+    else if (row.jev_error === null && row.vision_error === null) keptText = at;
+  }
+}
+bench.metric('ai.verification.hash_cache_skips', 'Verification calls a 7-day verdict cache by input hash answers (no AI call now)', verdictCacheHits, 'calls', 'info',
+  `${(100 * verdictCacheHits / Math.max(1, verification.length)).toFixed(1)}% of verification calls`);
+// The same calls judged by the repo's current description parser: an input
+// whose description it now drops as boilerplate is stored as "no description"
+// without any AI call.
+const snapshotDescriptions = new Map(all<{ h: string; marketplace: string; description: string | null }>(db, `SELECT verification_input_hash AS h, marketplace, description
+  FROM listing_detail_snapshots WHERE verification_input_hash IS NOT NULL AND description IS NOT NULL GROUP BY 1`).map((row) => [row.h, row]));
+let droppedCalls = 0;
+let droppedVision = 0;
+for (const [hash, rows] of callsByHash) {
+  const snap = snapshotDescriptions.get(hash);
+  if (!snap || listingDescriptionText(snap.description, snap.marketplace as Marketplace) !== null) continue;
+  droppedCalls += rows.length;
+  droppedVision += rows.filter(hasVision).length;
+}
+bench.metric('ai.verification.parser_dropped_calls', 'Verification calls whose description the current parser drops as boilerplate (no AI call now)', droppedCalls, 'calls', 'info',
+  `${droppedVision} of them went to vision`);
 
 const snapStats = all<{ marketplace: string; snapshots: number; noDescription: number; boilerplate: number; overLimit: number; listings: number }>(db, `SELECT marketplace,
   COUNT(*) AS snapshots, SUM(description IS NULL) AS noDescription, SUM(description LIKE ?) AS boilerplate,
@@ -482,7 +552,15 @@ const descLen = new Map(all<{ h: string; len: number }>(db, `SELECT verification
   WHERE verification_input_hash IS NOT NULL GROUP BY 1`).map((row) => [row.h, Number(row.len ?? 0)]));
 bench.distributionMetrics('ai.verification.description_chars', 'Description characters per verification call', distribution(verification.map((row) => Math.min(descLen.get(row.input_hash) ?? 0, LISTING_DESCRIPTION_MAX_CHARS))), 'chars', 'info', ['p50', 'p90', 'max']);
 bench.distributionMetrics('ai.relevance.title_chars', 'Title characters per watch relevance row', distribution(relRows.filter((row) => row.title).map((row) => row.title!.length)), 'chars', 'info', ['p50', 'p90']);
-bench.metric('ai.latency.recorded', 'AI calls with a recorded duration', 0, 'calls', 'higher', 'jev_shadow_log has no duration column; latency cannot be benchmarked from an export');
+const timed = shadow.filter((row) => typeof row.duration_ms === 'number');
+bench.metric('ai.latency.recorded', 'AI calls with a recorded duration', timed.length, 'calls', 'higher',
+  'duration_ms exists since migration 041 (wall time, queue wait and any vision tiebreak included); older rows have none');
+if (timed.length) {
+  bench.distributionMetrics('ai.latency.duration_ms', 'Logged AI call wall time', distribution(timed.map((row) => Number(row.duration_ms))), 'ms', 'info', ['p50', 'p90', 'max']);
+  for (const task of new Set(timed.map((row) => row.task))) {
+    bench.distributionMetrics(`ai.latency.${task.replace(/-/g, '_')}_ms`, `${task} call wall time`, distribution(timed.filter((row) => row.task === task).map((row) => Number(row.duration_ms))), 'ms', 'info', ['p50', 'p90']);
+  }
+}
 
 // =========================================================== accuracy proxies
 
@@ -571,6 +649,25 @@ const dealByRow = new Map(all<{ watch_id: string; marketplace: string; listing_i
 const plainExcluded = plain.filter((row) => row.ai === 'irrelevant');
 bench.metric('ai.rules.plain_excluded_strong_deals', 'Plain-match titles the AI excluded that were Very strong / Exceptional deals', plainExcluded.filter((row) => ['Very strong', 'Exceptional'].includes(dealByRow.get(row.key) ?? '')).length, 'rows', 'lower',
   'the relevance check only runs on gated (deal-strength) listings, so an exclusion here hides a deal');
+
+// The shipped plain-variant rule (server/aiRules.ts) on the same judged rows:
+// what it decides without an AI call, and where it overrides an AI exclusion.
+const shipped = relRows.flatMap((row) => {
+  const status = relStatus(row);
+  const watch = watchById.get(row.watch_id);
+  const groups = watch ? groupsByWatch.get(watch.id) ?? [] : [];
+  if ((status !== 'relevant' && status !== 'irrelevant') || !watch || !row.title || !groups.length) return [];
+  const match = plainVariantMatch({ title: row.title, condition: row.condition, query: watch.query, includedTerms: watch.included_terms ?? '', excludedTerms: watch.excluded_terms ?? '', groups });
+  return [{ watch: watch.name, title: row.title, ai: status, p: /p=([\d.]+)/.exec(row.reason ?? '')?.[1] ?? null, variant: match?.label ?? null, hash: row.input_hash }];
+});
+const shippedDecided = shipped.filter((row) => row.variant !== null);
+const decidedHashes = new Set(shippedDecided.map((row) => row.hash));
+bench.metric('ai.relevance.plain_variant_calls', 'Logged relevance calls on inputs the plain-variant rule now decides', relevanceCalls.filter((row) => decidedHashes.has(row.input_hash)).length, 'calls', 'info',
+  `of ${relevanceCalls.length} relevance calls (manual searches have no groups, so the rule never runs there)`);
+bench.metric('ai.relevance.plain_variant_decided', 'Judged rows on watches with variant groups the plain-variant rule decides without AI', pct(ratio(shippedDecided.length, shipped.length)), '%', 'higher',
+  `${shippedDecided.length} of ${shipped.length}`);
+bench.metric('ai.relevance.plain_variant_overrides', 'Of those, rows the AI had excluded (the rule keeps them)', shippedDecided.filter((row) => row.ai === 'irrelevant').length, 'rows', 'info');
+bench.table('plain-variant rule overrides of AI exclusions', shippedDecided.filter((row) => row.ai === 'irrelevant').slice(0, examples).map(({ hash: _hash, ...row }) => row));
 
 // Candidate accessory vocabulary the AI excludes but flags.ts does not know
 // (GPU fans and coolers, phone cases in other languages, bare chips). Not repo

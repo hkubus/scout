@@ -170,6 +170,20 @@ const cases: Array<[string, ListingFlagInput, string[]]> = [
   ['Ładowarka 20W Apple', { title: 'Ładowarka 20W Apple USB-C', query: 'iphone 13' }, ['accessory']],
   ['Szkło 9H iPhone 13', { title: 'Szkło 9H iPhone 13', query: 'iphone 13' }, ['accessory']],
   ['Bateria 3110 mAh iPhone 13', { title: 'Bateria 3110 mAh iPhone 13', query: 'iphone 13' }, ['accessory']],
+  // GPU fans and coolers, cases in other languages (titles from the 2026-11 improvement export).
+  ['Wentylator for a GPU query', { title: 'Wentylator MSI Aero RTX GTX 1660/2060/2070/3050/3060 95mm XY-D10015SH', query: 'rtx 3050' }, ['accessory']],
+  ['Wentylatory Gigabyte', { title: 'Wentylatory Gigabyte GTX RTX RX 470/480/1050/1060/1070/1650/1660/2060', query: 'gtx 1660' }, ['accessory']],
+  ['2szt Wentylator', { title: 'Wentylator 2szt MSI GTX 1650 1660 GAMING X - 87mm', query: 'gtx 1650' }, ['accessory']],
+  ['Wiatrak', { title: 'Wiatrak do karty Palit RTX 3060', query: 'rtx 3060' }, ['accessory']],
+  ['Radiator', { title: 'Radiator GPU RTX 3070 Founders', query: 'rtx 3070' }, ['accessory']],
+  ['Huse telefon', { title: 'Huse telefon Iphone 12', query: 'iPhone 12' }, ['accessory']],
+  ['Hardcase', { title: 'Hardcase Steam Deck', query: 'steam deck' }, ['accessory']],
+  ['Wentylator for a fan query', { title: 'Wentylator MSI RTX 3060 95mm', query: 'wentylator rtx 3060' }, []],
+  // Traps: the accessory only comes with the item, or names a part of it.
+  ['Procesor + chłodzenie', { title: 'Procesor i5 12400f + chłodzenie', query: 'i5 12400f' }, []],
+  ['iPhone cu husă', { title: 'iPhone 12 64GB cu cutie si husă', query: 'iPhone 12' }, []],
+  ['Niski Śledź Low Profile', { title: 'Niski Śledź Low Profile Gigabyte RTX 3050 6GB', query: 'rtx 3050' }, []],
+  ['Cooler Master PSU', { title: 'Cooler Master MWE 650 zasilacz', query: 'zasilacz 650w' }, []],
   // several at once, in LISTING_FLAGS order
   ['several flags', { title: 'Kupię iPhone na części', condition: 'Uszkodzone', description: 'Blokada iCloud.' }, ['for_parts', 'wanted_ad', 'damaged', 'locked']],
 ];

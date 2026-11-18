@@ -375,8 +375,9 @@ test('joins a scan check in the same context and waits out one in another watch 
     assert.equal(joined.status, 'pass');
 
     // Another watch's context: the tool waits for the scan, then runs its
-    // own check, and answers for its own watch.
-    seedListing(context.db, 'Allegro Lokalnie', 'al-6', { watchId: 'ps5' });
+    // own check, and answers for its own watch. Its own title keeps al-5's
+    // ps5 verdict (same input, text only) from answering for it.
+    seedListing(context.db, 'Allegro Lokalnie', 'al-6', { watchId: 'ps5', title: 'PS5 Slim console' });
     let releaseOther!: () => void;
     const otherGate = new Promise<void>((resolve) => { releaseOther = resolve; });
     context.state.jev = async (jevContext) => {

@@ -118,6 +118,19 @@ test('prefers the Lokalnie offer description over the templated meta boilerplate
   assert.equal(parseListingDescription(html, 'Allegro Lokalnie'), 'Sprzedaję oryginalne Nike Air Max Plus 3.');
 });
 
+test('drops the Vinted marketing blurb so the seller description wins', () => {
+  const blurb = 'Jedna społeczność, tysiące marek i mnóstwo niepowtarzalnego stylu. Brzmi jak coś dla ciebie? Sprawdź, jak to działa.';
+  // Blurb only: nothing about the item, so there is no description at all.
+  assert.equal(parseListingDescription(`<html><head><meta name="description" content="${blurb}"><meta property="og:description" content="${blurb}"></head><body></body></html>`, 'Vinted'), null);
+  assert.equal(listingDescriptionText(blurb, 'Vinted'), null);
+  // Blurb in the meta tags plus the seller's text in the description markup.
+  const html = `<html><head><meta name="description" content="${blurb}"></head><body><div data-testid="item-description"><span>Karta sprawna, bez artefaktów.</span></div></body></html>`;
+  assert.equal(parseListingDescription(html, 'Vinted'), 'Karta sprawna, bez artefaktów.');
+  // Only Vinted's template is treated this way, and only as the whole opening.
+  assert.equal(listingDescriptionText(blurb, 'OLX'), blurb);
+  assert.equal(listingDescriptionText('RTX 3060. Jedna społeczność, tysiące marek', 'Vinted'), 'RTX 3060. Jedna społeczność, tysiące marek');
+});
+
 test('normalizes object-shaped JSON-LD images before storage', () => {
   const html = `<script type="application/ld+json">${JSON.stringify({
     '@type': 'Product', name: 'Intel i5', sku: 'i5-8400', url: 'https://allegrolokalnie.pl/oferta/i5-8400',

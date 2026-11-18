@@ -31,6 +31,7 @@ import { bucketDailyObservations, type MarketTrendObservation } from './marketTr
 import { DUPLICATE_FEED_DAYS, DUPLICATE_WINDOW_DAYS, findDuplicatePairs } from './duplicates';
 import { summarizeAnalytics, type AnalyticsRow } from './analytics';
 import { FLAGS_VERSION, accessoryFlag, flagsJson, listingFlags, mergeFlags, parseFlagsJson, storedListingFlags, type StoredListingFlagName } from './flags';
+import { PLAIN_VARIANT_RULE_MODEL, lacksQueryModelNumber, plainVariantMatch } from './aiRules';
 import type { AnalyticsAiQuality, AnalyticsData, AnalyticsMarketplaceRow, AnalyticsOverview, AnalyticsTriage, Connector, ConnectorRun, DailyDigestSettings, DashboardData, DealLabel, Listing, ListingAction, ListingDecision, ListingDescriptionVerification, ListingDetail, ListingDetailSnapshot, ListingDescriptionVerificationStatus, LogEntry, ManualSearchResponse, MarketListingSnapshot, MarketResearchData, MarketTrackedListing, MarketWatch, MarketWatchTrend, NotificationPriority, NotificationRecord, PriceHistoryPoint, SearchFilters, SearchSourceStatus, SearchTypoVariantStatus, SettingsData, VerificationComparison, VerificationTraceEntry, Watch, WatchAnalytics, WatchAnalyticsPoint, WatchAnalyticsSource, WatchDealCounts, WatchVariantStat, ResaleListingDraft, FlipImport, PriceReference, PriceReferenceFigure, PriceReferenceMatch, SaleBand, Comparables, ComparableListing, CompactListingDetail, DuplicateListing, ListingLiveCheck, ListingNegotiation, Relist, NegotiationFigures, NegotiationOutcome, NegotiationRole, PriceReferenceOutcomes, RecordedOutcome, AgentFlip, AgentFlips, ConversationResult, InboxResult, AgentListingVerification } from '../src/types';
 import { estimatedNetAtTypical, flipCost, flipNet, isFlipChannel, listingConditionFromLabel, normalizeFeePresets, suggestedListingPrice, type FeePresets } from '../src/profit';
 import { vintedFeesNote } from '../src/listingSignals';
@@ -45,7 +46,10 @@ type WatchRow = Record<string, any>;
 
 /** Settings key for the Flips page's seller-fee presets. */
 export const FEE_PRESETS_KEY = 'flip_fee_presets';
-type ListingRelevanceSearch = Pick<ListingRelevanceContext, 'query' | 'includedTerms' | 'excludedTerms'>;
+type ListingRelevanceSearch = Pick<ListingRelevanceContext, 'query' | 'includedTerms' | 'excludedTerms'> & {
+  /** The watch's variant groups; with them, titles that plainly name one skip the AI. */
+  variantGroups?: VariantGroup[];
+};
 type RelevanceFilterResult = {
   listings: NormalizedListing[];
   excluded: number;
@@ -215,6 +219,11 @@ const RESEARCH_TYPO_LEGACY = 1;
 const RESEARCH_TYPO_CURRENT = 2;
 /** Jev variant assignments a grouped watch may request per scan and source. */
 const VARIANT_JEV_BUDGET = 10;
+/** `jev_fuzzy_cache.decision` for a failed rescue call, retried after FUZZY_ERROR_RETRY_MS. */
+const FUZZY_ERROR_DECISION = 'error';
+const FUZZY_ERROR_RETRY_MS = 60 * 60_000;
+/** An unsure negotiability answer is not re-asked for the same text within this window. */
+const NEGOTIABILITY_UNSURE_TTL_MS = 14 * 24 * 60 * 60_000;
 /**
  * A standing deal that cannot alert (already alerted at this price, no due
  * channel or digest) is not re-verified while its stored verdict for the
@@ -222,6 +231,13 @@ const VARIANT_JEV_BUDGET = 10;
  * price drop, a higher priority, a new channel) verifies it as before.
  */
 const DESCRIPTION_VERIFICATION_FRESH_MS = 6 * 60 * 60_000;
+/**
+ * description_verification_cache rows younger than this answer a check on
+ * the same input hash without an AI call, after a fetch error or a missing
+ * description has overwritten the listing's own verdict slot. On the owner's
+ * data 152 of 153 same-listing repeats came back within 7 days.
+ */
+const DESCRIPTION_VERDICT_REUSE_MS = 7 * 24 * 60 * 60_000;
 /** Rolling window of ended listings that feed probable-sale bands. */
 const SALE_BAND_WINDOW_DAYS = 90;
 /** scout_price_reference prices at most this many matching candidates. */
@@ -1322,15 +1338,17 @@ export class ScoutService {
     };
   }
 
+  /** `startedAt` is Date.now() before the AI call, so duration_ms includes limiter queue wait and any vision tiebreak. */
   private logJevLive(
-    task: 'relevance' | 'verification' | 'term-match' | 'negotiability' | 'condition' | 'variant',
+    task: 'relevance' | 'verification' | 'term-match' | 'negotiability' | 'condition' | 'variant' | 'checks',
     inputHash: string,
     live: NonNullable<ReturnType<ScoutService['jevLiveConfig']>>,
+    startedAt: number,
     jev: { jevAnswer?: unknown; jevConfidence?: number | null; jevUnsure?: boolean; jevError?: string | null },
     vision?: { visionVerdict?: string | null; visionConfidence?: number | null; visionImagesSeen?: number | null; visionError?: string | null },
   ) {
     this.logJevShadow({
-      task, inputHash, jevModel: live.jevModel,
+      task, inputHash, jevModel: live.jevModel, startedAt,
       jevAnswer: jev.jevAnswer, jevConfidence: jev.jevConfidence, jevUnsure: jev.jevUnsure, jevError: jev.jevError,
       deepseekDecision: null, agreement: null,
       visionVerdict: vision?.visionVerdict, visionConfidence: vision?.visionConfidence,
@@ -1340,9 +1358,11 @@ export class ScoutService {
   }
 
   private logJevShadow(row: {
-    task: 'relevance' | 'verification' | 'term-match' | 'negotiability' | 'condition' | 'variant';
+    task: 'relevance' | 'verification' | 'term-match' | 'negotiability' | 'condition' | 'variant' | 'checks';
     inputHash: string;
     jevModel: string;
+    /** Date.now() before the call; stored as duration_ms. */
+    startedAt: number;
     jevAnswer?: unknown;
     jevConfidence?: number | null;
     jevUnsure?: boolean;
@@ -1356,8 +1376,8 @@ export class ScoutService {
     note?: string | null;
   }) {
     try {
-      this.stmt(`INSERT INTO jev_shadow_log (created_at, task, input_hash, jev_model, jev_answer_json, jev_confidence, jev_unsure, jev_error, deepseek_decision, agreement, vision_verdict, vision_confidence, vision_images_seen, vision_error, note)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      this.stmt(`INSERT INTO jev_shadow_log (created_at, task, input_hash, jev_model, jev_answer_json, jev_confidence, jev_unsure, jev_error, deepseek_decision, agreement, vision_verdict, vision_confidence, vision_images_seen, vision_error, note, duration_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         nowIso(),
         row.task,
         row.inputHash,
@@ -1373,6 +1393,7 @@ export class ScoutService {
         row.visionImagesSeen ?? null,
         row.visionError?.slice(0, 500) ?? null,
         row.note?.slice(0, 500) ?? null,
+        Number.isFinite(row.startedAt) ? Math.max(0, Date.now() - row.startedAt) : null,
       );
     } catch {
       // Shadow logging must never break scans; a missing table (migration not
@@ -1393,12 +1414,13 @@ export class ScoutService {
     shadow: NonNullable<ReturnType<ScoutService['jevShadowConfig']>>,
   ) {
     void (async () => {
+      const startedAt = Date.now();
       let judgment: JevRelevanceJudgment;
       try {
         judgment = await classifyListingRelevanceWithJev(context, { apiKey: shadow.apiKey, model: shadow.jevModel });
       } catch (error) {
         this.logJevShadow({
-          task: 'relevance', inputHash, jevModel: shadow.jevModel,
+          task: 'relevance', inputHash, jevModel: shadow.jevModel, startedAt,
           jevError: error instanceof Error ? error.message : String(error),
           deepseekDecision: deepseekRelevant === null ? 'unknown' : deepseekRelevant ? 'relevant' : 'irrelevant',
         });
@@ -1408,7 +1430,7 @@ export class ScoutService {
       const agreement = deepseekRelevant === null ? null : (judgment.relevant ? 'relevant' : 'irrelevant') === deepseekDecision;
       if (!judgment.unsure) {
         this.logJevShadow({
-          task: 'relevance', inputHash, jevModel: shadow.jevModel,
+          task: 'relevance', inputHash, jevModel: shadow.jevModel, startedAt,
           jevAnswer: judgment, jevConfidence: judgment.p, jevUnsure: false,
           deepseekDecision, agreement,
         });
@@ -1420,7 +1442,7 @@ export class ScoutService {
           { apiKey: shadow.apiKey, model: shadow.visionModel },
         );
         this.logJevShadow({
-          task: 'relevance', inputHash, jevModel: shadow.jevModel,
+          task: 'relevance', inputHash, jevModel: shadow.jevModel, startedAt,
           jevAnswer: judgment, jevConfidence: judgment.p, jevUnsure: true,
           deepseekDecision, agreement,
           visionVerdict: vision.relevant ? 'relevant' : 'irrelevant',
@@ -1428,7 +1450,7 @@ export class ScoutService {
         });
       } catch (error) {
         this.logJevShadow({
-          task: 'relevance', inputHash, jevModel: shadow.jevModel,
+          task: 'relevance', inputHash, jevModel: shadow.jevModel, startedAt,
           jevAnswer: judgment, jevConfidence: judgment.p, jevUnsure: true,
           deepseekDecision, agreement,
           visionError: error instanceof Error ? error.message : String(error),
@@ -1451,26 +1473,27 @@ export class ScoutService {
     shadow: NonNullable<ReturnType<ScoutService['jevShadowConfig']>>,
   ) {
     void (async () => {
+      const startedAt = Date.now();
       let judgment: JevVerificationJudgment;
       try {
         judgment = await verifyListingDescriptionWithJev(context, { apiKey: shadow.apiKey, model: shadow.jevModel });
       } catch (error) {
         await this.shadowVisionVerification(context, inputHash, deepseekDecision, galleryImageUrls, shadow, {
-          jevModel: shadow.jevModel, jevError: error instanceof Error ? error.message : String(error),
+          jevModel: shadow.jevModel, startedAt, jevError: error instanceof Error ? error.message : String(error),
         });
         return;
       }
       const agreement = judgment.decision === deepseekDecision;
       if (!judgment.unsure) {
         this.logJevShadow({
-          task: 'verification', inputHash, jevModel: shadow.jevModel,
+          task: 'verification', inputHash, jevModel: shadow.jevModel, startedAt,
           jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: false,
           deepseekDecision, agreement,
         });
         return;
       }
       await this.shadowVisionVerification(context, inputHash, deepseekDecision, galleryImageUrls, shadow, {
-        jevModel: shadow.jevModel, jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: true,
+        jevModel: shadow.jevModel, startedAt, jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: true,
         agreement,
       });
     })().catch(() => { /* shadow path never rejects */ });
@@ -1482,7 +1505,7 @@ export class ScoutService {
     deepseekDecision: string,
     galleryImageUrls: string[],
     shadow: NonNullable<ReturnType<ScoutService['jevShadowConfig']>>,
-    jev: { jevModel: string; jevAnswer?: unknown; jevConfidence?: number | null; jevUnsure?: boolean; jevError?: string | null; agreement?: boolean | null },
+    jev: { jevModel: string; startedAt: number; jevAnswer?: unknown; jevConfidence?: number | null; jevUnsure?: boolean; jevError?: string | null; agreement?: boolean | null },
   ) {
     try {
       const vision = await verifyListingDescriptionWithVision(
@@ -1509,18 +1532,21 @@ export class ScoutService {
    * falls back to its lean (cached as a decisive verdict so repeat scans
    * reuse it); a Jev failure stays 'unknown' (kept, like the legacy path).
    * Vision escalation is reserved for high-priority description verification,
-   * never for filter-only relevance — the relevance unsure rate (~88% in
-   * production) made every filtered listing cost 2 Jev calls plus vision.
+   * never for filter-only relevance: the judgment reads no URL or photo, so a
+   * verdict belongs to its input hash and is reused across listings. The
+   * unsure band (0.4–0.6) held 4.41% of live relevance calls on the
+   * 2026-11 improvement export.
    */
   private async decideRelevanceLive(
     context: ListingRelevanceContext,
     inputHash: string,
     live: NonNullable<ReturnType<ScoutService['jevLiveConfig']>>,
   ): Promise<{ relevant: boolean; status: 'relevant' | 'irrelevant' | 'unknown'; reason: string; error?: string }> {
+    const startedAt = Date.now();
     try {
       const judgment = await this.jevRelevance(context, { apiKey: live.apiKey, model: live.jevModel });
       const status: 'relevant' | 'irrelevant' = judgment.relevant ? 'relevant' : 'irrelevant';
-      this.logJevLive('relevance', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.p, jevUnsure: judgment.unsure });
+      this.logJevLive('relevance', inputHash, live, startedAt, { jevAnswer: judgment, jevConfidence: judgment.p, jevUnsure: judgment.unsure });
       if (!judgment.unsure) return { relevant: judgment.relevant, status, reason: `Jev classified listing as ${status} (p=${judgment.p.toFixed(2)})` };
       // Unsure: follow the lean rather than spending a second Jev call plus
       // vision — an accessory-leaning judgment excludes the listing outright
@@ -1528,24 +1554,30 @@ export class ScoutService {
       return { relevant: judgment.relevant, status, reason: `Jev leaned ${status} (p=${judgment.p.toFixed(2)})` };
     } catch (error) {
       const message = (error instanceof Error ? error.message : 'Jev could not classify listing relevance').slice(0, 500);
-      this.logJevLive('relevance', inputHash, live, { jevError: message });
+      this.logJevLive('relevance', inputHash, live, startedAt, { jevError: message });
       return { relevant: true, status: 'unknown', reason: 'Jev relevance check failed', error: message };
     }
   }
 
   /**
-   * Live description verification (Phase 2): Jev decides; unsure or Jev
-   * failure escalates to exactly one vision call over the gallery photos.
-   * When vision fails after an unsure Jev answer, Jev's lean decides; when
-   * Jev failed too, the error propagates so the caller keeps the fail-open
-   * alert behavior for provider outages.
+   * Live description verification (Phase 2): Jev decides; an unsure pass or
+   * unknown, or a Jev failure, escalates to exactly one vision call over the
+   * gallery photos. An unsure reject stands without vision: vision can only
+   * release the alert by passing, and it agreed with every reject lean on
+   * the owner's data. When vision fails after an unsure Jev answer, Jev's
+   * lean decides; when Jev failed too, the error propagates so the caller
+   * keeps the fail-open alert behavior for provider outages. `basis` says
+   * what the verdict rests on, for description_verification_cache: 'text'
+   * (Jev alone, reusable by any listing with the input), 'photos' (vision
+   * saw this listing's gallery) or null (a lean after a failed tiebreak,
+   * not kept).
    */
   private async verifyDescriptionLive(
     context: ListingDescriptionVerificationContext,
     inputHash: string,
     galleryImageUrls: string[],
     live: NonNullable<ReturnType<ScoutService['jevLiveConfig']>>,
-  ): Promise<ListingDescriptionVerification> {
+  ): Promise<{ verification: ListingDescriptionVerification; basis: 'text' | 'photos' | null }> {
     const visionInput = {
       marketplace: context.marketplace,
       title: context.title,
@@ -1559,6 +1591,7 @@ export class ScoutService {
     };
     const visionConfig = { apiKey: live.apiKey, model: live.visionModel };
 
+    const startedAt = Date.now();
     let judgment: JevVerificationJudgment | null = null;
     let jevFailed: string | null = null;
     try {
@@ -1571,8 +1604,22 @@ export class ScoutService {
           issues: judgment.issues ?? [],
           evidence: [],
         };
-        this.logJevLive('verification', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: false });
-        return verification;
+        this.logJevLive('verification', inputHash, live, startedAt, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: false });
+        return { verification, basis: 'text' };
+      }
+      if (judgment.decision === 'reject') {
+        this.logJevLive('verification', inputHash, live, startedAt, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: true });
+        const confidence = judgment.confidence === null ? 'none' : judgment.confidence.toFixed(2);
+        return {
+          verification: {
+            decision: 'reject',
+            confidence: judgment.confidence ?? 0,
+            summary: `Jev leaned reject (confidence ${confidence}); vision skipped.`,
+            issues: judgment.issues ?? [],
+            evidence: [],
+          },
+          basis: 'text',
+        };
       }
     } catch (error) {
       jevFailed = error instanceof Error ? error.message : String(error);
@@ -1581,15 +1628,15 @@ export class ScoutService {
     try {
       const vision = await this.visionVerification(visionInput, visionConfig);
       const verification = visionToVerification(vision, judgment ? 'Jev was unsure; vision tiebreak.' : 'Jev failed; vision decided directly.');
-      this.logJevLive('verification', inputHash, live,
+      this.logJevLive('verification', inputHash, live, startedAt,
         judgment
           ? { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: true }
           : { jevError: jevFailed },
         { visionVerdict: vision.decision, visionConfidence: vision.confidence, visionImagesSeen: vision.imagesSeen });
-      return verification;
+      return { verification, basis: 'photos' };
     } catch (visionError) {
       const message = visionError instanceof Error ? visionError.message : String(visionError);
-      this.logJevLive('verification', inputHash, live,
+      this.logJevLive('verification', inputHash, live, startedAt,
         judgment
           ? { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: true }
           : { jevError: jevFailed },
@@ -1599,11 +1646,14 @@ export class ScoutService {
       if (judgment) {
         const confidence = judgment.confidence === null ? 'none' : judgment.confidence.toFixed(2);
         return {
-          decision: judgment.decision,
-          confidence: judgment.confidence ?? 0,
-          summary: `Jev leaned ${judgment.decision} (confidence ${confidence}); vision tiebreak failed.`.slice(0, 240),
-          issues: judgment.issues ?? [],
-          evidence: [],
+          verification: {
+            decision: judgment.decision,
+            confidence: judgment.confidence ?? 0,
+            summary: `Jev leaned ${judgment.decision} (confidence ${confidence}); vision tiebreak failed.`.slice(0, 240),
+            issues: judgment.issues ?? [],
+            evidence: [],
+          },
+          basis: null,
         };
       }
       throw visionError;
@@ -1641,14 +1691,15 @@ export class ScoutService {
    * but with no watch row; a hit skips the Jev/DeepSeek call entirely. Reads are
    * best-effort: a missing table (migration not yet applied) is a miss.
    */
-  private readManualRelevance(inputHash: string, legacyInputHash: string, model: string): 'relevant' | 'irrelevant' | null {
+  private readManualRelevance(inputHash: string, legacyInputHash: string, model: string): { status: 'relevant' | 'irrelevant'; reason: string } | null {
     try {
-      const row = (this.stmt('SELECT relevant, relevance_status, error FROM manual_relevance_cache WHERE input_hash = ? AND model = ?').get(inputHash, model)
-        ?? this.stmt('SELECT relevant, relevance_status, error FROM manual_relevance_cache WHERE input_hash = ? AND model = ?').get(legacyInputHash, model)) as
-        { relevant?: number; relevance_status?: string; error?: string | null } | undefined;
+      const row = (this.stmt('SELECT relevant, relevance_status, reason, error FROM manual_relevance_cache WHERE input_hash = ? AND model = ?').get(inputHash, model)
+        ?? this.stmt('SELECT relevant, relevance_status, reason, error FROM manual_relevance_cache WHERE input_hash = ? AND model = ?').get(legacyInputHash, model)) as
+        { relevant?: number; relevance_status?: string; reason?: string; error?: string | null } | undefined;
       if (!row || row.error) return null;
-      if (row.relevance_status === 'irrelevant' || row.relevant === 0) return 'irrelevant';
-      if (row.relevance_status === 'relevant' || row.relevant === 1) return 'relevant';
+      const reason = row.reason ?? 'Reused cached relevance decision';
+      if (row.relevance_status === 'irrelevant' || row.relevant === 0) return { status: 'irrelevant', reason };
+      if (row.relevance_status === 'relevant' || row.relevant === 1) return { status: 'relevant', reason };
       return null;
     } catch {
       return null;
@@ -1780,6 +1831,23 @@ export class ScoutService {
       let cached: CachedRelevance | undefined;
       if (watchId) {
         cached = this.stmt('SELECT input_hash, model, relevant, reason, error, relevance_status FROM listing_relevance WHERE watch_id = ? AND marketplace = ? AND listing_id = ?').get(watchId, listing.marketplace, listing.listingId) as CachedRelevance | undefined;
+        // A title that names one of the watch's variants and nothing else is
+        // relevant without an AI call. It also replaces an AI exclusion of the
+        // same input: the prompt does not see the variant groups, so it read
+        // "iPhone 12 mini 64GB" as another model than "iPhone 12".
+        const plain = search.variantGroups?.length ? plainVariantMatch({
+          title: listing.title, condition: listing.condition,
+          query: search.query, includedTerms: search.includedTerms, excludedTerms: search.excludedTerms,
+          groups: search.variantGroups,
+        }) : null;
+        if (plain) {
+          const reason = `Title plainly names the "${plain.label}" variant`.slice(0, 240);
+          const sameInput = cached?.input_hash === inputHash && !cached.error;
+          const keptByAi = sameInput && cached?.model === activeModel && cached.relevance_status === 'relevant';
+          const ruleRow = sameInput && cached?.model === PLAIN_VARIANT_RULE_MODEL && cached.relevance_status === 'relevant' && cached.reason === reason;
+          if (!keptByAi && !ruleRow) persistRelevance(listing, inputHash, PLAIN_VARIANT_RULE_MODEL, true, 'relevant', reason);
+          return { listing, status: 'relevant' };
+        }
         const cachedStatus: 'relevant' | 'irrelevant' | 'unknown' = cached?.relevance_status === 'irrelevant' || cached?.relevance_status === 'unknown' || cached?.relevance_status === 'relevant'
           ? cached.relevance_status
           : cached?.error ? 'unknown' : cached?.relevant === 0 ? 'irrelevant' : 'relevant';
@@ -1787,17 +1855,18 @@ export class ScoutService {
           if (cached.input_hash === legacyInputHash) persistRelevance(listing, inputHash, activeModel, cachedStatus === 'relevant', cachedStatus, cached.reason ?? 'Reused cached relevance decision');
           return { listing, status: cachedStatus };
         }
-      } else {
-        const manual = this.readManualRelevance(inputHash, legacyInputHash, activeModel);
-        if (manual) return { listing, status: manual };
       }
-
-      // Cross-listing reuse is keyed by input hash, which omits the per-listing
-      // URL/thumbnail live escalation uses — live mode relies on the
-      // per-listing watch cache above instead.
-      const reusable = !jevLive ? this.stmt(`SELECT relevant, reason, relevance_status FROM listing_relevance
+      // The judgment reads only the input hash's fields (no URL or photo), so
+      // a verdict for the same input and model is reused from any listing:
+      // manual searches first, then any watch's row.
+      const manual = this.readManualRelevance(inputHash, legacyInputHash, activeModel);
+      if (manual) {
+        if (watchId) persistRelevance(listing, inputHash, activeModel, manual.status === 'relevant', manual.status, manual.reason);
+        return { listing, status: manual.status };
+      }
+      const reusable = this.stmt(`SELECT relevant, reason, relevance_status FROM listing_relevance
         WHERE input_hash = ? AND model = ? AND relevance_status IN ('relevant', 'irrelevant') AND error IS NULL
-        ORDER BY checked_at DESC LIMIT 1`).get(inputHash, activeModel) as { relevant?: number; reason?: string; relevance_status?: string } | undefined : undefined;
+        ORDER BY checked_at DESC LIMIT 1`).get(inputHash, activeModel) as { relevant?: number; reason?: string; relevance_status?: string } | undefined;
       if (reusable) {
         const status: 'relevant' | 'irrelevant' = reusable.relevance_status === 'irrelevant' || reusable.relevant === 0 ? 'irrelevant' : 'relevant';
         persistRelevance(listing, inputHash, activeModel, status === 'relevant', status, reusable.reason ?? 'Reused cached relevance decision');
@@ -1816,9 +1885,8 @@ export class ScoutService {
 
       // Per-scan budget: uncached listings beyond the budget stay unknown
       // instead of burning quota on every scan before the cache warms.
-      // Live dedupe is per listing (not per input hash): the escalation path
-      // uses each listing's own URL and thumbnail, which the hash omits.
-      const liveKey = `${inputHash}|${listing.url}|${listing.imageUrl ?? ''}`;
+      // Listings with the same input in one pass share one call.
+      const liveKey = inputHash;
       if (aiCalls >= AI_RELEVANCE_BUDGET_PER_SCAN && !pendingClassifications.has(inputHash) && !pendingLive.has(liveKey)) {
         budgetExhausted += 1;
         persistNotJudged(listing, inputHash, cached, 'AI relevance budget exhausted for this scan');
@@ -1936,16 +2004,19 @@ export class ScoutService {
           description = null;
         }
       }
+      const startedAt = Date.now();
       try {
         const results = await this.jevChecks({ marketplace: listing.marketplace, title: listing.title, condition: listing.condition, description, checks }, { apiKey: live.apiKey, model: live.jevModel });
         const summary = summarizeCheckResults(results);
         const issues = results.map(checkIssue).filter((issue): issue is string => issue !== null);
+        this.logJevLive('checks', inputHash, live, startedAt, { jevAnswer: { summary, results, fromDescription: Boolean(description) }, jevUnsure: summary === 'unconfirmed' });
         if (description) this.writeFuzzyCache(inputHash, live.jevModel, 'checks', JSON.stringify({ summary, issues, results }), null, summary !== 'rejected');
         if (summary === 'rejected') return 'rejected';
         status.set(listing, { state: summary, note: issues.join(' · ') + (description ? '' : `${issues.length ? ' · ' : ''}Judged from the title only`) });
         return summary;
       } catch (error) {
         failed += 1;
+        this.logJevLive('checks', inputHash, live, startedAt, { jevError: error instanceof Error ? error.message : String(error) });
         status.set(listing, { state: 'unchecked', note: `Jev check failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 200) });
         return 'unchecked';
       }
@@ -1970,18 +2041,21 @@ export class ScoutService {
    * verdict is cached in `jev_fuzzy_cache` by input hash + model so repeat
    * scans reuse it instead of re-spending on the same near-miss title.
    */
-  private readFuzzyCache(inputHash: string, model: string, task: 'term-match' | 'condition' | 'variant' | 'checks'): { rescued: boolean; decision: string } | null {
+  private readFuzzyCache(inputHash: string, model: string, task: 'term-match' | 'condition' | 'variant' | 'checks' | 'negotiability'): { rescued: boolean; decision: string; checkedAt: string } | null {
     try {
-      const row = this.stmt('SELECT rescued, decision FROM jev_fuzzy_cache WHERE input_hash = ? AND model = ? AND task = ?').get(inputHash, model, task) as { rescued?: number; decision?: string } | undefined;
+      const row = this.stmt('SELECT rescued, decision, checked_at FROM jev_fuzzy_cache WHERE input_hash = ? AND model = ? AND task = ?').get(inputHash, model, task) as { rescued?: number; decision?: string; checked_at?: string } | undefined;
       if (!row || row.rescued === undefined || row.rescued === null) return null;
-      return { rescued: Number(row.rescued) === 1, decision: String(row.decision ?? '') };
+      // A failed call is remembered briefly so a provider outage does not
+      // re-send the same near-miss on every scan; after the window it retries.
+      if (row.decision === FUZZY_ERROR_DECISION && !(Date.now() - Date.parse(row.checked_at ?? '') < FUZZY_ERROR_RETRY_MS)) return null;
+      return { rescued: Number(row.rescued) === 1, decision: String(row.decision ?? ''), checkedAt: String(row.checked_at ?? '') };
     } catch {
       // Missing table (migration not yet applied) means cache miss.
       return null;
     }
   }
 
-  private writeFuzzyCache(inputHash: string, model: string, task: 'term-match' | 'condition' | 'variant' | 'checks', decision: string, confidence: number | null, rescued: boolean) {
+  private writeFuzzyCache(inputHash: string, model: string, task: 'term-match' | 'condition' | 'variant' | 'checks' | 'negotiability', decision: string, confidence: number | null, rescued: boolean) {
     try {
       this.stmt(`INSERT INTO jev_fuzzy_cache (input_hash, model, task, decision, confidence, rescued, checked_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -2011,7 +2085,11 @@ export class ScoutService {
     if (!live) return { rescued, rescuedByTerm, rescuedByCondition };
     const FUZZY_RESCUE_BUDGET = 10;
     let budget = FUZZY_RESCUE_BUDGET;
-    const gatedTerm = gate ? candidates.termCandidates.filter(gate) : candidates.termCandidates;
+    // A near-miss with none of the query's numbers ("GTX 1660 Super" for
+    // "rtx 2060") is never the searched model, so it is dropped before the
+    // gate and the budget and Jev is spent on candidates that can pass.
+    const viableTerm = candidates.termCandidates.filter((listing) => !lacksQueryModelNumber(listing.title, search.query, search.includedTerms, search.excludedTerms));
+    const gatedTerm = gate ? viableTerm.filter(gate) : viableTerm;
     const gatedCondition = gate ? candidates.conditionCandidates.filter(gate) : candidates.conditionCandidates;
     const termSlice = gatedTerm.slice(0, FUZZY_RESCUE_BUDGET);
     budget -= termSlice.length;
@@ -2022,9 +2100,17 @@ export class ScoutService {
     // Verdicts still round-trip through `jev_fuzzy_cache`, so repeating a scan
     // reuses them instead of re-spending.
     type RescueTask = { listing: NormalizedListing; run: () => Promise<boolean> };
+    // Candidates with the same title and condition (the rest of the input is
+    // this pass's search) share one call instead of racing the cache.
+    const inFlight = new Map<string, Promise<boolean>>();
+    const once = (key: string, run: () => Promise<boolean>) => {
+      const pending = inFlight.get(key) ?? run();
+      inFlight.set(key, pending);
+      return pending;
+    };
     const termTasks: RescueTask[] = termSlice.map((listing) => ({
       listing,
-      run: async () => {
+      run: () => once(`term-match\u0000${listing.title}\u0000${listing.condition ?? ''}`, async () => {
         const inputHash = listingTermMatchInputHash({
           title: listing.title, listingCondition: listing.condition,
           query: search.query,
@@ -2032,42 +2118,46 @@ export class ScoutService {
         });
         const cached = this.readFuzzyCache(inputHash, live.jevModel, 'term-match');
         if (cached) return cached.rescued;
+        const startedAt = Date.now();
         try {
           const judgment = await this.jevTermMatch({
             query: search.query, includedTerms: search.includedTerms, excludedTerms: search.excludedTerms,
             title: listing.title, condition: listing.condition,
           }, { apiKey: live.apiKey, model: live.jevModel });
-          this.logJevLive('term-match', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
+          this.logJevLive('term-match', inputHash, live, startedAt, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
           const rescuedListing = judgment.decision === 'pass' && !judgment.unsure;
           this.writeFuzzyCache(inputHash, live.jevModel, 'term-match', judgment.decision, judgment.confidence, rescuedListing);
           return rescuedListing;
         } catch (error) {
-          this.logJevLive('term-match', inputHash, live, { jevError: error instanceof Error ? error.message : String(error) });
+          this.logJevLive('term-match', inputHash, live, startedAt, { jevError: error instanceof Error ? error.message : String(error) });
+          this.writeFuzzyCache(inputHash, live.jevModel, 'term-match', FUZZY_ERROR_DECISION, null, false);
           return false;
         }
-      },
+      }),
     }));
     const conditionTasks: RescueTask[] = conditionSlice.map((listing) => ({
       listing,
-      run: async () => {
+      run: () => once(`condition\u0000${listing.title}\u0000${listing.condition ?? ''}`, async () => {
         const inputHash = listingConditionMatchInputHash({
           title: listing.title, listingCondition: listing.condition, requestedCondition: search.condition ?? 'Any',
         });
         const cached = this.readFuzzyCache(inputHash, live.jevModel, 'condition');
         if (cached) return cached.rescued;
+        const startedAt = Date.now();
         try {
           const judgment = await this.jevConditionMatch({
             requestedCondition: search.condition ?? 'Any', listingCondition: listing.condition, title: listing.title,
           }, { apiKey: live.apiKey, model: live.jevModel });
-          this.logJevLive('condition', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
+          this.logJevLive('condition', inputHash, live, startedAt, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
           const rescuedListing = judgment.decision === 'match' && !judgment.unsure;
           this.writeFuzzyCache(inputHash, live.jevModel, 'condition', judgment.decision, judgment.confidence, rescuedListing);
           return rescuedListing;
         } catch (error) {
-          this.logJevLive('condition', inputHash, live, { jevError: error instanceof Error ? error.message : String(error) });
+          this.logJevLive('condition', inputHash, live, startedAt, { jevError: error instanceof Error ? error.message : String(error) });
+          this.writeFuzzyCache(inputHash, live.jevModel, 'condition', FUZZY_ERROR_DECISION, null, false);
           return false;
         }
-      },
+      }),
     }));
     const tasks = [...termTasks, ...conditionTasks];
     const outcomes = new Array<boolean>(tasks.length).fill(false);
@@ -2145,16 +2235,25 @@ export class ScoutService {
       ) as { price_negotiable?: number | null } | undefined;
       if (!stored) return false;
       if (stored.price_negotiable !== null && stored.price_negotiable !== undefined) return false;
-      const judgment = await this.jevNegotiability({
-        marketplace: candidate.listing.marketplace, title: candidate.listing.title,
-        condition: candidate.listing.condition, description,
-      }, { apiKey: live.apiKey, model: live.jevModel });
       const inputHash = listingNegotiabilityInputHash({
         marketplace: candidate.listing.marketplace, title: candidate.listing.title,
         condition: candidate.listing.condition, description,
       });
-      this.logJevLive('negotiability', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
-      if (judgment.unsure) return false;
+      // Most descriptions say nothing about the price, so Jev is unsure on
+      // them (10 of 11 calls on the 2026-11 export). An unsure answer is
+      // remembered for the same text instead of re-asked on every re-check.
+      const unsure = this.readFuzzyCache(inputHash, live.jevModel, 'negotiability');
+      if (unsure && Date.now() - Date.parse(unsure.checkedAt) < NEGOTIABILITY_UNSURE_TTL_MS) return false;
+      const startedAt = Date.now();
+      const judgment = await this.jevNegotiability({
+        marketplace: candidate.listing.marketplace, title: candidate.listing.title,
+        condition: candidate.listing.condition, description,
+      }, { apiKey: live.apiKey, model: live.jevModel });
+      this.logJevLive('negotiability', inputHash, live, startedAt, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
+      if (judgment.unsure) {
+        this.writeFuzzyCache(inputHash, live.jevModel, 'negotiability', judgment.decision, judgment.confidence, false);
+        return false;
+      }
       if (judgment.decision === 'fixed') {
         this.stmt('UPDATE listings SET price_negotiable = 0 WHERE marketplace = ? AND listing_id = ? AND price_negotiable IS NULL').run(
           candidate.listing.marketplace, candidate.listing.listingId,
@@ -2278,6 +2377,15 @@ export class ScoutService {
     this.stmt('UPDATE listing_detail_snapshots SET verification_status = ?, verification_input_hash = ? WHERE id = ? AND (verification_status IS NOT ? OR verification_input_hash IS NOT ?)').run(status, inputHash, snapshotId, status, inputHash);
   }
 
+  /** Keeps a fresh AI verdict by input hash; scope '' (text only) or 'Marketplace:listingId' (vision saw its photos). */
+  private saveVerdictByHash(inputHash: string, model: string, scope: string, verification: ListingDescriptionVerification) {
+    this.stmt(`INSERT INTO description_verification_cache (input_hash, model, scope, status, verification_json, checked_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(input_hash, model, scope) DO UPDATE SET status = excluded.status,
+        verification_json = excluded.verification_json, checked_at = excluded.checked_at`)
+      .run(inputHash, model, scope, verification.decision, JSON.stringify(verification), nowIso());
+  }
+
   private async verifyHighPriorityDealOnce(candidate: DealNotificationCandidate, notifyContext?: ScanNotifyContext): Promise<boolean> {
     return (await this.runDescriptionVerification(candidate, notifyContext)).allowed;
   }
@@ -2351,6 +2459,19 @@ export class ScoutService {
         this.saveDescriptionVerification({ marketplace, listingId, status: cached.decision, verification: cached, inputHash, model: activeModel });
         return { done: true, allowed: cached.decision === 'pass', reused: true, emit: null };
       }
+      // The listing's slot lost its verdict (a fetch error or a missing
+      // description overwrote it, or the text flapped A -> B -> A): a fresh
+      // verdict for this exact input is reused instead of a new AI call.
+      const known = this.stmt(`SELECT verification_json FROM description_verification_cache
+        WHERE input_hash = ? AND model = ? AND scope IN ('', ?) AND checked_at >= ?
+        ORDER BY checked_at DESC LIMIT 1`).get(inputHash, activeModel, `${marketplace}:${listingId}`,
+        new Date(Date.now() - DESCRIPTION_VERDICT_REUSE_MS).toISOString()) as { verification_json?: string } | undefined;
+      const knownVerdict = parseStoredListingDescriptionVerification(known?.verification_json);
+      if (knownVerdict) {
+        this.updateListingDetailSnapshot(snapshot?.id ?? null, knownVerdict.decision, inputHash);
+        this.saveDescriptionVerification({ marketplace, listingId, status: knownVerdict.decision, verification: knownVerdict, inputHash, model: activeModel });
+        return { done: true, allowed: knownVerdict.decision === 'pass', reused: true, emit: knownVerdict.decision };
+      }
       if (row?.ai_description_verification_error && row.ai_description_verification_input_hash === inputHash
         && row.ai_description_verification_model === activeModel && row.ai_description_verification_at
         && Date.now() - Date.parse(row.ai_description_verification_at) < 6 * 60 * 60_000) {
@@ -2374,8 +2495,9 @@ export class ScoutService {
       }
 
       // Cross-listing reuse is keyed by input hash, which omits the gallery
-      // photos live escalation uses — live mode relies on the per-listing cache
-      // above instead.
+      // photos live escalation uses, and a listing's slot does not record
+      // whether vision decided — live mode relies on description_verification_cache
+      // above instead, whose scope keeps photo verdicts with their listing.
       const reusable = !jevLive ? this.stmt(`SELECT ai_description_verification_json
         FROM listings
         WHERE ai_description_verification_input_hash = ?
@@ -2410,12 +2532,13 @@ export class ScoutService {
 
     try {
       this.saveDescriptionVerification({ marketplace, listingId, status: 'pending', model: activeModel });
-      const verification = jevLive
+      const { verification, basis } = jevLive
         ? await this.verifyDescriptionLive(context, inputHash, galleryImageUrls, jevLive)
-        : await this.verifyListingDescription(context, { apiKey, model: config.model });
+        : { verification: await this.verifyListingDescription(context, { apiKey, model: config.model }), basis: 'text' as const };
       if (jevShadow) this.shadowJevVerification(context, inputHash, verification.decision, galleryImageUrls, jevShadow);
       this.updateListingDetailSnapshot(snapshot?.id ?? null, verification.decision, inputHash);
       this.saveDescriptionVerification({ marketplace, listingId, status: verification.decision, verification, inputHash, model: activeModel });
+      if (basis) this.saveVerdictByHash(inputHash, activeModel, basis === 'photos' ? `${marketplace}:${listingId}` : '', verification);
       this.emit('ai-description-verification', { key: `${marketplace}:${listingId}`, status: verification.decision });
       return { allowed: verification.decision === 'pass', reused: false };
     } catch (error) {
@@ -3588,14 +3711,15 @@ export class ScoutService {
         task.outcome = { variantId: cached.rescued && ids.has(cached.decision) ? cached.decision : null, cached: true };
         return;
       }
+      const startedAt = Date.now();
       try {
         const judgment = await this.jevVariant(task.context, { apiKey: live.apiKey, model: live.jevModel });
-        this.logJevLive('variant', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
+        this.logJevLive('variant', inputHash, live, startedAt, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
         const variantId = judgment.decision === 'variant' && !judgment.unsure ? judgment.variantId : null;
         this.writeFuzzyCache(inputHash, live.jevModel, 'variant', judgment.variantId ?? judgment.decision, judgment.confidence, variantId !== null);
         task.outcome = { variantId, cached: false };
       } catch (error) {
-        this.logJevLive('variant', inputHash, live, { jevError: error instanceof Error ? error.message : String(error) });
+        this.logJevLive('variant', inputHash, live, startedAt, { jevError: error instanceof Error ? error.message : String(error) });
         task.outcome = null;
       }
     });
@@ -4242,7 +4366,7 @@ export class ScoutService {
       else triage.none += count;
     }
 
-    const relevanceRow = this.stmt("SELECT SUM(CASE WHEN relevance_status IN ('relevant', 'irrelevant') THEN 1 ELSE 0 END) AS judged, SUM(CASE WHEN relevance_status = 'relevant' THEN 1 ELSE 0 END) AS passed FROM listing_relevance WHERE checked_at >= ?").get(cutoff) as { judged?: number; passed?: number };
+    const relevanceRow = this.stmt("SELECT SUM(CASE WHEN relevance_status IN ('relevant', 'irrelevant') THEN 1 ELSE 0 END) AS judged, SUM(CASE WHEN relevance_status = 'relevant' THEN 1 ELSE 0 END) AS passed FROM listing_relevance WHERE checked_at >= ? AND model != ?").get(cutoff, PLAIN_VARIANT_RULE_MODEL) as { judged?: number; passed?: number };
     const shadowRow = this.stmt('SELECT SUM(CASE WHEN agreement IS NOT NULL THEN 1 ELSE 0 END) AS judged, SUM(CASE WHEN agreement = 1 THEN 1 ELSE 0 END) AS agreed FROM jev_shadow_log WHERE created_at >= ?').get(cutoff) as { judged?: number; agreed?: number };
     const relevanceJudged = Number(relevanceRow.judged ?? 0);
     const shadowJudged = Number(shadowRow.judged ?? 0);
@@ -6808,6 +6932,7 @@ export class ScoutService {
             query: row.query,
             includedTerms: row.included_terms ?? '',
             excludedTerms: row.excluded_terms ?? '',
+            variantGroups: baselines.groups,
           }, row.id, row.ai_relevance === undefined ? true : Boolean(row.ai_relevance), strongEnough);
           const candidates = this.transaction(() => {
             const pendingCandidates: DealNotificationCandidate[] = [];
@@ -7309,6 +7434,7 @@ export class ScoutService {
     // scans; listings rarely stay up past 45 days (the longest seen: 86).
     this.stmt('DELETE FROM jev_fuzzy_cache WHERE checked_at < ?').run(new Date(Date.now() - JEV_FUZZY_CACHE_DAYS * 24 * 60 * 60_000).toISOString());
     this.appLog.prune();
+    this.stmt('DELETE FROM description_verification_cache WHERE checked_at < ?').run(new Date(Date.now() - DESCRIPTION_VERDICT_REUSE_MS).toISOString());
     this.stmt('DELETE FROM connector_runs WHERE started_at < ?').run(cutoff);
     this.connectorRunCountCache = null;
     this.stmt('DELETE FROM scans WHERE started_at < ?').run(cutoff);
@@ -7327,6 +7453,7 @@ export class ScoutService {
       const relevance = this.stmt('DELETE FROM listing_relevance').run() as { changes?: number };
       const shadow = this.stmt('DELETE FROM jev_shadow_log').run() as { changes?: number };
       const snapshots = this.stmt('DELETE FROM listing_detail_snapshots').run() as { changes?: number };
+      this.stmt('DELETE FROM description_verification_cache').run();
       const verification = this.stmt(`UPDATE listings SET
         ai_description_verification_json = NULL,
         ai_description_verification_input_hash = NULL,
