@@ -72,3 +72,14 @@ test('extra terms count like query tokens', () => {
   const match = only('iphone 13', candidate('iphone 13'), { terms: '128gb' });
   assert.deepEqual([match.match, match.unmatchedTokens, match.modelTokenUnmatched], ['broader', ['128gb'], true]);
 });
+
+test('a watch excluding a word also rules out a query with its inflected form', () => {
+  const watch = candidate('rtx 2070', { excludedTerms: 'uszkodzone' });
+  assert.equal(only('rtx 2070 uszkodzona', watch), undefined);
+  assert.equal(only('rtx 2070 nieuszkodzona', watch)?.match, 'broader');
+});
+
+test('a query that writes a quantity keeps the number with its unit', () => {
+  const match = only('iphone 12 128 gb', candidate('iphone 12'));
+  assert.deepEqual([match.matchedTokens, match.unmatchedTokens], [['iphone', '12'], ['128 gb']]);
+});

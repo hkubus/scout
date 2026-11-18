@@ -33,6 +33,12 @@ import type {
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Something went wrong";
 
+/** The resale price the server's estimate assumes, else the typical; empty while neither is known. */
+const defaultResale = (listing: Pick<Listing, "typical" | "resaleBasis">) => {
+  const price = listing.resaleBasis?.resalePrice ?? listing.typical;
+  return price === null || price === undefined ? "" : String(price);
+};
+
 export default function ListingDetailDrawer({
   listing,
   onClose,
@@ -58,7 +64,7 @@ export default function ListingDetailDrawer({
   const [hidden, setHidden] = useState(listing.hidden ?? false);
   const [shippingCost, setShippingCost] = useState("");
   const [extraCost, setExtraCost] = useState("");
-  const [resalePrice, setResalePrice] = useState(listing.typical === null ? "" : String(listing.typical));
+  const [resalePrice, setResalePrice] = useState(defaultResale(listing));
   // Resell on the same platform by default; the fee comes from the operator's
   // presets on the Flips page. Display-only, like the rest of the calculator.
   const [sellOn, setSellOn] = useState<FlipChannel>(listing.marketplace);
@@ -79,7 +85,10 @@ export default function ListingDetailDrawer({
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : 0;
   };
-  const totalCost = currentListing.price + toFiniteCost(shippingCost) + toFiniteCost(extraCost);
+  // An empty shipping field means the buying-cost preset the server's estimate used.
+  const basis = currentListing.resaleBasis ?? null;
+  const presetBuyCosts = basis?.buyCosts ?? 0;
+  const totalCost = currentListing.price + (shippingCost === "" ? presetBuyCosts : toFiniteCost(shippingCost)) + toFiniteCost(extraCost);
   const expectedResale = resalePrice === "" ? null : Number(resalePrice);
   const resaleFee = expectedResale === null || !Number.isFinite(expectedResale) ? 0 : saleFee(expectedResale, feePresets[sellOn]);
   const expectedProfit = expectedResale === null || !Number.isFinite(expectedResale) ? null : expectedResale - resaleFee - totalCost;
@@ -133,7 +142,7 @@ export default function ListingDetailDrawer({
     setDecision(listing.decision ?? null);
     setNote(listing.note ?? "");
     setHidden(listing.hidden ?? false);
-    setResalePrice(listing.typical === null ? "" : String(listing.typical));
+    setResalePrice(defaultResale(listing));
     setShippingCost("");
     setExtraCost("");
     setComparison(null);
@@ -149,7 +158,7 @@ export default function ListingDetailDrawer({
         setDecision(result.action.decision);
         setNote(result.action.note);
         setHidden(result.action.hidden);
-        if (result.listing.typical !== null) setResalePrice(String(result.listing.typical));
+        if (result.listing.typical !== null) setResalePrice(defaultResale(result.listing));
       })
       .catch(async () => {
         // Manual search results do not have stored observations yet, but their triage action can still persist.
@@ -205,7 +214,7 @@ export default function ListingDetailDrawer({
     try {
       const result = await api.setListingVariant(marketplaceListingKey, currentListing.watchId, variantId);
       setDetail(result);
-      if (result.listing.typical !== null) setResalePrice(String(result.listing.typical));
+      if (result.listing.typical !== null) setResalePrice(defaultResale(result.listing));
       onUpdated(result.listing);
     } catch (variantError) {
       setError(errorMessage(variantError));
@@ -307,7 +316,7 @@ export default function ListingDetailDrawer({
               ) : (
                 <span>
                   ≈ <strong className={expectedProfit >= 0 ? "result-positive" : "result-negative"}>{expectedProfit >= 0 ? "+" : "−"}{formatPln(Math.abs(Math.round(expectedProfit)))}</strong>
-                  {expectedRoi !== null ? ` (ROI ${expectedRoi.toFixed(0)}%)` : ""} if resold at {formatPln(expectedResale)} on {sellOn}
+                  {expectedRoi !== null ? ` (ROI ${expectedRoi.toFixed(0)}%)` : ""} if resold at {formatPln(expectedResale)}{basis && expectedResale === basis.resalePrice ? ` (${basis.label})` : ""} on {sellOn}
                 </span>
               )}
               <button type="button" className="icon-button" aria-expanded={editingEstimate} aria-label="Edit the estimate" title="Edit costs, resale price and channel" onClick={() => setEditingEstimate((open) => !open)}>
@@ -316,7 +325,7 @@ export default function ListingDetailDrawer({
             </div>
             {editingEstimate ? (
               <div className="calculator-fields">
-                <label className="field-label">Shipping / fees (zł)<input type="number" min="0" step="1" value={shippingCost} onChange={(event) => setShippingCost(event.target.value)} placeholder="0" /></label>
+                <label className="field-label" title={presetBuyCosts ? `Empty uses the ${currentListing.marketplace} buying-cost preset (${formatPln(presetBuyCosts)}) from the Flips page` : undefined}>Shipping / fees (zł)<input type="number" min="0" step="1" value={shippingCost} onChange={(event) => setShippingCost(event.target.value)} placeholder={String(presetBuyCosts)} /></label>
                 <label className="field-label">Other cost (zł)<input type="number" min="0" step="1" value={extraCost} onChange={(event) => setExtraCost(event.target.value)} placeholder="0" /></label>
                 <label className="field-label">Expected resale (zł)<input type="number" min="0" step="1" value={resalePrice} onChange={(event) => setResalePrice(event.target.value)} placeholder="Add estimate" /></label>
                 <label className="field-label" title={resaleFee ? `Seller fee ${formatPln(Math.round(resaleFee))}` : "No seller fee"}>Sell on<select value={sellOn} onChange={(event) => setSellOn(event.target.value as FlipChannel)}>{FLIP_CHANNELS.map((channel) => <option key={channel}>{channel}</option>)}</select></label>

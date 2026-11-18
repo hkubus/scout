@@ -18,6 +18,11 @@ test('compares listings field by field', () => {
   assert.equal(sameListingFields(row('a', cheapest(90)), row('a', cheapest(80))), false);
   assert.equal(sameListingFields(row('a', cheapest(90)), row('a', cheapest(90, '2026-11-12T11:00:00.000Z'))), false);
   assert.equal(sameListingFields(row('a', cheapest(90)), row('a', { duplicateCount: 1, duplicateCheapest: undefined })), false);
+  // And the resale basis behind the estimated net.
+  const basis = (resalePrice: number) => ({ estimatedNet: 40, resaleBasis: { source: 'typical-haircut' as const, resalePrice, samples: null, buyCosts: 16, label: '88% of typical' } });
+  assert.equal(sameListingFields(row('a', basis(264)), row('a', basis(264))), true);
+  assert.equal(sameListingFields(row('a', basis(264)), row('a', basis(260))), false);
+  assert.equal(sameListingFields(row('a', basis(264)), row('a', { estimatedNet: 40, resaleBasis: null })), false);
 });
 
 test('returns the previous array when a refetch changed nothing', () => {

@@ -1,3 +1,5 @@
+import type { ResaleBasis } from "./profit";
+
 export type Theme = 'light' | 'dark' | 'system';
 export type View = 'overview' | 'search' | 'watches' | 'market-research' | 'analytics' | 'listings' | 'flips' | 'connectors' | 'logs' | 'settings';
 export type Marketplace = 'OLX' | 'Allegro Lokalnie' | 'Vinted';
@@ -117,10 +119,13 @@ export interface Listing {
   /** From the marketplace's business-account flag; null when unknown. */
   sellerType?: SellerType | null;
   /**
-   * What reselling at the typical asking price on the same marketplace would
-   * net after its seller fee, in whole zł; null without a typical. Display-only.
+   * What buying here and reselling on the same marketplace would net after
+   * its buying costs and seller fee, in whole zł, at the resale price in
+   * resaleBasis; null without a typical. Display-only.
    */
   estimatedNet?: number | null;
+  /** The resale price and buying costs estimatedNet assumes, and where the price comes from. */
+  resaleBasis?: ResaleBasis | null;
   /** The price is at or below the watch's target price. */
   targetHit?: boolean;
   /**

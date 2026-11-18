@@ -773,6 +773,14 @@ test('ntfy alerts attach the photo and carry price, resale and seller context', 
   assert.match(lines[2], /^≈ \+500 zł net if resold at typical on OLX$/);
   assert.equal(lines[3], 'Używane · Private seller · Shipping · posted 3 h ago');
   assert.equal(lines.at(-1), listing.url);
+  // With its basis the line says which resale price and buying costs it assumes.
+  const resaleBasis = { source: 'own-sales' as const, resalePrice: 1150, samples: 2, buyCosts: 15, label: 'your 2 recent sales' };
+  const based = buildNtfyPayload({ listing, typical: 1400, discountPercent: 35.7, confidence: 94, estimatedNet: 235, resaleBasis }, 'scout-deals');
+  assert.match(based.message.split('\n')[2], /^≈ \+235 zł net on OLX · resale 1\s?150 zł \(your 2 recent sales\) · buying 15 zł$/);
+  const fields = buildDiscordEmbed({ listing, typical: 1400, discountPercent: 35.7, confidence: 94, estimatedNet: 235, resaleBasis }).embeds[0].fields;
+  assert.match(fields.find((item) => item.name === 'Est. net')?.value ?? '', /^≈ \+235 zł on OLX · resale 1\s?150 zł \(your 2 recent sales\) · buying 15 zł$/);
+  assert.equal(fields.some((item) => item.name === 'Est. net at typical'), false);
+  assert.equal(buildDiscordEmbed({ listing, typical: 1400, discountPercent: 35.7, confidence: 94, estimatedNet: 500 }).embeds[0].fields.find((item) => item.name === 'Est. net at typical')?.value, '≈ +500 zł on OLX');
   // Only https images are attached.
   assert.equal(buildNtfyPayload({ listing: { ...listing, imageUrl: 'http://example.com/a.jpg' }, typical: 1400, discountPercent: 35.7, confidence: 94 }, 'scout-deals').attach, undefined);
 });
@@ -839,6 +847,55 @@ test('drops query stopwords but keeps single-digit models on token boundaries', 
   ];
   assert.deepEqual(filterListings(listings, 'ssd for laptop', '', '').map((listing) => listing.listingId), ['1']);
   assert.deepEqual(filterListings(listings, 'iphone 5', '', '').map((listing) => listing.listingId), ['2']);
+});
+
+test('a model number does not match the same number used as a quantity', () => {
+  const base = { marketplace: 'OLX' as const, price: 100, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/test', observedAt: new Date().toISOString(), shippingAvailable: null as boolean | null };
+  const titles = [
+    'iPhone 12 64GB czarny',
+    'Apple iPhone12 Pro',
+    'Iphone 12mini Red',
+    'iPhone 12, 128 GB',
+    'iPhone 12 w etui',
+    'Smartfon Apple iPhone 17 Pro Max 12 GB / 256 GB',
+    'iPhone 15 gwarancja 12 miesięcy',
+    'iPhone 13 12m gwarancji',
+    'iPhone 16 12mc gwarancji',
+    'Etui iPhone 14 za 12zł',
+    'iPhone 11 12gb ram',
+  ];
+  const listings = titles.map((title, index) => ({ ...base, listingId: String(index), title }));
+  const kept = (query: string, included = '') => filterListings(listings, query, included, '').map((listing) => listing.title);
+  assert.deepEqual(kept('iphone 12'), ['iPhone 12 64GB czarny', 'Apple iPhone12 Pro', 'Iphone 12mini Red', 'iPhone 12, 128 GB', 'iPhone 12 w etui']);
+  assert.deepEqual(kept('', 'iphone,12'), kept('iphone 12'));
+  // A quantity is still found by writing its unit.
+  assert.deepEqual(kept('iphone 12gb'), ['Smartfon Apple iPhone 17 Pro Max 12 GB / 256 GB', 'iPhone 11 12gb ram']);
+
+  const cards = ['GTX 1660Ti 6GB', 'Karta GTX1660 Super', 'Intel i5-12400F', 'RTX 2060S', 'Zasilacz Corsair 650W', 'Galaxy S23 5G'].map((title, index) => ({ ...base, listingId: String(index), title }));
+  const keptCards = (query: string) => filterListings(cards, query, '', '').map((listing) => listing.title);
+  assert.deepEqual(keptCards('1660'), ['GTX 1660Ti 6GB', 'Karta GTX1660 Super']);
+  assert.deepEqual(keptCards('12400'), ['Intel i5-12400F']);
+  assert.deepEqual(keptCards('2060'), ['RTX 2060S']);
+  assert.deepEqual(keptCards('s23 5'), ['Galaxy S23 5G']);
+  // Watts name a power supply, so they are not a quantity unit.
+  assert.deepEqual(keptCards('zasilacz 650'), ['Zasilacz Corsair 650W']);
+});
+
+test('excluded terms also rule out inflected forms and the condition label', () => {
+  const base = { marketplace: 'OLX' as const, price: 100, currency: 'PLN' as const, url: 'https://www.olx.pl/d/oferta/test', observedAt: new Date().toISOString(), shippingAvailable: null as boolean | null };
+  const listings = [
+    { ...base, listingId: '1', title: 'RTX 2070 SUPER – USZKODZONA' },
+    { ...base, listingId: '2', title: 'RTX 2070 uszkodzony wentylator' },
+    { ...base, listingId: '3', title: 'RTX 2070 nieuszkodzona, sprawna' },
+    { ...base, listingId: '4', title: 'RTX 2070 bez uszkodzeń' },
+    { ...base, listingId: '5', title: 'RTX 2070 sprawna', condition: 'Uszkodzone' },
+    { ...base, listingId: '6', title: 'RTX 2070 sprawna', condition: 'Używane' },
+    { ...base, listingId: '7', title: 'RTX 2070 Uszkodzone' },
+  ];
+  assert.deepEqual(filterListings(listings, 'rtx 2070', '', 'uszkodzone').map((listing) => listing.listingId), ['3', '4', '6']);
+  // Terms of six letters or more cover their endings; shorter ones stay exact.
+  const more = [{ ...base, listingId: '8', title: 'RTX 2070 niesprawny' }, { ...base, listingId: '9', title: 'RTX 2070 dwie karty' }];
+  assert.deepEqual(filterListings(more, 'rtx 2070', '', 'niesprawne, karta').map((listing) => listing.listingId), ['9']);
 });
 
 test('relaxes the implicit query terms only for opt-in manual searches', () => {

@@ -100,14 +100,21 @@ public actor DemoTransport: HTTPTransport {
         return dashboard
     }
 
-    /// `estimatedNet` and `targetHit` as the server derives them: resale at the
-    /// typical price on the same marketplace after its default fee, and the
-    /// price against the watch's target.
+    /// `estimatedNet`, `resaleBasis` and `targetHit` as the server derives them
+    /// without flip history: resale at 88% of the typical on the same
+    /// marketplace after its default buying costs and fee, and the price
+    /// against the watch's target.
     static func withAlertFields(_ listings: [Listing], watches: [Watch]) -> [Listing] {
         listings.map { listing in
             var listing = listing
-            listing.estimatedNet = listing.typical.map {
-                Profit.estimate(buyPrice: listing.price, buyCosts: 0, resalePrice: $0, preset: FeePresets.defaults[FlipChannel(listing.marketplace)]).net.rounded()
+            listing.estimatedNet = nil
+            listing.resaleBasis = nil
+            if let typical = listing.typical {
+                let preset = FeePresets.defaults[FlipChannel(listing.marketplace)]
+                let resale = (typical * Profit.typicalResaleShare).rounded()
+                let buyCosts = Profit.buyCost(price: listing.price, preset: preset)
+                listing.estimatedNet = Profit.estimate(buyPrice: listing.price, buyCosts: buyCosts, resalePrice: resale, preset: preset).net.rounded()
+                listing.resaleBasis = ResaleBasis(source: "typical-haircut", resalePrice: resale, samples: nil, buyCosts: buyCosts.rounded(), label: "88% of typical")
             }
             let target = watches.first { $0.id == listing.watchId }?.targetPrice
             listing.targetHit = target.map { listing.price <= $0 } ?? false
@@ -401,6 +408,7 @@ public actor DemoTransport: HTTPTransport {
             result.associationId = nil
             result.decision = nil
             result.estimatedNet = nil
+            result.resaleBasis = nil
             result.targetHit = nil
             return result
         }

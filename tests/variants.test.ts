@@ -336,3 +336,82 @@ test('AI proposals are validated against the titles and fall back to title analy
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('glued model names land in their own variant, and a number used as a quantity does not', () => {
+  assert.equal(assignVariant('Zotac GTX 1660Ti 6GB GDDR6', gtxGroups), 'gtx-1660-ti');
+  assert.equal(assignVariant('Karta graficzna GTX1660SUPER', gtxGroups), 'gtx-1660-super');
+  assert.equal(assignVariant('GTX1660 6GB', gtxGroups), 'gtx-1660');
+  const phones = [
+    { id: 'iphone-12', label: 'iPhone 12', terms: 'iphone, 12' },
+    { id: 'iphone-12-mini', label: 'iPhone 12 mini', terms: 'iphone, 12, mini' },
+  ];
+  assert.equal(assignVariant('iPhone 12mini white', phones), 'iphone-12-mini');
+  assert.equal(assignVariant('iPhone 13 mini, gwarancja 12 miesięcy', phones), OTHER_VARIANT_KEY);
+  assert.equal(assignVariant('iPhone 17 Pro Max 12 GB / 256 GB', phones), OTHER_VARIANT_KEY);
+});
+
+function seedVariantWatch(context: ReturnType<typeof fixture>, rows: Array<{ title: string; price: number; key?: string; source?: string; typical?: number }>, watch: Record<string, unknown> = {}) {
+  const now = new Date(Date.now() - 8 * 3_600_000).toISOString();
+  context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, variant_groups_json, min_price_pln, max_price_pln, enabled, next_scan_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`).run('w', 'GTX 1660', 'gtx 1660', '["OLX"]', JSON.stringify(watch.groups ?? gtxGroups), (watch.minPrice ?? null) as number | null, (watch.maxPrice ?? null) as number | null, now, now, now);
+  const insertListing = context.db.prepare('INSERT INTO listings (marketplace, listing_id, title, price_pln, url, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+  const insertAssociation = context.db.prepare('INSERT INTO watch_listings (watch_id, listing_id, first_seen_at, last_seen_at, variant_key, variant_source, typical_pln, deal_strength, deal_label, typical_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+  const insertObservation = context.db.prepare('INSERT INTO observations (listing_id, watch_id, watch_listing_id, price_pln, observed_at) VALUES (?, ?, ?, ?, ?)');
+  rows.forEach((row, index) => {
+    const listingId = Number(insertListing.run('OLX', `l-${index}`, row.title, row.price, `https://www.olx.pl/d/oferta/${index}`, now, now).lastInsertRowid);
+    const typical = row.typical ?? null;
+    const association = insertAssociation.run('w', listingId, now, now, row.key ?? null, row.source ?? null, typical, typical === null ? null : 5, typical === null ? null : 'Exceptional', typical === null ? null : 'own-history');
+    insertObservation.run(listingId, 'w', Number(association.lastInsertRowid), row.price, now);
+  });
+}
+
+function storedVariants(context: ReturnType<typeof fixture>) {
+  return context.db.prepare(`SELECT l.title AS title, wl.variant_key AS key, wl.variant_source AS source, wl.typical_pln AS typical, wl.deal_strength AS strength
+    FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id ORDER BY l.listing_id`).all() as Array<{ title: string; key: string | null; source: string | null; typical: number | null; strength: number | null }>;
+}
+
+test('re-tags saved listings once when the variant rules change, keeping manual picks', () => {
+  const context = fixture();
+  try {
+    seedVariantWatch(context, [
+      { title: 'GTX 1660Ti OC', price: 700, key: 'gtx-1660', source: 'rule', typical: 900 },
+      { title: 'GTX 1660Super', price: 650, key: 'gtx-1660', source: 'manual' },
+      { title: 'Karta graficzna Gigabyte', price: 640, key: 'gtx-1660-ti', source: 'jev' },
+      { title: 'GTX1660TI 6GB', price: 720, key: 'gtx-1660', source: 'jev' },
+      { title: 'RTX 3060 12GB', price: 1100, key: 'gtx-1660', source: 'rule' },
+      { title: 'GTX 1660 6GB', price: 500, key: 'gtx-1660', source: 'rule' },
+    ]);
+    assert.equal(context.service.retagVariantRules(), 3);
+    assert.deepEqual(storedVariants(context).map((row) => [row.title, row.key, row.source]), [
+      ['GTX 1660Ti OC', 'gtx-1660-ti', 'rule'],
+      ['GTX 1660Super', 'gtx-1660', 'manual'],
+      ['Karta graficzna Gigabyte', 'gtx-1660-ti', 'jev'],
+      ['GTX1660TI 6GB', 'gtx-1660-ti', 'rule'],
+      ['RTX 3060 12GB', OTHER_VARIANT_KEY, 'rule'],
+      ['GTX 1660 6GB', 'gtx-1660', 'rule'],
+    ]);
+    // The moved listing is re-scored against its new bucket, which is not ready yet: the stale 900 zł typical goes.
+    assert.equal(storedVariants(context)[0].typical, null);
+    assert.equal(storedVariants(context)[0].strength, null);
+    // Once per rules version.
+    context.db.prepare("UPDATE watch_listings SET variant_key = 'gtx-1660', variant_source = 'rule'").run();
+    assert.equal(context.service.retagVariantRules(), 0);
+    assert.equal(storedVariants(context)[0].key, 'gtx-1660');
+  } finally { context.close(); }
+});
+
+test('changing a watch\'s price bounds re-scores its saved listings', () => {
+  const context = fixture();
+  try {
+    const rows = Array.from({ length: 30 }, (_, index) => ({ title: `GTX 1660 ${index}`, price: 600, key: 'gtx-1660', source: 'rule' }));
+    seedVariantWatch(context, [...rows, { title: 'Komputer GTX 1660', price: 2400, key: 'gtx-1660', source: 'rule', typical: 600 }, { title: 'GTX 1660 tanio', price: 420, key: 'gtx-1660', source: 'rule', typical: 2000 }]);
+    context.service.updateWatch('w', { maxPrice: 1500 });
+    const stored = new Map(storedVariants(context).map((row) => [row.title, row]));
+    // Outside the new bounds: a scan would no longer keep it, so it loses its score.
+    assert.equal(stored.get('Komputer GTX 1660')?.typical, null);
+    assert.equal(stored.get('Komputer GTX 1660')?.strength, null);
+    // Inside: priced against today's 600 zł baseline instead of the stale 2,000 zł.
+    assert.equal(stored.get('GTX 1660 tanio')?.typical, 600);
+    assert.equal(stored.get('GTX 1660 0')?.typical, 600);
+  } finally { context.close(); }
+});

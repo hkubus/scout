@@ -30,7 +30,7 @@ test('profit maths: fees, realised net and forward estimates', () => {
   assert.deepEqual(quarterOf('2026-09-30'), { year: 2026, quarter: 3 });
   assert.deepEqual(quarterOf('2026-10-01'), { year: 2026, quarter: 4 });
   const presets = normalizeFeePresets({ OLX: { percent: 8, fixed: 0 }, Vinted: { percent: -1, fixed: 'x' }, Bogus: { percent: 1 } });
-  assert.deepEqual(presets.OLX, { percent: 8, fixed: 0 });
+  assert.deepEqual(presets.OLX, { percent: 8, fixed: 0, buyPercent: 0, buyFixed: 15 });
   assert.deepEqual(presets.Vinted, DEFAULT_FEE_PRESETS.Vinted);
   assert.equal('Bogus' in presets, false);
 });

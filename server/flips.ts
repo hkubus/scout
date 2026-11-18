@@ -223,7 +223,7 @@ export class FlipStore {
   }
 
   setFeePresets(presets: FeePresets) {
-    const normalized = normalizeFeePresets(presets);
+    const normalized = normalizeFeePresets(presets, this.feePresets());
     this.db.prepare('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run(FEE_PRESETS_KEY, JSON.stringify(normalized), new Date().toISOString());
     this.onChange({ feePresets: true });
     return normalized;

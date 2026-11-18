@@ -1,4 +1,4 @@
-import { normalizeFilterText, splitTerms } from './text';
+import { normalizeFilterText, splitTerms, termMatches } from './text';
 
 /**
  * One model bucket inside a watch. A watch searches broadly (e.g. "1660") and
@@ -80,19 +80,31 @@ function mostSpecificFirst(groups: VariantGroup[]) {
 }
 
 /**
+ * Bump when assignVariant's matching changes: saved rule-assigned listings
+ * are then re-tagged once at startup (ScoutService.retagVariantRules).
+ * 2: terms match like the watch filter (termMatches), so glued model tokens
+ * ("1660ti", "RTX2060") reach their group and "12" no longer matches "12gb".
+ */
+export const VARIANT_RULES_VERSION = 2;
+
+/**
  * Assign a listing title to a group id. Most-specific-first (more required
  * terms wins, declared order breaks ties) so "1660 super" beats "1660"
- * without the user having to order the groups. Unmatched titles fall into
+ * without the user having to order the groups. Terms match the way the
+ * watch's include/exclude filter does (termMatches), so "GTX 1660Ti" lands in
+ * "1660 ti" and "RTX2060" in "rtx 2060". Unmatched titles fall into
  * {@link OTHER_VARIANT_KEY}.
  */
 export function assignVariant(title: string, groups: VariantGroup[]): string {
   if (!groups.length) return OTHER_VARIANT_KEY;
   const normalized = normalizeFilterText(title);
+  const glued = normalized.replace(/ /g, '');
+  const matches = (term: string) => termMatches(normalized, glued, term);
   for (const group of mostSpecificFirst(groups)) {
     const required = splitTerms(group.terms);
     if (!required.length) continue;
     const excluded = splitTerms(group.exclude ?? '');
-    if (required.every((term) => normalized.includes(term)) && !excluded.some((term) => normalized.includes(term))) {
+    if (required.every(matches) && !excluded.some(matches)) {
       return group.id;
     }
   }

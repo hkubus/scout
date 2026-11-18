@@ -128,9 +128,9 @@ struct ListingDetailView: View {
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                     }
-                    // The server's estimate with the platform's preset fee.
+                    // The server's estimate with the platform's preset fee and buying costs.
                     if let net = listing.estimatedNet {
-                        EstimatedNetText(net: net, suffix: "net at typical")
+                        EstimatedNetText(net: net, suffix: listing.estimatedNetSuffix)
                             .font(.subheadline.weight(.semibold))
                     }
                 } else {
@@ -216,8 +216,9 @@ struct ListingDetailView: View {
         }
     }
 
-    /// Display-only estimate: resale minus the chosen platform's seller fee
-    /// and this price. "I bought this" starts a flip in the ledger.
+    /// Display-only estimate: resale minus the chosen platform's seller fee,
+    /// the buying costs the server assumed and this price. "I bought this"
+    /// starts a flip in the ledger.
     private func flip(_ listing: Listing) -> some View {
         Section {
             TextField("Expected resale (zł)", text: $resalePrice)
@@ -228,6 +229,9 @@ struct ListingDetailView: View {
                 }
             }
             if let estimate = flipEstimate(for: listing) {
+                if let buyCosts = listing.resaleBasis?.buyCosts, buyCosts > 0 {
+                    LabeledContent("Buying costs", value: Format.zl(buyCosts))
+                }
                 LabeledContent("Platform fee", value: Format.zl(estimate.fee))
                 LabeledContent("Net if resold") {
                     Text(verbatim: Format.zl(estimate.net))
@@ -254,7 +258,7 @@ struct ListingDetailView: View {
 
     private func flipEstimate(for listing: Listing) -> (fee: Double, net: Double)? {
         guard let resale = Double(resalePrice.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")), resale > 0 else { return nil }
-        return Profit.estimate(buyPrice: listing.price, buyCosts: 0, resalePrice: resale, preset: feePresets[sellOn])
+        return Profit.estimate(buyPrice: listing.price, buyCosts: listing.resaleBasis?.buyCosts ?? 0, resalePrice: resale, preset: feePresets[sellOn])
     }
 
     private func addFlip(_ listing: Listing) {
@@ -318,9 +322,9 @@ struct ListingDetailView: View {
         do {
             let detail = try await client.listingDetail(key: link.key, watchId: link.watchId)
             if self.detail == nil {
-                // Resell on the same platform at the typical price by default.
+                // Resell on the same platform at the server's resale basis (older servers: the typical) by default.
                 sellOn = FlipChannel(detail.listing.marketplace)
-                if resalePrice.isEmpty, let typical = detail.listing.typical { resalePrice = String(Int(typical.rounded())) }
+                if resalePrice.isEmpty, let resale = detail.listing.resaleBasis?.resalePrice ?? detail.listing.typical { resalePrice = String(Int(resale.rounded())) }
             }
             self.detail = detail
             decision = detail.action.decision

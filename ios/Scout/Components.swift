@@ -591,7 +591,7 @@ struct ListingPreview: View {
                     }
                 }
                 if let net = listing.estimatedNet {
-                    EstimatedNetText(net: net, suffix: "net at typical")
+                    EstimatedNetText(net: net, suffix: listing.estimatedNetSuffix)
                         .font(.caption.weight(.medium))
                 }
                 Text(verbatim: ([listing.marketplace.rawValue, listing.condition, listing.location] as [String?]).compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))

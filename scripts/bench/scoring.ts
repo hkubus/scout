@@ -38,8 +38,9 @@ import {
   type ListingState,
   type WatchCfg,
 } from './scoring-data';
-import { normalizeFilterText, parseIncludedExcluded, termMatches } from '../../server/text';
-import { DEFAULT_FEE_PRESETS, estimatedNetAtTypical, flipNet, isFlipChannel, normalizeFeePresets, saleFee, type FeePresets } from '../../src/profit';
+import { excludedTermMatches, normalizeFilterText, parseIncludedExcluded } from '../../server/text';
+import { DEFAULT_FEE_PRESETS, estimateResaleNet, estimatedNetAtTypical, flipNet, isFlipChannel, normalizeFeePresets, saleFee, type FeePresets, type ResaleBasis } from '../../src/profit';
+import { ownSalesFor, type ResaleWatch, type SoldFlip } from '../../server/resale';
 
 const started = Date.now();
 const bench = new Bench('scoring');
@@ -360,8 +361,10 @@ for (const watch of watches) {
   for (const assoc of assocByWatch.get(watch.id)?.values() ?? []) {
     const listing = listings.get(assoc.listingId);
     if (!listing) continue;
+    // As the watch filter decides it now (evaluateDeterministic): excluded terms and their inflections, on the title and the condition label.
     const title = normalizeFilterText(listing.title);
-    const excludedHit = excluded.some((term) => termMatches(title, title.replace(/ /g, ''), term));
+    const conditionText = normalizeFilterText(listing.condition ?? '');
+    const excludedHit = excluded.some((term) => excludedTermMatches(title, title.replace(/ /g, ''), term) || (conditionText !== '' && excludedTermMatches(conditionText, conditionText.replace(/ /g, ''), term)));
     const isBroken = junkKinds(listing.title, watch.query).includes('broken');
     if (isBroken) {
       broken += 1;
@@ -382,7 +385,7 @@ for (const watch of watches) {
 }
 bench.metric('scoring.exclusion.broken_title_kept', 'Watch listings with a broken/for-parts title that the watch\'s excluded terms let through ("uszkodzone" misses "uszkodzona", "niesprawna", …)', brokenKept, 'count', 'lower', `of ${brokenTotal} broken titles`);
 bench.metric('scoring.exclusion.broken_title_kept_strong_plus', 'Of those, labelled Strong+ (they look like deals because they are broken)', brokenKeptStrong, 'count', 'lower');
-bench.metric('scoring.exclusion.damaged_condition_kept', 'Watch listings whose marketplace condition says damaged/for parts (exclusions only read the title)', damagedConditionKept, 'count', 'lower');
+bench.metric('scoring.exclusion.damaged_condition_kept', 'Watch listings whose marketplace condition says damaged/for parts that the watch\'s excluded terms let through (watches without exclusions count too)', damagedConditionKept, 'count', 'lower');
 bench.metric('scoring.flags.broken_title_unflagged_share', 'Broken-title watch listings without a damaged/for_parts quick flag', ratio(brokenUnflagged, brokenTotal), 'share', 'lower', `n=${brokenTotal}`);
 bench.table('exclusions_by_watch', exclusionRows);
 bench.table('exclusion_misses', exclusionExamples);
@@ -460,7 +463,7 @@ const sentRows = [...sent.values()].map((s) => {
   const watch = watches.find((w) => w.id === s.watchId);
   const listing = listingByKey.get(s.key);
   const assoc = listing ? assocByWatch.get(s.watchId)?.get(listing.id) : undefined;
-  return { s, watch, listing, proxies: watch && listing && assoc ? junkProxies(watch, assoc, listing) : null };
+  return { s, watch, listing, assoc, proxies: watch && listing && assoc ? junkProxies(watch, assoc, listing) : null };
 });
 const known = sentRows.filter((r) => r.proxies);
 bench.metric('scoring.alerts.sent', 'Distinct (watch, listing) deal alerts delivered', sent.size, 'count', 'info');
@@ -481,7 +484,7 @@ bench.table('alerts_by_watch', watches.map((watch) => {
   };
 }).filter((row) => row.sent > 0));
 
-// ------------------------------------------------------------ 8. flips: "net at typical" against the ledger
+// ------------------------------------------------------------ 8. flips: Scout's estimated net against the ledger
 
 let feePresets: FeePresets = DEFAULT_FEE_PRESETS;
 try {
@@ -492,9 +495,18 @@ const presetFor = (channel: string) => (isFlipChannel(channel) ? feePresets[chan
 
 interface FlipRow { id: number; title: string; listing_key: string | null; watch_id: string | null; buy_channel: string; bought_on: string; buy_price_pln: number; buy_costs_pln: number | null; sold_on: string | null; sale_channel: string | null; sale_price_pln: number | null; sale_fee_pln: number | null; sale_costs_pln: number | null }
 const flips = db.prepare('SELECT * FROM flips ORDER BY bought_on').all() as unknown as FlipRow[];
+// The resale basis reads the operator's sold flips (server/resale.ts); each
+// flip is estimated from the others sold before it was bought.
+const soldFlips = flips.filter((f) => f.sold_on && Number(f.sale_price_pln) > 0).map((f) => ({ id: f.id, flip: { title: f.title, watchId: f.watch_id, soldOn: f.sold_on!, salePrice: Number(f.sale_price_pln) } satisfies SoldFlip }));
+const resaleWatch = (w: (typeof watches)[number]): ResaleWatch => ({ id: w.id, query: w.query, includedTerms: String(w.raw.included_terms ?? ''), excludedTerms: w.excludedTerms, groups: w.groups });
+const ownSalesAt = (watch: (typeof watches)[number], variantKey: string | null, asOf: number, exceptFlip?: number) =>
+  ownSalesFor(soldFlips.filter((o) => o.id !== exceptFlip).map((o) => o.flip), resaleWatch(watch), watch.groups.length ? variantKey : null, asOf);
+const linkedBands = watches.filter((w) => w.referenceMarketWatchId).length;
+bench.note(`Resale basis: ${linkedBands} watch(es) link a research band${linkedBands ? '; the bench does not replay bands, so their estimates use own sales or the haircut' : ', so the sale-band tier has no evidence here'}.`);
 const flipRows: Array<Record<string, unknown>> = [];
 const saleToTypical: number[] = [];
 const overstatement: number[] = [];
+const atTypicalOverstatement: number[] = [];
 const buyDiscounts: number[] = [];
 const buyCosts: number[] = [];
 for (const flip of flips) {
@@ -506,10 +518,12 @@ for (const flip of flips) {
   const watch = candidates.find((w) => w.id === flip.watch_id) ?? candidates[0];
   let typical: number | null = null;
   let basis = '';
+  let resale: { net: number; basis: ResaleBasis } | null = null;
   if (watch) {
     const assocMap = assocByWatch.get(watch.id) ?? new Map();
     const boughtMs = Date.parse(`${flip.bought_on}T23:59:59Z`);
     const listing = flip.listing_key ? listingByKey.get(flip.listing_key) : undefined;
+    const variantKey = (listing ? assocMap.get(listing.id)?.variantKey : undefined) ?? assignVariant(flip.title, watch.groups);
     const own = listing ? (observations.get(watch.id) ?? []).filter((o) => o.listingId === listing.id && o.at <= boughtMs && o.baseline !== null) : [];
     if (own.length) {
       typical = own[own.length - 1].baseline;
@@ -526,36 +540,48 @@ for (const flip of flips) {
         basis = typical === null ? '' : `bucket ${bucketName(watch, key)} at export`;
       }
     }
+    // What Scout shows now: the resale basis on the buy marketplace, after its buying costs and seller fee.
+    if (typical !== null) resale = estimateResaleNet(flip.buy_price_pln, typical, presetFor(flip.buy_channel), { ownSales: ownSalesAt(watch, variantKey, boughtMs, flip.id) });
   }
   const realized = flip.sale_price_pln === null ? null : flipNet({ buyPrice: flip.buy_price_pln, buyCosts: Number(flip.buy_costs_pln ?? 0), salePrice: flip.sale_price_pln, saleFee: flip.sale_fee_pln, saleCosts: flip.sale_costs_pln });
-  // What Scout shows: resale at typical on the buy marketplace, after its seller fee, minus the asking price (buy costs ignored).
-  const estimated = typical === null ? null : estimatedNetAtTypical(flip.buy_price_pln, typical, presetFor(flip.buy_channel));
+  // What Scout showed before the resale basis: resale at typical after the seller fee, buy costs ignored.
+  const atTypical = typical === null ? null : estimatedNetAtTypical(flip.buy_price_pln, typical, presetFor(flip.buy_channel));
+  const estimated = resale?.net ?? null;
   if (typical !== null && flip.sale_price_pln !== null) saleToTypical.push(flip.sale_price_pln / typical);
   if (typical !== null) buyDiscounts.push(1 - flip.buy_price_pln / typical);
   if (estimated !== null && realized !== null) overstatement.push(estimated - realized);
-  flipRows.push({ id: flip.id, title: flip.title.slice(0, 40), watch: watch?.name ?? '—', basis: basis || '—', buy: flip.buy_price_pln, buyCosts: flip.buy_costs_pln, typical: round(typical, 0), sale: flip.sale_price_pln, saleFee: flip.sale_fee_pln, estNetAtTypical: estimated, realizedNet: realized, saleToTypical: typical && flip.sale_price_pln ? round(flip.sale_price_pln / typical, 3) : null });
+  if (atTypical !== null && realized !== null) atTypicalOverstatement.push(atTypical - realized);
+  flipRows.push({ id: flip.id, title: flip.title.slice(0, 40), watch: watch?.name ?? '—', basis: basis || '—', buy: flip.buy_price_pln, buyCosts: flip.buy_costs_pln, typical: round(typical, 0), sale: flip.sale_price_pln, saleFee: flip.sale_fee_pln, estNetAtTypical: atTypical, resaleBasis: resale ? `${resale.basis.resalePrice} (${resale.basis.label}), buying ${resale.basis.buyCosts}` : null, estNet: estimated, realizedNet: realized, saleToTypical: typical && flip.sale_price_pln ? round(flip.sale_price_pln / typical, 3) : null });
 }
 const saleRatio = median(saleToTypical);
 bench.metric('scoring.flips.matched', 'Flips with a typical price at purchase', saleToTypical.length, 'count', 'info', `of ${flips.length}; flips without a watch (RAM) have none`);
 bench.metric('scoring.flips.sale_to_typical.p50', 'Realised sale price / typical asking price at purchase, p50', saleRatio, 'ratio', 'info', 'tiny n; asking prices overstate sales');
 bench.metric('scoring.flips.buy_discount_vs_typical.p50', 'Buy price below typical at purchase, p50', median(buyDiscounts), 'ratio', 'info');
-bench.metric('scoring.flips.estimated_net_overstatement_pln.p50', 'Scout\'s "net at typical" minus the realised net, p50', median(overstatement), 'PLN', 'lower', `n=${overstatement.length}`);
+bench.metric('scoring.flips.estimated_net_overstatement_pln.p50', 'Scout\'s estimated net (resale basis, buying costs) minus the realised net, p50', median(overstatement), 'PLN', 'info', `n=${overstatement.length}; signed, see abs_error`);
+bench.metric('scoring.flips.estimated_net_abs_error_pln.p50', 'Scout\'s estimated net minus the realised net, absolute, p50', median(overstatement.map(Math.abs)), 'PLN', 'lower', `n=${overstatement.length}`);
+bench.metric('scoring.flips.net_at_typical_overstatement_pln.p50', 'The old "net at typical" (no haircut, no buying costs) minus the realised net, p50', median(atTypicalOverstatement), 'PLN', 'info', `n=${atTypicalOverstatement.length}`);
 bench.table('flips', flipRows);
 
 // What sent alerts would net if items resold at the flips' realised share of typical, paying the flips' median buy costs.
 const buyCost = median(buyCosts) ?? 0;
 const estNets: number[] = [];
+const basisNets: number[] = [];
 const haircutNets: number[] = [];
-for (const { s } of sentRows) {
+for (const { s, watch, assoc } of sentRows) {
   const preset = presetFor(s.marketplace);
   const est = estimatedNetAtTypical(s.price, s.typical, preset);
   if (est !== null) estNets.push(est);
+  const ownSales = watch ? ownSalesAt(watch, assoc?.variantKey ?? null, Date.parse(s.at)) : [];
+  const now = estimateResaleNet(s.price, s.typical, preset, { ownSales });
+  if (now) basisNets.push(now.net);
   if (saleRatio !== null) {
     const resale = saleRatio * s.typical;
     haircutNets.push(resale - saleFee(resale, preset) - buyCost - s.price);
   }
 }
-bench.metric('scoring.econ.alert_net_at_typical.p50', 'Delivered alerts: Scout\'s net at typical, p50', median(estNets), 'PLN', 'info', `n=${estNets.length}`);
+bench.metric('scoring.econ.alert_net_at_typical.p50', 'Delivered alerts: the old net at typical, p50', median(estNets), 'PLN', 'info', `n=${estNets.length}`);
+bench.metric('scoring.econ.alert_net_at_basis.p50', 'Delivered alerts: Scout\'s estimated net now (resale basis, buying costs), p50', median(basisNets), 'PLN', 'info', `n=${basisNets.length}`);
+bench.metric('scoring.econ.alert_net_ge_30_at_basis_share', 'Delivered alerts Scout now estimates at ≥ 30 zł net', ratio(basisNets.filter((n) => n >= 30).length, basisNets.length), 'share', 'info');
 bench.metric('scoring.econ.alert_net_at_realised.p50', 'Delivered alerts: net if resold at the flips\' sale/typical ratio with their median buy costs, p50', median(haircutNets), 'PLN', 'higher', `ratio ${round(saleRatio, 3)}, buy costs ${buyCost} zł`);
 bench.metric('scoring.econ.alert_net_ge_30_at_typical_share', 'Delivered alerts netting ≥ 30 zł at typical', ratio(estNets.filter((n) => n >= 30).length, estNets.length), 'share', 'info');
 bench.metric('scoring.econ.alert_net_ge_30_at_realised_share', 'Delivered alerts netting ≥ 30 zł at the realised ratio', ratio(haircutNets.filter((n) => n >= 30).length, haircutNets.length), 'share', 'higher');

@@ -2,6 +2,7 @@ import { isIP } from 'node:net';
 import { lookup } from 'node:dns/promises';
 import type { NormalizedListing } from './marketplaces';
 import type { NotificationPriority } from '../src/types';
+import type { ResaleBasis } from '../src/profit';
 import { discardResponse } from './fetch-diagnostics';
 import { formatAge } from '../src/listingSignals';
 
@@ -151,10 +152,12 @@ export interface DealNotificationInput {
   variantLabel?: string | null;
   /** The watch's target price, set when the listing is at or below it. */
   targetPrice?: number | null;
-  /** Display-only estimate of what reselling at the typical would net (whole zł). */
+  /** Display-only estimate of what buying and reselling would net (whole zł). */
   estimatedNet?: number | null;
   /** Set when the description check gave no verdict (descriptionUnverifiedReason); the alert says so. */
   descriptionUnverified?: string | null;
+  /** The resale price and buying costs the estimate assumes; missing on alerts queued before it existed. */
+  resaleBasis?: ResaleBasis | null;
 }
 
 /**
@@ -188,8 +191,14 @@ function priceLine(input: DealNotificationInput) {
   return `${price} · typical ${pln(typical)} · ${discountPercent.toFixed(1)}% below${saving > 0 ? ` (${signedPln(-saving)})` : ''} · ${input.confidence}% confidence`;
 }
 
-export function estimatedNetLine(estimatedNet: number, marketplace: string) {
-  return `≈ ${signedPln(estimatedNet)} net if resold at typical on ${marketplace}`;
+/** Resale price and buying costs behind an estimated net: "resale 235 zł (your recent sale) · buying 24 zł". */
+function resaleBasisText(basis: ResaleBasis) {
+  return `resale ${pln(basis.resalePrice)} (${basis.label})${basis.buyCosts > 0 ? ` · buying ${pln(basis.buyCosts)}` : ''}`;
+}
+
+export function estimatedNetLine(estimatedNet: number, marketplace: string, basis?: ResaleBasis | null) {
+  if (!basis) return `≈ ${signedPln(estimatedNet)} net if resold at typical on ${marketplace}`;
+  return `≈ ${signedPln(estimatedNet)} net on ${marketplace} · ${resaleBasisText(basis)}`;
 }
 
 /** Condition, seller, shipping and posting age: what decides whether to message the seller. */
@@ -228,7 +237,7 @@ export function buildNtfyPayload(
       ...(input.variantLabel ? [`Variant: ${input.variantLabel}`] : []),
       priceLine(input),
       ...(targetHit ? [`At or below your ${pln(input.targetPrice!)} target`] : []),
-      ...(input.estimatedNet !== null && input.estimatedNet !== undefined ? [estimatedNetLine(input.estimatedNet, listing.marketplace)] : []),
+      ...(input.estimatedNet !== null && input.estimatedNet !== undefined ? [estimatedNetLine(input.estimatedNet, listing.marketplace, input.resaleBasis)] : []),
       ...(context ? [context] : []),
       listing.url,
     ].join('\n'),
@@ -311,7 +320,9 @@ export function buildDiscordEmbed(input: DealNotificationInput) {
         ...(targetHit ? [{ name: 'Target price', value: `≤ ${pln(input.targetPrice!)}`, inline: true }] : []),
         { name: 'Typical price', value: input.typical === null ? 'Still learning' : `${input.typical.toLocaleString('pl-PL')} zł`, inline: true },
         ...(input.discountPercent === null ? [] : [{ name: 'Below typical', value: `${input.discountPercent.toFixed(1)}%`, inline: true }]),
-        ...(input.estimatedNet === null || input.estimatedNet === undefined ? [] : [{ name: 'Est. net at typical', value: `≈ ${signedPln(input.estimatedNet)} on ${listing.marketplace}`, inline: true }]),
+        ...(input.estimatedNet === null || input.estimatedNet === undefined ? [] : [input.resaleBasis
+          ? { name: 'Est. net', value: `≈ ${signedPln(input.estimatedNet)} on ${listing.marketplace} · ${resaleBasisText(input.resaleBasis)}`, inline: true }
+          : { name: 'Est. net at typical', value: `≈ ${signedPln(input.estimatedNet)} on ${listing.marketplace}`, inline: true }]),
         ...(input.typical === null ? [] : [{ name: 'Confidence', value: `${input.confidence}%`, inline: true }]),
         { name: 'Observed', value: input.observedAt ?? listing.observedAt, inline: true },
       ],
