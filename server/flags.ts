@@ -300,6 +300,11 @@ const ACCESSORY_GROUPS = [
   'etui', 'case', 'futeral*', 'pokrowi*|pokrowc*', 'szklo|szkla|szkielko|szkielka', 'folia|folie|folii', 'ladowark*', 'kabel|kabl*',
   'zasilacz*', 'pudelk*|box|karton|kartonik', 'opakowanie|opakowania', 'obudow*', 'bateri*', 'pasek|paski|paska', 'uchwyt*', 'rysik*|stylus',
   'cover', 'charger*', 'cable|cables', 'strap|straps', 'holder', 'adapter*',
+  // GPU fans and coolers sold for a card ("Wentylator MSI RTX 3060 95mm"), a
+  // hard case, Romanian "husă" (case), and BGA chips. Not "cooler" (Cooler
+  // Master leads PSU and case titles) or "śledź" (a low-profile card's bracket
+  // is named on the card itself).
+  'wentylator*', 'wiatrak*', 'chlodz*', 'radiator*', 'hardcase', 'husa|huse', 'bga',
 ];
 /** Leading words skipped before the accessory noun: "2x", "Oryginalne", "Nowe". */
 const isLeadingFiller = anyOf('x|szt|oryginal*|original*|nowe|nowy|nowa|new|silikon*|skorzan*|magnetyczn*|pancern*|ochronn*|premium');
