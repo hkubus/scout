@@ -17,7 +17,8 @@ const brotliOptions = (sizeHint?: number): zlib.BrotliOptions => ({
 const gzipOptions: zlib.ZlibOptions = { level: 6 };
 const brotliCompress = promisify(zlib.brotliCompress);
 const gzip = promisify(zlib.gzip);
-const compressibleType = /^(?:application\/json|text\/(?!event-stream))/i;
+// SQLite files (the improvement export, debug snapshots) shrink about 4x.
+const compressibleType = /^(?:application\/json|application\/vnd\.sqlite3|text\/(?!event-stream))/i;
 
 // Replies whose stream this hook is compressing. If that stream fails before
 // its first byte, Fastify sends the error through onSend again while the
@@ -51,8 +52,9 @@ function addVaryAcceptEncoding(reply: FastifyReply) {
 }
 
 /**
- * onSend hook that compresses /api/* JSON and text responses (including
- * streams such as /api/export) with br or gzip when the client accepts it.
+ * onSend hook that compresses /api/* JSON, text and SQLite responses
+ * (including streams such as /api/export) with br or gzip when the client
+ * accepts it.
  * Hijacked routes (/events, /mcp) never reach onSend; binary types, tiny
  * bodies, bodiless statuses and already-encoded responses pass through.
  */

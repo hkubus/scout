@@ -19,7 +19,8 @@ function buildApp() {
     yield ']}';
   })())));
   app.get('/api/image', async (_request, reply) => reply.type('image/png').send(Buffer.alloc(4096, 7)));
-  app.get('/api/binary', async (_request, reply) => reply.type('application/vnd.sqlite3').send(Buffer.alloc(4096, 1)));
+  app.get('/api/binary', async (_request, reply) => reply.type('application/octet-stream').send(Buffer.alloc(4096, 1)));
+  app.get('/api/sqlite', async (_request, reply) => reply.type('application/vnd.sqlite3').send(Readable.from([Buffer.alloc(8192, 3), Buffer.alloc(8192, 4)])));
   app.get('/api/encoded', async (_request, reply) => reply.header('content-encoding', 'gzip').type('application/json').send(Buffer.from('x'.repeat(2048))));
   app.get('/api/empty', async (_request, reply) => reply.code(204).send());
   app.get('/page', async () => big);
@@ -58,6 +59,25 @@ test('compresses large /api JSON, text and stream bodies with identical decoded 
       }
     }
     assert.deepEqual(JSON.parse((await app.inject({ method: 'GET', url: '/api/big' })).body), big);
+  } finally {
+    await app.close();
+  }
+});
+
+test('compresses SQLite downloads such as the improvement export', async () => {
+  const app = buildApp();
+  try {
+    const expected = Buffer.concat([Buffer.alloc(8192, 3), Buffer.alloc(8192, 4)]);
+    for (const encoding of ['br', 'gzip'] as const) {
+      const response = await app.inject({ method: 'GET', url: '/api/sqlite', headers: { 'accept-encoding': encoding } });
+      assert.equal(response.headers['content-encoding'], encoding);
+      assert.equal(response.headers['content-length'], undefined);
+      assert.ok(response.rawPayload.byteLength < expected.byteLength);
+      assert.deepEqual(decode(encoding, response.rawPayload), expected);
+    }
+    const plain = await app.inject({ method: 'GET', url: '/api/sqlite' });
+    assert.equal(plain.headers['content-encoding'], undefined);
+    assert.deepEqual(plain.rawPayload, expected);
   } finally {
     await app.close();
   }

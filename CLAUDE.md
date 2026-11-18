@@ -27,6 +27,8 @@ For a controlled local smoke test, use a temporary `SCOUT_DB_PATH`, loopback bin
 
 The running app exposes read-only database access at `/api/debug/*` (schema, table rows, read-only SQL with a 5 s limit, runtime/logs, full redacted SQLite snapshot) and as `scout_debug_*` MCP tools; see README "Debug API". It is on by default only while auth is off; an authenticated instance needs `SCOUT_DEBUG_API=true`. Use it to check real listings, scores, and scan history before changing behavior.
 
+When the user hands over an improvement export (`scout-improvement-*.sqlite`, from Settings → Data or `GET /api/export/improvement`; see README "Improvement data"), it is a redacted copy of the whole database that, unlike the debug API, can include the flip ledger and negotiation outcomes. Start with its `export_tables` (what each table holds and how it was cleaned), `export_info` (version, readiness, connectors, settings) and `export_logs`. Every new table must be classified in `IMPROVEMENT_TABLES` (`server/improvementExport.ts`); a test fails until it is.
+
 ## Important boundaries
 
 - Treat public marketplace prices as asking prices, not completed-sale prices.
