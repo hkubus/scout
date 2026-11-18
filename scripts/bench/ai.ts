@@ -54,6 +54,8 @@ type ShadowRow = {
   vision_images_seen: number | null;
   vision_error: string | null;
   note: string | null;
+  /** Since migration 041; absent from older exports. */
+  duration_ms?: number | null;
 };
 
 const shadow = all<ShadowRow>(db, 'SELECT * FROM jev_shadow_log ORDER BY created_at, id');
@@ -92,7 +94,7 @@ bench.metric('ai.calls.live_share', 'Share of logged calls made in Jev live mode
 bench.metric('ai.shadow.deepseek_rows', 'Rows with a DeepSeek decision to compare against (shadow mode)', shadow.filter((row) => row.deepseek_decision !== null).length, 'rows', 'info',
   'zero means Jev-vs-DeepSeek agreement cannot be measured from this export');
 bench.metric('ai.calls.unlogged_checks_cached', 'Manual-search check verdicts cached but never logged as calls', scalar(db, "SELECT COUNT(*) FROM jev_fuzzy_cache WHERE task = 'checks'"), 'rows', 'info',
-  'applySearchChecks (server/service.ts) calls Jev without logJevLive; title-only calls leave no row at all');
+  'before migration 041 applySearchChecks did not log its Jev calls; title-only verdicts left no row at all. Now every check call is logged as task "checks"');
 
 const taskSummary = [...byTask.entries()].map(([task, rows]) => ({
   task,
@@ -467,6 +469,30 @@ bench.metric('ai.verification.cross_listing_repeats', 'Verifications of an input
 bench.metric('ai.verification.boilerplate_calls', 'Jev calls on the Vinted marketing blurb instead of a description', boilerCalls, 'calls', 'lower',
   `${boilerVision} of them also went to vision`);
 bench.metric('ai.verification.unmatched_calls', 'Verification calls with no snapshot for their input', unmatched, 'calls', 'info');
+// description_verification_cache (migration 041): a verdict is kept by input
+// hash for 7 days, text-only verdicts for any listing, vision verdicts for the
+// listing whose photos were seen (approximated here as inputs only one
+// listing had). A lean after a failed vision tiebreak and a failed call are
+// not kept. Counts the calls such a cache would have answered.
+const VERDICT_REUSE_MS = 7 * 86_400_000;
+let verdictCacheHits = 0;
+for (const [hash, rows] of callsByHash) {
+  const singleListing = (snapshotHashes.get(hash)?.listings ?? 1) <= 1;
+  let keptText: number | null = null;
+  let keptPhotos: number | null = null;
+  for (const row of rows) {
+    const at = Date.parse(row.created_at);
+    const fresh = (kept: number | null) => kept !== null && at - kept < VERDICT_REUSE_MS;
+    if (fresh(keptText) || (singleListing && fresh(keptPhotos))) {
+      verdictCacheHits += 1;
+      continue;
+    }
+    if (row.vision_verdict !== null) keptPhotos = at;
+    else if (row.jev_error === null && row.vision_error === null) keptText = at;
+  }
+}
+bench.metric('ai.verification.hash_cache_skips', 'Verification calls a 7-day verdict cache by input hash answers (no AI call now)', verdictCacheHits, 'calls', 'info',
+  `${(100 * verdictCacheHits / Math.max(1, verification.length)).toFixed(1)}% of verification calls`);
 // The same calls judged by the repo's current description parser: an input
 // whose description it now drops as boilerplate is stored as "no description"
 // without any AI call.
@@ -526,7 +552,15 @@ const descLen = new Map(all<{ h: string; len: number }>(db, `SELECT verification
   WHERE verification_input_hash IS NOT NULL GROUP BY 1`).map((row) => [row.h, Number(row.len ?? 0)]));
 bench.distributionMetrics('ai.verification.description_chars', 'Description characters per verification call', distribution(verification.map((row) => Math.min(descLen.get(row.input_hash) ?? 0, LISTING_DESCRIPTION_MAX_CHARS))), 'chars', 'info', ['p50', 'p90', 'max']);
 bench.distributionMetrics('ai.relevance.title_chars', 'Title characters per watch relevance row', distribution(relRows.filter((row) => row.title).map((row) => row.title!.length)), 'chars', 'info', ['p50', 'p90']);
-bench.metric('ai.latency.recorded', 'AI calls with a recorded duration', 0, 'calls', 'higher', 'jev_shadow_log has no duration column; latency cannot be benchmarked from an export');
+const timed = shadow.filter((row) => typeof row.duration_ms === 'number');
+bench.metric('ai.latency.recorded', 'AI calls with a recorded duration', timed.length, 'calls', 'higher',
+  'duration_ms exists since migration 041 (wall time, queue wait and any vision tiebreak included); older rows have none');
+if (timed.length) {
+  bench.distributionMetrics('ai.latency.duration_ms', 'Logged AI call wall time', distribution(timed.map((row) => Number(row.duration_ms))), 'ms', 'info', ['p50', 'p90', 'max']);
+  for (const task of new Set(timed.map((row) => row.task))) {
+    bench.distributionMetrics(`ai.latency.${task.replace(/-/g, '_')}_ms`, `${task} call wall time`, distribution(timed.filter((row) => row.task === task).map((row) => Number(row.duration_ms))), 'ms', 'info', ['p50', 'p90']);
+  }
+}
 
 // =========================================================== accuracy proxies
 

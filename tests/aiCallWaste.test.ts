@@ -292,3 +292,113 @@ test('negotiability: an unsure answer is remembered for the same text, then aske
     context.close();
   }
 });
+
+test('verification: a verdict comes back after a fetch error, a missing description or a text flap without an AI call', async () => {
+  const restore = liveJevEnv();
+  const jev: string[] = [];
+  const vision: string[] = [];
+  const context = fixture({
+    verifyListingDescriptionWithJev: async (ctx: any) => {
+      jev.push(ctx.description);
+      return /maybe/.test(ctx.description) ? { decision: 'pass', confidence: 0.55, unsure: true } : { decision: 'pass', confidence: 0.9, unsure: false };
+    },
+    verifyListingDescriptionWithVision: async (input: any) => { vision.push(input.description); return { decision: 'pass', confidence: 0.8, issues: [], imagesSeen: 1 }; },
+    classifyNegotiabilityWithJev: async () => ({ decision: 'fixed', confidence: 0.9, unsure: false }),
+  });
+  let page: string | null = detailPage('Works great, no scratches.');
+  context.service.fetchPublicPage = async () => {
+    if (page === null) throw new Error('HTTP 503');
+    return page;
+  };
+  const verify = (listingId: string, seed = false) => context.service.verifyHighPriorityDealOnce(dealCandidate(listingId, seed ? context.db : undefined));
+  const slot = (listingId: string) => (context.db.prepare('SELECT ai_description_verification_status AS status FROM listings WHERE listing_id = ?').get(listingId) as { status: string }).status;
+  try {
+    assert.equal(await verify('v-1', true), true);
+    assert.equal(jev.length, 1);
+
+    // A failed fetch overwrites the listing's slot; the next good fetch of the same text reuses the verdict.
+    page = null;
+    assert.equal(await verify('v-1'), false);
+    assert.equal(slot('v-1'), 'unknown');
+    page = detailPage('Works great, no scratches.');
+    assert.equal(await verify('v-1'), true);
+    assert.equal(slot('v-1'), 'pass');
+    assert.equal(jev.length, 1);
+
+    // So does a page that briefly shows no description.
+    page = '<html></html>';
+    assert.equal(await verify('v-1'), false);
+    page = detailPage('Works great, no scratches.');
+    assert.equal(await verify('v-1'), true);
+    assert.equal(jev.length, 1);
+
+    // A -> B -> A: B is new text, the way back to A is not.
+    page = detailPage('Works great, small scratch on the side.');
+    assert.equal(await verify('v-1'), true);
+    assert.equal(jev.length, 2);
+    page = detailPage('Works great, no scratches.');
+    assert.equal(await verify('v-1'), true);
+    assert.equal(jev.length, 2);
+
+    // A text-only verdict serves another listing with the same input.
+    assert.equal(await verify('v-2', true), true);
+    assert.equal(jev.length, 2);
+
+    // A vision verdict rests on one listing's photos: only that listing reuses it.
+    page = detailPage('maybe works');
+    assert.equal(await verify('m-1', true), true);
+    assert.equal(await verify('m-2', true), true);
+    assert.deepEqual(vision, ['maybe works', 'maybe works']);
+    page = null;
+    await verify('m-1');
+    page = detailPage('maybe works');
+    assert.equal(await verify('m-1'), true);
+    assert.equal(vision.length, 2);
+    assert.equal(jev.length, 4);
+
+    // After 7 days the same input is judged again.
+    context.db.prepare('UPDATE description_verification_cache SET checked_at = ?').run(new Date(Date.now() - 8 * 86_400_000).toISOString());
+    page = null;
+    await verify('v-1');
+    page = detailPage('Works great, no scratches.');
+    assert.equal(await verify('v-1'), true);
+    assert.equal(jev.length, 5);
+
+    // Every logged call carries its wall time.
+    const durations = context.db.prepare('SELECT task, duration_ms FROM jev_shadow_log').all() as Array<{ task: string; duration_ms: number | null }>;
+    assert.ok(durations.length >= 5);
+    assert.ok(durations.every((row) => typeof row.duration_ms === 'number' && row.duration_ms >= 0), JSON.stringify(durations));
+
+    context.service.resetAiResults();
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS n FROM description_verification_cache').get() as { n: number }).n, 0);
+  } finally {
+    restore();
+    context.close();
+  }
+});
+
+test('manual-search checks: every Jev call is logged with its duration, failures included', async () => {
+  const restore = liveJevEnv();
+  let fail = false;
+  const context = fixture({
+    classifyChecksWithJev: async (ctx: any) => {
+      if (fail) throw new Error('provider down');
+      return ctx.checks.map((check: any) => ({ text: check.text, mode: check.mode, answer: 'yes', confidence: 0.9, outcome: 'satisfied' }));
+    },
+  });
+  try {
+    const checks = [{ mode: 'require', text: 'original box' }];
+    context.service.detailHtml = async () => detailPage('Original box included.');
+    const first = await context.service.applySearchChecks([listing('c-1', 'PS5 console')], checks);
+    assert.equal(first.failed, 0);
+    fail = true;
+    const second = await context.service.applySearchChecks([listing('c-2', 'PS5 console')], checks);
+    assert.equal(second.failed, 1);
+    const log = context.db.prepare("SELECT jev_error IS NOT NULL AS failed, duration_ms FROM jev_shadow_log WHERE task = 'checks' ORDER BY id").all() as Array<{ failed: number; duration_ms: number | null }>;
+    assert.deepEqual(log.map((row) => row.failed), [0, 1]);
+    assert.ok(log.every((row) => typeof row.duration_ms === 'number'));
+  } finally {
+    restore();
+    context.close();
+  }
+});

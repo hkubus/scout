@@ -2344,7 +2344,7 @@ test('applies numbered migrations idempotently and resumes interrupted scans tru
   const databasePath = join(directory, 'scout.sqlite');
   let db = openDatabase(databasePath);
   try {
-    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals', '030_perf_indexes', '031_flips', '032_flip_listings', '033_verification_checks', '033_watch_alert_targets', '034_flip_ready_to_list', '034_listing_seller', '035_connected_apps', '035_negotiation_outcomes', '036_shared_sessions', '037_marketplace_session_checks', '038_watch_listing_scores', '039_listing_duplicates', '040_listing_flags']);
+    assert.deepEqual((db.prepare('SELECT id FROM migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id), ['001_init', '002_correctness', '003_auto_negotiation', '004_daily_digests', '005_ai_cache', '006_ai_cache_reuse', '007_exceptional_description_verification', '008_listing_detail_snapshots', '009_recovery_integrity', '010_listing_feed_index', '011_connector_health_index', '012_observations_watch_listing', '013_market_listing_snapshots', '014_typo_variants', '015_reference_series', '016_drop_observation_link_trigger', '017_reference_series_cleanup', '018_jev_shadow_log', '019_drop_ai_normalization', '019_watch_variants', '020_drop_messaging_negotiation', '021_listing_visibility', '022_jev_fuzzy_cache', '023_per_marketplace_intervals', '024_manual_relevance_cache', '025_variant_source', '026_auth_sessions', '027_auto_variant_groups', '028_olx_category', '029_drop_location_filter', '030_listing_signals', '030_perf_indexes', '031_flips', '032_flip_listings', '033_verification_checks', '033_watch_alert_targets', '034_flip_ready_to_list', '034_listing_seller', '035_connected_apps', '035_negotiation_outcomes', '036_shared_sessions', '037_marketplace_session_checks', '038_watch_listing_scores', '039_listing_duplicates', '040_listing_flags', '041_ai_call_cache_and_timing']);
     assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
     db.prepare('INSERT INTO scans (watch_id, watch_kind, marketplace, status, started_at) VALUES (?, ?, ?, ?, ?)').run('restart-watch', 'watch', 'OLX', 'running', new Date().toISOString());
     db.close();
@@ -2841,7 +2841,7 @@ test('reports database and scheduler readiness separately from the lightweight h
     const after = context.service.readiness();
     assert.equal(after.status, 'ready');
     assert.equal(after.scheduler.healthy, true);
-    assert.equal(after.migrations.count, 45);
+    assert.equal(after.migrations.count, 46);
   } finally { context.close(); }
 });
 
@@ -3898,8 +3898,9 @@ test('watch verification checks reach Jev and vision, store failed checks as iss
     const withoutChecks = listingDescriptionVerificationInputHash({ marketplace: 'OLX', title: seen[0].title, condition: seen[0].condition, description: seen[0].description, query: 'iphone 13', includedTerms: null, excludedTerms: null });
     assert.notEqual(stored.ai_description_verification_input_hash, withoutChecks);
 
-    // An unsure answer escalates to vision with the same checks.
-    const unsure = { ...candidate, listing: liveListing({ listingId: 'live-2', url: 'https://www.olx.pl/d/oferta/live-2' }) };
+    // An unsure answer escalates to vision with the same checks. (Another
+    // title: live-1's verdict for the same input would answer otherwise.)
+    const unsure = { ...candidate, listing: liveListing({ listingId: 'live-2', url: 'https://www.olx.pl/d/oferta/live-2', title: 'PS5 console digital' }) };
     (context.service as any).jevVerification = async (ctx: any) => { seen.push({ ...ctx }); return { decision: 'unknown', confidence: 0.7, unsure: true, issues: ['Could not confirm: includes charger'] }; };
     assert.equal(await (context.service as any).verifyHighPriorityDealOnce(unsure), false);
     assert.deepEqual(visionInputs[0].checks, checks);
