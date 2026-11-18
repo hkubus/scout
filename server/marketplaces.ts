@@ -668,8 +668,19 @@ function normalizeDescriptionCandidate(value: unknown) {
  */
 const ALLEGRO_DESCRIPTION_BOILERPLATE = /szybko i bezpiecznie w najlepszym miejscu dla lokalnych allegrowicz|kup teraz .* za .+ (?:zł|pln)/i;
 
+/**
+ * Vinted item pages whose seller text is not server-rendered fall back to the
+ * site's marketing blurb in the meta description ("Jedna społeczność, tysiące
+ * marek i mnóstwo niepowtarzalnego stylu. Brzmi jak coś dla ciebie? Sprawdź,
+ * jak to działa."). It says nothing about the item, so it is dropped and a
+ * real description candidate, when the page has one, wins instead.
+ */
+const VINTED_DESCRIPTION_BOILERPLATE = /^jedna społeczność,? tysiące marek\b/i;
+
 function isDescriptionBoilerplate(text: string, marketplace: Marketplace) {
-  return marketplace === 'Allegro Lokalnie' && ALLEGRO_DESCRIPTION_BOILERPLATE.test(text);
+  if (marketplace === 'Allegro Lokalnie') return ALLEGRO_DESCRIPTION_BOILERPLATE.test(text);
+  if (marketplace === 'Vinted') return VINTED_DESCRIPTION_BOILERPLATE.test(text);
+  return false;
 }
 
 /**

@@ -18,6 +18,7 @@
 
 import { listingRelevanceInputHash, listingTermMatchInputHash, LISTING_DESCRIPTION_MAX_CHARS } from '../../server/ai';
 import { listingFlags } from '../../server/flags';
+import { listingDescriptionText, type Marketplace } from '../../server/marketplaces';
 import { isModelToken } from '../../server/queryMatch';
 import { normalizeFilterText, parseIncludedExcluded, termMatches } from '../../server/text';
 import { OTHER_VARIANT_KEY, assignVariant, parseVariantGroups, type VariantGroup } from '../../server/variants';
@@ -438,6 +439,21 @@ bench.metric('ai.verification.cross_listing_repeats', 'Verifications of an input
 bench.metric('ai.verification.boilerplate_calls', 'Jev calls on the Vinted marketing blurb instead of a description', boilerCalls, 'calls', 'lower',
   `${boilerVision} of them also went to vision`);
 bench.metric('ai.verification.unmatched_calls', 'Verification calls with no snapshot for their input', unmatched, 'calls', 'info');
+// The same calls judged by the repo's current description parser: an input
+// whose description it now drops as boilerplate is stored as "no description"
+// without any AI call.
+const snapshotDescriptions = new Map(all<{ h: string; marketplace: string; description: string | null }>(db, `SELECT verification_input_hash AS h, marketplace, description
+  FROM listing_detail_snapshots WHERE verification_input_hash IS NOT NULL AND description IS NOT NULL GROUP BY 1`).map((row) => [row.h, row]));
+let droppedCalls = 0;
+let droppedVision = 0;
+for (const [hash, rows] of callsByHash) {
+  const snap = snapshotDescriptions.get(hash);
+  if (!snap || listingDescriptionText(snap.description, snap.marketplace as Marketplace) !== null) continue;
+  droppedCalls += rows.length;
+  droppedVision += rows.filter(hasVision).length;
+}
+bench.metric('ai.verification.parser_dropped_calls', 'Verification calls whose description the current parser drops as boilerplate (no AI call now)', droppedCalls, 'calls', 'info',
+  `${droppedVision} of them went to vision`);
 
 const snapStats = all<{ marketplace: string; snapshots: number; noDescription: number; boilerplate: number; overLimit: number; listings: number }>(db, `SELECT marketplace,
   COUNT(*) AS snapshots, SUM(description IS NULL) AS noDescription, SUM(description LIKE ?) AS boilerplate,
