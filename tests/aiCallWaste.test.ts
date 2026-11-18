@@ -264,3 +264,31 @@ test('relevance: watch scans and manual searches reuse each other\'s verdicts by
     context.close();
   }
 });
+
+test('negotiability: an unsure answer is remembered for the same text, then asked again after 14 days', async () => {
+  const restore = liveJevEnv();
+  let calls = 0;
+  let answer: { decision: 'negotiable' | 'fixed' | 'unknown'; confidence: number; unsure: boolean } = { decision: 'unknown', confidence: 0.4, unsure: true };
+  const context = fixture({ classifyNegotiabilityWithJev: async () => { calls += 1; return answer; } });
+  try {
+    const live = context.service.jevLiveConfig();
+    const description = 'Konsola sprawna, odbiór osobisty.';
+    assert.equal(await context.service.upgradeNegotiabilityFromDescription(dealCandidate('n-1', context.db), description, live), false);
+    assert.equal(calls, 1);
+    // Another listing (or a re-check) with the same text makes no call.
+    assert.equal(await context.service.upgradeNegotiabilityFromDescription(dealCandidate('n-2', context.db), description, live), false);
+    assert.equal(calls, 1);
+    // New text is a new question.
+    assert.equal(await context.service.upgradeNegotiabilityFromDescription(dealCandidate('n-3', context.db), `${description} Cena do negocjacji.`, live), false);
+    assert.equal(calls, 2);
+    // After the window the same text is asked again, and a confident answer is stored on the listing.
+    context.db.prepare("UPDATE jev_fuzzy_cache SET checked_at = ? WHERE task = 'negotiability'").run(new Date(Date.now() - 15 * 86_400_000).toISOString());
+    answer = { decision: 'negotiable', confidence: 0.9, unsure: false };
+    assert.equal(await context.service.upgradeNegotiabilityFromDescription(dealCandidate('n-2'), description, live), true);
+    assert.equal(calls, 3);
+    assert.equal((context.db.prepare("SELECT price_negotiable AS n FROM listings WHERE listing_id = 'n-2'").get() as { n: number }).n, 1);
+  } finally {
+    restore();
+    context.close();
+  }
+});

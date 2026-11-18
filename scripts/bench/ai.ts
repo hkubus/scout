@@ -373,8 +373,19 @@ bench.metric('ai.variant.none_share', 'Variant verdicts "none of the variants"',
 // ============================================================= negotiability
 
 const negotiability = taskRows('negotiability');
-bench.metric('ai.negotiability.unsure_rate', 'Negotiability calls that came back unsure (no write, asked again on the next fresh check)', pct(ratio(negotiability.filter((row) => row.jev_unsure === 1).length, negotiability.length)), '%', 'lower');
+bench.metric('ai.negotiability.unsure_rate', 'Negotiability calls that came back unsure (cached 14 days for the same text)', pct(ratio(negotiability.filter((row) => row.jev_unsure === 1).length, negotiability.length)), '%', 'lower');
 bench.metric('ai.negotiability.useful_calls', 'Negotiability calls that changed a listing', negotiability.filter((row) => row.jev_unsure === 0).length, 'calls', 'higher');
+// upgradeNegotiabilityFromDescription now remembers an unsure answer for the
+// same text for 14 days (NEGOTIABILITY_UNSURE_TTL_MS).
+const lastUnsure = new Map<string, number>();
+let unsureRepeats = 0;
+for (const row of negotiability) {
+  const at = Date.parse(row.created_at);
+  const previous = lastUnsure.get(row.input_hash);
+  if (previous !== undefined && at - previous < 14 * 86_400_000) unsureRepeats += 1;
+  if (row.jev_unsure === 1) lastUnsure.set(row.input_hash, at);
+}
+bench.metric('ai.negotiability.unsure_repeats', 'Negotiability calls on a text that was answered unsure within 14 days (now skipped)', unsureRepeats, 'calls', 'lower');
 
 // ================================================== description verification
 

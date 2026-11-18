@@ -220,6 +220,8 @@ const VARIANT_JEV_BUDGET = 10;
 /** `jev_fuzzy_cache.decision` for a failed rescue call, retried after FUZZY_ERROR_RETRY_MS. */
 const FUZZY_ERROR_DECISION = 'error';
 const FUZZY_ERROR_RETRY_MS = 60 * 60_000;
+/** An unsure negotiability answer is not re-asked for the same text within this window. */
+const NEGOTIABILITY_UNSURE_TTL_MS = 14 * 24 * 60 * 60_000;
 /**
  * A standing deal that cannot alert (already alerted at this price, no due
  * channel or digest) is not re-verified while its stored verdict for the
@@ -1967,21 +1969,21 @@ export class ScoutService {
    * verdict is cached in `jev_fuzzy_cache` by input hash + model so repeat
    * scans reuse it instead of re-spending on the same near-miss title.
    */
-  private readFuzzyCache(inputHash: string, model: string, task: 'term-match' | 'condition' | 'variant' | 'checks'): { rescued: boolean; decision: string } | null {
+  private readFuzzyCache(inputHash: string, model: string, task: 'term-match' | 'condition' | 'variant' | 'checks' | 'negotiability'): { rescued: boolean; decision: string; checkedAt: string } | null {
     try {
       const row = this.stmt('SELECT rescued, decision, checked_at FROM jev_fuzzy_cache WHERE input_hash = ? AND model = ? AND task = ?').get(inputHash, model, task) as { rescued?: number; decision?: string; checked_at?: string } | undefined;
       if (!row || row.rescued === undefined || row.rescued === null) return null;
       // A failed call is remembered briefly so a provider outage does not
       // re-send the same near-miss on every scan; after the window it retries.
       if (row.decision === FUZZY_ERROR_DECISION && !(Date.now() - Date.parse(row.checked_at ?? '') < FUZZY_ERROR_RETRY_MS)) return null;
-      return { rescued: Number(row.rescued) === 1, decision: String(row.decision ?? '') };
+      return { rescued: Number(row.rescued) === 1, decision: String(row.decision ?? ''), checkedAt: String(row.checked_at ?? '') };
     } catch {
       // Missing table (migration not yet applied) means cache miss.
       return null;
     }
   }
 
-  private writeFuzzyCache(inputHash: string, model: string, task: 'term-match' | 'condition' | 'variant' | 'checks', decision: string, confidence: number | null, rescued: boolean) {
+  private writeFuzzyCache(inputHash: string, model: string, task: 'term-match' | 'condition' | 'variant' | 'checks' | 'negotiability', decision: string, confidence: number | null, rescued: boolean) {
     try {
       this.stmt(`INSERT INTO jev_fuzzy_cache (input_hash, model, task, decision, confidence, rescued, checked_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -2159,16 +2161,24 @@ export class ScoutService {
       ) as { price_negotiable?: number | null } | undefined;
       if (!stored) return false;
       if (stored.price_negotiable !== null && stored.price_negotiable !== undefined) return false;
-      const judgment = await this.jevNegotiability({
-        marketplace: candidate.listing.marketplace, title: candidate.listing.title,
-        condition: candidate.listing.condition, description,
-      }, { apiKey: live.apiKey, model: live.jevModel });
       const inputHash = listingNegotiabilityInputHash({
         marketplace: candidate.listing.marketplace, title: candidate.listing.title,
         condition: candidate.listing.condition, description,
       });
+      // Most descriptions say nothing about the price, so Jev is unsure on
+      // them (10 of 11 calls on the 2026-11 export). An unsure answer is
+      // remembered for the same text instead of re-asked on every re-check.
+      const unsure = this.readFuzzyCache(inputHash, live.jevModel, 'negotiability');
+      if (unsure && Date.now() - Date.parse(unsure.checkedAt) < NEGOTIABILITY_UNSURE_TTL_MS) return false;
+      const judgment = await this.jevNegotiability({
+        marketplace: candidate.listing.marketplace, title: candidate.listing.title,
+        condition: candidate.listing.condition, description,
+      }, { apiKey: live.apiKey, model: live.jevModel });
       this.logJevLive('negotiability', inputHash, live, { jevAnswer: judgment, jevConfidence: judgment.confidence, jevUnsure: judgment.unsure });
-      if (judgment.unsure) return false;
+      if (judgment.unsure) {
+        this.writeFuzzyCache(inputHash, live.jevModel, 'negotiability', judgment.decision, judgment.confidence, false);
+        return false;
+      }
       if (judgment.decision === 'fixed') {
         this.stmt('UPDATE listings SET price_negotiable = 0 WHERE marketplace = ? AND listing_id = ? AND price_negotiable IS NULL').run(
           candidate.listing.marketplace, candidate.listing.listingId,
