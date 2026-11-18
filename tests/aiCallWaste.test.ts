@@ -222,3 +222,45 @@ test('verification: an unsure reject stands without vision; an unsure pass or un
     context.close();
   }
 });
+
+test('relevance: watch scans and manual searches reuse each other\'s verdicts by input hash and model', async () => {
+  const restore = liveJevEnv();
+  const titles: string[] = [];
+  const context = fixture({
+    classifyListingRelevanceWithJev: async (ctx: any) => { titles.push(ctx.title); return { relevant: !/box/.test(ctx.title), p: 0.9, unsure: false }; },
+  });
+  try {
+    seedWatch(context.db, 'ps5', 'PS5');
+    const search = { query: 'PS5', includedTerms: '', excludedTerms: '' };
+    // Manual search first: two listings with the same input share one call.
+    const manual = await context.service.filterListingsByAiRelevance([listing('a', 'PS5 console'), listing('b', 'PS5 console'), listing('c', 'PS5 empty box')], search, undefined, true);
+    assert.deepEqual(titles, ['PS5 console', 'PS5 empty box']);
+    assert.equal(manual.excluded, 1);
+
+    // The watch scan reuses the manual verdicts, keeping their reasons.
+    const watch = await context.service.filterListingsByAiRelevance([listing('d', 'PS5 console'), listing('e', 'PS5 empty box')], search, 'ps5', true);
+    assert.equal(titles.length, 2);
+    assert.deepEqual(watch.listings.map((item: any) => item.listingId), ['d']);
+    assert.deepEqual(relevanceRows(context.db, 'ps5').map((row) => [row.listing_id, row.relevance_status, row.reason]), [
+      ['d', 'relevant', 'Jev classified listing as relevant (p=0.90)'],
+      ['e', 'irrelevant', 'Jev classified listing as irrelevant (p=0.90)'],
+    ]);
+
+    // A watch verdict serves a later manual search of the same input.
+    await context.service.filterListingsByAiRelevance([listing('f', 'PS5 Slim 1TB')], search, 'ps5', true);
+    assert.equal(titles.length, 3);
+    assert.equal((context.db.prepare('SELECT COUNT(*) AS n FROM manual_relevance_cache').get() as { n: number }).n, 2, 'the watch verdict is not copied to the manual cache');
+    const again = await context.service.filterListingsByAiRelevance([listing('g', 'PS5 Slim 1TB')], search, undefined, true);
+    assert.equal(again.listings.length, 1);
+    assert.equal(titles.length, 3);
+
+    // The cross-listing lookup is scoped to the model: a new Jev model judges afresh.
+    process.env.SCOUT_JEV_MODEL = '~typesafe/jev-next';
+    await context.service.filterListingsByAiRelevance([listing('h', 'PS5 console')], search, undefined, true);
+    assert.equal(titles.length, 4);
+  } finally {
+    delete process.env.SCOUT_JEV_MODEL;
+    restore();
+    context.close();
+  }
+});

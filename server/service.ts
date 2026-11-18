@@ -1473,8 +1473,10 @@ export class ScoutService {
    * falls back to its lean (cached as a decisive verdict so repeat scans
    * reuse it); a Jev failure stays 'unknown' (kept, like the legacy path).
    * Vision escalation is reserved for high-priority description verification,
-   * never for filter-only relevance — the relevance unsure rate (~88% in
-   * production) made every filtered listing cost 2 Jev calls plus vision.
+   * never for filter-only relevance: the judgment reads no URL or photo, so a
+   * verdict belongs to its input hash and is reused across listings. The
+   * unsure band (0.4–0.6) held 4.41% of live relevance calls on the
+   * 2026-11 improvement export.
    */
   private async decideRelevanceLive(
     context: ListingRelevanceContext,
@@ -1618,14 +1620,15 @@ export class ScoutService {
    * but with no watch row; a hit skips the Jev/DeepSeek call entirely. Reads are
    * best-effort: a missing table (migration not yet applied) is a miss.
    */
-  private readManualRelevance(inputHash: string, legacyInputHash: string, model: string): 'relevant' | 'irrelevant' | null {
+  private readManualRelevance(inputHash: string, legacyInputHash: string, model: string): { status: 'relevant' | 'irrelevant'; reason: string } | null {
     try {
-      const row = (this.stmt('SELECT relevant, relevance_status, error FROM manual_relevance_cache WHERE input_hash = ? AND model = ?').get(inputHash, model)
-        ?? this.stmt('SELECT relevant, relevance_status, error FROM manual_relevance_cache WHERE input_hash = ? AND model = ?').get(legacyInputHash, model)) as
-        { relevant?: number; relevance_status?: string; error?: string | null } | undefined;
+      const row = (this.stmt('SELECT relevant, relevance_status, reason, error FROM manual_relevance_cache WHERE input_hash = ? AND model = ?').get(inputHash, model)
+        ?? this.stmt('SELECT relevant, relevance_status, reason, error FROM manual_relevance_cache WHERE input_hash = ? AND model = ?').get(legacyInputHash, model)) as
+        { relevant?: number; relevance_status?: string; reason?: string; error?: string | null } | undefined;
       if (!row || row.error) return null;
-      if (row.relevance_status === 'irrelevant' || row.relevant === 0) return 'irrelevant';
-      if (row.relevance_status === 'relevant' || row.relevant === 1) return 'relevant';
+      const reason = row.reason ?? 'Reused cached relevance decision';
+      if (row.relevance_status === 'irrelevant' || row.relevant === 0) return { status: 'irrelevant', reason };
+      if (row.relevance_status === 'relevant' || row.relevant === 1) return { status: 'relevant', reason };
       return null;
     } catch {
       return null;
@@ -1781,17 +1784,18 @@ export class ScoutService {
           if (cached.input_hash === legacyInputHash) persistRelevance(listing, inputHash, activeModel, cachedStatus === 'relevant', cachedStatus, cached.reason ?? 'Reused cached relevance decision');
           return { listing, status: cachedStatus };
         }
-      } else {
-        const manual = this.readManualRelevance(inputHash, legacyInputHash, activeModel);
-        if (manual) return { listing, status: manual };
       }
-
-      // Cross-listing reuse is keyed by input hash, which omits the per-listing
-      // URL/thumbnail live escalation uses — live mode relies on the
-      // per-listing watch cache above instead.
-      const reusable = !jevLive ? this.stmt(`SELECT relevant, reason, relevance_status FROM listing_relevance
+      // The judgment reads only the input hash's fields (no URL or photo), so
+      // a verdict for the same input and model is reused from any listing:
+      // manual searches first, then any watch's row.
+      const manual = this.readManualRelevance(inputHash, legacyInputHash, activeModel);
+      if (manual) {
+        if (watchId) persistRelevance(listing, inputHash, activeModel, manual.status === 'relevant', manual.status, manual.reason);
+        return { listing, status: manual.status };
+      }
+      const reusable = this.stmt(`SELECT relevant, reason, relevance_status FROM listing_relevance
         WHERE input_hash = ? AND model = ? AND relevance_status IN ('relevant', 'irrelevant') AND error IS NULL
-        ORDER BY checked_at DESC LIMIT 1`).get(inputHash, activeModel) as { relevant?: number; reason?: string; relevance_status?: string } | undefined : undefined;
+        ORDER BY checked_at DESC LIMIT 1`).get(inputHash, activeModel) as { relevant?: number; reason?: string; relevance_status?: string } | undefined;
       if (reusable) {
         const status: 'relevant' | 'irrelevant' = reusable.relevance_status === 'irrelevant' || reusable.relevant === 0 ? 'irrelevant' : 'relevant';
         persistRelevance(listing, inputHash, activeModel, status === 'relevant', status, reusable.reason ?? 'Reused cached relevance decision');
@@ -1810,9 +1814,8 @@ export class ScoutService {
 
       // Per-scan budget: uncached listings beyond the budget stay unknown
       // instead of burning quota on every scan before the cache warms.
-      // Live dedupe is per listing (not per input hash): the escalation path
-      // uses each listing's own URL and thumbnail, which the hash omits.
-      const liveKey = `${inputHash}|${listing.url}|${listing.imageUrl ?? ''}`;
+      // Listings with the same input in one pass share one call.
+      const liveKey = inputHash;
       if (aiCalls >= AI_RELEVANCE_BUDGET_PER_SCAN && !pendingClassifications.has(inputHash) && !pendingLive.has(liveKey)) {
         budgetExhausted += 1;
         persistNotJudged(listing, inputHash, cached, 'AI relevance budget exhausted for this scan');

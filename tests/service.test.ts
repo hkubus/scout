@@ -3300,7 +3300,7 @@ test('verifies high-priority deals live with Jev and vision escalation', async (
   }
 });
 
-test('evaluates same-title live listings separately per URL with one Jev call each', async () => {
+test('shares one live Jev relevance call between listings with the same input', async () => {
   const restore = liveJevEnv();
   let calls = 0;
   const context = fixture({
@@ -3321,21 +3321,22 @@ test('evaluates same-title live listings separately per URL with one Jev call ea
       ],
       { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
     );
-    assert.equal(calls, 2);
-    assert.equal(result.listings.length, 1);
-    assert.equal(result.listings[0].listingId, 'dup-a');
-    assert.equal(result.excluded, 1);
+    // The judgment reads no URL or thumbnail, so the same input is one call.
+    assert.equal(calls, 1);
+    assert.deepEqual(result.listings.map((item: any) => item.listingId), ['dup-a', 'dup-b']);
+    assert.equal(result.excluded, 0);
   } finally {
     restore();
     context.close();
   }
 });
 
-test('live mode ignores cross-listing cache rows scoped by input hash', async () => {
+test('live mode reuses cross-listing relevance rows for the same input hash and model', async () => {
   const restore = liveJevEnv();
   const now = new Date().toISOString();
+  let calls = 0;
   const context = fixture({
-    classifyListingRelevanceWithJev: async () => ({ relevant: false, p: 0.1, unsure: false }),
+    classifyListingRelevanceWithJev: async () => { calls += 1; return { relevant: false, p: 0.1, unsure: false }; },
   });
   try {
     seedWatch(context.db, 'other-watch');
@@ -3344,12 +3345,21 @@ test('live mode ignores cross-listing cache rows scoped by input hash', async ()
       query: 'PS5', includedTerms: '', excludedTerms: '',
     });
     context.db.prepare(`INSERT INTO listing_relevance (watch_id, marketplace, listing_id, input_hash, model, relevant, reason, error, checked_at, relevance_status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('other-watch', 'OLX', 'other-1', hash, '~typesafe/jev-latest', 1, 'stale cross-listing row', null, now, 'relevant');
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('other-watch', 'OLX', 'other-1', hash, '~typesafe/jev-latest', 1, 'cross-listing row', null, now, 'relevant');
     const result = await (context.service as any).filterListingsByAiRelevance(
       [liveListing()], { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
     );
-    assert.equal(result.listings.length, 0);
-    assert.equal(result.excluded, 1);
+    assert.equal(calls, 0);
+    assert.equal(result.listings.length, 1);
+    assert.equal(result.excluded, 0);
+    // A row from another model (legacy DeepSeek) is never a live verdict.
+    context.db.prepare("UPDATE listing_relevance SET model = 'deepseek-v4-flash'").run();
+    context.db.prepare('DELETE FROM manual_relevance_cache').run();
+    const fresh = await (context.service as any).filterListingsByAiRelevance(
+      [liveListing()], { query: 'PS5', includedTerms: '', excludedTerms: '' }, undefined, true,
+    );
+    assert.equal(calls, 1);
+    assert.equal(fresh.excluded, 1);
   } finally {
     restore();
     context.close();

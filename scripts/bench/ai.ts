@@ -137,9 +137,10 @@ function safeGroups(raw: string | null): VariantGroup[] {
 
 const relevanceCalls = taskRows('relevance');
 // Repeat calls: a call whose exact input was already answered (no error) by an
-// earlier call. Live mode skips the cross-listing reuse the legacy path has
-// (server/service.ts filterListingsByAiRelevance), so identical titles on
-// different listings each cost a call.
+// earlier call. Until 2026-11 live mode keyed reuse per listing URL, so
+// identical titles on different listings, and the same input on the watch
+// and manual paths, each cost a call; filterListingsByAiRelevance now
+// dedupes and reuses by input hash and model across both caches.
 function repeats(rows: ShadowRow[]) {
   const decided = new Map<string, unknown[]>();
   let repeat = 0;
