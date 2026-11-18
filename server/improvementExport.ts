@@ -13,6 +13,7 @@
 import { randomBytes } from 'node:crypto';
 import { createReadStream, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, resolve } from 'node:path';
+import { APP_LOG_MAX_ROWS } from './appLog';
 import { EMBEDDED_SECRET, ENCRYPTED_SECRET, REDACTED, runNodeChild, runtimeEnvironment } from './debug';
 import { ServiceError } from './service';
 import type { ScoutService } from './service';
@@ -29,6 +30,8 @@ export type TablePolicy = {
   blank?: Record<string, Blank>;
   /** Encrypted values and secret keys of the settings table are redacted. */
   settings?: boolean;
+  /** Text columns in which the encrypted-secret shape is redacted wherever it appears. */
+  redactSecrets?: string[];
 };
 
 const IMAGE_BYTES: Blank = { to: 'empty-blob', note: 'image bytes removed' };
@@ -43,6 +46,7 @@ export const IMPROVEMENT_TABLES: Record<string, TablePolicy> = {
   manual_relevance_cache: { keep: 'yes', contents: 'AI relevance verdicts from manual searches, by input hash and model.' },
   jev_shadow_log: { keep: 'yes', contents: 'Jev judgments logged beside the DeepSeek decision and the vision verdict, for agreement and calibration.' },
   jev_fuzzy_cache: { keep: 'yes', contents: 'Jev rescue decisions on near-miss term and condition matches.' },
+  app_log: { keep: 'yes', redactSecrets: ['message'], contents: 'Warnings and errors from Scout\'s log kept across restarts (the last 30 days, at most 10,000 lines); an identical line within a minute is one row with a repeat count. export_logs merges them with the in-memory log.' },
   listing_detail_snapshots: { keep: 'yes', contents: 'Listing pages captured for the description check: description, condition, location, price and check status.' },
   listing_duplicate_pairs: { keep: 'yes', contents: 'Pairs of listings judged to be the same item posted more than once, with their similarity.' },
   scans: { keep: 'yes', contents: 'Every watch and research scan per marketplace: status, start, finish and error.' },
@@ -134,6 +138,16 @@ process.stdin.on('end', () => {
             db.prepare('UPDATE ' + quote(name) + ' SET ' + quote(column) + ' = ?').run(blankValue(blank));
             notes.push(blank.note);
           }
+          for (const column of policy.redactSecrets || []) {
+            if (!columns.has(column)) continue;
+            const update = db.prepare('UPDATE ' + quote(name) + ' SET ' + quote(column) + ' = ? WHERE rowid = ?');
+            for (const row of db.prepare('SELECT rowid AS id, ' + quote(column) + ' AS value FROM ' + quote(name)).all()) {
+              if (typeof row.value !== 'string') continue;
+              const value = row.value.replace(embedded, job.redacted);
+              if (value !== row.value) update.run(value, row.id);
+            }
+            notes.push('encrypted values redacted');
+          }
           if (policy.settings) {
             const update = db.prepare('UPDATE ' + quote(name) + ' SET value = ? WHERE key = ?');
             for (const row of db.prepare('SELECT key, value FROM ' + quote(name)).all()) {
@@ -150,9 +164,11 @@ process.stdin.on('end', () => {
       db.exec('CREATE TABLE export_info (key TEXT PRIMARY KEY, value TEXT)');
       const info = db.prepare('INSERT INTO export_info (key, value) VALUES (?, ?)');
       for (const [key, value] of Object.entries(job.info)) info.run(key, typeof value === 'string' ? value : JSON.stringify(value));
-      db.exec('CREATE TABLE export_logs (id INTEGER PRIMARY KEY, at TEXT NOT NULL, level TEXT NOT NULL, scope TEXT NOT NULL, message TEXT NOT NULL)');
-      const log = db.prepare('INSERT OR IGNORE INTO export_logs (id, at, level, scope, message) VALUES (?, ?, ?, ?, ?)');
-      for (const entry of job.logs) log.run(entry.id, entry.at, entry.level, entry.scope, String(entry.message).replace(embedded, job.redacted));
+      // Oldest first. Buffer and stored ids are separate sequences, so rows are renumbered.
+      db.exec('CREATE TABLE export_logs (id INTEGER PRIMARY KEY, at TEXT NOT NULL, level TEXT NOT NULL, scope TEXT NOT NULL, message TEXT NOT NULL, source TEXT, repeats INTEGER)');
+      const log = db.prepare('INSERT INTO export_logs (id, at, level, scope, message, source, repeats) VALUES (?, ?, ?, ?, ?, ?, ?)');
+      const logs = [...job.logs].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+      logs.forEach((entry, index) => log.run(index + 1, entry.at, entry.level, entry.scope, String(entry.message).replace(embedded, job.redacted), entry.source ?? null, entry.repeats ?? null));
       db.exec('CREATE TABLE export_tables (name TEXT PRIMARY KEY, rows INTEGER NOT NULL, contents TEXT, handling TEXT NOT NULL)');
       const describe = db.prepare('INSERT INTO export_tables (name, rows, contents, handling) VALUES (?, ?, ?, ?)');
       for (const entry of guide) describe.run(entry.name, db.prepare('SELECT COUNT(*) AS count FROM ' + quote(entry.name)).get().count, entry.contents, entry.handling);
@@ -169,10 +185,10 @@ type BuildResult = { bytes?: number; error?: string };
 export type ImprovementContext = {
   /** Runtime facts stored as JSON in export_info. */
   info: Record<string, unknown>;
-  logs: Array<{ id: number; at: string; level: string; scope: string; message: string }>;
+  logs: Array<{ id: number; at: string; level: string; scope: string; message: string; source?: 'memory' | 'stored'; repeats?: number }>;
 };
 
-/** The live state an export records beside the tables: readiness, settings, connectors, environment and the log buffer. */
+/** The live state an export records beside the tables: readiness, settings, connectors, environment and the log (buffer plus stored warnings and errors). */
 export function improvementContext(service: ScoutService): ImprovementContext {
   const settings = service.settings();
   return {
@@ -183,7 +199,7 @@ export function improvementContext(service: ScoutService): ImprovementContext {
       connectors: service.getConnectors(),
       runtime: runtimeEnvironment(),
     },
-    logs: service.logs(),
+    logs: service.logHistory(APP_LOG_MAX_ROWS),
   };
 }
 

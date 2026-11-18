@@ -555,21 +555,30 @@ if (selected('scan')) {
 }
 
 // -------------------------------------------------------------------- heavy
-function measureHeavy(name: string, label: string, run: () => unknown) {
+async function measureHeavy(name: string, label: string, run: () => unknown) {
   currentCase = name;
   gc();
   const heapBefore = process.memoryUsage().heapUsed;
   const rssBefore = process.resourceUsage().maxRSS;
+  // How late a 20 ms timer fires while the operation runs: the event-loop
+  // block a request would see (all of it while the work is synchronous).
+  let maxLag = 0;
+  let expected = performance.now() + 20;
+  const timer = setInterval(() => { const now = performance.now(); maxLag = Math.max(maxLag, now - expected); expected = now + 20; }, 20);
   quiet();
   const started = performance.now();
-  const result = run();
+  const result = await run();
   const ms = performance.now() - started;
+  // A synchronous run never let the timer fire: its whole duration was the block.
+  const lag = Math.max(maxLag, performance.now() - expected);
   loud();
+  clearInterval(timer);
   const heapAfter = process.memoryUsage().heapUsed;
-  bench.metric(`heavy.${name}.ms`, `${label} (main thread)`, round(ms), 'ms', 'lower');
+  bench.metric(`heavy.${name}.ms`, `${label} (total)`, round(ms), 'ms', 'lower');
+  bench.metric(`heavy.${name}.max_timer_lag_ms`, `${label}: worst main-thread timer lag`, round(lag), 'ms', 'lower');
   bench.metric(`heavy.${name}.heap_mb`, `${label} heap growth`, round((heapAfter - heapBefore) / 1048576, 1), 'MB', 'lower');
   bench.metric(`heavy.${name}.maxrss_growth_mb`, `${label} peak RSS growth`, round((process.resourceUsage().maxRSS - rssBefore) / 1024, 1), 'MB', 'lower');
-  log(`${name}: ${round(ms)} ms`);
+  log(`${name}: ${round(ms)} ms, timer lag ${round(lag)} ms`);
   return result;
 }
 
@@ -597,13 +606,13 @@ if (flags.has('heavy')) {
     bench.metric('heavy.exportJson.maxrss_growth_mb', 'GET /api/export peak RSS growth', round((process.resourceUsage().maxRSS - rssBefore) / 1024, 1), 'MB', 'lower');
   }
   if (selected('heavy.backup')) {
-    const path = measureHeavy('backup', 'POST /api/backup VACUUM INTO', () => backupDatabase(db, copy.path, 1)) as string;
+    const path = await measureHeavy('backup', 'POST /api/backup VACUUM INTO', () => backupDatabase(db, copy.path, 1)) as string;
     bench.metric('heavy.backup.bytes', 'backup file bytes', statSync(path).size, 'bytes', 'lower');
     for (const suffix of ['', '-journal']) { try { (await import('node:fs')).rmSync(path + suffix, { force: true }); } catch { /* gone */ } }
   }
   if (selected('heavy.debugSnapshot')) {
     const debug = new ScoutDebug(db, service, copy.path);
-    const snapshot = measureHeavy('debugSnapshot', 'GET /api/debug/snapshot VACUUM INTO + redaction', () => debug.snapshot()) as { bytes: number; cleanup: () => void };
+    const snapshot = await measureHeavy('debugSnapshot', 'GET /api/debug/snapshot VACUUM INTO + redaction', () => debug.snapshot()) as { bytes: number; cleanup: () => void };
     bench.metric('heavy.debugSnapshot.bytes', 'debug snapshot bytes', snapshot.bytes, 'bytes', 'lower');
     snapshot.cleanup();
     debug.close();

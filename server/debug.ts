@@ -1,17 +1,19 @@
 // Read-only debug access to the live database for development and agent
 // troubleshooting. Browsing runs on a separate read-only SQLite connection;
-// free-form SQL runs in a short-lived child process on its own read-only
-// connection that is killed at a deadline, so a runaway query cannot block
-// Scout's event loop. Encrypted credentials are redacted by shape wherever
+// free-form SQL and the snapshot run in short-lived child processes on their
+// own read-only connections (queries are killed at a deadline), so neither a
+// runaway query nor copying the database can block Scout's event loop. Encrypted credentials are redacted by shape wherever
 // they appear.
 // @ts-ignore node:sqlite is present in the supported Node 22+ runtime.
 import { DatabaseSync } from 'node:sqlite';
-import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, statSync, unlinkSync } from 'node:fs';
+import { chmodSync, existsSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { basename, dirname, resolve } from 'node:path';
+import { runNodeChild } from './nodeChild';
 import { ServiceError } from './service';
 import type { ScoutService } from './service';
+
+export { runNodeChild };
 
 export const REDACTED = '[redacted: encrypted secret]';
 // encryptSecret() output: base64url(12-byte iv).base64url(16-byte tag).base64url(ciphertext)
@@ -142,50 +144,6 @@ process.stdin.on('end', () => {
 
 type QueryChildResult = { error?: 'open' | 'sql'; message?: string; columns?: string[]; rows?: Array<Record<string, unknown>>; truncated?: boolean };
 
-/**
- * Run `script` in a short-lived Node child that reads `payload` as JSON on
- * stdin and prints one JSON result on stdout, so slow SQLite work cannot
- * block Scout's event loop. The child is killed at the deadline, when its
- * output passes maxOutputBytes, or when `signal` aborts.
- */
-export function runNodeChild<T>(script: string, payload: object, options: {
-  timeoutMs: number;
-  maxOutputBytes: number;
-  errors: { timeout: () => Error; tooLarge: () => Error; noResult: () => Error; aborted?: () => Error };
-  signal?: AbortSignal;
-}): Promise<T> {
-  return new Promise((resolvePromise, reject) => {
-    const aborted = options.errors.aborted ?? (() => new ServiceError('The request was cancelled', 400));
-    if (options.signal?.aborted) { reject(aborted()); return; }
-    // Keep flags such as --experimental-sqlite that node:sqlite needs on older Node 22.
-    const flags = process.execArgv.filter((flag) => flag.startsWith('--experimental'));
-    const child = spawn(process.execPath, [...flags, '--no-warnings', '--max-old-space-size=256', '-e', script], { stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: process.env.PATH ?? '' } });
-    const chunks: Buffer[] = [];
-    let bytes = 0;
-    let failure: Error | null = null;
-    const kill = (error: Error) => { if (!failure) { failure = error; child.kill('SIGKILL'); } };
-    const timer = setTimeout(() => kill(options.errors.timeout()), options.timeoutMs);
-    const onAbort = () => kill(aborted());
-    options.signal?.addEventListener('abort', onAbort, { once: true });
-    const settle = () => { clearTimeout(timer); options.signal?.removeEventListener('abort', onAbort); };
-    child.stdout.on('data', (chunk: Buffer) => {
-      bytes += chunk.byteLength;
-      if (bytes > options.maxOutputBytes) kill(options.errors.tooLarge());
-      else chunks.push(chunk);
-    });
-    child.stderr.resume();
-    // A child killed before it read its input closes stdin under us.
-    child.stdin.on('error', () => {});
-    child.on('error', (error) => { settle(); reject(error); });
-    child.on('close', () => {
-      settle();
-      if (failure) { reject(failure); return; }
-      try { resolvePromise(JSON.parse(Buffer.concat(chunks).toString('utf8')) as T); } catch { reject(options.errors.noResult()); }
-    });
-    child.stdin.end(JSON.stringify(payload));
-  });
-}
-
 function runQueryChild(payload: object, timeoutMs: number): Promise<QueryChildResult> {
   return runNodeChild<QueryChildResult>(QUERY_CHILD, payload, {
     timeoutMs,
@@ -197,6 +155,47 @@ function runQueryChild(payload: object, timeoutMs: number): Promise<QueryChildRe
     },
   });
 }
+
+const SNAPSHOT_TIMEOUT_MS = 10 * 60_000;
+
+// Runs in a child process (see runNodeChild): copies the database read-only
+// with VACUUM INTO, then blanks credentials and empties the private tables in
+// the copy. secure_delete zeroes the removed values where they lay, so the
+// copy needs no second VACUUM: at 235 MB that VACUUM took 15 s of the 26 s.
+const SNAPSHOT_CHILD = `
+const { DatabaseSync } = require('node:sqlite');
+const { statSync } = require('node:fs');
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => { input += chunk; });
+process.stdin.on('end', () => {
+  const job = JSON.parse(input);
+  const out = (value) => process.stdout.write(JSON.stringify(value));
+  const quote = (name) => '"' + String(name).replace(/"/g, '""') + '"';
+  try {
+    const source = new DatabaseSync(job.source, { readOnly: true });
+    try {
+      source.exec('PRAGMA busy_timeout = 5000');
+      source.prepare('VACUUM INTO ?').run(job.target);
+    } finally { source.close(); }
+    const copy = new DatabaseSync(job.target);
+    try {
+      copy.exec('PRAGMA secure_delete = ON; PRAGMA foreign_keys = OFF;');
+      const encrypted = new RegExp(job.encryptedSecret);
+      const hasTable = (name) => Boolean(copy.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
+      copy.exec('BEGIN');
+      if (hasTable('settings')) {
+        const update = copy.prepare('UPDATE settings SET value = ? WHERE key = ?');
+        for (const row of copy.prepare('SELECT key, value FROM settings').all()) if (typeof row.value === 'string' && encrypted.test(row.value)) update.run(job.redacted, row.key);
+      }
+      if (hasTable('marketplace_sessions')) copy.prepare('UPDATE marketplace_sessions SET storage_state_encrypted = ?').run(job.redacted);
+      for (const table of job.privateTables) if (hasTable(table)) copy.exec('DELETE FROM ' + quote(table));
+      copy.exec('COMMIT');
+    } finally { copy.close(); }
+    out({ bytes: statSync(job.target).size });
+  } catch (error) { out({ error: String(error && error.message || error) }); }
+});
+`;
 
 export class ScoutDebug {
   private readonlyDb: any = null;
@@ -304,7 +303,10 @@ export class ScoutDebug {
     return { columns: result.columns ?? [], rows, rowCount: rows.length, truncated: Boolean(result.truncated), maxRows: limit, elapsedMs: Math.round((performance.now() - started) * 10) / 10 };
   }
 
-  /** Process, configuration, readiness, and the in-memory log buffer. */
+  /**
+   * Process, configuration, readiness, and the log: this process's buffer
+   * plus the warnings and errors stored from before it (app_log).
+   */
   runtime() {
     return {
       now: new Date().toISOString(),
@@ -312,34 +314,42 @@ export class ScoutDebug {
       ...runtimeEnvironment(),
       readiness: this.service.readiness(),
       settings: this.service.settings(),
-      logs: this.service.logs(),
+      logs: this.service.logHistory(),
     };
   }
 
   /**
    * Write a consistent copy of the whole database with stored credentials
-   * blanked. The caller streams it and must call cleanup() afterwards.
+   * blanked. Built in a child process (SNAPSHOT_CHILD) so the copy never
+   * blocks the event loop. The caller streams it and must call cleanup()
+   * afterwards.
    */
-  snapshot() {
+  async snapshot(options: { signal?: AbortSignal; timeoutMs?: number } = {}) {
     const path = resolve(dirname(this.databasePath), `.${basename(this.databasePath)}.debug-${Date.now()}-${randomBytes(3).toString('hex')}.sqlite`);
     const cleanup = () => { for (const suffix of ['', '-journal', '-wal', '-shm']) { try { unlinkSync(`${path}${suffix}`); } catch { /* already gone */ } } };
     try {
-      this.db.exec(`VACUUM INTO '${path.replace(/'/g, "''")}'`);
+      // VACUUM INTO fills an existing empty file, so the copy is private from its first byte.
+      writeFileSync(path, '', { mode: 0o600, flag: 'wx' });
+      const timeoutMs = options.timeoutMs ?? SNAPSHOT_TIMEOUT_MS;
+      const result = await runNodeChild<{ bytes?: number; error?: string }>(SNAPSHOT_CHILD, {
+        source: this.databasePath,
+        target: path,
+        privateTables: PRIVATE_TABLES,
+        redacted: REDACTED,
+        encryptedSecret: ENCRYPTED_SECRET.source,
+      }, {
+        timeoutMs,
+        maxOutputBytes: 64 * 1024,
+        signal: options.signal,
+        errors: {
+          timeout: () => new ServiceError(`The debug snapshot took longer than ${Math.round(timeoutMs / 1000)} s and was stopped`, 500),
+          tooLarge: () => new ServiceError('The debug snapshot process answered with too much output', 500),
+          noResult: () => new ServiceError('The debug snapshot process ended without a result (out of memory or disk?)', 500),
+          aborted: () => new ServiceError('The debug snapshot was cancelled', 400),
+        },
+      });
+      if (result.error) throw new ServiceError(`Could not write the debug snapshot: ${result.error}`, 500);
       try { chmodSync(path, 0o600); } catch { /* best-effort on non-POSIX filesystems */ }
-      const copy = new DatabaseSync(path);
-      try {
-        const hasTable = (name: string) => Boolean(copy.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
-        if (hasTable('settings')) {
-          const rows = copy.prepare('SELECT key, value FROM settings').all() as Array<{ key: string; value: unknown }>;
-          const update = copy.prepare('UPDATE settings SET value = ? WHERE key = ?');
-          for (const row of rows) if (typeof row.value === 'string' && ENCRYPTED_SECRET.test(row.value)) update.run(REDACTED, row.key);
-        }
-        if (hasTable('marketplace_sessions')) copy.prepare('UPDATE marketplace_sessions SET storage_state_encrypted = ?').run(REDACTED);
-        for (const table of PRIVATE_TABLES) if (hasTable(table)) copy.exec(`DELETE FROM ${quoteIdent(table)}`);
-        copy.exec('VACUUM');
-      } finally {
-        copy.close();
-      }
       return { path, filename: `scout-debug-${new Date().toISOString().replace(/[:.]/g, '-')}.sqlite`, bytes: statSync(path).size, cleanup };
     } catch (error) {
       cleanup();

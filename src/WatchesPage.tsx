@@ -430,7 +430,7 @@ export function WatchAnalyticsDialog({ watch, onClose }: { watch: Watch; onClose
         </div>
         <div className="modal-body analytics-body">
           <div className="analytics-toolbar">
-            <span>{analytics ? `${analytics.totalObservations.toLocaleString("pl-PL")} observations · ${formatAnalyticsDate(analytics.firstObservedAt)}–${formatAnalyticsDate(analytics.lastObservedAt)}` : "Loading observation history…"}</span>
+            <span>{analytics ? `${analytics.totalObservations.toLocaleString("pl-PL")} daily prices · ${formatAnalyticsDate(analytics.firstObservedAt)}–${formatAnalyticsDate(analytics.lastObservedAt)}` : "Loading observation history…"}</span>
             <div className="analytics-range-options" role="group" aria-label="Analytics time range">
               {[30, 90, 180].map((option) => <button key={option} className={days === option ? "analytics-range-option analytics-range-option--active" : "analytics-range-option"} onClick={() => setDays(option)}>{option}d</button>)}
             </div>

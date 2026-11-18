@@ -384,6 +384,7 @@ export interface WatchAnalytics {
   rangeDays: number;
   firstObservedAt: string | null;
   lastObservedAt: string | null;
+  /** Daily price observations in the window: one per listing per day. */
   totalObservations: number;
   current: {
     medianPrice: number | null;
