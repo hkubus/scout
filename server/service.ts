@@ -5811,7 +5811,7 @@ export class ScoutService {
       // The scan's own deterministic filters. Shipping is left out: a search
       // result's delivery is often still unknown, and it does not change
       // which product a listing is.
-      filters: { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, sellerType: sellerTypeFromRow(row.seller_type), ignorePromoted: Boolean(row.ignore_promoted), shippingOnly: false },
+      filters: { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, sellerType: sellerTypeFromRow(row.seller_type), ignorePromoted: Boolean(row.ignore_promoted), excludeDamaged: watchExcludesDamaged(row), shippingOnly: false },
       scoredAgainst,
     };
   }
@@ -7045,7 +7045,7 @@ export class ScoutService {
             }
           }
           this.log('info', 'watch', `${row.name} · ${source}: ${matchingExact.length ? `exact-urls (${matchingExact.length})` : 'query-search'}${variantFetches.length ? ` + typo-variants (${variantFetches.join(', ')})` : ''} → ${paths.join(' → ') || 'no fetch'} · fetched=${fetched.length}`);
-          const deterministicFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, sellerType: sellerTypeFromRow(row.seller_type), ignorePromoted: Boolean(row.ignore_promoted), shippingOnly: false };
+          const deterministicFilters = { minPrice: row.min_price_pln, maxPrice: row.max_price_pln, condition: row.condition, sellerType: sellerTypeFromRow(row.seller_type), ignorePromoted: Boolean(row.ignore_promoted), excludeDamaged: watchExcludesDamaged(row), shippingOnly: false };
           const filterScan = (rows: NormalizedListing[], filters: ListingFilters) => foundByTypo.size
             ? filterTypoRows(rows, (listing) => foundByTypo.get(listingKey(listing)), row.query, row.included_terms ?? '', row.excluded_terms ?? '', filters)
             : filterListings(rows, row.query, row.included_terms, row.excluded_terms, filters);
@@ -8485,6 +8485,18 @@ export function sellerTypeFromRow(value: unknown): SellerType | null {
 }
 
 /**
+ * Whether a watch drops listings whose marketplace condition label says
+ * damaged or for parts (OLX Uszkodzone, Allegro Lokalnie Uszkodzony). Once a
+ * watch has excluded terms of its own they decide, since they read the
+ * condition label too; a watch with none gets this as its default, unless it
+ * asks for damaged items (condition Damaged).
+ */
+export function watchExcludesDamaged(row: { excluded_terms?: unknown; condition?: unknown }): boolean {
+  if (parseIncludedExcluded('', '', String(row.excluded_terms ?? '')).excluded.length) return false;
+  return normalizeFilterText(String(row.condition ?? '')) !== 'damaged';
+}
+
+/**
  * A stored row's quick flags: the stored ones while their rule version is
  * current (else recomputed from title and condition, as the background
  * backfill will store them), plus accessory against the watch query.
@@ -8549,8 +8561,8 @@ export type ListingFilters = {
    */
   relaxTerms?: boolean;
   /**
-   * Manual search only: drop listings whose condition says damaged or for
-   * parts, so a search for used items does not return broken ones.
+   * Drop listings whose condition says damaged or for parts: a manual search
+   * for used items, and watches without excluded terms (watchExcludesDamaged).
    */
   excludeDamaged?: boolean;
 };

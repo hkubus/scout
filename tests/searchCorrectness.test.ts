@@ -161,18 +161,30 @@ test('an unrecognised condition searches any condition and says so', async () =>
   } finally { context.close(); }
 });
 
-test('a used watch still keeps damaged listings; excluding them is manual-search only', async () => {
+test('a watch without excluded terms drops damaged listings; its own terms or condition Damaged decide otherwise', async () => {
   const context = searchFixture();
   try {
     (context.service as any).fetchOlxApi = async () => olxPage([
       olxOffer('U-1', 'Ladowarka Dell', 100, 'Używane'),
       olxOffer('U-2', 'Ladowarka Dell uszkodzona', 20, 'Uszkodzone'),
+      olxOffer('U-3', 'Ladowarka Dell 90W', 60, 'Uszkodzone'),
+      olxOffer('U-4', 'Ladowarka Dell zamiennik', 40, 'Używane'),
     ]);
     const now = new Date().toISOString();
-    context.db.prepare(`INSERT INTO watches (id, name, query, sources_json, enabled, next_scan_at, created_at, updated_at, condition)
-      VALUES ('used-watch', 'Used watch', 'ladowarka', '["OLX"]', 1, ?, ?, ?, 'Used')`).run(now, now, now);
-    await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get('used-watch'), { forceAll: true });
-    const stored = context.db.prepare("SELECT l.listing_id FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE wl.watch_id = 'used-watch' ORDER BY l.listing_id").all() as Array<{ listing_id: string }>;
-    assert.deepEqual(stored.map((row) => row.listing_id), ['U-1', 'U-2']);
+    const watch = (id: string, condition: string, excluded: string) => context.db.prepare(`INSERT INTO watches (id, name, query, excluded_terms, sources_json, enabled, next_scan_at, created_at, updated_at, condition)
+      VALUES (?, ?, 'ladowarka', ?, '["OLX"]', 1, ?, ?, ?, ?)`).run(id, id, excluded, now, now, now, condition);
+    watch('plain', 'Any', '');
+    watch('used', 'Used', '');
+    watch('own-terms', 'Any', 'zamiennik');
+    watch('wants-damaged', 'Damaged', '');
+    const stored = async (id: string) => {
+      await (context.service as any).runWatch(context.db.prepare('SELECT * FROM watches WHERE id = ?').get(id), { forceAll: true });
+      return (context.db.prepare('SELECT l.listing_id FROM watch_listings wl JOIN listings l ON l.id = wl.listing_id WHERE wl.watch_id = ? ORDER BY l.listing_id').all(id) as Array<{ listing_id: string }>).map((row) => row.listing_id);
+    };
+    assert.deepEqual(await stored('plain'), ['U-1', 'U-4']);
+    assert.deepEqual(await stored('used'), ['U-1', 'U-4']);
+    // Excluded terms of its own replace the default: only "zamiennik" goes.
+    assert.deepEqual(await stored('own-terms'), ['U-1', 'U-2', 'U-3']);
+    assert.deepEqual(await stored('wants-damaged'), ['U-2', 'U-3']);
   } finally { context.close(); }
 });
