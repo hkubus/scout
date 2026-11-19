@@ -194,9 +194,9 @@ test('Strong+ matches the dashboard count, and scout_deals answers it best first
     const [first] = deals.deals;
     assert.deepEqual(first, {
       id: 'OLX:exc', listingId: 'exc', source: 'OLX', title: 'iPhone 13 exc', price: 600, typical: 1000, discountPercent: 40,
-      // OLX's default preset: no seller fee and 15 zł shipping in, so 88% of the 1000 typical nets 880 - 15 - 600.
-      tier: 'exceptional', dealLabel: 'Exceptional', typicalSource: 'own-history', estimatedNet: 265,
-      resaleBasis: { source: 'typical-haircut', resalePrice: 880, samples: null, buyCosts: 15, label: '88% of typical' },
+      // OLX's default preset: no seller fee and a 1,99 zł + 4,3% buyer fee (27,79 zł), so 88% of the 1000 typical nets 880 - 27,79 - 600.
+      tier: 'exceptional', dealLabel: 'Exceptional', typicalSource: 'own-history', estimatedNet: 252,
+      resaleBasis: { source: 'typical-haircut', resalePrice: 880, samples: null, buyCosts: 28, label: '88% of typical' },
       watchId: 'deal-ready', watch: 'Ready watch', variantKey: null, variant: null, url: 'https://example.test/exc', image: null,
       condition: null, location: null, shippingAvailable: null, negotiable: null, sellerType: null, postedAt: null,
       seenAt: first.seenAt, decision: null, verification: 'pass',

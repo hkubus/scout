@@ -62,8 +62,8 @@ public struct FeePresets: Hashable, Sendable {
 
     /// Private-seller defaults as of 2026-09 (see `src/profit.ts`).
     public static let defaults = FeePresets([
-        .olx: FeePreset(percent: 0, fixed: 0, buyPercent: 0, buyFixed: 15),
-        .allegroLokalnie: FeePreset(percent: 4.9, fixed: 0, buyPercent: 0, buyFixed: 15),
+        .olx: FeePreset(percent: 0, fixed: 0, buyPercent: 4.3, buyFixed: 1.99),
+        .allegroLokalnie: FeePreset(percent: 4.9, fixed: 0, buyPercent: 0, buyFixed: 0),
         .vinted: FeePreset(percent: 0, fixed: 0, buyPercent: 5, buyFixed: 16),
         .other: FeePreset(percent: 0, fixed: 0, buyPercent: 0, buyFixed: 0),
     ])

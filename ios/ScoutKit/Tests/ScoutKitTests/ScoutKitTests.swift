@@ -803,11 +803,11 @@ final class AlertRuleTests: XCTestCase {
         let dashboard = try await client.dashboard()
         let sony = try XCTUnwrap(dashboard.listings.first { $0.watchId == "watch-sony" })
         XCTAssertTrue(sony.isTargetHit)
-        // 88% of the 1199 typical (1055) − 4.9% Allegro Lokalnie fee − 749 − 15 zł shipping in.
-        XCTAssertEqual(sony.estimatedNet, 239)
+        // 88% of the 1199 typical (1055) − 4.9% Allegro Lokalnie fee − 749; buying on Allegro Lokalnie costs nothing.
+        XCTAssertEqual(sony.estimatedNet, 254)
         XCTAssertEqual(sony.resaleBasis?.label, "88% of typical")
-        // 2639 − 1899 − 15.
-        XCTAssertEqual(dashboard.listings.first { $0.key == "OLX:890231" }?.estimatedNet, 725)
+        // 2639 − 1899 − OLX's buyer fee (1,99 zł + 4,3% of 1899 = 83,65).
+        XCTAssertEqual(dashboard.listings.first { $0.key == "OLX:890231" }?.estimatedNet, 656)
         XCTAssertFalse(dashboard.listings.contains { $0.estimatedNet == nil })
         XCTAssertEqual(dashboard.listings.filter(\.isTargetHit).count, 1)
         XCTAssertEqual(dashboard.watches.first { $0.id == "watch-deck" }?.minSaving, 300)

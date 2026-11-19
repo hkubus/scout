@@ -24,13 +24,15 @@ export interface FeePreset {
 export type FeePresets = Record<FlipChannel, FeePreset>;
 
 /**
- * Seller-side fees for private sellers as of 2026-09. The buyer pays
- * shipping and buyer protection on all three platforms, which the buy-side
- * figures cover when you are the buyer (shipped, since that is how most
- * flips are bought):
+ * Seller-side fees for private sellers as of 2026-09, and what buying costs
+ * on top of the asking price (the operator's figures, 2026-11):
  * - Vinted: buyer protection 5% + 2,90 zł, plus about 13 zł parcel shipping.
- * - OLX and Allegro Lokalnie: about 15 zł parcel shipping with the
- *   platform's delivery.
+ * - OLX: the buyer's service fee (opłata serwisowa) when paying through OLX,
+ *   which OLX sets by price and category and caps at 50 zł. 1,99 zł + 4,3%
+ *   reproduces OLX's published example (3,67 zł on a 39 zł item); OLX does
+ *   not publish the formula, so it is an estimate. Above about 1 100 zł the
+ *   cap applies and this overstates it.
+ * - Allegro Lokalnie: nothing.
  * Rough figures to edit on the Flips page; a local pickup costs nothing.
  * - OLX: a standard listing with OLX Przesyłka has no seller commission. The
  *   optional "Zapłać, jeśli sprzedasz" model charges roughly 6–10% in
@@ -40,8 +42,8 @@ export type FeePresets = Record<FlipChannel, FeePreset>;
  * - Vinted: no seller fee.
  */
 export const DEFAULT_FEE_PRESETS: FeePresets = {
-  OLX: { percent: 0, fixed: 0, buyPercent: 0, buyFixed: 15 },
-  "Allegro Lokalnie": { percent: 4.9, fixed: 0, buyPercent: 0, buyFixed: 15 },
+  OLX: { percent: 0, fixed: 0, buyPercent: 4.3, buyFixed: 1.99 },
+  "Allegro Lokalnie": { percent: 4.9, fixed: 0, buyPercent: 0, buyFixed: 0 },
   Vinted: { percent: 0, fixed: 0, buyPercent: 5, buyFixed: 16 },
   Other: { percent: 0, fixed: 0, buyPercent: 0, buyFixed: 0 },
 };
@@ -54,8 +56,8 @@ export const FEE_PRESET_NOTES: Record<FlipChannel, string> = {
 };
 
 export const BUY_COST_NOTES: Record<FlipChannel, string> = {
-  OLX: "Buying shipped with OLX Przesyłka: about 15 zł shipping. Pickup: 0.",
-  "Allegro Lokalnie": "Buying shipped with Allegro Lokalnie delivery: about 15 zł shipping. Pickup: 0.",
+  OLX: "OLX's buyer service fee when paying through OLX: about 1,99 zł + 4,3%, at most 50 zł. Pickup: 0.",
+  "Allegro Lokalnie": "No buying cost.",
   Vinted: "Buyer protection 5% + 2,90 zł, plus about 13 zł shipping.",
   Other: "Anything else, e.g. buying in person.",
 };

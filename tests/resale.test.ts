@@ -35,8 +35,8 @@ test('the estimated net takes buying costs on the buy marketplace and the seller
     net: 38, // 264 − 26 − 200
     basis: { source: 'typical-haircut', resalePrice: 264, samples: null, buyCosts: 26, label: '88% of typical' },
   });
-  // Allegro Lokalnie: 4,9% of a 900 zł own-sale basis, 15 zł shipping in.
-  assert.equal(estimateResaleNet(700, 1000, DEFAULT_FEE_PRESETS['Allegro Lokalnie'], { ownSales: [900] })?.net, 141);
+  // Allegro Lokalnie: 4,9% of a 900 zł own-sale basis, nothing to buy there.
+  assert.equal(estimateResaleNet(700, 1000, DEFAULT_FEE_PRESETS['Allegro Lokalnie'], { ownSales: [900] })?.net, 156);
   assert.equal(estimateResaleNet(700, null, DEFAULT_FEE_PRESETS.OLX), null);
 });
 
@@ -97,8 +97,9 @@ test('the resale context loads flips, watches and bands once and only for flip c
     watches: () => { calls.watches += 1; return [{ ...gpus, groups: [] }, { id: 'cpus', query: 'ryzen 5600', includedTerms: '', excludedTerms: '', groups: [], referenceId: 'research-cpus' }]; },
     band: () => { calls.band += 1; return { p25: 380, samples: 12 }; },
   }, NOW);
-  assert.deepEqual(context.estimate('OLX', 'gpus', null, 900, 1300), { net: 235, basis: { source: 'own-sales', resalePrice: 1150, samples: 1, buyCosts: 15, label: 'your recent sale' } });
-  assert.equal(context.estimate('OLX', 'gpus', null, 950, 1300)?.net, 185);
+  // OLX's buyer fee: 1,99 zł + 4,3% of 900 = 40,69 zł.
+  assert.deepEqual(context.estimate('OLX', 'gpus', null, 900, 1300), { net: 209, basis: { source: 'own-sales', resalePrice: 1150, samples: 1, buyCosts: 41, label: 'your recent sale' } });
+  assert.equal(context.estimate('OLX', 'gpus', null, 950, 1300)?.net, 157);
   assert.deepEqual(context.estimate('Vinted', 'cpus', null, 300, 450)?.basis, { source: 'sale-band', resalePrice: 380, samples: 12, buyCosts: 31, label: 'probable-sale p25' });
   assert.equal(context.estimate('Vinted', 'cpus', null, 320, 450)?.basis.source, 'sale-band');
   assert.equal(context.estimate('OLX', 'missing', null, 900, 1000)?.basis.source, 'typical-haircut');
