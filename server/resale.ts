@@ -47,7 +47,8 @@ export function ownSalesFor(flips: readonly SoldFlip[], watch: ResaleWatch, vari
   const from = asOf - OWN_SALES_WINDOW_DAYS * DAY_MS;
   const prices: number[] = [];
   for (const flip of flips) {
-    const soldAt = Date.parse(`${flip.soldOn}T12:00:00Z`);
+    // A sale counts from the start of its day, so one recorded today counts at once.
+    const soldAt = Date.parse(`${flip.soldOn}T00:00:00Z`);
     if (!Number.isFinite(soldAt) || soldAt > asOf || soldAt < from || !(flip.salePrice > 0)) continue;
     if (flip.watchId !== watch.id && !passesWatchTerms(watch, flip.title)) continue;
     if (grouped && assignVariant(flip.title, watch.groups) !== variantKey) continue;

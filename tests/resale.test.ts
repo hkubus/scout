@@ -102,6 +102,8 @@ test('own sales are recent flips of the same model: by watch or filter, in the s
   assert.deepEqual(ownSalesFor(flips, ungrouped, null, NOW), [1150, 1500, 1100]);
   // A sale after the moment asked about does not count (the bench replays the past).
   assert.deepEqual(ownSalesFor(flips, ungrouped, null, Date.parse('2026-10-25T00:00:00Z')), [1500]);
+  // A sale dated today counts at once, not from midday.
+  assert.deepEqual(ownSalesFor(flips, ungrouped, null, Date.parse('2026-11-05T03:00:00Z')), [1150, 1500, 1100]);
 });
 
 test('the resale context loads flips, watches and bands once and only for flip channels', () => {
