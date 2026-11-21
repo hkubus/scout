@@ -128,9 +128,14 @@ test('GET /api/listings takes excludeFlags over stored flags, after the startup 
     };
     const sellerOnly = { OLX: { percent: 0, fixed: 0 }, 'Allegro Lokalnie': { percent: 4.9, fixed: 0 }, Vinted: { percent: 0, fixed: 0 }, Other: { percent: 0, fixed: 0 } };
     const saved = await putPresets({ ...sellerOnly, OLX: { percent: 0, fixed: 0, buyPercent: 0, buyFixed: 25 } });
-    assert.deepEqual([saved.status, saved.body.feePresets?.OLX], [200, { percent: 0, fixed: 0, buyPercent: 0, buyFixed: 25 }]);
+    assert.deepEqual([saved.status, saved.body.feePresets?.OLX], [200, { percent: 0, fixed: 0, buyPercent: 0, buyFixed: 25, buyMax: 70 }]);
     const merged = await putPresets({ ...sellerOnly, OLX: { percent: 8, fixed: 0 } });
-    assert.deepEqual([merged.status, merged.body.feePresets?.OLX, merged.body.feePresets?.Vinted], [200, { percent: 8, fixed: 0, buyPercent: 0, buyFixed: 25 }, { percent: 0, fixed: 0, buyPercent: 5, buyFixed: 16 }]);
+    assert.deepEqual([merged.status, merged.body.feePresets?.OLX, merged.body.feePresets?.Vinted], [200, { percent: 8, fixed: 0, buyPercent: 0, buyFixed: 25, buyMax: 70 }, { percent: 0, fixed: 0, buyPercent: 5, buyFixed: 16, buyMax: null }]);
+    // Null removes the cap and stays removed; a cap over 1000 zł is refused.
+    const uncapped = await putPresets({ ...sellerOnly, OLX: { percent: 8, fixed: 0, buyMax: null } });
+    assert.deepEqual([uncapped.status, uncapped.body.feePresets?.OLX?.buyMax], [200, null]);
+    assert.equal((await putPresets({ ...sellerOnly, OLX: { percent: 8, fixed: 0 } })).body.feePresets?.OLX?.buyMax, null);
+    assert.equal((await putPresets({ ...sellerOnly, OLX: { percent: 8, fixed: 0, buyMax: 5000 } })).status, 400);
     assert.equal((await putPresets({ ...sellerOnly, Vinted: { percent: 0, fixed: 0, buyPercent: 90 } })).status, 400);
   } finally {
     await scout.stop();

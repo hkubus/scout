@@ -767,6 +767,10 @@ final class AlertRuleTests: XCTestCase {
         let presets = try JSONDecoder().decode(FeePresets.self, from: Data(#"{"Vinted":{"percent":0,"fixed":0,"buyPercent":5,"buyFixed":16},"OLX":{"percent":0,"fixed":0}}"#.utf8))
         XCTAssertEqual(Profit.buyCost(price: 159, preset: presets[.vinted]), 23.95)
         XCTAssertEqual(Profit.buyCost(price: 159, preset: presets[.olx]), 0)
+        // A cap, and a null cap (none).
+        let capped = try JSONDecoder().decode(FeePresets.self, from: Data(#"{"OLX":{"percent":0,"fixed":0,"buyPercent":4.6,"buyFixed":3.99,"buyMax":70},"Vinted":{"percent":0,"fixed":0,"buyPercent":5,"buyFixed":16,"buyMax":null}}"#.utf8))
+        XCTAssertEqual(Profit.buyCost(price: 2000, preset: capped[.olx]), 70)
+        XCTAssertEqual(Profit.buyCost(price: 2000, preset: capped[.vinted]), 116)
     }
 
     func testDraftSendsAlertRulesAndNullSoEditsCanClearThem() throws {
@@ -806,8 +810,9 @@ final class AlertRuleTests: XCTestCase {
         // 88% of the 1199 typical (1055) − 4.9% Allegro Lokalnie fee − 749; buying on Allegro Lokalnie costs nothing.
         XCTAssertEqual(sony.estimatedNet, 254)
         XCTAssertEqual(sony.resaleBasis?.label, "88% of typical")
-        // 2639 − 1899 − OLX's buyer fee (1,99 zł + 4,3% of 1899 = 83,65).
-        XCTAssertEqual(dashboard.listings.first { $0.key == "OLX:890231" }?.estimatedNet, 656)
+        // 2639 − 1899 − OLX's buyer fee (3,99 zł + 4,6% of 1899 = 91,34, capped at 70).
+        XCTAssertEqual(dashboard.listings.first { $0.key == "OLX:890231" }?.estimatedNet, 670)
+        XCTAssertEqual(Profit.buyCost(price: 350, preset: FeePresets.defaults[.olx]), 20.09)
         XCTAssertFalse(dashboard.listings.contains { $0.estimatedNet == nil })
         XCTAssertEqual(dashboard.listings.filter(\.isTargetHit).count, 1)
         XCTAssertEqual(dashboard.watches.first { $0.id == "watch-deck" }?.minSaving, 300)

@@ -40,12 +40,26 @@ test('the estimated net takes buying costs on the buy marketplace and the seller
   assert.equal(estimateResaleNet(700, null, DEFAULT_FEE_PRESETS.OLX), null);
 });
 
+test("OLX's buying cost matches what OLX's checkout charged, capped at 70 zł", () => {
+  // SERVICE_FEE from OLX's checkout on 2026-11-21 for computer parts, phones and laptops.
+  for (const [price, fee] of [[295, 17.56], [350, 20.09], [500, 26.99], [998, 49.9], [1299, 63.74], [1500, 70], [4000, 70]]) {
+    assert.equal(buyCost(price, DEFAULT_FEE_PRESETS.OLX), fee, `${price} zł`);
+  }
+  // A saved "no cap" (null) stays through saves that leave the cap out; a bad cap falls back.
+  const uncapped = normalizeFeePresets({ OLX: { percent: 0, fixed: 0, buyPercent: 4.6, buyFixed: 3.99, buyMax: null } });
+  assert.equal(uncapped.OLX.buyMax, null);
+  assert.equal(buyCost(2000, uncapped.OLX), 95.99);
+  assert.equal(normalizeFeePresets({ OLX: { percent: 8, fixed: 0 } }, uncapped).OLX.buyMax, null);
+  assert.equal(normalizeFeePresets({}, uncapped).OLX.buyMax, null);
+  assert.equal(normalizeFeePresets({ OLX: { percent: 0, fixed: 0, buyMax: -5 } }).OLX.buyMax, 70);
+});
+
 test('fee presets keep saved buying costs when a client sends only seller fees', () => {
   const saved = normalizeFeePresets({ Vinted: { percent: 0, fixed: 0, buyPercent: 3, buyFixed: 20 } });
-  assert.deepEqual(saved.Vinted, { percent: 0, fixed: 0, buyPercent: 3, buyFixed: 20 });
+  assert.deepEqual(saved.Vinted, { percent: 0, fixed: 0, buyPercent: 3, buyFixed: 20, buyMax: null });
   // An older client (or the iOS app) sends seller fees only, or no entry at all.
   const merged = normalizeFeePresets({ Vinted: { percent: 2, fixed: 1 } }, saved);
-  assert.deepEqual(merged.Vinted, { percent: 2, fixed: 1, buyPercent: 3, buyFixed: 20 });
+  assert.deepEqual(merged.Vinted, { percent: 2, fixed: 1, buyPercent: 3, buyFixed: 20, buyMax: null });
   assert.deepEqual(normalizeFeePresets({}, saved).Vinted, { ...DEFAULT_FEE_PRESETS.Vinted, buyPercent: 3, buyFixed: 20 });
   // Out-of-range buy costs fall back too.
   assert.deepEqual(normalizeFeePresets({ OLX: { percent: 0, fixed: 0, buyPercent: 80, buyFixed: -1 } }).OLX, DEFAULT_FEE_PRESETS.OLX);
@@ -56,7 +70,7 @@ test('fee presets keep saved buying costs when a client sends only seller fees',
     const store = new FlipStore(db);
     store.setFeePresets({ ...DEFAULT_FEE_PRESETS, OLX: { percent: 0, fixed: 0, buyPercent: 0, buyFixed: 25 } });
     store.setFeePresets({ ...DEFAULT_FEE_PRESETS, OLX: { percent: 8, fixed: 0 } } as typeof DEFAULT_FEE_PRESETS);
-    assert.deepEqual(store.feePresets().OLX, { percent: 8, fixed: 0, buyPercent: 0, buyFixed: 25 });
+    assert.deepEqual(store.feePresets().OLX, { percent: 8, fixed: 0, buyPercent: 0, buyFixed: 25, buyMax: 70 });
   } finally {
     db.close();
     rmSync(directory, { recursive: true, force: true });
@@ -97,9 +111,9 @@ test('the resale context loads flips, watches and bands once and only for flip c
     watches: () => { calls.watches += 1; return [{ ...gpus, groups: [] }, { id: 'cpus', query: 'ryzen 5600', includedTerms: '', excludedTerms: '', groups: [], referenceId: 'research-cpus' }]; },
     band: () => { calls.band += 1; return { p25: 380, samples: 12 }; },
   }, NOW);
-  // OLX's buyer fee: 1,99 zł + 4,3% of 900 = 40,69 zł.
-  assert.deepEqual(context.estimate('OLX', 'gpus', null, 900, 1300), { net: 209, basis: { source: 'own-sales', resalePrice: 1150, samples: 1, buyCosts: 41, label: 'your recent sale' } });
-  assert.equal(context.estimate('OLX', 'gpus', null, 950, 1300)?.net, 157);
+  // OLX's buyer fee: 3,99 zł + 4,6% of 900 = 45,39 zł.
+  assert.deepEqual(context.estimate('OLX', 'gpus', null, 900, 1300), { net: 205, basis: { source: 'own-sales', resalePrice: 1150, samples: 1, buyCosts: 45, label: 'your recent sale' } });
+  assert.equal(context.estimate('OLX', 'gpus', null, 950, 1300)?.net, 152); // 1150 − 47,69 − 950
   assert.deepEqual(context.estimate('Vinted', 'cpus', null, 300, 450)?.basis, { source: 'sale-band', resalePrice: 380, samples: 12, buyCosts: 31, label: 'probable-sale p25' });
   assert.equal(context.estimate('Vinted', 'cpus', null, 320, 450)?.basis.source, 'sale-band');
   assert.equal(context.estimate('OLX', 'missing', null, 900, 1000)?.basis.source, 'typical-haircut');

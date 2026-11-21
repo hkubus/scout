@@ -19,6 +19,11 @@ export interface FeePreset {
   buyPercent?: number;
   /** Fixed buying cost per purchase (shipping, a protection fee), in PLN. */
   buyFixed?: number;
+  /**
+   * Most the buying cost can come to, in PLN (OLX caps its buyer fee). Null
+   * means no cap; missing on presets saved before caps existed.
+   */
+  buyMax?: number | null;
 }
 
 export type FeePresets = Record<FlipChannel, FeePreset>;
@@ -27,11 +32,13 @@ export type FeePresets = Record<FlipChannel, FeePreset>;
  * Seller-side fees for private sellers as of 2026-09, and what buying costs
  * on top of the asking price (the operator's figures, 2026-11):
  * - Vinted: buyer protection 5% + 2,90 zł, plus about 13 zł parcel shipping.
- * - OLX: the buyer's service fee (opłata serwisowa) when paying through OLX,
- *   which OLX sets by price and category and caps at 50 zł. 1,99 zł + 4,3%
- *   reproduces OLX's published example (3,67 zł on a 39 zł item); OLX does
- *   not publish the formula, so it is an estimate. Above about 1 100 zł the
- *   cap applies and this overstates it.
+ * - OLX: the buyer's fee for Pakiet Ochronny when paying through OLX, as
+ *   OLX's checkout charged it on 2026-11-21 (SERVICE_FEE from
+ *   checkout/v1/listing/{id}/cost on 90 listings). Computer parts, phones and
+ *   laptops pay 3,99 zł + 4,6% from about 125 zł, at most 70 zł (reached at
+ *   about 1 435 zł). Cheaper items pay a lower percentage (4% from about
+ *   50 zł, 3,4–3,6% below that), so under 125 zł this overstates the fee by
+ *   less than 0,75 zł. Clothes and books pay 3,50 zł + 3,5%.
  * - Allegro Lokalnie: nothing.
  * Rough figures to edit on the Flips page; a local pickup costs nothing.
  * - OLX: a standard listing with OLX Przesyłka has no seller commission. The
@@ -42,10 +49,10 @@ export type FeePresets = Record<FlipChannel, FeePreset>;
  * - Vinted: no seller fee.
  */
 export const DEFAULT_FEE_PRESETS: FeePresets = {
-  OLX: { percent: 0, fixed: 0, buyPercent: 4.3, buyFixed: 1.99 },
-  "Allegro Lokalnie": { percent: 4.9, fixed: 0, buyPercent: 0, buyFixed: 0 },
-  Vinted: { percent: 0, fixed: 0, buyPercent: 5, buyFixed: 16 },
-  Other: { percent: 0, fixed: 0, buyPercent: 0, buyFixed: 0 },
+  OLX: { percent: 0, fixed: 0, buyPercent: 4.6, buyFixed: 3.99, buyMax: 70 },
+  "Allegro Lokalnie": { percent: 4.9, fixed: 0, buyPercent: 0, buyFixed: 0, buyMax: null },
+  Vinted: { percent: 0, fixed: 0, buyPercent: 5, buyFixed: 16, buyMax: null },
+  Other: { percent: 0, fixed: 0, buyPercent: 0, buyFixed: 0, buyMax: null },
 };
 
 export const FEE_PRESET_NOTES: Record<FlipChannel, string> = {
@@ -56,7 +63,7 @@ export const FEE_PRESET_NOTES: Record<FlipChannel, string> = {
 };
 
 export const BUY_COST_NOTES: Record<FlipChannel, string> = {
-  OLX: "OLX's buyer service fee when paying through OLX: about 1,99 zł + 4,3%, at most 50 zł. Pickup: 0.",
+  OLX: "OLX's buyer fee (Pakiet Ochronny) when paying through OLX: 3,99 zł + 4,6% for electronics from about 125 zł, at most 70 zł. Pickup: 0.",
   "Allegro Lokalnie": "No buying cost.",
   Vinted: "Buyer protection 5% + 2,90 zł, plus about 13 zł shipping.",
   Other: "Anything else, e.g. buying in person.",
@@ -70,6 +77,7 @@ export function isFlipChannel(value: unknown): value is FlipChannel {
 
 const presetPercent = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 50;
 const presetAmount = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1000;
+const presetCap = (value: unknown) => value === null || presetAmount(value);
 
 /**
  * Merge stored presets over the defaults, dropping anything malformed. Buy
@@ -83,16 +91,19 @@ export function normalizeFeePresets(value: unknown, fallback: FeePresets = DEFAU
     const entry = stored[channel];
     const defaults = DEFAULT_FEE_PRESETS[channel];
     const previous = fallback[channel] ?? defaults;
+    // Null is a saved "no cap", so only a missing cap falls back.
+    const previousMax = previous.buyMax === undefined ? defaults.buyMax ?? null : previous.buyMax;
     if (typeof entry !== "object" || entry === null) {
-      presets[channel] = { ...defaults, buyPercent: previous.buyPercent ?? defaults.buyPercent, buyFixed: previous.buyFixed ?? defaults.buyFixed };
+      presets[channel] = { ...defaults, buyPercent: previous.buyPercent ?? defaults.buyPercent, buyFixed: previous.buyFixed ?? defaults.buyFixed, buyMax: previousMax };
       continue;
     }
-    const { percent, fixed, buyPercent, buyFixed } = entry as Record<string, unknown>;
+    const { percent, fixed, buyPercent, buyFixed, buyMax } = entry as Record<string, unknown>;
     presets[channel] = {
       percent: presetPercent(percent) ? (percent as number) : defaults.percent,
       fixed: presetAmount(fixed) ? (fixed as number) : defaults.fixed,
       buyPercent: presetPercent(buyPercent) ? (buyPercent as number) : previous.buyPercent ?? defaults.buyPercent,
       buyFixed: presetAmount(buyFixed) ? (buyFixed as number) : previous.buyFixed ?? defaults.buyFixed,
+      buyMax: presetCap(buyMax) ? (buyMax as number | null) : previousMax,
     };
   }
   return presets;
@@ -103,10 +114,11 @@ export function saleFee(salePrice: number, preset: FeePreset) {
   return round2((salePrice * preset.percent) / 100 + preset.fixed);
 }
 
-/** What buying at `price` on a channel costs on top of the price (shipping, buyer protection). */
+/** What buying at `price` on a channel costs on top of the price (shipping, buyer protection), up to the preset's cap. */
 export function buyCost(price: number, preset: FeePreset) {
   if (!Number.isFinite(price) || price <= 0) return 0;
-  return round2((price * (preset.buyPercent ?? 0)) / 100 + (preset.buyFixed ?? 0));
+  const cost = round2((price * (preset.buyPercent ?? 0)) / 100 + (preset.buyFixed ?? 0));
+  return typeof preset.buyMax === "number" ? Math.min(cost, preset.buyMax) : cost;
 }
 
 export interface FlipAmounts {

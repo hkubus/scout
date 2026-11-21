@@ -634,16 +634,17 @@ function ReadyDialog({ flip, onClose, onSaved, onEditListing }: { flip: Flip; on
 }
 
 function FeePresetsPanel({ presets, onSaved, onToast }: { presets: FeePresets; onSaved: (presets: FeePresets) => void; onToast: (message: string, type?: ToastType) => void }) {
-  type Draft = { percent: string; fixed: string; buyPercent: string; buyFixed: string };
+  type Draft = { percent: string; fixed: string; buyPercent: string; buyFixed: string; buyMax: string };
   const [draft, setDraft] = useState(() => Object.fromEntries(FLIP_CHANNELS.map((channel) => [channel, {
     percent: String(presets[channel].percent),
     fixed: String(presets[channel].fixed),
     buyPercent: String(presets[channel].buyPercent ?? 0),
     buyFixed: String(presets[channel].buyFixed ?? 0),
+    buyMax: presets[channel].buyMax == null ? "" : String(presets[channel].buyMax),
   }])) as Record<FlipChannel, Draft>);
   const [busy, setBusy] = useState(false);
-  const parsed = FLIP_CHANNELS.map((channel) => [channel, { percent: toAmount(draft[channel].percent), fixed: toAmount(draft[channel].fixed), buyPercent: toAmount(draft[channel].buyPercent), buyFixed: toAmount(draft[channel].buyFixed) }] as const);
-  const valid = parsed.every(([, preset]) => [preset.percent, preset.buyPercent].every((value) => Number.isFinite(value) && value <= 50) && [preset.fixed, preset.buyFixed].every((value) => Number.isFinite(value) && value <= 1000));
+  const parsed = FLIP_CHANNELS.map((channel) => [channel, { percent: toAmount(draft[channel].percent), fixed: toAmount(draft[channel].fixed), buyPercent: toAmount(draft[channel].buyPercent), buyFixed: toAmount(draft[channel].buyFixed), buyMax: draft[channel].buyMax.trim() === "" ? null : toAmount(draft[channel].buyMax) }] as const);
+  const valid = parsed.every(([, preset]) => [preset.percent, preset.buyPercent].every((value) => Number.isFinite(value) && value <= 50) && [preset.fixed, preset.buyFixed, preset.buyMax ?? 0].every((value) => Number.isFinite(value) && value <= 1000));
   const edit = (channel: FlipChannel, field: keyof Draft, value: string) => setDraft((current) => ({ ...current, [channel]: { ...current[channel], [field]: value } }));
   const save = async () => {
     setBusy(true);
@@ -667,10 +668,12 @@ function FeePresetsPanel({ presets, onSaved, onToast }: { presets: FeePresets; o
             <strong>{channel}</strong>
             <label>%<input inputMode="decimal" aria-label={`${channel} fee percent`} value={draft[channel].percent} onChange={(event) => edit(channel, "percent", event.target.value)} /></label>
             <label>+ zł<input inputMode="decimal" aria-label={`${channel} fixed fee`} value={draft[channel].fixed} onChange={(event) => edit(channel, "fixed", event.target.value)} /></label>
+            <span className="fee-preset-gap" />
             <small>{FEE_PRESET_NOTES[channel]}</small>
             <span className="fee-preset-buy">Buying</span>
             <label>%<input inputMode="decimal" aria-label={`${channel} buying cost percent`} value={draft[channel].buyPercent} onChange={(event) => edit(channel, "buyPercent", event.target.value)} /></label>
             <label>+ zł<input inputMode="decimal" aria-label={`${channel} fixed buying cost`} value={draft[channel].buyFixed} onChange={(event) => edit(channel, "buyFixed", event.target.value)} /></label>
+            <label>max zł<input inputMode="decimal" placeholder="none" aria-label={`${channel} buying cost cap`} value={draft[channel].buyMax} onChange={(event) => edit(channel, "buyMax", event.target.value)} /></label>
             <small>{BUY_COST_NOTES[channel]}</small>
           </div>
         ))}

@@ -4534,10 +4534,10 @@ test('target prices alert while learning on every channel, and the minimum savin
     const deal = store('big-saving', 670);
     assert.ok(deal);
     assert.equal(deal.targetPrice, null);
-    // 88% of the typical, less OLX's buyer fee (1,99 zł + 4,3% of 670 = 30,80 zł) and the 670 zł price.
-    const olxBuyIn = 30.8;
+    // 88% of the typical, less OLX's buyer fee (3,99 zł + 4,6% of 670 = 34,81 zł) and the 670 zł price.
+    const olxBuyIn = 34.81;
     assert.equal(deal.estimatedNet, Math.round(Math.round(deal.typical * 0.88) - olxBuyIn - 670));
-    assert.deepEqual(deal.resaleBasis, { source: 'typical-haircut', resalePrice: Math.round(deal.typical * 0.88), samples: null, buyCosts: 31, label: '88% of typical' });
+    assert.deepEqual(deal.resaleBasis, { source: 'typical-haircut', resalePrice: Math.round(deal.typical * 0.88), samples: null, buyCosts: 35, label: '88% of typical' });
     // The floor does not touch the feed: the small-saving row is still scored.
     const feed = context.service.listingsPage({ page: 1, pageSize: 100 }).listings;
     const smallSaving = feed.find((item) => item.listingId === 'small-saving')!;
@@ -4560,7 +4560,7 @@ test('target prices alert while learning on every channel, and the minimum savin
     sell('Monitor', null, today, 5000);
     sell('CPU sold long ago', 'target-watch', '2025-01-01', 100);
     const withSale = context.service.listingsPage({ page: 1, pageSize: 100 }).listings.find((item) => item.listingId === 'big-saving')!;
-    assert.deepEqual(withSale.resaleBasis, { source: 'own-sales', resalePrice: 900, samples: 1, buyCosts: 31, label: 'your recent sale' });
+    assert.deepEqual(withSale.resaleBasis, { source: 'own-sales', resalePrice: 900, samples: 1, buyCosts: 35, label: 'your recent sale' });
     assert.equal(withSale.estimatedNet, Math.round(900 - 90 - olxBuyIn - 670));
     assert.equal(refreshed.find((item) => item.listingId === 'base-0')!.targetHit, false);
     const watch = context.service.watchById('target-watch')!;

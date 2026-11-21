@@ -43,12 +43,15 @@ public struct FeePreset: Codable, Hashable, Sendable {
     public var buyPercent: Double?
     /// Fixed buying cost per purchase (shipping), in PLN. Nil from older servers.
     public var buyFixed: Double?
+    /// Most the buying cost can come to, in PLN (OLX caps its buyer fee). Nil: no cap.
+    public var buyMax: Double?
 
-    public init(percent: Double, fixed: Double, buyPercent: Double? = nil, buyFixed: Double? = nil) {
+    public init(percent: Double, fixed: Double, buyPercent: Double? = nil, buyFixed: Double? = nil, buyMax: Double? = nil) {
         self.percent = percent
         self.fixed = fixed
         self.buyPercent = buyPercent
         self.buyFixed = buyFixed
+        self.buyMax = buyMax
     }
 }
 
@@ -62,7 +65,7 @@ public struct FeePresets: Hashable, Sendable {
 
     /// Private-seller defaults as of 2026-09 (see `src/profit.ts`).
     public static let defaults = FeePresets([
-        .olx: FeePreset(percent: 0, fixed: 0, buyPercent: 4.3, buyFixed: 1.99),
+        .olx: FeePreset(percent: 0, fixed: 0, buyPercent: 4.6, buyFixed: 3.99, buyMax: 70),
         .allegroLokalnie: FeePreset(percent: 4.9, fixed: 0, buyPercent: 0, buyFixed: 0),
         .vinted: FeePreset(percent: 0, fixed: 0, buyPercent: 5, buyFixed: 16),
         .other: FeePreset(percent: 0, fixed: 0, buyPercent: 0, buyFixed: 0),
@@ -426,10 +429,11 @@ public enum Profit {
     /// Share of the typical asking price a resale is assumed to fetch without better evidence.
     public static let typicalResaleShare = 0.88
 
-    /// What buying at `price` on a channel costs on top of it (shipping, buyer protection).
+    /// What buying at `price` on a channel costs on top of it (shipping, buyer protection), up to the preset's cap.
     public static func buyCost(price: Double, preset: FeePreset) -> Double {
         guard price.isFinite, price > 0 else { return 0 }
-        return round2(price * (preset.buyPercent ?? 0) / 100 + (preset.buyFixed ?? 0))
+        let cost = round2(price * (preset.buyPercent ?? 0) / 100 + (preset.buyFixed ?? 0))
+        return preset.buyMax.map { min(cost, $0) } ?? cost
     }
 
     public static func cost(buyPrice: Double, buyCosts: Double) -> Double {

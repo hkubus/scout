@@ -984,7 +984,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .flips-dac7 strong { color: var(--text-strong); font-size: 16px; }
 .flips-dac7--warn { border-color: rgba(241, 90, 53, .45) !important; }
 .fee-preset-grid { display: grid; gap: 8px; margin-bottom: 12px; }
-.fee-preset-row { display: grid; grid-template-columns: 130px 110px 110px minmax(0, 1fr); align-items: center; gap: 10px; font-size: 13px; }
+.fee-preset-row { display: grid; grid-template-columns: 130px 110px 110px 120px minmax(0, 1fr); align-items: center; gap: 10px; font-size: 13px; }
 .fee-preset-row label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
 .fee-preset-row input { width: 70px; min-height: 32px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); color: var(--text); }
 .fee-preset-row small { color: var(--muted); font-size: 11px; }
@@ -1000,6 +1000,7 @@ button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
   .fee-preset-row { grid-template-columns: 1fr 1fr; }
   .fee-preset-row strong, .fee-preset-row small, .fee-preset-buy { grid-column: 1 / -1; }
   .fee-preset-buy { text-align: left; }
+  .fee-preset-gap { display: none; }
 }
 
 .listing-prices { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
